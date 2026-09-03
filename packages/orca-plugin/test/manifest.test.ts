@@ -1,26 +1,28 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { validatePluginManifest } from "@orca-pi/core";
+import { qualifiedPluginKey, validatePluginManifest } from "@orca-pi/core";
 import { activate, renderPluginStatus } from "../src/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function loadArtifact(): { manifest: unknown; panelHtml: string; commands: unknown } {
+function loadArtifact(): { manifest: unknown; panelHtml: string } {
   const root = join(here, "..");
-  const manifest = JSON.parse(readFileSync(join(root, "orca.plugin.json"), "utf8")) as unknown;
+  const manifest = JSON.parse(readFileSync(join(root, "orca-plugin.json"), "utf8")) as unknown;
   const panelHtml = readFileSync(join(root, "panel.html"), "utf8");
-  const commands = JSON.parse(readFileSync(join(root, "commands.json"), "utf8")) as unknown;
-  return { manifest, panelHtml, commands };
+  return { manifest, panelHtml };
 }
 
 describe("orca-plugin artifact", () => {
-  it("ships a valid manifest", () => {
+  it("ships a valid v1 manifest named orca-plugin.json", () => {
     const { manifest } = loadArtifact();
     const result = validatePluginManifest(manifest);
     expect(result.errors).toEqual([]);
     expect(result.ok).toBe(true);
+    expect(
+      qualifiedPluginKey(manifest as { publisher: string; id: string }),
+    ).toBe("44madfire.orca-pi");
   });
 
   it("manifest version tracks the plugin package version", () => {
@@ -31,29 +33,47 @@ describe("orca-plugin artifact", () => {
     expect((manifest as { version: string }).version).toBe(pkg.version);
   });
 
+  it("every panel entry points at a file that exists in the artifact", () => {
+    const { manifest } = loadArtifact();
+    const panels = (manifest as { contributes: { panels: { entry: string }[] } })
+      .contributes.panels;
+    expect(panels.length).toBeGreaterThan(0);
+    for (const panel of panels) {
+      expect(existsSync(join(here, "..", panel.entry))).toBe(true);
+    }
+  });
+
   it("ships a placeholder panel referencing the companion CLI", () => {
     const { panelHtml } = loadArtifact();
     expect(panelHtml).toContain("Orca–Pi Status");
     expect(panelHtml).toContain("orca-pi doctor");
   });
 
-  it("ships a placeholder command matching the manifest", () => {
-    const { manifest, commands } = loadArtifact();
-    const manifestCommands = (manifest as { contributions: { commands: { id: string }[] } })
-      .contributions.commands;
-    expect(manifestCommands.map((c) => c.id)).toContain("orca-pi.showStatus");
-    expect(JSON.stringify(commands)).toContain("orca-pi.showStatus");
+  it("declares no worker main and no capabilities (declarative-only scaffold)", () => {
+    const { manifest } = loadArtifact();
+    const typed = manifest as {
+      main?: string;
+      capabilities: unknown[];
+      contributes: { commands: { action?: string }[] };
+    };
+    expect(typed.main).toBeUndefined();
+    expect(typed.capabilities).toEqual([]);
+    // Every declared command must carry a built-in action alias: action-less
+    // commands are worker commands and would require a `main` entry.
+    for (const command of typed.contributes.commands) {
+      expect(typeof command.action).toBe("string");
+    }
   });
 
   it("activates without I/O and renders status from injected doctor data", () => {
     expect(activate()).toEqual({
-      plugin: "orca-pi",
-      commands: ["orca-pi.showStatus"],
-      panels: ["orca-pi.status"],
+      plugin: "44madfire.orca-pi",
+      commands: [],
+      panels: ["orca-pi-status"],
     });
     const text = renderPluginStatus({
       pluginVersion: "0.1.0",
-      orcaApiVersion: "1.4.x",
+      pluginApi: 1,
       doctor: {
         ok: true,
         orca: { executable: "orca", found: true, version: "1.4.196", detail: "orca 1.4.196" },

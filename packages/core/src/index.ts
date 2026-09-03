@@ -1,4 +1,4 @@
-export { ORCA_PI_VERSION, TARGET_ORCA_API_RANGE, TARGET_ORCA_APP_VERSION } from "./version.js";
+export { ORCA_PI_VERSION, TARGET_ORCA_PLUGIN_API, TARGET_ORCA_APP_VERSION } from "./version.js";
 export {
   doctor,
   formatDoctorReport,
@@ -12,12 +12,20 @@ export {
 } from "./doctor.js";
 export { createNodeRunner } from "./nodeRunner.js";
 export {
+  qualifiedPluginKey,
   validatePluginManifest,
   type ManifestValidation,
   type OrcaPluginManifest,
   type OrcaPluginCommandContribution,
   type OrcaPluginPanelContribution,
-  type OrcaPluginSkillContribution,
+  type OrcaPluginEventContribution,
+  type OrcaPluginCapability,
+  type OrcaPluginKeybindingContribution,
+  type OrcaPluginLanguagePackContribution,
+  type OrcaPluginPathContribution,
+  type PluginCapabilityKind,
+  type PluginCommandContext,
+  type PluginEventName,
 } from "./pluginManifest.js";
 export {
   ExecutableNotFoundError,

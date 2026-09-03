@@ -8,9 +8,8 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "orca.plugin.json",
+    "orca-plugin.json",
     "panel.html",
-    "commands.json",
     "skills"
   ],
   "scripts": {
