@@ -101,11 +101,81 @@ describe("validatePluginManifest", () => {
       ...VALID,
       main: "dist/index.js",
       contributes: { events: [{ on: "worktree.created" }] },
+      capabilities: [{ kind: "events:subscribe" }],
     };
-    expect(validatePluginManifest(withEvents).ok).toBe(true);
+    expect(validatePluginManifest(withEvents)).toEqual({ ok: true, errors: [] });
+    // Missing main fails…
     expect(
       validatePluginManifest({ ...withEvents, main: undefined }).ok,
     ).toBe(false);
+    // …and so does a missing events:subscribe capability.
+    const withoutCapability = validatePluginManifest({ ...withEvents, capabilities: [] });
+    expect(withoutCapability.ok).toBe(false);
+    expect(withoutCapability.errors.join("\n")).toContain("events:subscribe");
+  });
+
+  it("validates capability entries against the closed v0 kind set", () => {
+    const base = { ...VALID, main: "dist/index.js" };
+    expect(
+      validatePluginManifest({ ...base, capabilities: [{ kind: "storage" }] }),
+    ).toEqual({ ok: true, errors: [] });
+
+    const unknownKind = validatePluginManifest({
+      ...base,
+      capabilities: [{ kind: "network:admin" }],
+    });
+    expect(unknownKind.ok).toBe(false);
+    expect(unknownKind.errors.join("\n")).toContain("capabilities[0].kind");
+
+    const nonStrict = validatePluginManifest({
+      ...base,
+      capabilities: [{ kind: "storage", scope: "global" }],
+    });
+    expect(nonStrict.ok).toBe(false);
+    expect(nonStrict.errors.join("\n")).toContain("strict");
+
+    const tooMany = validatePluginManifest({
+      ...base,
+      capabilities: Array.from({ length: 33 }, () => ({ kind: "storage" })),
+    });
+    expect(tooMany.ok).toBe(false);
+    expect(tooMany.errors.join("\n")).toContain("at most 32");
+  });
+
+  it("validates language packs and keybindings against host schemas", () => {
+    const base = {
+      ...VALID,
+      contributes: {
+        commands: [{ id: "open-tasks", title: "Open Tasks", context: "global", action: "view.tasks" }],
+        languagePacks: [{ locale: "pt-BR", path: "locales/pt-BR.json" }],
+        keybindings: [{ command: "open-tasks", key: "Mod+Alt+T", when: "global" }],
+      },
+    };
+    expect(validatePluginManifest(base)).toEqual({ ok: true, errors: [] });
+
+    const badLocale = validatePluginManifest({
+      ...base,
+      contributes: { languagePacks: [{ locale: "not a locale!", path: "x.json" }] },
+    });
+    expect(badLocale.ok).toBe(false);
+    expect(badLocale.errors.join("\n")).toContain("languagePacks[0].locale");
+
+    const danglingKeybinding = validatePluginManifest({
+      ...base,
+      contributes: { keybindings: [{ command: "missing.command", key: "Mod+Alt+T" }] },
+    });
+    expect(danglingKeybinding.ok).toBe(false);
+    expect(danglingKeybinding.errors.join("\n")).toContain("unknown contributed command");
+
+    const contextMismatch = validatePluginManifest({
+      ...base,
+      contributes: {
+        commands: [{ id: "open-tasks", title: "Open Tasks", context: "worktree", action: "view.tasks" }],
+        keybindings: [{ command: "open-tasks", key: "Mod+Alt+T", when: "global" }],
+      },
+    });
+    expect(contextMismatch.ok).toBe(false);
+    expect(contextMismatch.errors.join("\n")).toContain("must match its command context");
   });
 
   it("rejects duplicate command ids and bad event names", () => {

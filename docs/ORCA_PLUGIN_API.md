@@ -50,7 +50,11 @@ Upstream sources (public `stablyai/orca`, `src/shared/plugins/`):
   (capability limitations).
 
 `packages/core/src/pluginManifest.ts` mirrors these rules (action aliases are
-shape-checked only — the host is authoritative) and
+shape-checked only and keybinding `key` conflict detection is an exact-match
+approximation — the host is authoritative for both) and
+enforces the rest, including the closed capability kind set (max 32), all
+contribution limits, and the `events:subscribe` gate, so `ok: true` means the
+manifest is expected to pass Orca validation.
 `packages/orca-plugin/test/manifest.test.ts` validates the shipped
 `orca-plugin.json` against it on every `npm test`.
 

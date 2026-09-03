@@ -19,6 +19,11 @@ export {
   type OrcaPluginCommandContribution,
   type OrcaPluginPanelContribution,
   type OrcaPluginEventContribution,
+  type OrcaPluginCapability,
+  type OrcaPluginKeybindingContribution,
+  type OrcaPluginLanguagePackContribution,
+  type OrcaPluginPathContribution,
+  type PluginCapabilityKind,
   type PluginCommandContext,
   type PluginEventName,
 } from "./pluginManifest.js";

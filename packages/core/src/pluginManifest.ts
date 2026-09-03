@@ -11,7 +11,11 @@
  *
  * Deliberate simplifications vs. the host: `contributes.commands[].action`
  * is shape-checked only (the host rejects unknown built-in action aliases
- * against a closed list); `capabilities[]` entries are shape-checked only.
+ * against a closed list), and keybinding `key` conflict detection is an
+ * exact-match approximation (the host normalizes key names per platform).
+ * Everything else — including capability kinds, contribution limits, and
+ * the `events:subscribe` gate — is enforced so `ok: true` means the
+ * manifest is expected to pass Orca validation.
  */
 
 export type PluginCommandContext = "global" | "worktree";
@@ -41,6 +45,39 @@ export interface OrcaPluginEventContribution {
   on: PluginEventName;
 }
 
+/**
+ * Closed v0 capability set (strict `{ kind }` objects — a typo fails
+ * validation instead of silently granting nothing). Mirrors
+ * `PLUGIN_CAPABILITY_KINDS` upstream.
+ */
+export type PluginCapabilityKind =
+  | "workspace:read"
+  | "terminal:send"
+  | "notifications:show"
+  | "storage"
+  | "secrets"
+  | "events:subscribe"
+  | "settings:own";
+
+export interface OrcaPluginCapability {
+  kind: PluginCapabilityKind;
+}
+
+export interface OrcaPluginLanguagePackContribution {
+  locale: string;
+  path: string;
+}
+
+export interface OrcaPluginKeybindingContribution {
+  command: string;
+  key: string;
+  when?: PluginCommandContext;
+}
+
+export interface OrcaPluginPathContribution {
+  path: string;
+}
+
 export interface OrcaPluginManifest {
   manifestVersion: 1;
   /** Kebab-case plugin id; canonical identity is `<publisher>.<id>`. */
@@ -61,18 +98,26 @@ export interface OrcaPluginManifest {
     panels?: OrcaPluginPanelContribution[];
     commands?: OrcaPluginCommandContribution[];
     events?: OrcaPluginEventContribution[];
-    languagePacks?: { locale: string; path: string }[];
-    keybindings?: { command: string; key: string; when?: PluginCommandContext }[];
-    vmRecipes?: { path: string }[];
-    agents?: { path: string }[];
+    languagePacks?: OrcaPluginLanguagePackContribution[];
+    keybindings?: OrcaPluginKeybindingContribution[];
+    vmRecipes?: OrcaPluginPathContribution[];
+    agents?: OrcaPluginPathContribution[];
   };
-  capabilities?: unknown[];
+  capabilities?: OrcaPluginCapability[];
 }
 
 export interface ManifestValidation {
   ok: boolean;
   errors: string[];
 }
+
+/**
+ * Design contract: `ok: true` means the manifest is expected to pass Orca's
+ * own validation. Every contribution family the validator recognizes is
+ * therefore checked against the host schema and limits — not just
+ * shape-checked. Anything the host normalizes itself (keybinding `key`
+ * strings) is length-checked here and flagged as host-authoritative.
+ */
 
 /** Canonical install identity: `<publisher>.<id>`. */
 export function qualifiedPluginKey(manifest: Pick<OrcaPluginManifest, "publisher" | "id">): string {
@@ -99,6 +144,31 @@ const KNOWN_CONTRIBUTION_KEYS = new Set([
   "vmRecipes",
   "agents",
 ]);
+
+// Host contribution limits mirrored from plugin-manifest.ts /
+// plugin-content-pack-contributions.ts upstream.
+const LIMITS = {
+  panels: 64,
+  commands: 256,
+  events: 3,
+  languagePacks: 16,
+  keybindings: 256,
+  vmRecipes: 64,
+  agents: 64,
+  capabilities: 32,
+} as const;
+
+const CAPABILITY_KINDS: readonly string[] = [
+  "workspace:read",
+  "terminal:send",
+  "notifications:show",
+  "storage",
+  "secrets",
+  "events:subscribe",
+  "settings:own",
+];
+
+const LOCALE_RE = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/;
 
 const WINDOWS_DEVICE_NAME_RE =
   /^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/i;
@@ -199,14 +269,18 @@ export function validatePluginManifest(manifest: unknown): ManifestValidation {
       validatePanels(contributes["panels"], errors);
       validateCommands(contributes["commands"], errors);
       validateEvents(contributes["events"], errors);
-      validatePathList(contributes["vmRecipes"], "vmRecipes", errors);
-      validatePathList(contributes["agents"], "agents", errors);
+      validateLanguagePacks(contributes["languagePacks"], errors);
+      validateKeybindings(
+        contributes["keybindings"],
+        declaredCommandContexts(contributes["commands"]),
+        errors,
+      );
+      validatePathList(contributes["vmRecipes"], "vmRecipes", LIMITS.vmRecipes, errors);
+      validatePathList(contributes["agents"], "agents", LIMITS.agents, errors);
     }
   }
 
-  if (manifest["capabilities"] !== undefined && !Array.isArray(manifest["capabilities"])) {
-    errors.push("manifest.capabilities must be an array when present");
-  }
+  const capabilityKinds = validateCapabilities(manifest["capabilities"], errors);
 
   // Cross-field rules mirrored from the host's contribution validation:
   // action-less commands are worker commands and need a `main` entry, as do
@@ -238,8 +312,61 @@ export function validatePluginManifest(manifest: unknown): ManifestValidation {
       "manifest.main is required when contributes.events is non-empty",
     );
   }
+  if (eventList.length > 0 && !capabilityKinds.has("events:subscribe")) {
+    errors.push(
+      'manifest.capabilities must include { "kind": "events:subscribe" } when contributes.events is non-empty',
+    );
+  }
 
   return { ok: errors.length === 0, errors };
+}
+
+/** Strict `{ kind }` capability entries against the closed v0 kind set. */
+function validateCapabilities(value: unknown, errors: string[]): Set<string> {
+  const kinds = new Set<string>();
+  if (value === undefined) return kinds;
+  if (!Array.isArray(value)) {
+    errors.push("manifest.capabilities must be an array when present");
+    return kinds;
+  }
+  if (value.length > LIMITS.capabilities) {
+    errors.push(
+      `manifest.capabilities must contain at most ${LIMITS.capabilities} entries`,
+    );
+  }
+  for (const [index, capability] of value.entries()) {
+    const at = `manifest.capabilities[${index}]`;
+    if (!isRecord(capability)) {
+      errors.push(`${at} must be an object`);
+      continue;
+    }
+    const keys = Object.keys(capability);
+    if (keys.length !== 1 || keys[0] !== "kind") {
+      errors.push(`${at} must be a strict { "kind": ... } object`);
+      continue;
+    }
+    if (typeof capability["kind"] !== "string" || !CAPABILITY_KINDS.includes(capability["kind"])) {
+      errors.push(`${at}.kind must be one of: ${CAPABILITY_KINDS.join(", ")}`);
+      continue;
+    }
+    kinds.add(capability["kind"] as string);
+  }
+  return kinds;
+}
+
+/** Declared command ids mapped to their effective context (default global). */
+function declaredCommandContexts(value: unknown): Map<string, string> {
+  const contexts = new Map<string, string>();
+  if (!Array.isArray(value)) return contexts;
+  for (const command of value) {
+    if (!isRecord(command) || !isCommandId(command["id"])) continue;
+    const context = command["context"];
+    contexts.set(
+      command["id"] as string,
+      context === "worktree" ? "worktree" : "global",
+    );
+  }
+  return contexts;
 }
 
 function validatePanels(value: unknown, errors: string[]): void {
@@ -247,6 +374,9 @@ function validatePanels(value: unknown, errors: string[]): void {
   if (!Array.isArray(value)) {
     errors.push("contributes.panels must be an array when present");
     return;
+  }
+  if (value.length > LIMITS.panels) {
+    errors.push(`contributes.panels must contain at most ${LIMITS.panels} entries`);
   }
   const seen = new Set<string>();
   for (const [index, panel] of value.entries()) {
@@ -276,6 +406,9 @@ function validateCommands(value: unknown, errors: string[]): void {
   if (!Array.isArray(value)) {
     errors.push("contributes.commands must be an array when present");
     return;
+  }
+  if (value.length > LIMITS.commands) {
+    errors.push(`contributes.commands must contain at most ${LIMITS.commands} entries`);
   }
   const seen = new Set<string>();
   for (const [index, command] of value.entries()) {
@@ -315,6 +448,9 @@ function validateEvents(value: unknown, errors: string[]): void {
     errors.push("contributes.events must be an array when present");
     return;
   }
+  if (value.length > LIMITS.events) {
+    errors.push(`contributes.events must contain at most ${LIMITS.events} entries`);
+  }
   for (const [index, event] of value.entries()) {
     const at = `contributes.events[${index}]`;
     if (!isRecord(event)) {
@@ -330,15 +466,116 @@ function validateEvents(value: unknown, errors: string[]): void {
   }
 }
 
-function validatePathList(value: unknown, key: string, errors: string[]): void {
+function validatePathList(value: unknown, key: string, limit: number, errors: string[]): void {
   if (value === undefined) return;
   if (!Array.isArray(value)) {
     errors.push(`contributes.${key} must be an array when present`);
     return;
   }
+  if (value.length > limit) {
+    errors.push(`contributes.${key} must contain at most ${limit} entries`);
+  }
+  const seen = new Set<string>();
   for (const [index, entry] of value.entries()) {
+    const at = `contributes.${key}[${index}]`;
     if (!isRecord(entry) || !isSafeRelativePath(entry["path"])) {
-      errors.push(`contributes.${key}[${index}].path must be a safe plugin-relative path`);
+      errors.push(`${at}.path must be a safe plugin-relative path`);
+      continue;
+    }
+    const path = entry["path"] as string;
+    if (seen.has(path)) {
+      errors.push(`${at}.path is a duplicate ${key} path`);
+    } else {
+      seen.add(path);
+    }
+  }
+}
+
+function validateLanguagePacks(value: unknown, errors: string[]): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    errors.push("contributes.languagePacks must be an array when present");
+    return;
+  }
+  if (value.length > LIMITS.languagePacks) {
+    errors.push(`contributes.languagePacks must contain at most ${LIMITS.languagePacks} entries`);
+  }
+  const seen = new Set<string>();
+  for (const [index, pack] of value.entries()) {
+    const at = `contributes.languagePacks[${index}]`;
+    if (!isRecord(pack)) {
+      errors.push(`${at} must be an object`);
+      continue;
+    }
+    const locale = pack["locale"];
+    if (
+      typeof locale !== "string" ||
+      locale.length < 2 ||
+      locale.length > 35 ||
+      !LOCALE_RE.test(locale)
+    ) {
+      errors.push(`${at}.locale must be a portable locale identifier (e.g. "en", "pt-BR")`);
+    } else if (seen.has(locale.toLowerCase())) {
+      errors.push(`${at}.locale is a duplicate language pack locale`);
+    } else {
+      seen.add(locale.toLowerCase());
+    }
+    if (!isSafeRelativePath(pack["path"])) {
+      errors.push(`${at}.path must be a safe plugin-relative path`);
+    }
+  }
+}
+
+function validateKeybindings(
+  value: unknown,
+  commandContexts: Map<string, string>,
+  errors: string[],
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    errors.push("contributes.keybindings must be an array when present");
+    return;
+  }
+  if (value.length > LIMITS.keybindings) {
+    errors.push(`contributes.keybindings must contain at most ${LIMITS.keybindings} entries`);
+  }
+  // Approximation of the host's per-platform conflict detection: exact key
+  // strings compared case-insensitively. The host normalizes key names
+  // itself and remains authoritative for near-misses.
+  const seenKeys = new Set<string>();
+  for (const [index, keybinding] of value.entries()) {
+    const at = `contributes.keybindings[${index}]`;
+    if (!isRecord(keybinding)) {
+      errors.push(`${at} must be an object`);
+      continue;
+    }
+    const target = keybinding["command"];
+    if (!isCommandId(target)) {
+      errors.push(`${at}.command must be a portable command id`);
+    } else if (!commandContexts.has(target as string)) {
+      errors.push(`${at}.command references an unknown contributed command`);
+    } else if (
+      keybinding["when"] !== undefined &&
+      keybinding["when"] !== commandContexts.get(target as string)
+    ) {
+      errors.push(`${at}.when must match its command context`);
+    }
+    if (
+      keybinding["when"] !== undefined &&
+      keybinding["when"] !== "global" &&
+      keybinding["when"] !== "worktree"
+    ) {
+      errors.push(`${at}.when must be "global" or "worktree" when present`);
+    }
+    const key = keybinding["key"];
+    if (typeof key !== "string" || key.length === 0 || key.length > 128) {
+      errors.push(
+        `${at}.key must be a non-empty keybinding string (max 128 chars; host normalization is authoritative)`,
+      );
+    } else if (seenKeys.has(key.toLowerCase())) {
+      errors.push(`${at}.key is a duplicate keybinding`);
+    } else {
+      seenKeys.add(key.toLowerCase());
     }
   }
 }
