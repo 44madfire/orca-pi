@@ -68,18 +68,40 @@ export const BUILTIN_PROFILE_DEFAULTS: BuiltinProfileDefaults = {
 export const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 export const MAX_PROFILE_NAME_LENGTH = 64;
 
+/**
+ * Profile names that must never become map keys. `__proto__` has prototype-
+ * setter semantics on ordinary objects (assignment would mutate the map
+ * prototype instead of storing an entry); `constructor`/`prototype` resolve
+ * through `Object.prototype` when lookups skip an own-property check
+ * (phantom parents). They are rejected at validation time (defense in
+ * depth); every runtime lookup additionally requires an own entry.
+ */
+export const RESERVED_PROFILE_NAMES: ReadonlySet<string> = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
 /** Pi provider names (e.g. `anthropic`, `openai-codex`, `opencode-go`). */
 export const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 export const MAX_PROVIDER_LENGTH = 64;
 
 /**
- * Pi `--model` patterns/IDs. Supports `provider/id`, `:<thinking>` suffixes,
- * and glob/fuzzy patterns (`anthropic/*`, `*sonnet*`). Allows alphanumerics
- * plus `/ - _ . * : + @ ? ~` in any position — everything else (whitespace,
+ * Pi `--model` IDs/patterns (canonical v1 representation).
+ *
+ * Supports `provider/id` and glob/fuzzy patterns (`anthropic/*`,
+ * `*sonnet*`). Allows alphanumerics
+ * plus `/ - _ . * + @ ? ~` in any position — everything else (whitespace,
  * shell metacharacters such as `; | & $ ` ' " \\ ! ( ) < >`) is rejected
  * so a model string can never inject shell.
+ *
+ * The Pi `:<thinking>` suffix (e.g. `sonnet:high`) is intentionally rejected:
+ * `resolveProfile()` fills an omitted `thinking` with the built-in default
+ * and JEF-7 translates both fields to `--model <model> --thinking <thinking>`,
+ * where explicit `--thinking` silently overrides the suffix. Use the separate
+ * `thinking:` field instead (`{ model: "sonnet", thinking: "high" }`).
  */
-export const MODEL_PATTERN: RegExp = new RegExp("^[A-Za-z0-9._/*:@?+~-]+$");
+export const MODEL_PATTERN: RegExp = new RegExp("^[A-Za-z0-9._/*@?+~-]+$");
 export const MAX_MODEL_LENGTH = 256;
 
 /** Tool names: built-ins plus custom/extension tools share one safe grammar. */
@@ -456,7 +478,7 @@ function validateSingleProfile(
     if (typeof modelRaw !== "string" || modelRaw.length === 0 || modelRaw.length > MAX_MODEL_LENGTH || !MODEL_PATTERN.test(modelRaw)) {
       issues.push({
         path: `${basePath}.model`,
-        message: `expected a Pi model ID/pattern (e.g. "anthropic/claude-sonnet", "openai/gpt-4o", "sonnet:high"), got ${preview(modelRaw)}. Model strings are passed literally to Pi --model and must not contain whitespace or shell metacharacters.`,
+        message: `expected a Pi model ID/pattern (e.g. "anthropic/claude-sonnet", "openai/gpt-4o", "anthropic/*"), got ${preview(modelRaw)}. Model strings are passed literally to Pi --model and must not contain whitespace, shell metacharacters, or the Pi ":<thinking>" suffix (use the separate "thinking" field instead, e.g. { model: "sonnet", thinking: "high" }).`,
       });
       failed = true;
     } else {
@@ -655,9 +677,19 @@ export function validateProfilesDocument(
     throw new ProfileValidationError(sourceLabel, issues);
   }
 
-  const profiles: Record<string, ValidatedPiProfile> = {};
+  // Null-prototype map: `__proto__` assignment on `{}` would set the prototype
+  // instead of storing an entry. Reserved names are rejected below, but the
+  // map stays prototype-safe even for manually constructed inputs.
+  const profiles: Record<string, ValidatedPiProfile> = Object.create(null);
   for (const [name, value] of entries) {
     const basePath = `profiles.${name}`;
+    if (RESERVED_PROFILE_NAMES.has(name)) {
+      issues.push({
+        path: basePath,
+        message: `reserved profile name ${preview(name)}: "__proto__", "constructor", and "prototype" must never become profile map keys (prototype pollution/phantom-parent risk). Rename the profile (e.g. "scout", "worker", "reviewer").`,
+      });
+      continue;
+    }
     if (!PROFILE_NAME_PATTERN.test(name) || name.length > MAX_PROFILE_NAME_LENGTH) {
       issues.push({
         path: basePath,

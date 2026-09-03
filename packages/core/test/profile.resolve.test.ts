@@ -2,13 +2,19 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { parseAndValidateProfilesText } from "../src/profile/load.js";
+import {
+  mergeValidatedDocuments,
+  parseAndValidateProfilesText,
+} from "../src/profile/load.js";
 import {
   ProfileResolveError,
   resolveAllProfiles,
   resolveProfile,
 } from "../src/profile/resolve.js";
-import { ProfileValidationError } from "../src/profile/schema.js";
+import {
+  ProfileValidationError,
+  validateProfilesDocument,
+} from "../src/profile/schema.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = (name: string): string =>
@@ -238,6 +244,122 @@ describe("profile resolve: CLI overrides (precedence level 6)", () => {
       expect(error).toBeInstanceOf(ProfileResolveError);
       expect((error as ProfileResolveError).code).toBe("invalid-override");
     }
+  });
+});
+
+
+describe("profile resolve: model/thinking canonicity", () => {
+  it("separate thinking field is the single source of truth (no :suffix)", () => {
+    // A suffixed model is rejected at validation, so it can never resolve to
+    // a contradictory `thinking: medium` default (PR2 Blocking 1).
+    expect(() =>
+      parseAndValidateProfilesText(
+        `profiles:
+  s:
+    model: sonnet:high
+`,
+        "suffixed.yaml",
+      ),
+    ).toThrow(/thinking/);
+    // Canonical form resolves exactly as written.
+    const doc = parseAndValidateProfilesText(
+      `profiles:
+  s:
+    model: sonnet
+    thinking: high
+`,
+      "canonical.yaml",
+    );
+    const resolved = resolveProfile("s", doc);
+    expect(resolved.model).toBe("sonnet");
+    expect(resolved.thinking).toBe("high");
+  });
+});
+
+describe("profile resolve: prototype safety", () => {
+  it("extends: toString is unknown-parent, not a phantom Object.prototype hit", () => {
+    const doc = parseAndValidateProfilesText(
+      `profiles:
+  s:
+    extends: toString
+    model: anthropic/claude-haiku
+`,
+      "phantom.yaml",
+    );
+    // `toString` exists on Object.prototype but was never defined as a
+    // profile, so own-property lookup must report unknown-parent.
+    expect(Object.hasOwn(doc.profiles, "toString")).toBe(false);
+    try {
+      resolveProfile("s", doc);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProfileResolveError);
+      expect((error as ProfileResolveError).code).toBe("unknown-parent");
+      expect((error as Error).message).toContain("toString");
+    }
+  });
+
+  it("extends: constructor is unknown-parent (reserved names cannot exist)", () => {
+    const doc = parseAndValidateProfilesText(
+      `profiles:
+  s:
+    extends: constructor
+    model: anthropic/claude-haiku
+`,
+      "ctor.yaml",
+    );
+    try {
+      resolveProfile("s", doc);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProfileResolveError);
+      expect((error as ProfileResolveError).code).toBe("unknown-parent");
+    }
+  });
+
+  it("defining toString explicitly creates a safe own entry", () => {
+    const doc = parseAndValidateProfilesText(
+      `profiles:
+  toString:
+    model: anthropic/claude-haiku
+`,
+      "tostring.yaml",
+    );
+    expect(Object.hasOwn(doc.profiles, "toString")).toBe(true);
+    const resolved = resolveProfile("toString", doc);
+    expect(resolved.name).toBe("toString");
+    expect(resolved.model).toBe("anthropic/claude-haiku");
+  });
+
+  it("__proto__ can neither be defined nor extended", () => {
+    // Definition is rejected at validation (reserved + pattern).
+    expect(() =>
+      parseAndValidateProfilesText(
+        `profiles:
+  s:
+    extends: __proto__
+    model: x
+`,
+        "proto.yaml",
+      ),
+    ).toThrow(ProfileValidationError);
+    // Merging never materializes a __proto__ entry, even across layers.
+    const base = parseAndValidateProfilesText(
+      `profiles:
+  s:
+    model: anthropic/claude-haiku
+`,
+      "base.yaml",
+    );
+    const polluted = JSON.parse(
+      '{"profiles": {"__proto__": {"model": "x"}, "s": {"model": "y"}}}',
+    ) as unknown;
+    expect(() =>
+      validateProfilesDocument(polluted, "polluted.yaml"),
+    ).toThrow(ProfileValidationError);
+    const merged = mergeValidatedDocuments([base]);
+    expect(Object.hasOwn(merged.profiles, "__proto__")).toBe(false);
+    expect(resolveProfile("s", merged).model).toBe("anthropic/claude-haiku");
   });
 });
 

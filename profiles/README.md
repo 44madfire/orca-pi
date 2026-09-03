@@ -48,11 +48,13 @@ profiles:
 
 ## Field reference (v1)
 
+Profile names matching `^[A-Za-z0-9][A-Za-z0-9_-]*$` are accepted except the reserved `__proto__`, `constructor`, and `prototype` (prototype-pollution/phantom-parent risk). Parent lookups require an own entry, so `extends: toString` fails as unknown-parent unless `toString` is explicitly defined.
+
 | Field | Pi mapping | Notes |
 |---|---|---|
 | `extends` | — | Optional single parent; cycles/unknown parents fail pre-launch. |
 | `provider` | `--provider` | Optional (e.g. `anthropic`, `openai-codex`). |
-| `model` | `--model` | Model ID/pattern (`provider/id`, `:<thinking>`, globs). Literal — never shell-expanded. |
+| `model` | `--model` | Model ID/pattern (`provider/id`, globs). The Pi `:<thinking>` suffix is rejected; use the separate `thinking:` field. Literal — never shell-expanded. |
 | `thinking` | `--thinking` | `off\|minimal\|low\|medium\|high\|xhigh\|max`. |
 | `systemPrompt` | `--system-prompt` | Inline text. Mutually exclusive with `systemPromptFile`. |
 | `systemPromptFile` | `--system-prompt` (via file read at launch) | Project-relative path (e.g. `.pi/agents/scout.md`). Listing/resolving never reads file contents. |

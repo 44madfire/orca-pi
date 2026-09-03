@@ -121,18 +121,23 @@ function buildExtendsChain(
         message: `Pi profile "extends" cycle detected: ${cycle.map((entry) => `"${entry}"`).join(" → ")}. v1 supports single-parent inheritance only; break the cycle so the chain terminates.`,
       });
     }
-    const profile: ValidatedPiProfile | undefined = profiles[current as string];
-    if (!profile) {
+    // Own-property lookup only: inherited keys such as `toString` must not
+    // resolve as phantom parents. Reserved names (`__proto__`, `constructor`,
+    // `prototype`) are rejected at validation, and this guard keeps manually
+    // constructed maps safe as well.
+    const currentName = current as string;
+    if (!Object.hasOwn(profiles, currentName)) {
       // `current` is a parent named via `extends` that does not exist.
       const child = leafToRoot.length > 0 ? leafToRoot[leafToRoot.length - 1] : name;
       throw new ProfileResolveError({
         code: "unknown-parent",
-        profileName: child,
+        profileName: child as string,
         chain: [...visiting],
         available,
-        message: `Pi profile "${child}" extends unknown parent "${current}".${suggest(current, available)} Fix "extends" to name an existing profile or remove it.`,
+        message: `Pi profile "${child}" extends unknown parent "${current}".${suggest(current as string, available)} Fix "extends" to name an existing profile or remove it.`,
       });
     }
+    const profile: ValidatedPiProfile = profiles[currentName] as ValidatedPiProfile;
     visiting.push(current as string);
     leafToRoot.push(current as string);
     const parent: string | undefined = profile.extends;

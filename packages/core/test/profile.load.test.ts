@@ -165,6 +165,31 @@ describe("profile load: merging and listing", () => {
       "/repo/my-project/.pi/profiles.yaml",
     );
   });
+
+  it("resolves the OS home directory when HOME is unset (Windows-safe)", () => {
+    // Native Windows rarely sets HOME; the loader must not return a literal
+    // `~` path that loadProfilesFile cannot expand (PR2 non-blocking).
+    expect(
+      getUserProfilesPath({
+        env: {} as NodeJS.ProcessEnv,
+        osHomedir: () => "C:/Users/test",
+      }),
+    ).toBe("C:/Users/test/.pi/agent/profiles.yaml");
+    // Explicit homedir still wins (tests), then HOME, then os.homedir().
+    expect(
+      getUserProfilesPath({
+        env: { HOME: "/home/env" } as NodeJS.ProcessEnv,
+        osHomedir: () => "C:/Users/os",
+      }),
+    ).toBe("/home/env/.pi/agent/profiles.yaml");
+    expect(
+      getCandidateConfigPaths({
+        projectRoot: "/repo/p",
+        env: {} as NodeJS.ProcessEnv,
+        osHomedir: () => "/home/os",
+      }),
+    ).toEqual(["/home/os/.pi/agent/profiles.yaml", "/repo/p/.pi/profiles.yaml"]);
+  });
 });
 
 describe("profile load: filesystem helpers", () => {

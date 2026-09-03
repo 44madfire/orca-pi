@@ -6,6 +6,7 @@ import {
   BUILTIN_PROFILE_DEFAULTS,
   BUILTIN_TOOLS,
   ProfileValidationError,
+  RESERVED_PROFILE_NAMES,
   THINKING_LEVELS,
   validateProfileOverrides,
   validateProfilesDocument,
@@ -165,19 +166,55 @@ describe("profile schema: rejection cases", () => {
     }
   });
 
-  it("accepts model globs and provider/id:thinking patterns", () => {
+  it("accepts model globs and provider/id patterns", () => {
     const doc = validateProfilesDocument(
       {
         profiles: {
           a: { model: "anthropic/*" },
           b: { model: "*sonnet*" },
           c: { model: "openai/gpt-4o" },
-          d: { model: "sonnet:high" },
+          d: { model: "sonnet" },
         },
       },
       "models.yaml",
     );
     expect(Object.keys(doc.profiles).sort()).toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("rejects the Pi :<thinking> suffix in model (canonical thinking field only)", () => {
+    // Regression for PR2 Blocking 1: `model: sonnet:high` with omitted
+    // `thinking` used to resolve to `thinking: medium`, so JEF-7 would emit
+    // `pi --model sonnet:high --thinking medium` (Pi lets explicit
+    // `--thinking` win, silently running at medium instead of high).
+    for (const bad of ["sonnet:high", "anthropic/claude:low", "openai/gpt-4o:xhigh"]) {
+      const error = expectInvalid(
+        { profiles: { s: { model: bad } } },
+        "model-thinking.yaml",
+        "model",
+      );
+      expect(error.message).toContain("thinking");
+    }
+    // Colon is rejected even alongside an explicit thinking field: one
+    // canonical representation only.
+    expectInvalid(
+      { profiles: { s: { model: "sonnet:high", thinking: "high" } } },
+      "model-thinking.yaml",
+      "model",
+    );
+  });
+
+  it("rejects reserved profile names that would endanger the profile map", () => {
+    expect(RESERVED_PROFILE_NAMES.has("__proto__")).toBe(true);
+    expect(RESERVED_PROFILE_NAMES.has("constructor")).toBe(true);
+    expect(RESERVED_PROFILE_NAMES.has("prototype")).toBe(true);
+    for (const reserved of ["__proto__", "constructor", "prototype"]) {
+      const error = expectInvalid(
+        { profiles: { [reserved]: { model: "anthropic/claude-haiku" } } },
+        "reserved.yaml",
+        `profiles.${reserved}`,
+      );
+      expect(error.message).toMatch(/reserved/i);
+    }
   });
 
   it("rejects invalid tool names and duplicates", () => {

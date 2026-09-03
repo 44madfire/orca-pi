@@ -16,7 +16,7 @@
  * semantics — the deterministic launcher (JEF-7) must ignore it.
  */
 
-/** Pi `--thinking` levels (also valid as `:level` suffix in `--model`). */
+/** Pi `--thinking` levels. (Pi CLI also accepts a `:<level>` suffix in `--model`; profiles reject the suffix so `thinking` stays canonical.) */
 export type ThinkingLevel =
   | "off"
   | "minimal"
@@ -45,7 +45,11 @@ export interface PiProfileInput {
   extends?: string;
   /** Pi `--provider` value (e.g. `"anthropic"`, `"openai-codex"`). */
   provider?: string;
-  /** Pi `--model` pattern/ID (supports `provider/id` and globs). */
+  /**
+   * Pi `--model` ID/pattern (supports `provider/id` and globs).
+   * The Pi `:<thinking>` suffix is rejected; use the separate `thinking`
+   * field so JEF-7 never emits a contradictory `--model X:high --thinking Y`.
+   */
   model?: string;
   /** Pi `--thinking` level. */
   thinking?: ThinkingLevel;

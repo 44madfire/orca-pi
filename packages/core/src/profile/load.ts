@@ -121,12 +121,16 @@ export function parseAndValidateProfilesText(
 export function mergeValidatedDocuments(
   documents: readonly ValidatedProfilesDocument[],
 ): ValidatedProfilesDocument {
-  const merged: Record<string, ValidatedProfilesDocument["profiles"][string]> = {};
+  // Null-prototype map so reserved/prototype names can never observe inherited
+  // properties (`merged["toString"]` is `undefined`, not `Object.prototype.toString`).
+  const merged: Record<string, ValidatedProfilesDocument["profiles"][string]> = Object.create(null);
   const labels: string[] = [];
   for (const doc of documents) {
     labels.push(doc.sourceLabel);
     for (const [name, profile] of Object.entries(doc.profiles)) {
-      const existing = merged[name];
+      const existing = Object.hasOwn(merged, name)
+        ? merged[name]
+        : undefined;
       if (!existing) {
         merged[name] = {
           ...profile,
@@ -180,15 +184,45 @@ export function listProfileNames(
 /** Canonical user/global config path (`$PI_CODING_AGENT_DIR/profiles.yaml`). */
 export function getUserProfilesPath(options?: {
   env?: NodeJS.ProcessEnv;
+  /** Explicit home override (tests). When omitted, `HOME` then `os.homedir()`. */
   homedir?: string;
+  /** Injectable home resolver (defaults to `node:os.homedir`); keeps Windows working when `HOME` is unset. */
+  osHomedir?: () => string;
 }): string {
   const env = options?.env ?? process.env;
   const base = env.PI_CODING_AGENT_DIR?.trim();
   if (base) {
     return joinPosix(normalizeSlashes(base), "profiles.yaml");
   }
-  const home = (options?.homedir ?? env.HOME ?? "~").trim() || "~";
-  return joinPosix(normalizeSlashes(home), ".pi/agent/profiles.yaml");
+  const explicitHome = options?.homedir?.trim();
+  if (explicitHome) {
+    return joinPosix(normalizeSlashes(explicitHome), ".pi/agent/profiles.yaml");
+  }
+  const envHome = env.HOME?.trim();
+  if (envHome) {
+    return joinPosix(normalizeSlashes(envHome), ".pi/agent/profiles.yaml");
+  }
+  // Native Windows rarely sets HOME; `os.homedir()` resolves via USERPROFILE.
+  // The filesystem loader never expands a literal `~`, so only fall back to
+  // it when the OS resolver itself is unavailable.
+  try {
+    const resolveHome = options?.osHomedir ?? defaultOsHomedir;
+    const osHome = resolveHome().trim();
+    if (osHome) {
+      return joinPosix(normalizeSlashes(osHome), ".pi/agent/profiles.yaml");
+    }
+  } catch {
+    // Fall through to the literal-`~` last resort below.
+  }
+  return "~/.pi/agent/profiles.yaml";
+}
+
+function defaultOsHomedir(): string {
+  // Lazy require keeps core importable where `node:os` is stubbed; the real
+  // implementation delegates to `os.homedir()`.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const os = require("node:os") as typeof import("node:os");
+  return os.homedir();
 }
 
 /** Canonical project config path (`<projectRoot>/.pi/profiles.yaml`). */
@@ -205,9 +239,10 @@ export function getCandidateConfigPaths(options: {
   projectRoot: string;
   env?: NodeJS.ProcessEnv;
   homedir?: string;
+  osHomedir?: () => string;
 }): readonly string[] {
   return [
-    getUserProfilesPath({ env: options.env, homedir: options.homedir }),
+    getUserProfilesPath({ env: options.env, homedir: options.homedir, osHomedir: options.osHomedir }),
     getProjectProfilesPath(options.projectRoot),
   ];
 }
@@ -278,10 +313,12 @@ export async function loadMergedProfiles(options: {
   projectConfigPath?: string;
   env?: NodeJS.ProcessEnv;
   homedir?: string;
+  osHomedir?: () => string;
   fs?: Pick<typeof import("node:fs/promises"), "readFile">;
 }): Promise<ValidatedProfilesDocument> {
   const userPath =
-    options.userConfigPath ?? getUserProfilesPath({ env: options.env, homedir: options.homedir });
+    options.userConfigPath ??
+    getUserProfilesPath({ env: options.env, homedir: options.homedir, osHomedir: options.osHomedir });
   const projectPath = options.projectConfigPath ?? getProjectProfilesPath(options.projectRoot);
   const documents: ValidatedProfilesDocument[] = [];
   for (const filePath of [userPath, projectPath]) {
