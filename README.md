@@ -90,9 +90,10 @@ orca-pi doctor
 - Placeholder panel `panel.html` (`contributes.panels`: `orca-pi-status`)
   showing the plugin/CLI version and pointing at `orca-pi doctor` for live
   diagnostics.
-- Placeholder command `orca-pi.showStatus` (`contributes.commands`,
-  `context: global`, no `action` — inert until a later ticket wires it to a
-  supported built-in action or capability).
+- No commands yet: manifest v1 treats action-less commands as worker
+  commands requiring a `main` entry, and `action` aliases must come from the
+  host's closed built-in list — so a command waits for a later ticket with a
+  real worker or a suitable built-in action.
 - The plugin is declarative-only: no `main` worker entry, `capabilities: []`.
 - Placeholder skill `skills/orca-pi-doctor/SKILL.md`. Note: manifest v1 has
   no `skills` contribution point, so the skill ships as repo documentation
@@ -105,8 +106,8 @@ orca-pi doctor
 1. Build: `npm run build`.
 2. In Orca, load the folder `packages/orca-plugin/` via the development
    plugin loader (it must contain `orca-plugin.json` at its root).
-3. Verify Orca loads it and the `Orca-Pi Status` panel / `Orca-Pi: Show Status`
-   command appear, without destabilizing Orca.
+3. Verify Orca loads it and the `Orca-Pi Status` panel appears,
+   without destabilizing Orca.
 4. In a terminal, verify `orca-pi doctor` reports your Orca/Pi versions.
 
 If your Orca build reports a manifest error, update

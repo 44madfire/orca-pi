@@ -21,8 +21,12 @@ the upstream manifest schema on `main` (2026-09-03).
   - Command: portable id (`[A-Za-z0-9]+([._-][A-Za-z0-9]+)*`, so dots are
     fine), `title`, optional `context: global | worktree`, optional `action`.
     `action` must be a **known built-in action alias** (closed list, e.g.
-    `view.tasks`, `sidebar.search.toggle`) — the host rejects anything else,
-    so placeholder commands omit `action` and are inert.
+    `view.tasks`, `sidebar.search.toggle`) — the host rejects anything else.
+    Commands **without** `action` are worker commands and additionally
+    require a `main` worker entry (same for non-empty `events`, which also
+    need an `events:subscribe` capability). OP1.1 therefore ships no
+    commands: no suitable built-in action exists for a status placeholder,
+    and a worker is out of scope.
   - Events (closed set): `worktree.created`, `worktree.removed`,
     `agent.status.changed`.
   - There is **no `skills` contribution point** in v1 — skills ship

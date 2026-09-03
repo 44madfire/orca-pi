@@ -13,7 +13,9 @@ const VALID = {
   pluginApi: 1,
   contributes: {
     panels: [{ id: "orca-pi-status", title: "Orca-Pi Status", entry: "panel.html" }],
-    commands: [{ id: "orca-pi.showStatus", title: "Orca-Pi: Show Status", context: "global" }],
+    commands: [
+      { id: "orca-pi.showStatus", title: "Orca-Pi: Show Status", context: "global", action: "view.tasks" },
+    ],
   },
   capabilities: [],
 };
@@ -78,6 +80,32 @@ describe("validatePluginManifest", () => {
     const joined = result.errors.join("\n");
     expect(joined).toContain("panels[0].entry");
     expect(joined).toContain("contributes.skills");
+  });
+
+  it("requires main for worker commands (action-less) and event subscriptions", () => {
+    const workerCommand = {
+      ...VALID,
+      contributes: {
+        commands: [{ id: "orca-pi.showStatus", title: "Orca-Pi: Show Status" }],
+      },
+    };
+    expect(validatePluginManifest(workerCommand).ok).toBe(false);
+    expect(
+      validatePluginManifest(workerCommand).errors.join("\n"),
+    ).toContain("manifest.main is required");
+    expect(
+      validatePluginManifest({ ...workerCommand, main: "dist/index.js" }).ok,
+    ).toBe(true);
+
+    const withEvents = {
+      ...VALID,
+      main: "dist/index.js",
+      contributes: { events: [{ on: "worktree.created" }] },
+    };
+    expect(validatePluginManifest(withEvents).ok).toBe(true);
+    expect(
+      validatePluginManifest({ ...withEvents, main: undefined }).ok,
+    ).toBe(false);
   });
 
   it("rejects duplicate command ids and bad event names", () => {

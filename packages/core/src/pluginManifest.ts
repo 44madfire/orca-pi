@@ -208,6 +208,37 @@ export function validatePluginManifest(manifest: unknown): ManifestValidation {
     errors.push("manifest.capabilities must be an array when present");
   }
 
+  // Cross-field rules mirrored from the host's contribution validation:
+  // action-less commands are worker commands and need a `main` entry, as do
+  // event subscriptions (which additionally need an events:subscribe
+  // capability object).
+  const hasMain =
+    typeof manifest["main"] === "string" && manifest["main"].length > 0;
+  const contributesRecord = isRecord(contributes) ? contributes : undefined;
+  const commandList =
+    contributesRecord && Array.isArray(contributesRecord["commands"])
+      ? (contributesRecord["commands"] as unknown[])
+      : [];
+  if (
+    !hasMain &&
+    commandList.some(
+      (command) => isRecord(command) && command["action"] === undefined,
+    )
+  ) {
+    errors.push(
+      'manifest.main is required when contributes.commands contains a worker command (a command without a built-in "action" alias)',
+    );
+  }
+  const eventList =
+    contributesRecord && Array.isArray(contributesRecord["events"])
+      ? (contributesRecord["events"] as unknown[])
+      : [];
+  if (!hasMain && eventList.length > 0) {
+    errors.push(
+      "manifest.main is required when contributes.events is non-empty",
+    );
+  }
+
   return { ok: errors.length === 0, errors };
 }
 

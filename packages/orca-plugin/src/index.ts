@@ -11,8 +11,14 @@ import type { DoctorReport } from "@orca-pi/core";
 
 /** Canonical install identity: `<publisher>.<id>` (also the install dir name). */
 export const PLUGIN_KEY = "44madfire.orca-pi";
-export const PLUGIN_COMMAND_ID = "orca-pi.showStatus";
 export const PANEL_ID = "orca-pi-status";
+
+/**
+ * Reserved for a later ticket: manifest v1 treats action-less commands as
+ * worker commands requiring a `main` entry, and `action` aliases must come
+ * from the host's closed built-in list — so OP1.1 ships no commands.
+ */
+export const PLUGIN_COMMAND_ID = "orca-pi.showStatus";
 
 export interface PluginStatusInput {
   pluginVersion: string;
@@ -45,7 +51,8 @@ export function renderPluginStatus(input: PluginStatusInput): string {
 export function activate(): { plugin: string; commands: string[]; panels: string[] } {
   return {
     plugin: PLUGIN_KEY,
-    commands: [PLUGIN_COMMAND_ID],
+    // No commands in OP1.1 (see PLUGIN_COMMAND_ID note above).
+    commands: [],
     panels: [PANEL_ID],
   };
 }

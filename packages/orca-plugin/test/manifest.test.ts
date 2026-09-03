@@ -51,15 +51,24 @@ describe("orca-plugin artifact", () => {
 
   it("declares no worker main and no capabilities (declarative-only scaffold)", () => {
     const { manifest } = loadArtifact();
-    const typed = manifest as { main?: string; capabilities: unknown[] };
+    const typed = manifest as {
+      main?: string;
+      capabilities: unknown[];
+      contributes: { commands: { action?: string }[] };
+    };
     expect(typed.main).toBeUndefined();
     expect(typed.capabilities).toEqual([]);
+    // Every declared command must carry a built-in action alias: action-less
+    // commands are worker commands and would require a `main` entry.
+    for (const command of typed.contributes.commands) {
+      expect(typeof command.action).toBe("string");
+    }
   });
 
   it("activates without I/O and renders status from injected doctor data", () => {
     expect(activate()).toEqual({
       plugin: "44madfire.orca-pi",
-      commands: ["orca-pi.showStatus"],
+      commands: [],
       panels: ["orca-pi-status"],
     });
     const text = renderPluginStatus({
