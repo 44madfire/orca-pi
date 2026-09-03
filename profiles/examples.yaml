@@ -1,0 +1,42 @@
+# Example Pi agent profiles (OP1.2 / JEF-6).
+#
+# Copy to `$PI_CODING_AGENT_DIR/profiles.yaml` (user/global) or
+# `<projectRoot>/.pi/profiles.yaml` (project) and adapt models/paths.
+# Validate with:
+#   node -e "import('@orca-pi/core').then(async (m) => { ... })"
+# or wait for JEF-7's `orca-pi launch --profile <name>` (deterministic argv).
+#
+# Rules: `extends` is single-parent (cycles/unknown parents fail pre-launch);
+# arrays replace wholesale in v1; `systemPrompt`/`systemPromptFile` are
+# mutually exclusive; paths are project-relative (no absolute/`..` escapes).
+
+profiles:
+  readonly:
+    tools: [read, grep, find, ls]
+    skills: []
+    extensions: []
+    contextFiles: false
+    discoverSkills: false
+    discoverExtensions: false
+    session: ephemeral
+    displayName: Read-only
+    description: Safe code exploration without writes.
+
+  scout:
+    extends: readonly
+    model: anthropic/claude-haiku
+    thinking: low
+    systemPromptFile: .pi/agents/scout.md
+    skills: [.pi/skills/repo-search]
+    displayName: Scout
+    description: Fast repository search and triage.
+
+  worker:
+    model: anthropic/claude-sonnet
+    thinking: high
+    systemPromptFile: .pi/agents/worker.md
+    tools: [read, grep, find, ls, bash, edit, write]
+    skills: [.pi/skills/project, .pi/skills/testing]
+    contextFiles: true
+    displayName: Worker
+    description: Coding worker with full tool access.

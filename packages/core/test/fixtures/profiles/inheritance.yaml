@@ -1,0 +1,26 @@
+# Inheritance example from JEF-6: readonly base with scout/worker children.
+# Arrays replace wholesale in v1 (no merging/append).
+profiles:
+  readonly:
+    tools: [read, grep, find, ls]
+    skills: []
+    extensions: []
+    contextFiles: false
+    discoverSkills: false
+    discoverExtensions: false
+    session: ephemeral
+
+  scout:
+    extends: readonly
+    model: anthropic/claude-haiku
+    thinking: low
+    systemPromptFile: .pi/agents/scout.md
+    skills: [.pi/skills/repo-search]
+
+  worker:
+    model: anthropic/claude-sonnet
+    thinking: high
+    systemPromptFile: .pi/agents/worker.md
+    tools: [read, grep, find, ls, bash, edit, write]
+    skills: [.pi/skills/project, .pi/skills/testing]
+    contextFiles: true

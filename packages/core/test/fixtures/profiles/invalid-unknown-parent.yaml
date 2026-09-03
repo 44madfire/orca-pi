@@ -1,0 +1,5 @@
+# Invalid: extends names a profile that does not exist.
+profiles:
+  scout:
+    extends: does-not-exist
+    model: anthropic/claude-haiku
