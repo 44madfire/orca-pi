@@ -1,22 +1,44 @@
 import { describe, expect, it } from "vitest";
-import { validatePluginManifest } from "../src/index.js";
+import { qualifiedPluginKey, validatePluginManifest } from "../src/index.js";
 
 const VALID = {
-  name: "orca-pi",
-  displayName: "Orca–Pi Orchestration",
+  manifestVersion: 1,
+  id: "orca-pi",
+  publisher: "44madfire",
+  name: "Orca–Pi Orchestration",
   version: "0.1.0",
   description: "Thin Orca shell over the companion orca-pi CLI.",
-  orcaApiVersion: "1.4.x",
-  contributions: {
-    commands: [{ id: "orca-pi.showStatus", title: "Orca-Pi: Show Status" }],
-    panels: [{ id: "orca-pi.status", title: "Orca-Pi Status", entry: "./panel.html" }],
-    skills: [{ id: "orca-pi-doctor", path: "./skills/orca-pi-doctor" }],
+  repository: "https://github.com/44madfire/orca-pi",
+  engines: { orca: ">=1.4.0" },
+  pluginApi: 1,
+  contributes: {
+    panels: [{ id: "orca-pi-status", title: "Orca-Pi Status", entry: "panel.html" }],
+    commands: [{ id: "orca-pi.showStatus", title: "Orca-Pi: Show Status", context: "global" }],
   },
+  capabilities: [],
 };
 
 describe("validatePluginManifest", () => {
-  it("accepts a well-formed manifest", () => {
+  it("accepts a well-formed v1 manifest", () => {
     expect(validatePluginManifest(VALID)).toEqual({ ok: true, errors: [] });
+  });
+
+  it("accepts a minimal manifest (optional keys omitted)", () => {
+    expect(
+      validatePluginManifest({
+        manifestVersion: 1,
+        id: "example",
+        publisher: "example",
+        name: "Example",
+        version: "1.0.0",
+        engines: { orca: ">=1.4.0" },
+        pluginApi: 1,
+      }),
+    ).toEqual({ ok: true, errors: [] });
+  });
+
+  it("derives the qualified <publisher>.<id> key", () => {
+    expect(qualifiedPluginKey(VALID)).toBe("44madfire.orca-pi");
   });
 
   it("rejects non-objects", () => {
@@ -24,29 +46,54 @@ describe("validatePluginManifest", () => {
     expect(validatePluginManifest("orca-pi").ok).toBe(false);
   });
 
-  it("requires name, version, and orcaApiVersion", () => {
+  it("requires manifestVersion 1, kebab-case id/publisher, semver, engines range, pluginApi 1", () => {
     const result = validatePluginManifest({
       ...VALID,
-      name: "",
+      manifestVersion: 2,
+      id: "Orca_Pi",
+      publisher: "",
       version: "not-semver",
-      orcaApiVersion: "",
+      engines: { orca: "^1.4.0" },
+      pluginApi: "1.x",
     });
     expect(result.ok).toBe(false);
-    expect(result.errors.join("\n")).toContain("manifest.name");
-    expect(result.errors.join("\n")).toContain("manifest.version");
-    expect(result.errors.join("\n")).toContain("manifest.orcaApiVersion");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("manifestVersion");
+    expect(joined).toContain("manifest.id");
+    expect(joined).toContain("manifest.publisher");
+    expect(joined).toContain("manifest.version");
+    expect(joined).toContain("manifest.engines.orca");
+    expect(joined).toContain("manifest.pluginApi");
   });
 
-  it("validates command and panel entries", () => {
+  it("rejects dot-prefixed panel entries and unknown contribution points", () => {
     const result = validatePluginManifest({
       ...VALID,
-      contributions: {
-        commands: [{ id: "", title: "" }],
-        panels: [{ id: "x", title: "X", entry: "/absolute/panel.html" }],
+      contributes: {
+        panels: [{ id: "p", title: "P", entry: "./panel.html" }],
+        skills: [{ id: "s", path: "./skills/s" }],
       },
     });
     expect(result.ok).toBe(false);
-    expect(result.errors.join("\n")).toContain("commands[0].id");
-    expect(result.errors.join("\n")).toContain("panels[0].entry");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("panels[0].entry");
+    expect(joined).toContain("contributes.skills");
+  });
+
+  it("rejects duplicate command ids and bad event names", () => {
+    const result = validatePluginManifest({
+      ...VALID,
+      contributes: {
+        commands: [
+          { id: "a.b", title: "A" },
+          { id: "a.b", title: "A again" },
+        ],
+        events: [{ on: "plugin.clicked" }],
+      },
+    });
+    expect(result.ok).toBe(false);
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("duplicate command id");
+    expect(joined).toContain("contributes.events[0].on");
   });
 });

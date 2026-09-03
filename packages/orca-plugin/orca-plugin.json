@@ -1,0 +1,30 @@
+{
+  "manifestVersion": 1,
+  "id": "orca-pi",
+  "publisher": "44madfire",
+  "name": "Orca–Pi Orchestration",
+  "version": "0.1.0",
+  "description": "Thin Orca UI shell over the companion orca-pi CLI. OP1.1 scaffold: status panel plus a placeholder command; no role spawning yet.",
+  "repository": "https://github.com/44madfire/orca-pi",
+  "engines": {
+    "orca": ">=1.4.0"
+  },
+  "pluginApi": 1,
+  "contributes": {
+    "panels": [
+      {
+        "id": "orca-pi-status",
+        "title": "Orca-Pi Status",
+        "entry": "panel.html"
+      }
+    ],
+    "commands": [
+      {
+        "id": "orca-pi.showStatus",
+        "title": "Orca-Pi: Show Status",
+        "context": "global"
+      }
+    ]
+  },
+  "capabilities": []
+}

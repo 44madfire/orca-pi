@@ -9,13 +9,14 @@
  */
 import type { DoctorReport } from "@orca-pi/core";
 
-export const PLUGIN_ID = "orca-pi";
+/** Canonical install identity: `<publisher>.<id>` (also the install dir name). */
+export const PLUGIN_KEY = "44madfire.orca-pi";
 export const PLUGIN_COMMAND_ID = "orca-pi.showStatus";
-export const PANEL_ID = "orca-pi.status";
+export const PANEL_ID = "orca-pi-status";
 
 export interface PluginStatusInput {
   pluginVersion: string;
-  orcaApiVersion: string;
+  pluginApi: number;
   doctor: DoctorReport;
 }
 
@@ -31,7 +32,7 @@ export function renderPluginStatus(input: PluginStatusInput): string {
     ? "ready — both CLIs available"
     : "action needed — run `orca-pi doctor` for details";
   return [
-    `Orca–Pi ${input.pluginVersion} (Orca API ${input.orcaApiVersion})`,
+    `Orca–Pi ${input.pluginVersion} (pluginApi ${input.pluginApi})`,
     `Companion CLIs: ${orca}, ${pi}`,
     `Status: ${health}`,
   ].join("\n");
@@ -43,7 +44,7 @@ export function renderPluginStatus(input: PluginStatusInput): string {
  */
 export function activate(): { plugin: string; commands: string[]; panels: string[] } {
   return {
-    plugin: PLUGIN_ID,
+    plugin: PLUGIN_KEY,
     commands: [PLUGIN_COMMAND_ID],
     panels: [PANEL_ID],
   };

@@ -11,5 +11,5 @@ export const ORCA_PI_VERSION = "0.1.0";
 /** Orca app version this scaffold was developed and smoke-tested against. */
 export const TARGET_ORCA_APP_VERSION = "1.4.196";
 
-/** Version range of the Orca plugin API this scaffold targets. */
-export const TARGET_ORCA_API_RANGE = "1.4.x";
+/** Host-API major version (`pluginApi`) this scaffold targets. */
+export const TARGET_ORCA_PLUGIN_API = 1;

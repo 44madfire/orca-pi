@@ -4,6 +4,9 @@ Thin Orca skill placeholder (OP1.1 scaffold). It documents the read-only
 diagnostic flow; execution lives in the companion `orca-pi` CLI so the plugin
 worker never needs unrestricted process spawning.
 
+Note: manifest v1 has no `skills` contribution point, so this skill is not
+wired into `orca-plugin.json` — install it through Orca's skill flow.
+
 ## Use
 
 Run in a terminal (not from the plugin worker):
