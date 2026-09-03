@@ -1,0 +1,7 @@
+[
+  {
+    "id": "orca-pi.showStatus",
+    "title": "Orca-Pi: Show Status",
+    "description": "Show plugin/CLI version and orca-pi doctor status (read-only). Delegates to the companion orca-pi CLI; performs no spawning from the plugin worker."
+  }
+]

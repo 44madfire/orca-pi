@@ -1,0 +1,18 @@
+{
+  "name": "@orca-pi/core",
+  "version": "0.1.0",
+  "description": "Shared library for orca-pi: version, doctor checks, Orca plugin manifest validation. No Electron/Orca Desktop dependencies.",
+  "type": "commonjs",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src test"
+  }
+}

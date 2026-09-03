@@ -1,0 +1,13 @@
+node_modules/
+packages/*/dist/
+dist/
+*.tsbuildinfo
+packages/*/*.tsbuildinfo
+coverage/
+.nyc_output/
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+.env
+.env.local

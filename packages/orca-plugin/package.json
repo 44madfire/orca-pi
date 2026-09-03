@@ -1,0 +1,25 @@
+{
+  "name": "@orca-pi/orca-plugin",
+  "version": "0.1.0",
+  "description": "Thin Orca plugin shell for the Orca–Pi integration (OP1.1 scaffold). Delegates to the companion orca-pi CLI.",
+  "type": "commonjs",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "orca.plugin.json",
+    "panel.html",
+    "commands.json",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src test"
+  },
+  "dependencies": {
+    "@orca-pi/core": "0.1.0"
+  }
+}

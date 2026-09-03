@@ -1,0 +1,22 @@
+{
+  "name": "orca-pi",
+  "version": "0.1.0",
+  "description": "Companion CLI for the Orca–Pi integration: version, doctor, and future profile launching.",
+  "type": "commonjs",
+  "license": "MIT",
+  "bin": {
+    "orca-pi": "./dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src test"
+  },
+  "dependencies": {
+    "@orca-pi/core": "0.1.0"
+  }
+}

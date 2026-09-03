@@ -1,0 +1,36 @@
+<!doctype html>
+<!--
+  Orca–Pi status panel (OP1.1 scaffold placeholder).
+  Static by design: the thin plugin must not depend on unrestricted
+  child_process access in the plugin worker. Run `orca-pi doctor` in a
+  terminal for live diagnostics; future tickets may wire this panel to the
+  companion CLI through a supported Orca capability.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orca–Pi Status</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 16px; line-height: 1.5; }
+      code { background: rgba(127,127,127,.15); padding: 1px 5px; border-radius: 4px; }
+      .card { border: 1px solid rgba(127,127,127,.35); border-radius: 8px; padding: 12px 14px; max-width: 560px; }
+      .muted { opacity: .75; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Orca–Pi Status</h2>
+      <p><strong>Plugin:</strong> orca-pi 0.1.0 (Orca API 1.4.x)</p>
+      <p class="muted">
+        Placeholder panel for OP1.1. It proves the plugin artifact loads and
+        documents the architectural split; it does not spawn processes.
+      </p>
+      <p>Live diagnostics live in the companion CLI (read-only):</p>
+      <pre><code>orca-pi --version
+orca-pi doctor
+orca-pi doctor --json</code></pre>
+      <p class="muted">Targets Orca app 1.4.196. See docs/ORCA_PLUGIN_API.md.</p>
+    </div>
+  </body>
+</html>
