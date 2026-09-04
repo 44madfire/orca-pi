@@ -33,8 +33,9 @@
  *   element, so correctness never depends on shell quoting.
  * - Relative skill/extension/prompt paths resolve against `projectRoot`,
  *   never `process.cwd()`. `cwd` is the preserved Orca worktree cwd.
- * - Task text is never embedded — Orca `dispatch --inject` owns supervised
- *   task injection (JEF-8). No positional messages are emitted.
+ * - Task text is never embedded — Orca supervised attachment
+ *   (`worker-start --terminal`) owns task injection (JEF-8). No positional
+ *   messages are emitted.
  * - Fresh sessions never auto-resume coordinator context.
  * - Display metadata (`displayName`, `description`, `name`, `extendsChain`)
  *   never affects argv.
