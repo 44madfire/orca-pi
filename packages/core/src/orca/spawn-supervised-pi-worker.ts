@@ -12,7 +12,10 @@
  * 1. Resolve target Run/coordinator context.
  * 2. Create/select an Orca Task if the caller supplied only a task spec.
  * 3. Choose worktree policy explicitly (`current` default; new
- *    child/top-level only when requested).
+ *    child/top-level only when requested). `current` is coordinator-bound
+ *    when the coordinator terminal handle is known (matching native
+ *    `worker-start --worktree current` semantics) and falls back to the
+ *    helper's ambient worktree otherwise.
  * 4. Build the Pi launch (OP1.3) against the *selected* worker checkout, so
  *    `spec.cwd` and absolute skill/extension/prompt paths target the
  *    checkout Pi actually starts in.
@@ -69,6 +72,7 @@ import {
   WorkerStartAmbiguousError,
   type SupervisedWorkerReceipt,
   type SupervisedWorkerStage,
+  type WorktreeIdentity,
   type WorktreePolicy,
 } from "./receipts.js";
 
@@ -320,6 +324,15 @@ export async function spawnSupervisedPiWorker(
   // 3. Choose worktree explicitly. The checkout path is required: step 4
   // rebuilds the OP1.3 launch against it so cwd and absolute resource paths
   // target the checkout Pi actually starts in.
+  //
+  // Coordinator binding for the terminal handle, with full-record fallback
+  // when terminal-show yields only an id. Throws raw errors for the caller
+  // to wrap with the stage-appropriate failure.
+  async function coordinatorWorktree(): Promise<WorktreeIdentity> {
+    const binding = await orca.resolveTerminalWorktree(fromHandle as string);
+    if (binding.path !== undefined) return binding;
+    return await orca.resolveWorktree(`id:${binding.id}`);
+  }
   let worktreeSelector: string;
   let worktreeId: string;
   let worktreePath: string;
@@ -327,16 +340,50 @@ export async function spawnSupervisedPiWorker(
   let createdNewWorktree = false;
   try {
     if (worktreePolicy.kind === "current") {
-      worktreeSelector = "active";
-      const identity = await orca.resolveWorktree("active");
-      if (identity.path === undefined) {
-        throw new Error(
-          `Orca worktree ${identity.id} reported no checkout path; cannot build the Pi launch for it.`,
-        );
+      if (fromHandle !== undefined) {
+        // Coordinator-bound: match native `worker-start --worktree current`
+        // semantics (`id:<coordinatorTerminal.worktreeId>`), never the
+        // helper's ambient worktree. The exact selector is also used for
+        // terminal creation and supervised attach so launch cwd/resources
+        // target the coordinator checkout.
+        try {
+          const coordinator = await coordinatorWorktree();
+          if (coordinator.path === undefined) {
+            throw new Error(
+              `Orca worktree ${coordinator.id} reported no checkout path; cannot build the Pi launch for it.`,
+            );
+          }
+          worktreeId = coordinator.id;
+          worktreePath = coordinator.path;
+          worktreeDisplayName = coordinator.displayName;
+          worktreeSelector = `id:${coordinator.id}`;
+        } catch (error) {
+          if (error instanceof SupervisedWorkerError) throw error;
+          throw wrapStageError({
+            stage: "worktree-resolve",
+            code: "coordinator-worktree-resolve-failed",
+            stageLabel: "Coordinator worktree resolution",
+            error,
+            taskId,
+            hint:
+              "Could not resolve the coordinator terminal's worktree for the current-worktree policy. " +
+              "Pass fromHandle of a live coordinator terminal or use an explicit existing worktree selector; " +
+              "the Task remains unattached.",
+            createdNewWorktree: false,
+          });
+        }
+      } else {
+        worktreeSelector = "active";
+        const identity = await orca.resolveWorktree("active");
+        if (identity.path === undefined) {
+          throw new Error(
+            `Orca worktree ${identity.id} reported no checkout path; cannot build the Pi launch for it.`,
+          );
+        }
+        worktreeId = identity.id;
+        worktreePath = identity.path;
+        worktreeDisplayName = identity.displayName;
       }
-      worktreeId = identity.id;
-      worktreePath = identity.path;
-      worktreeDisplayName = identity.displayName;
     } else if (worktreePolicy.kind === "existing") {
       worktreeSelector = worktreePolicy.selector;
       const identity = await orca.resolveWorktree(worktreePolicy.selector);

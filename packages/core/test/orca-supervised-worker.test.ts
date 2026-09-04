@@ -651,6 +651,101 @@ describe("spawnSupervisedPiWorker builds the launch against the selected checkou
   });
 });
 
+describe("spawnSupervisedPiWorker current policy follows the coordinator", () => {
+  const SKILL_YAML = `profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: low\n    systemPrompt: Be brief.\n    skills: [.pi/skills/a]\n`;
+  const AMBIENT = { id: "repo::/wt/helper-ambient", path: "/wt/helper-ambient" };
+  const COORDINATOR = { id: "repo::/wt/coordinator-b", path: "/wt/coordinator-b" };
+
+  function crossWorktreeOrca() {
+    const orca = makeFakeOrca({
+      async resolveWorktree() {
+        orca.calls.push("resolveWorktree:active");
+        return { ...AMBIENT };
+      },
+      async resolveTerminalWorktree(handle: string) {
+        orca.calls.push(`resolveTerminalWorktree:${handle}`);
+        return { ...COORDINATOR };
+      },
+    });
+    return orca;
+  }
+
+  it("helper ambient A + coordinator handle in B: Pi cwd/resources, terminal target, and attach all use B", async () => {
+    const profile = testProfile(SKILL_YAML);
+    const orca = crossWorktreeOrca();
+    const receipt = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      fromHandle: "term_coordinator",
+    });
+    // Coordinator-bound exact selector, never helper ambient.
+    expect(receipt.worktree.id).toBe(COORDINATOR.id);
+    expect(receipt.worktree.selector).toBe(`id:${COORDINATOR.id}`);
+    expect(receipt.piCwd).toBe("/wt/coordinator-b");
+    expect(receipt.worktree.path).toBe("/wt/coordinator-b");
+    const command = orca.terminalCommands[0] as string;
+    expect(command).toContain("/wt/coordinator-b/.pi/skills/a");
+    expect(command).not.toContain("/wt/helper-ambient");
+    expect(orca.calls).toContain("resolveTerminalWorktree:term_coordinator");
+    expect(orca.calls).toContain(`createTerminal:id:${COORDINATOR.id}`);
+    expect(orca.calls).toContain(
+      `attachWorker:t:term_created:id:${COORDINATOR.id}`,
+    );
+    expect(orca.calls).not.toContain("resolveWorktree:active");
+  });
+
+  it("resolves the full worktree record when terminal-show yields only an id", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca({
+      async resolveTerminalWorktree(handle: string) {
+        orca.calls.push(`resolveTerminalWorktree:${handle}`);
+        return { id: "repo::/wt/bare-id" };
+      },
+      async resolveWorktree(selector: string) {
+        orca.calls.push(`resolveWorktree:${selector}`);
+        expect(selector).toBe("id:repo::/wt/bare-id");
+        return { id: "repo::/wt/bare-id", path: "/wt/bare-id" };
+      },
+    });
+    const receipt = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      fromHandle: "term_coordinator",
+    });
+    expect(receipt.piCwd).toBe("/wt/bare-id");
+    expect(receipt.worktree.selector).toBe("id:repo::/wt/bare-id");
+  });
+
+  it("fails closed when the coordinator worktree cannot be resolved", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca({
+      async resolveTerminalWorktree() {
+        throw new OrcaCommandError({
+          code: "terminal_handle_stale",
+          message: "terminal-show: stale handle",
+          executable: "orca",
+          args: [],
+          diagnostics: "stale",
+        });
+      },
+    });
+    const error = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      fromHandle: "term_stale",
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SupervisedWorkerError);
+    expect((error as SupervisedWorkerError).stage).toBe("worktree-resolve");
+    expect((error as SupervisedWorkerError).code).toBe(
+      "coordinator-worktree-resolve-failed",
+    );
+    expect(orca.calls.join(",")).not.toContain("createTerminal:");
+  });
+});
+
 describe("spawnSupervisedPiWorker new-child parent lineage", () => {
   const AMBIENT = { id: "repo::/wt/helper-ambient", path: "/wt/helper-ambient" };
   const COORDINATOR = { id: "repo::/wt/coordinator", path: "/wt/coordinator" };
