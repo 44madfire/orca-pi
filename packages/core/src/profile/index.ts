@@ -1,5 +1,5 @@
 /**
- * Pi agent profile barrel (OP1.2 / JEF-6).
+ * Pi agent profile barrel (OP1.2 / JEF-6 + OP1.6 / JEF-10 defaults).
  *
  * Import from `@orca-pi/core` (re-exported in `src/index.ts`) or directly
  * from `@orca-pi/core/dist/profile/index.js` in constrained hosts.
@@ -15,6 +15,15 @@ export type {
   ValidatedPiProfile,
   ValidatedProfilesDocument,
 } from "./types.js";
+export {
+  BUILTIN_PROFILE_NAMES,
+  BUILTIN_PROFILES_SOURCE,
+  REVIEWER_SYSTEM_PROMPT,
+  SCOUT_SYSTEM_PROMPT,
+  WORKER_SYSTEM_PROMPT,
+  getBuiltinProfilesDocument,
+  isBuiltinProfileName,
+} from "./builtins.js";
 export {
   BUILTIN_PROFILE_DEFAULTS,
   BUILTIN_TOOLS,

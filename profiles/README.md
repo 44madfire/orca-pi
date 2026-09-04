@@ -1,24 +1,68 @@
 # profiles/
 
-Declarative Pi agent profiles (OP1.2 / JEF-6): reusable role definitions such
-as `scout`, `worker`, and `reviewer` with independent model, reasoning,
-prompt, tools, skills, extensions, and context policy.
+Declarative Pi agent profiles (OP1.2 / JEF-6 + OP1.6 / JEF-10 defaults):
+reusable role definitions such as `scout`, `worker`, and `reviewer` with
+independent model, reasoning, prompt, tools, skills, extensions, and context
+policy.
 
-The schema, loader, and resolver live in `@orca-pi/core`:
+Fresh installs expose built-in `scout`, `worker`, and `reviewer` with no
+config files (model-agnostic — see below). The schema, loader, resolver, and
+defaults live in `@orca-pi/core`:
 
 - `packages/core/src/profile/types.ts` — static shapes (`PiProfileInput`,
   `ResolvedPiProfile`, …)
 - `packages/core/src/profile/schema.ts` — runtime validator
   (`validateProfilesDocument`, `validateProfileOverrides`,
   `BUILTIN_PROFILE_DEFAULTS`)
+- `packages/core/src/profile/builtins.ts` — JEF-10 default role policy
+  (`getBuiltinProfilesDocument()`, `SCOUT/WORKER/REVIEWER_SYSTEM_PROMPT`)
 - `packages/core/src/profile/load.ts` — YAML/JSON parsing, multi-layer
   merging, and `node:fs` helpers (`parseAndValidateProfilesText`,
   `mergeValidatedDocuments`, `loadMergedProfiles`)
 - `packages/core/src/profile/resolve.ts` — inheritance flattening into one
   frozen `ResolvedPiProfile` (`resolveProfile`, `resolveAllProfiles`)
+- `packages/core/src/pi/context-summary.ts` — context-budget estimates
+  (`summarizeProfileContext`, `formatContextSummary`)
 
-See `examples.yaml` in this directory for a copy-paste starting point
-(`readonly` base with `scout`/`worker` children, matching the JEF-6 shape).
+Shipped files in this directory:
+
+- `scout.yaml`, `worker.yaml`, `reviewer.yaml` — per-role defaults with
+  inline prompts (mirror the built-ins; copy a block to override).
+- `examples.yaml` — fuller example (`readonly` base with
+  `scout`/`worker`/`reviewer` children plus model/skill examples).
+- `../prompts/scout.md`, `../prompts/worker.md`, `../prompts/reviewer.md` —
+  human-readable copies of the built-in prompts (tests enforce sync).
+
+## Built-in defaults (JEF-10)
+
+| Role | Tools | Thinking | Context | Session | Prompt |
+|---|---|---|---|---|---|
+| `scout` | `read,grep,find,ls` | `low` | `contextFiles: false`, no explicit skills/extensions | `ephemeral` | Evidence-backed handoff; no modifications |
+| `worker` | `read,grep,find,ls,bash,edit,write` | `high` | `contextFiles: true`, no explicit skills/extensions | `ephemeral` | Inspect-before-edit, scoped change, focused validation |
+| `reviewer` | `read,grep,find,ls,bash` (no `edit`/`write`) | `high` | `contextFiles: false`, no explicit skills/extensions | `ephemeral` | Fresh-context review, Blocking vs Non-blocking |
+
+Ambient discovery is off for all three (`discoverSkills/discoverExtensions:
+false`). Sessions are `ephemeral` (`--no-session`) so reviewer runs never
+resume worker context. Prompts never duplicate Orca `worker_done`/heartbeat
+lifecycle instructions (Orca injects those).
+
+## Model overrides (retain role policy)
+
+Built-ins omit `model`/`provider`. Select models in your own config:
+
+```yaml
+profiles:
+  scout:
+    model: <fast-model>
+  worker:
+    model: <coding-model>
+  reviewer:
+    model: <reasoning-model>
+```
+
+Later layers win per-field; arrays replace wholesale. A model-only override
+keeps the default tools/thinking/prompt/context for that role (tested in
+`profile.defaults.test.ts`).
 
 ## Example
 
@@ -73,7 +117,8 @@ Unknown fields are rejected — profiles must never contain secrets/API keys
 
 ## Configuration precedence (low → high)
 
-1. built-in defaults (`BUILTIN_PROFILE_DEFAULTS`: `thinking: medium`,
+1. built-in defaults (JEF-10: `scout`/`worker`/`reviewer` role policy in
+   `builtins.ts`, plus `BUILTIN_PROFILE_DEFAULTS`: `thinking: medium`,
    `contextFiles/discoverSkills/discoverExtensions: false`,
    `session: ephemeral`)
 2. user/global config (`$PI_CODING_AGENT_DIR/profiles.yaml`,
@@ -92,7 +137,8 @@ the parent's list entirely. Defining `systemPrompt` clears an inherited
 Helpers: `getCandidateConfigPaths({ projectRoot })` returns
 `[userPath, projectPath]` in merge order; `mergeValidatedDocuments` merges
 in order; `resolveProfile(name, merged, { overrides })` flattens
-inheritance and applies overrides last.
+inheritance and applies overrides last. `loadMergedProfiles` prepends
+builtins by default (`includeBuiltins: false` only for raw layer tests).
 
 ## Security / context rules
 
@@ -114,8 +160,12 @@ inheritance and applies overrides last.
 
 - Launcher (`packages/core/src/pi/`): `buildPiLaunch(resolved, { projectRoot, cwd })`
   → frozen `{ command: "pi", args, cwd, env }`. Inspect with
-  `orca-pi profile inspect <name> [--project-root <path>] [--json] [--show-prompt]`
+  `orca-pi profile inspect <name> [--project-root <path>] [--json] [--show-prompt] [--context-summary]`
   (redacted display-only formatter; execution always uses structured args).
+- Context summary (`context-summary.ts`): `summarizeProfileContext` reports
+  prompt chars/words/lines, `ceil(chars/4)` token estimate, tool count,
+  explicit/discovered skill/extension counts, and context-file policy.
+  Regression/debug heuristic only — not provider token accounting.
 - Prompt transport (`prompt-transport.ts`): current Pi treats
   `--system-prompt <value>` as file-or-text (`existsSync` → read file, else
   literal). Non-colliding prompts travel literally; colliding prompts

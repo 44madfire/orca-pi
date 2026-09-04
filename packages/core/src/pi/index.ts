@@ -1,5 +1,5 @@
 /**
- * Pi launcher barrel (OP1.3 / JEF-7).
+ * Pi launcher barrel (OP1.3 / JEF-7 + OP1.6 / JEF-10 context summary).
  *
  * Deterministic translation from a validated `ResolvedPiProfile` into a
  * structured Pi process invocation. Import from `@orca-pi/core` or directly
@@ -38,3 +38,9 @@ export {
   quoteForDisplay,
   type FormatInspectOptions,
 } from "./format-inspect.js";
+export {
+  estimatePromptTokens,
+  formatContextSummary,
+  summarizeProfileContext,
+  type ProfileContextSummary,
+} from "./context-summary.js";

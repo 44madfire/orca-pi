@@ -204,11 +204,30 @@ describe("profile load: filesystem helpers", () => {
     expect(doc?.profiles.scout?.model).toBe("anthropic/claude-haiku");
   });
 
-  it("loadMergedProfiles merges user < project and skips missing files", async () => {
+  it("loadMergedProfiles merges builtins < user < project and skips missing files", async () => {
     const merged = await loadMergedProfiles({
       projectRoot: "/repo/my-project",
       userConfigPath: join(here, "fixtures/profiles/minimal.yaml"),
       projectConfigPath: "/definitely/not/here/profiles.yaml",
+    });
+    expect(listProfileNames(merged)).toEqual(["reviewer", "scout", "worker"]);
+  });
+
+  it("loadMergedProfiles exposes fresh-install defaults with no files", async () => {
+    const merged = await loadMergedProfiles({
+      projectRoot: "/repo/my-project",
+      userConfigPath: "/definitely/not/here/user.yaml",
+      projectConfigPath: "/definitely/not/here/project.yaml",
+    });
+    expect(listProfileNames(merged)).toEqual(["reviewer", "scout", "worker"]);
+  });
+
+  it("loadMergedProfiles supports includeBuiltins:false for raw layer tests", async () => {
+    const merged = await loadMergedProfiles({
+      projectRoot: "/repo/my-project",
+      userConfigPath: join(here, "fixtures/profiles/minimal.yaml"),
+      projectConfigPath: "/definitely/not/here/profiles.yaml",
+      includeBuiltins: false,
     });
     expect(listProfileNames(merged)).toEqual(["scout"]);
   });

@@ -1,7 +1,8 @@
 # orca-pi
 
 Orca–Pi orchestration (**OP1.1 / JEF-5** scaffold + **OP1.2 / JEF-6** Pi agent
-profiles + **OP1.3 / JEF-7** deterministic Pi argv launcher): a thin Orca plugin
+profiles + **OP1.3 / JEF-7** deterministic Pi argv launcher + **OP1.6 / JEF-10**
+default scout/worker/reviewer profiles): a thin Orca plugin
 plus a separately testable companion `orca-pi` CLI/library.
 
 Later tickets add Orca Tasks/Dispatches — without coupling orchestration logic
@@ -25,8 +26,9 @@ orca-pi/
 │   ├── core/          # version + doctor + plugin-manifest validator + Pi profiles + Pi launcher (no Electron)
 │   ├── cli/           # `orca-pi` executable (thin wrapper over core)
 │   └── orca-plugin/   # Orca manifest, panel/skill/command contributions
-├── profiles/          # Pi agent profile schema docs + examples (OP1.2 / JEF-6)
-├── docs/              # targeted Orca plugin API/version notes
+├── profiles/          # Pi agent profile schema docs + defaults + examples (OP1.2 / JEF-6 + OP1.6 / JEF-10)
+├── prompts/           # Default scout/worker/reviewer role prompts (OP1.6 / JEF-10)
+├── docs/              # targeted Orca plugin API/version notes + manual evals
 └── README.md
 ```
 
@@ -77,6 +79,7 @@ node packages/cli/dist/main.js --version
 node packages/cli/dist/main.js doctor
 node packages/cli/dist/main.js doctor --json
 node packages/cli/dist/main.js profile inspect scout --project-root .
+node packages/cli/dist/main.js profile inspect scout --project-root . --context-summary
 ```
 
 Or link it globally for the `orca-pi` name:
@@ -101,8 +104,17 @@ orca-pi doctor
   deterministic Pi argv in redacted human-readable form (read-only, never
   launches Pi). `--json` prints the full structured `{ profile, spec }`;
   `--show-prompt` prints the full prompt text (default truncates to a
-  preview + length). The display formatter is never used for execution —
+  preview + length). `--context-summary` adds a context-budget estimate
+  (prompt chars/words/lines, ~tokens, tool/skill/extension counts,
+  context-file policy; heuristic, not provider billing). The display
+  formatter is never used for execution —
   launching always uses the structured `{ command, args, cwd, env }` array.
+- Fresh installs expose built-in `scout`, `worker`, and `reviewer`
+  (model-agnostic defaults in `packages/core/src/profile/builtins.ts`,
+  mirrored in `profiles/scout.yaml`/`worker.yaml`/`reviewer.yaml` and
+  `prompts/*.md`). Override models while retaining role policy:
+  `profiles: { scout: { model: <fast-model> } }`. See `profiles/README.md`
+  and `docs/EVALS.md` for role policy and manual evals.
 
 ## Orca plugin
 
@@ -137,9 +149,12 @@ If your Orca build reports a manifest error, update
 `docs/ORCA_PLUGIN_API.md` together — they are tested as a unit
 (`packages/orca-plugin/test/manifest.test.ts`).
 
-## Profiles (OP1.2 / JEF-6) + deterministic launcher (OP1.3 / JEF-7)
+## Profiles (OP1.2 / JEF-6) + deterministic launcher (OP1.3 / JEF-7) + defaults (OP1.6 / JEF-10)
 
-- Declarative roles (`scout`, `worker`, `reviewer`, …) in
+- Built-in model-agnostic defaults (`scout`, `worker`, `reviewer`) in
+  `packages/core/src/profile/builtins.ts` (fresh installs work with no config
+  files), mirrored in `profiles/scout.yaml`/`worker.yaml`/`reviewer.yaml`
+  and `prompts/*.md`. Declarative overrides in
   `profiles/examples.yaml` (copy to `$PI_CODING_AGENT_DIR/profiles.yaml` or
   `<projectRoot>/.pi/profiles.yaml`).
 - Schema/loader/resolver in `@orca-pi/core` (`packages/core/src/profile/`):
