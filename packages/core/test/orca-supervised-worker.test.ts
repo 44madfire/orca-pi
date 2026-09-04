@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { buildPiLaunch } from "../src/pi/build-pi-launch.js";
 import { parseAndValidateProfilesText } from "../src/profile/load.js";
 import { resolveProfile } from "../src/profile/resolve.js";
+import type { ResolvedPiProfile } from "../src/profile/types.js";
 import {
   createOrcaCliProcess,
   OrcaCommandError,
@@ -38,23 +38,20 @@ function envelope(result: unknown): string {
   return JSON.stringify({ id: "x", ok: true, result });
 }
 
-async function testLaunch() {
-  const doc = parseAndValidateProfilesText(
-    `profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: low\n    systemPrompt: Be brief.\n`,
-    "test.yaml",
-  );
-  const profile = resolveProfile("scout", doc);
-  const launch = await buildPiLaunch(profile, { projectRoot: "/repo/proj" });
-  return { profile, launch };
+function testProfile(yaml = `profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: low\n    systemPrompt: Be brief.\n`): ResolvedPiProfile {
+  const doc = parseAndValidateProfilesText(yaml, "test.yaml");
+  return resolveProfile("scout", doc);
 }
 
 /** Recording fake OrcaCli for spawn tests. */
 function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & {
   calls: string[];
   terminalCommands: string[];
+  worktreeCreates: { name: string; parent: string; parentWorktree?: string }[];
 } {
   const calls: string[] = [];
   const terminalCommands: string[] = [];
+  const worktreeCreates: { name: string; parent: string; parentWorktree?: string }[] = [];
   const base: OrcaCli = {
     async resolveRunId() {
       calls.push("resolveRunId");
@@ -65,7 +62,14 @@ function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & {
       return { taskId: "task_default" };
     },
     async createWorktree(input) {
-      calls.push(`createWorktree:${input.parent}`);
+      calls.push(`createWorktree:${input.parent}:${input.name}`);
+      worktreeCreates.push({
+        name: input.name,
+        parent: input.parent,
+        ...(input.parentWorktree !== undefined
+          ? { parentWorktree: input.parentWorktree }
+          : {}),
+      });
       return { id: `repo::/wt/${input.name}`, path: `/wt/${input.name}` };
     },
     async resolveWorktree(selector: string) {
@@ -80,19 +84,25 @@ function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & {
     async waitForTerminal(handle: string) {
       calls.push(`waitForTerminal:${handle}`);
     },
-    async dispatch(input) {
-      calls.push(`dispatch:${input.taskId}:${input.terminalHandle}`);
+    async attachWorker(input) {
+      calls.push(
+        `attachWorker:${input.taskId}:${input.terminalHandle}:${input.worktreeSelector ?? ""}`,
+      );
       return {
         taskId: input.taskId,
-        terminalHandle: input.terminalHandle,
         dispatchId: "dispatch_1",
+        terminalHandle: input.terminalHandle,
       };
     },
     async closeTerminal(handle: string) {
       calls.push(`closeTerminal:${handle}`);
     },
   };
-  return Object.assign(base, overrides ?? {}, { calls, terminalCommands });
+  return Object.assign(base, overrides ?? {}, {
+    calls,
+    terminalCommands,
+    worktreeCreates,
+  });
 }
 
 describe("terminal shell quoting", () => {
@@ -166,7 +176,7 @@ describe("orca-cli-process argv mapping", () => {
     expect(argv[specIndex + 1]).toBe("do work; rm -rf /");
   });
 
-  it("passes --no-parent only for top-level worktrees (lineage vs Git base)", async () => {
+  it("passes explicit --parent-worktree for child worktrees and --no-parent for top-level", async () => {
     const seen: string[][] = [];
     const runner = fakeRunner((_exe, args) => {
       seen.push([...args]);
@@ -174,6 +184,11 @@ describe("orca-cli-process argv mapping", () => {
     });
     const orca = createOrcaCliProcess(runner);
     await orca.createWorktree({ name: "child-w", parent: "child" });
+    await orca.createWorktree({
+      name: "child-explicit",
+      parent: "child",
+      parentWorktree: "id:repo::/parent",
+    });
     await orca.createWorktree({ name: "top-w", parent: "top-level" });
     await orca.createWorktree({
       name: "based",
@@ -181,12 +196,19 @@ describe("orca-cli-process argv mapping", () => {
       baseBranch: "origin/main",
       setup: "run",
     });
+    // Child lineage is always explicit — never ambient inference.
     expect(seen[0]).toContain("child-w");
+    expect(seen[0]).toContain("--parent-worktree");
+    expect(seen[0][(seen[0]?.indexOf("--parent-worktree") ?? -1) + 1]).toBe("active");
     expect(seen[0]).not.toContain("--no-parent");
-    expect(seen[1]).toContain("--no-parent");
+    expect(seen[1][(seen[1]?.indexOf("--parent-worktree") ?? -1) + 1]).toBe(
+      "id:repo::/parent",
+    );
     expect(seen[2]).toContain("--no-parent");
-    expect(seen[2]).toContain("origin/main");
-    expect(seen[2]).toContain("run");
+    expect(seen[2]).not.toContain("--parent-worktree");
+    expect(seen[3]).toContain("--no-parent");
+    expect(seen[3]).toContain("origin/main");
+    expect(seen[3]).toContain("run");
   });
 
   it("creates terminals with the Pi command as one --command element", async () => {
@@ -203,17 +225,51 @@ describe("orca-cli-process argv mapping", () => {
     expect(argv[argv.indexOf("--command") + 1]).toBe("pi --model x");
   });
 
-  it("dispatches with --inject and tolerates missing dispatch ids", async () => {
+  it("attaches supervised workers via worker-start --terminal (never --inject)", async () => {
     const seen: string[][] = [];
     const runner = fakeRunner((_exe, args) => {
       seen.push([...args]);
-      return ok(envelope({}));
+      return ok(
+        envelope({
+          ready: true,
+          dispatch: { id: "dispatch_9" },
+          worker: { agent_terminal_handle: "h" },
+          setup: { status: "running" },
+        }),
+      );
     });
     const orca = createOrcaCliProcess(runner);
-    const receipt = await orca.dispatch({ taskId: "t", terminalHandle: "h" });
-    expect(seen[0]).toContain("--inject");
-    expect(receipt.dispatchId).toBeUndefined();
+    const receipt = await orca.attachWorker({
+      taskId: "t",
+      terminalHandle: "h",
+      worktreeSelector: "active",
+    });
+    const argv = seen[0] ?? [];
+    expect(argv).toContain("worker-start");
+    expect(argv).toContain("--terminal");
+    expect(argv).toContain("--task");
+    expect(argv).toContain("--worktree");
+    expect(argv).toContain("--json");
+    expect(argv).not.toContain("--inject");
+    expect(argv).not.toContain("--agent");
+    expect(argv).not.toContain("--model");
+    expect(receipt.dispatchId).toBe("dispatch_9");
     expect(receipt.taskId).toBe("t");
+    expect(receipt.terminalHandle).toBe("h");
+  });
+
+  it("fails the attach when the dispatch id is missing or the worker is not ready", async () => {
+    const noId = createOrcaCliProcess(fakeRunner(() => ok(envelope({ ready: true }))));
+    await expect(
+      noId.attachWorker({ taskId: "t", terminalHandle: "h" }),
+    ).rejects.toMatchObject({ name: "OrcaCommandError", code: "orca-malformed-json" });
+
+    const notReady = createOrcaCliProcess(
+      fakeRunner(() => ok(envelope({ ready: false, dispatch: { id: "d1" } }))),
+    );
+    await expect(
+      notReady.attachWorker({ taskId: "t", terminalHandle: "h" }),
+    ).rejects.toMatchObject({ name: "OrcaCommandError", code: "orca-malformed-json" });
   });
 
   it("maps missing executables to orca-missing (POSIX ENOENT and Windows text)", async () => {
@@ -237,27 +293,21 @@ describe("orca-cli-process argv mapping", () => {
   });
 
   it("flags unknown commands/flags as compatibility failures", async () => {
-    const runner = fakeRunner(() =>
-      ok(
-        JSON.stringify({
-          ok: false,
-          error: { code: "unknown_option", message: "Unknown option --inject" },
-        }),
-      ),
-    );
     // Exit-0 ok:false path still surfaces through runJson.
     const zeroExitUnknown = fakeRunner(() => ({
       stdout: JSON.stringify({
         ok: false,
-        error: { code: "unknown_option", message: "Unknown option --inject" },
+        error: { code: "unknown_option", message: "Unknown option --foo" },
       }),
       stderr: "",
       exitCode: 0,
     }));
     await expect(
-      createOrcaCliProcess(zeroExitUnknown).dispatch({ taskId: "t", terminalHandle: "h" }),
+      createOrcaCliProcess(zeroExitUnknown).attachWorker({
+        taskId: "t",
+        terminalHandle: "h",
+      }),
     ).rejects.toMatchObject({ isCompatibility: true });
-    void runner;
   });
 
   it("wraps malformed JSON as orca-malformed-json", async () => {
@@ -283,11 +333,9 @@ describe("orca-cli-process argv mapping", () => {
 });
 
 describe("spawnSupervisedPiWorker happy path (current worktree)", () => {
-  it("resolves Run, creates Task, reuses current worktree, waits, dispatches, and returns a frozen receipt", async () => {
-    const { profile, launch } = await testLaunch();
+  it("resolves Run, creates Task, rebuilds the launch for the worktree, waits, attaches supervised, and returns a frozen receipt", async () => {
+    const profile = testProfile();
     const orca = makeFakeOrca();
-    const origResolve = orca.resolveRunId.bind(orca);
-    void origResolve;
     orca.resolveRunId = async () => {
       orca.calls.push("resolveRunId");
       return "run_7";
@@ -300,7 +348,6 @@ describe("spawnSupervisedPiWorker happy path (current worktree)", () => {
     };
     const receipt = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { spec: "Implement the thing", taskTitle: "Thing" },
     });
@@ -317,14 +364,14 @@ describe("spawnSupervisedPiWorker happy path (current worktree)", () => {
     expect(receipt.runId).toBe("run_7");
     expect(Object.isFrozen(receipt)).toBe(true);
 
-    // Order: Run → Task → worktree → terminal → wait → dispatch.
+    // Order: Run → Task → worktree → terminal → wait → supervised attach.
     expect(orca.calls).toEqual([
       "resolveRunId",
       "createTask",
       "resolveWorktree:active",
       "createTerminal:active",
       "waitForTerminal:term_created",
-      "dispatch:task_42:term_created",
+      "attachWorker:task_42:term_created:active",
     ]);
 
     // The Pi terminal command carries Pi argv but never the assigned task text.
@@ -334,8 +381,22 @@ describe("spawnSupervisedPiWorker happy path (current worktree)", () => {
     expect(command).not.toContain("Implement the thing");
   });
 
+  it("proves the receipt is supervised: real dispatch id, no unsupervised path", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca();
+    const receipt = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "task_existing" },
+    });
+    expect(receipt.dispatchId).toBe("dispatch_1");
+    expect(receipt.dispatchId.length).toBeGreaterThan(0);
+    expect("unsupervised" in receipt).toBe(false);
+    expect(orca.calls.some((c) => c.startsWith("attachWorker:"))).toBe(true);
+  });
+
   it("uses an explicit runId without resolving", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     const orca = makeFakeOrca();
     let resolved = false;
     orca.resolveRunId = async () => {
@@ -344,7 +405,6 @@ describe("spawnSupervisedPiWorker happy path (current worktree)", () => {
     };
     const receipt = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { spec: "work" },
       runId: "run_explicit",
@@ -356,21 +416,20 @@ describe("spawnSupervisedPiWorker happy path (current worktree)", () => {
 
 describe("spawnSupervisedPiWorker task selection", () => {
   it("reuses an existing Task id without calling createTask", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     const orca = makeFakeOrca();
     const receipt = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { taskId: "task_existing" },
     });
     expect(receipt.taskId).toBe("task_existing");
     expect(orca.calls).not.toContain("createTask");
-    expect(orca.calls).toContain("dispatch:task_existing:term_created");
+    expect(orca.calls).toContain("attachWorker:task_existing:term_created:active");
   });
 
   it("creates a Task from an inline spec with title/parent/deps passthrough", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     let seenInput: unknown;
     const orca = makeFakeOrca({
       async createTask(input) {
@@ -380,7 +439,6 @@ describe("spawnSupervisedPiWorker task selection", () => {
     });
     await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: {
         spec: "spec text",
@@ -398,58 +456,127 @@ describe("spawnSupervisedPiWorker task selection", () => {
   });
 });
 
-describe("spawnSupervisedPiWorker worktree policies", () => {
-  it("targets existing selectors directly", async () => {
-    const { profile, launch } = await testLaunch();
-    const orca = makeFakeOrca();
-    const receipt = await spawnSupervisedPiWorker({
-      orca,
-      launch,
-      profile,
-      task: { taskId: "t" },
-      worktree: { kind: "existing", selector: "name:Other" },
-    });
-    expect(receipt.worktree.selector).toBe("name:Other");
-    expect(receipt.worktree.createdNew).toBe(false);
-    expect(orca.calls).toContain("resolveWorktree:name:Other");
-    expect(orca.calls).toContain("createTerminal:name:Other");
-  });
+describe("spawnSupervisedPiWorker builds the launch against the selected checkout", () => {
+  const SKILL_YAML = `profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: low\n    systemPrompt: Be brief.\n    skills: [.pi/skills/a]\n    extensions: [.pi/extensions/e.ts]\n`;
 
-  it("creates child worktrees without --no-parent lineage and top-level with it (via OrcaCli parent)", async () => {
-    const { profile, launch } = await testLaunch();
-    const seenParents: string[] = [];
+  it("existing worktree: Pi argv and cwd target the selected checkout, not the caller root", async () => {
+    const profile = testProfile(SKILL_YAML);
     const orca = makeFakeOrca({
-      async createWorktree(input) {
-        seenParents.push(input.parent);
-        return { id: `repo::/wt/${input.name}`, path: `/wt/${input.name}` };
+      async resolveWorktree() {
+        orca.calls.push("resolveWorktree:path:/checkout/b");
+        return { id: "repo::/checkout/b", path: "/checkout/b" };
       },
     });
-    const child = await spawnSupervisedPiWorker({
+    const receipt = await spawnSupervisedPiWorker({
       orca,
-      launch,
+      profile,
+      task: { taskId: "t" },
+      worktree: { kind: "existing", selector: "path:/checkout/b" },
+    });
+    expect(receipt.piCwd).toBe("/checkout/b");
+    expect(receipt.worktree.path).toBe("/checkout/b");
+    const command = orca.terminalCommands[0] as string;
+    expect(command).toContain("/checkout/b/.pi/skills/a");
+    expect(command).toContain("/checkout/b/.pi/extensions/e.ts");
+    expect(command).not.toContain("/repo/proj");
+  });
+
+  it("new-child worktree: rebuilt launch targets the created checkout", async () => {
+    const profile = testProfile(SKILL_YAML);
+    const orca = makeFakeOrca({
+      async createWorktree(input) {
+        orca.calls.push(`createWorktree:${input.parent}:${input.name}`);
+        orca.worktreeCreates.push({
+          name: input.name,
+          parent: input.parent,
+          ...(input.parentWorktree !== undefined
+            ? { parentWorktree: input.parentWorktree }
+            : {}),
+        });
+        return { id: "repo::/wt/child-w", path: "/wt/child-w" };
+      },
+    });
+    const receipt = await spawnSupervisedPiWorker({
+      orca,
       profile,
       task: { taskId: "t" },
       worktree: { kind: "new-child", name: "child-w" },
     });
-    expect(seenParents[0]).toBe("child");
-    expect(child.worktree.createdNew).toBe(true);
-    expect(child.worktree.selector).toBe("id:repo::/wt/child-w");
+    expect(receipt.piCwd).toBe("/wt/child-w");
+    expect(receipt.worktree.createdNew).toBe(true);
+    expect(receipt.worktree.selector).toBe("id:repo::/wt/child-w");
+    const command = orca.terminalCommands[0] as string;
+    expect(command).toContain("/wt/child-w/.pi/skills/a");
+    // Parent lineage is explicit, never ambient inference.
+    expect(orca.worktreeCreates[0]).toMatchObject({ parent: "child" });
+  });
 
+  it("passes an explicit parent selector for new-child worktrees", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca();
+    await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      worktree: {
+        kind: "new-child",
+        name: "child-w",
+        parentWorktree: "id:repo::/parent",
+      },
+    });
+    expect(orca.worktreeCreates[0]).toMatchObject({
+      parent: "child",
+      parentWorktree: "id:repo::/parent",
+    });
+  });
+
+  it("creates top-level worktrees with --no-parent lineage (via OrcaCli parent)", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca();
     const top = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { taskId: "t" },
       worktree: { kind: "new-top-level", name: "top-w", baseBranch: "origin/main" },
     });
-    expect(seenParents[1]).toBe("top-level");
+    expect(orca.worktreeCreates[0]).toMatchObject({ parent: "top-level" });
     expect(top.worktree.selector).toBe("id:repo::/wt/top-w");
+  });
+
+  it("rejects a non-empty Pi env overlay instead of silently dropping it", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca();
+    const error = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      launchOptions: { env: { FOO: "bar" } },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SupervisedWorkerError);
+    expect((error as SupervisedWorkerError).stage).toBe("launch-build");
+    expect((error as SupervisedWorkerError).code).toBe("launch-env-unsupported");
+    expect(orca.calls).not.toContain("createTerminal:active");
+  });
+
+  it("surfaces prompt-file failures as launch-build with no terminal", async () => {
+    const profile = testProfile(
+      `profiles:\n  scout:\n    thinking: low\n    systemPromptFile: .pi/agents/missing.md\n`,
+    );
+    const orca = makeFakeOrca();
+    const error = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SupervisedWorkerError);
+    expect((error as SupervisedWorkerError).stage).toBe("launch-build");
+    expect(orca.calls).not.toContain("createTerminal:active");
   });
 });
 
 describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
   it("task-create failure creates no terminal", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     const orca = makeFakeOrca({
       async createTask() {
         throw new OrcaCommandError({
@@ -463,7 +590,6 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     });
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { spec: "work" },
     }).catch((e: unknown) => e);
@@ -473,8 +599,8 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     expect(orca.calls).not.toContain("createTerminal:active");
   });
 
-  it("terminal-create failure leaves the Task undispatched", async () => {
-    const { profile, launch } = await testLaunch();
+  it("terminal-create failure leaves the Task unattached", async () => {
+    const profile = testProfile();
     const orca = makeFakeOrca({
       async createTask() {
         return { taskId: "task_1" };
@@ -491,18 +617,17 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     });
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { taskId: "task_1" },
     }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(SupervisedWorkerError);
     expect((error as SupervisedWorkerError).stage).toBe("terminal-create");
     expect((error as SupervisedWorkerError).taskId).toBe("task_1");
-    expect(orca.calls.join(",")).not.toContain("dispatch:");
+    expect(orca.calls.join(",")).not.toContain("attachWorker:");
   });
 
   it("readiness timeout stops the new terminal (unless preserved) and never fakes completion", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     const orca = makeFakeOrca({
       async waitForTerminal() {
         throw new OrcaCommandError({
@@ -516,7 +641,6 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     });
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { taskId: "task_1" },
     }).catch((e: unknown) => e);
@@ -524,11 +648,11 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     expect((error as SupervisedWorkerError).terminalHandle).toBe("term_created");
     expect((error as SupervisedWorkerError).cleanup.terminalClosed).toBe(true);
     expect(orca.calls).toContain("closeTerminal:term_created");
-    expect(orca.calls.join(",")).not.toContain("dispatch:");
+    expect(orca.calls.join(",")).not.toContain("attachWorker:");
   });
 
   it("preserveTerminalOnFailure keeps the pane for debugging", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     const orca = makeFakeOrca({
       async waitForTerminal() {
         throw new Error("tui never idle");
@@ -536,7 +660,6 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     });
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { taskId: "task_1" },
       preserveTerminalOnFailure: true,
@@ -545,32 +668,31 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     expect(orca.calls).not.toContain("closeTerminal:term_created");
   });
 
-  it("dispatch failure stops the unassigned terminal and reports cleanup", async () => {
-    const { profile, launch } = await testLaunch();
+  it("worker-start failure stops the unattached terminal and reports cleanup", async () => {
+    const profile = testProfile();
     const orca = makeFakeOrca({
-      async dispatch() {
+      async attachWorker() {
         throw new OrcaCommandError({
-          code: "dispatch-failed",
-          message: "dispatch: circuit open",
+          code: "worker-start-failed",
+          message: "worker-start: not ready",
           executable: "orca",
           args: [],
-          diagnostics: "circuit",
+          diagnostics: "not ready",
         });
       },
     });
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { taskId: "task_1" },
     }).catch((e: unknown) => e);
-    expect((error as SupervisedWorkerError).stage).toBe("dispatch");
+    expect((error as SupervisedWorkerError).stage).toBe("worker-start");
     expect((error as SupervisedWorkerError).cleanup.terminalClosed).toBe(true);
     expect(orca.calls).toContain("closeTerminal:term_created");
   });
 
   it("malformed Orca JSON surfaces as a staged failure with diagnostics", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     const { OrcaJsonParseError } = await import("../src/orca/json-parsers.js");
     const orca = makeFakeOrca({
       async createTask(): Promise<{ taskId: string }> {
@@ -579,7 +701,6 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     });
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { spec: "work" },
     }).catch((e: unknown) => e);
@@ -587,35 +708,31 @@ describe("spawnSupervisedPiWorker failures leave recoverable state", () => {
     expect((error as SupervisedWorkerError).stage).toBe("task-create");
   });
 
-  it("missing orca executable surfaces as task-create failure before side effects", async () => {
-    const { profile, launch } = await testLaunch();
+  it("missing orca executable surfaces as run-resolve failure before side effects", async () => {
+    const profile = testProfile();
     const enoent = new Error("spawn orca ENOENT") as NodeJS.ErrnoException;
     enoent.code = "ENOENT";
     const runner = fakeRunner(() => enoent);
     const orca = createOrcaCliProcess(runner);
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { spec: "work" },
     }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(SupervisedWorkerError);
     // Run resolution happens first and already needs orca.
-    expect(["run-resolve", "task-create"]).toContain(
-      (error as SupervisedWorkerError).stage,
-    );
+    expect((error as SupervisedWorkerError).stage).toBe("run-resolve");
   });
 });
 
 describe("spawnSupervisedPiWorker cancellation is idempotent", () => {
   it("aborts before any Orca effects when already cancelled", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     const orca = makeFakeOrca();
     const controller = new AbortController();
     controller.abort(new Error("user cancel"));
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { spec: "work" },
       signal: controller.signal,
@@ -626,7 +743,7 @@ describe("spawnSupervisedPiWorker cancellation is idempotent", () => {
   });
 
   it("cleanup closes at most once even when abort races readiness", async () => {
-    const { profile, launch } = await testLaunch();
+    const profile = testProfile();
     let closes = 0;
     const controller = new AbortController();
     const orca = makeFakeOrca({
@@ -638,7 +755,6 @@ describe("spawnSupervisedPiWorker cancellation is idempotent", () => {
     });
     const error = await spawnSupervisedPiWorker({
       orca,
-      launch,
       profile,
       task: { taskId: "task_1" },
       signal: controller.signal,

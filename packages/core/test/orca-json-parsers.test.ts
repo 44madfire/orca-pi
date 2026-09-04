@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   ORCA_JSON_SNIPPET_LIMIT,
   OrcaJsonParseError,
-  parseDispatchJson,
   parseRunCurrentJson,
   parseTaskCreateJson,
   parseTerminalCreateJson,
+  parseWorkerStartJson,
   parseWorktreeCreateJson,
   parseWorktreeShowJson,
 } from "../src/orca/json-parsers.js";
@@ -132,36 +132,80 @@ describe("parseRunCurrentJson", () => {
   });
 });
 
-describe("parseDispatchJson", () => {
+describe("parseWorkerStartJson (supervised attach)", () => {
   const fallback = { taskId: "task_1", terminalHandle: "term_1" };
 
-  it("reads nested dispatch id", () => {
-    expect(
-      parseDispatchJson(envelope({ dispatch: { id: "dispatch_9" } }), fallback),
-    ).toMatchObject({ taskId: "task_1", terminalHandle: "term_1", dispatchId: "dispatch_9" });
+  it("reads the current worker-start shape (ready + dispatch + worker handle)", () => {
+    const receipt = parseWorkerStartJson(
+      envelope({
+        ready: true,
+        dispatch: { id: "dispatch_9" },
+        worker: { agent_terminal_handle: "term_1" },
+        setup: { status: "running" },
+      }),
+      fallback,
+    );
+    expect(receipt).toMatchObject({
+      taskId: "task_1",
+      terminalHandle: "term_1",
+      dispatchId: "dispatch_9",
+    });
   });
 
-  it("tolerates top-level dispatchId", () => {
+  it("tolerates alternate dispatch-id shapes", () => {
     expect(
-      parseDispatchJson(envelope({ dispatchId: "d_top" }), fallback),
+      parseWorkerStartJson(envelope({ ready: true, dispatchId: "d_top" }), fallback),
     ).toMatchObject({ dispatchId: "d_top" });
+    expect(
+      parseWorkerStartJson(
+        envelope({ dispatch: { dispatchId: "d_nested" } }),
+        fallback,
+      ),
+    ).toMatchObject({ dispatchId: "d_nested" });
+    expect(
+      parseWorkerStartJson(
+        envelope({ worker: { dispatch_id: "d_worker" } }),
+        fallback,
+      ),
+    ).toMatchObject({ dispatchId: "d_worker" });
   });
 
-  it("leaves dispatchId undefined when Orca reports none (unsupervised inject)", () => {
-    // dispatch --inject keeps operator terminals unsupervised: success without
-    // a worker_dispatches row must still yield a usable receipt.
-    const receipt = parseDispatchJson(envelope({ ok: true }), fallback);
-    expect(receipt.taskId).toBe("task_1");
-    expect(receipt.dispatchId).toBeUndefined();
+  it("fails when the dispatch id is missing (never a supervised receipt)", () => {
+    expect(() => parseWorkerStartJson(envelope({ ready: true }), fallback)).toThrowError(
+      OrcaJsonParseError,
+    );
+    expect(() =>
+      parseWorkerStartJson(envelope({ ok: true }), fallback),
+    ).toThrowError(OrcaJsonParseError);
   });
 
-  it("propagates unsupervised flags", () => {
-    expect(
-      parseDispatchJson(envelope({ dispatch: { id: "d1", unsupervised: true } }), fallback)
-        .unsupervised,
-    ).toBe(true);
-    expect(
-      parseDispatchJson(envelope({ supervised: false }), fallback).unsupervised,
-    ).toBe(true);
+  it("fails on non-ready state", () => {
+    expect(() =>
+      parseWorkerStartJson(
+        envelope({ ready: false, dispatch: { id: "d1" } }),
+        fallback,
+      ),
+    ).toThrowError(OrcaJsonParseError);
+    expect(() =>
+      parseWorkerStartJson(
+        envelope({ stage: "failed", dispatch: { id: "d1" } }),
+        fallback,
+      ),
+    ).toThrowError(OrcaJsonParseError);
+  });
+
+  it("rejects unsupervised markers (dispatch --inject is not supervised)", () => {
+    expect(() =>
+      parseWorkerStartJson(
+        envelope({ dispatch: { id: "d1", unsupervised: true } }),
+        fallback,
+      ),
+    ).toThrowError(OrcaJsonParseError);
+    expect(() =>
+      parseWorkerStartJson(
+        envelope({ dispatch: { id: "d1" }, supervised: false }),
+        fallback,
+      ),
+    ).toThrowError(OrcaJsonParseError);
   });
 });

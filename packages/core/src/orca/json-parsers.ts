@@ -14,9 +14,9 @@
  */
 
 import type {
-  DispatchReceipt,
   TaskReceipt,
   TerminalReceipt,
+  WorkerAttachReceipt,
   WorktreeIdentity,
   WorktreeReceipt,
 } from "./receipts.js";
@@ -243,48 +243,99 @@ export function parseRunCurrentJson(stdout: string): { runId?: string } {
 }
 
 /**
- * Parse `orchestration dispatch --task ... --to ... --inject --json` stdout.
+ * Parse `orchestration worker-start --task ... --terminal ... --json` stdout.
  *
- * The dispatch id is optional: `dispatch --inject` keeps an
- * operator-started terminal unsupervised (no `worker_dispatches` row), so a
- * successful response without an id still yields a usable receipt with
- * `dispatchId === undefined`.
+ * The supervised contract is strict: a missing dispatch id or a non-ready
+ * state is a failure, never a successful receipt. `dispatch --inject` is
+ * deliberately unsupervised (no `worker_dispatches` row) and must not be
+ * used here — Orca directs supervised callers to `worker-start --terminal`.
+ *
+ * Tolerated dispatch-id shapes (first hit wins):
+ * `result.dispatch.id`, `result.dispatch.dispatchId`,
+ * `result.dispatch.dispatch_id`, `result.dispatchId`, `result.dispatch_id`,
+ * `result.worker.dispatchId`, `result.worker.dispatch_id`.
+ *
+ * Readiness: `result.ready === false` (or a `failed`/`outcome_unknown`
+ * stage/status) throws. An absent `ready` flag is accepted because the CLI
+ * exits nonzero for failed/unknown starts, so exit-0 plus a dispatch id
+ * implies ready. An explicit unsupervised marker (`unsupervised: true` /
+ * `supervised: false`) also throws — the receipt must be supervised.
  */
-export function parseDispatchJson(
+export function parseWorkerStartJson(
   stdout: string,
   fallback: { taskId: string; terminalHandle: string },
-): DispatchReceipt {
-  const context = "dispatch";
+): WorkerAttachReceipt {
+  const context = "worker-start";
   const result = parseEnvelopeResult(stdout, context);
   const dispatch = child(result, "dispatch");
+  const worker = child(result, "worker");
   const dispatchId = firstString([
     child(dispatch, "id"),
     child(dispatch, "dispatchId"),
     child(dispatch, "dispatch_id"),
     child(result, "dispatchId"),
     child(result, "dispatch_id"),
-    child(result, "dispatchID"),
-    // Some CLIs echo the request id at the top level; only accept it when it
-    // does not collide with the task id shape is unknowable, so prefer nested
-    // fields above and treat a top-level `id` as a dispatch id only when it
-    // differs from the task id.
-    ...(() => {
-      const topId = asNonEmptyString(child(result, "id"));
-      return topId !== undefined && topId !== fallback.taskId ? [topId] : [];
-    })(),
+    child(worker, "dispatchId"),
+    child(worker, "dispatch_id"),
   ]);
+  if (dispatchId === undefined) {
+    missingField(
+      context,
+      stdout,
+      "dispatch id",
+      "result.dispatch.id, result.dispatchId, result.dispatch_id",
+    );
+  }
   const unsupervisedRaw =
-    child(dispatch, "unsupervised") ?? child(result, "unsupervised");
+    child(dispatch, "unsupervised") ??
+    child(worker, "unsupervised") ??
+    child(result, "unsupervised");
   const supervisedRaw =
-    child(dispatch, "supervised") ?? child(result, "supervised");
-  let unsupervised: boolean | undefined;
-  if (typeof unsupervisedRaw === "boolean") unsupervised = unsupervisedRaw;
-  else if (supervisedRaw === false) unsupervised = true;
-  else if (supervisedRaw === true) unsupervised = false;
+    child(dispatch, "supervised") ??
+    child(worker, "supervised") ??
+    child(result, "supervised");
+  if (unsupervisedRaw === true || supervisedRaw === false) {
+    throw new OrcaJsonParseError(
+      context,
+      snippetOf(stdout),
+      `${context}: Orca reported an unsupervised dispatch for a supervised ` +
+        `worker-start --terminal attach (dispatch ${dispatchId}). ` +
+        `Use worker-start --terminal for supervised lifecycle; dispatch ` +
+        `--inject is deliberately unsupervised.`,
+    );
+  }
+  const ready = child(result, "ready");
+  if (ready === false) {
+    throw new OrcaJsonParseError(
+      context,
+      snippetOf(stdout),
+      `${context}: Orca reported non-ready state (ready:false) for dispatch ` +
+        `${dispatchId}. A failed or unknown start exits nonzero; inspect its ` +
+        `stage, effects, and residualResources instead of retrying blindly.`,
+    );
+  }
+  const stage = firstString([
+    child(result, "stage"),
+    child(result, "status"),
+    child(dispatch, "stage"),
+    child(dispatch, "status"),
+  ]);
+  if (
+    stage !== undefined &&
+    ["failed", "outcome_unknown", "stopped", "failedstage"].includes(
+      stage.toLowerCase().replace(/[^a-z_]/g, ""),
+    )
+  ) {
+    throw new OrcaJsonParseError(
+      context,
+      snippetOf(stdout),
+      `${context}: Orca reported non-ready stage "${stage}" for dispatch ` +
+        `${dispatchId}.`,
+    );
+  }
   return {
     taskId: fallback.taskId,
+    dispatchId,
     terminalHandle: fallback.terminalHandle,
-    ...(dispatchId !== undefined ? { dispatchId } : {}),
-    ...(unsupervised !== undefined ? { unsupervised } : {}),
   };
 }

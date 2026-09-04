@@ -11,10 +11,10 @@ export {
   summarizePiSpecForDiagnostics,
   terminalSelectorForPolicy,
   worktreeSelectorForNewWorktree,
-  type DispatchInput,
   type OrcaCli,
   type TaskCreateInput,
   type TerminalCreateInput,
+  type WorkerAttachInput,
   type WorktreeCreateInput,
 } from "./orca-cli.js";
 export {
@@ -25,21 +25,21 @@ export {
 export {
   ORCA_JSON_SNIPPET_LIMIT,
   OrcaJsonParseError,
-  parseDispatchJson,
   parseRunCurrentJson,
   parseTaskCreateJson,
   parseTerminalCreateJson,
+  parseWorkerStartJson,
   parseWorktreeCreateJson,
   parseWorktreeShowJson,
 } from "./json-parsers.js";
 export {
   freezeSupervisedWorkerReceipt,
   SupervisedWorkerError,
-  type DispatchReceipt,
   type SupervisedWorkerReceipt,
   type SupervisedWorkerStage,
   type TaskReceipt,
   type TerminalReceipt,
+  type WorkerAttachReceipt,
   type WorktreeIdentity,
   type WorktreePolicy,
   type WorktreeReceipt,
@@ -47,6 +47,7 @@ export {
 } from "./receipts.js";
 export {
   spawnSupervisedPiWorker,
+  type SpawnLaunchOptions,
   type SpawnSupervisedPiWorkerOptions,
   type SpawnTaskSelection,
 } from "./spawn-supervised-pi-worker.js";

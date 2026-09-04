@@ -10,25 +10,25 @@
 
 import { isNotFoundError, type ProcessRunner } from "../runner.js";
 import {
-  parseDispatchJson,
   parseRunCurrentJson,
   parseTaskCreateJson,
   parseTerminalCreateJson,
+  parseWorkerStartJson,
   parseWorktreeCreateJson,
   parseWorktreeShowJson,
   OrcaJsonParseError,
 } from "./json-parsers.js";
 import type {
-  DispatchInput,
   OrcaCli,
   TaskCreateInput,
   TerminalCreateInput,
+  WorkerAttachInput,
   WorktreeCreateInput,
 } from "./orca-cli.js";
 import type {
-  DispatchReceipt,
   TaskReceipt,
   TerminalReceipt,
+  WorkerAttachReceipt,
   WorktreeIdentity,
   WorktreeReceipt,
 } from "./receipts.js";
@@ -272,10 +272,14 @@ export function createOrcaCliProcess(
       const args: string[] = ["worktree", "create", "--name", input.name];
       if (input.baseBranch !== undefined) args.push("--base-branch", input.baseBranch);
       if (input.setup !== undefined) args.push("--setup", input.setup);
-      if (input.parent === "top-level") args.push("--no-parent");
-      // `child` uses Orca's inferred caller lineage (no flag), preserving the
-      // distinction between orchestration lineage and Git base selection
-      // (`--base-branch` alone chooses the Git base).
+      if (input.parent === "top-level") {
+        args.push("--no-parent");
+      } else {
+        // Child lineage is always explicit via `--parent-worktree` (default
+        // `"active"`) so it never depends on ambient CLI-cwd inference.
+        // `--base-branch` independently chooses the Git base.
+        args.push("--parent-worktree", input.parentWorktree ?? "active");
+      }
       args.push("--json");
       const stdout = await runJson(args, "worktree-create");
       return wrapParse("worktree-create", stdout, () => parseWorktreeCreateJson(stdout));
@@ -323,22 +327,27 @@ export function createOrcaCliProcess(
       await runJson(args, "terminal-readiness");
     },
 
-    async dispatch(input: DispatchInput): Promise<DispatchReceipt> {
+    async attachWorker(input: WorkerAttachInput): Promise<WorkerAttachReceipt> {
+      // Supervised attach: `worker-start --terminal` creates real worker
+      // lifecycle state. Never `--inject` (deliberately unsupervised) and
+      // never `--agent`/`--model`/`--effort` (rejected with `--terminal`).
       const args: string[] = [
         "orchestration",
-        "dispatch",
+        "worker-start",
         "--task",
         input.taskId,
-        "--to",
+        "--terminal",
         input.terminalHandle,
-        "--inject",
       ];
+      if (input.worktreeSelector !== undefined) {
+        args.push("--worktree", input.worktreeSelector);
+      }
       if (input.runId !== undefined) args.push("--run", input.runId);
       if (input.fromHandle !== undefined) args.push("--from", input.fromHandle);
       args.push("--json");
-      const stdout = await runJson(args, "dispatch");
-      return wrapParse("dispatch", stdout, () =>
-        parseDispatchJson(stdout, {
+      const stdout = await runJson(args, "worker-start");
+      return wrapParse("worker-start", stdout, () =>
+        parseWorkerStartJson(stdout, {
           taskId: input.taskId,
           terminalHandle: input.terminalHandle,
         }),

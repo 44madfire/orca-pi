@@ -13,10 +13,10 @@
 
 import type { PiProcessSpec } from "../pi/process-spec.js";
 import type {
-  DispatchReceipt,
   SupervisedWorkerStage,
   TaskReceipt,
   TerminalReceipt,
+  WorkerAttachReceipt,
   WorktreeIdentity,
   WorktreePolicy,
   WorktreeReceipt,
@@ -30,7 +30,7 @@ export type {
   TerminalReceipt,
   WorktreeIdentity,
   WorktreeReceipt,
-  DispatchReceipt,
+  WorkerAttachReceipt,
 };
 
 /** Input for `orchestration task-create --spec ... --json`. */
@@ -46,8 +46,15 @@ export interface TaskCreateInput {
 /** Input for `worktree create --json`. */
 export interface WorktreeCreateInput {
   readonly name: string;
-  /** `child` inherits caller lineage; `top-level` passes `--no-parent`. */
+  /** `child` passes `--parent-worktree`; `top-level` passes `--no-parent`. */
   readonly parent: "child" | "top-level";
+  /**
+   * Explicit parent selector for child worktrees (default `"active"`).
+   * Always passed as `--parent-worktree` so lineage never relies on ambient
+   * CLI-cwd inference; pass an exact `id:<repo>::<path>` selector when the
+   * coordinator checkout differs from the helper's worktree.
+   */
+  readonly parentWorktree?: string;
   readonly baseBranch?: string;
   readonly setup?: WorktreeSetupPolicy;
 }
@@ -61,10 +68,19 @@ export interface TerminalCreateInput {
   readonly title?: string;
 }
 
-/** Input for `orchestration dispatch --task ... --to ... --inject --json`. */
-export interface DispatchInput {
+/**
+ * Input for `orchestration worker-start --task ... --terminal ... --json`.
+ *
+ * Supervised attachment for a custom-started terminal (Pi launched via the
+ * OP1.3 spec). `--model`/`--effort` must never be combined with `--terminal`
+ * and `--inject` must never be used: `dispatch --inject` is deliberately
+ * unsupervised (no `worker_dispatches` row).
+ */
+export interface WorkerAttachInput {
   readonly taskId: string;
   readonly terminalHandle: string;
+  /** Worktree selector for the reused terminal (same value as terminal create). */
+  readonly worktreeSelector?: string;
   readonly runId?: string;
   readonly fromHandle?: string;
 }
@@ -83,8 +99,12 @@ export interface OrcaCli {
   createTerminal(input: TerminalCreateInput): Promise<TerminalReceipt>;
   /** Wait for TUI readiness (`terminal wait --for tui-idle`). */
   waitForTerminal(handle: string, options?: { timeoutMs?: number }): Promise<void>;
-  /** Dispatch with `--inject` so Orca sends task + preamble authoritatively. */
-  dispatch(input: DispatchInput): Promise<DispatchReceipt>;
+  /**
+   * Attach an existing custom-started terminal as a supervised worker
+   * (`worker-start --terminal`). Requires a real dispatch id and ready
+   * state; missing ids / non-ready states are failures, never receipts.
+   */
+  attachWorker(input: WorkerAttachInput): Promise<WorkerAttachReceipt>;
   /**
    * Close one terminal pane (`terminal close`). Must be idempotent:
    * closing an already-closed/stale handle succeeds.
@@ -135,8 +155,9 @@ export function quoteForTerminalShell(token: string): string {
  * text. Execution-only — the display formatter (`format-inspect.ts`) must
  * never be used to execute.
  *
- * The assigned Orca task is never embedded here: Orca `dispatch --inject`
- * owns task/preamble delivery so lifecycle IDs stay authoritative.
+ * The assigned Orca task is never embedded here: Orca supervised attachment
+ * (`worker-start --terminal`) owns task/preamble delivery so lifecycle IDs
+ * stay authoritative.
  */
 export function formatPiCommandForTerminal(spec: PiProcessSpec): string {
   return [spec.command, ...spec.args].map(quoteForTerminalShell).join(" ");

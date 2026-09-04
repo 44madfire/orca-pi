@@ -1,38 +1,52 @@
 /**
  * Supervised Pi worker adapter (OP1.4 / JEF-8).
  *
- * Takes a resolved Pi process specification (OP1.3) and turns it into a real
- * Orca-supervised worker attached to a Task/Dispatch, using only public Orca
- * CLI contracts (`--json`). A role-configured Pi process then behaves like a
- * normal Orca worker: correct Run/Task, worktree, injected task/preamble,
- * Task/Dispatch lineage, and normal worker completion semantics.
+ * Takes a resolved Pi profile (OP1.2) plus the deterministic OP1.3 launcher
+ * and turns them into a real Orca-supervised worker attached to a
+ * Task/Dispatch, using only public Orca CLI contracts (`--json`). A
+ * role-configured Pi process then behaves like a normal Orca worker: correct
+ * Run/Task, worktree, injected task/preamble, Task/Dispatch lineage, and
+ * normal worker completion semantics.
  *
  * Required flow:
  * 1. Resolve target Run/coordinator context.
  * 2. Create/select an Orca Task if the caller supplied only a task spec.
  * 3. Choose worktree policy explicitly (`current` default; new
  *    child/top-level only when requested).
- * 4. Create an Orca terminal using the Pi launch spec from OP1.3.
- * 5. Wait for terminal/TUI readiness.
- * 6. Dispatch with `orca orchestration dispatch --inject`.
- * 7. Return a structured receipt (task/dispatch/terminal/worktree/profile).
+ * 4. Build the Pi launch (OP1.3) against the *selected* worker checkout, so
+ *    `spec.cwd` and absolute skill/extension/prompt paths target the
+ *    checkout Pi actually starts in.
+ * 5. Create an Orca terminal running that Pi command.
+ * 6. Wait for terminal/TUI readiness.
+ * 7. Attach the existing terminal as a supervised worker with
+ *    `orca orchestration worker-start --terminal` (required dispatch id +
+ *    ready state).
+ * 8. Return a structured receipt (task/dispatch/terminal/worktree/profile).
  *
- * The assigned task is never passed as initial Pi argv text. Orca injection
- * remains authoritative because it provides task/dispatch IDs and lifecycle
- * instructions.
+ * The assigned task is never passed as initial Pi argv text. Orca supervised
+ * attachment remains authoritative because it provides task/dispatch IDs and
+ * lifecycle instructions. `dispatch --inject` is deliberately unsupervised
+ * (no `worker_dispatches` row) and is never used here.
  *
  * Failure/rollback:
  * - Task creation failure: no terminal is created.
- * - Terminal creation failure: the Task remains undispatched.
+ * - Worktree or launch-build failure: no terminal is created.
+ * - Terminal creation failure: the Task remains unattached.
  * - Readiness timeout: the new terminal is stopped/cleaned when safe; the
  *   Task is never faked complete.
- * - Dispatch failure: the unassigned terminal is stopped unless explicit
- *   preserve/debug mode is set.
+ * - Worker-start failure (including missing dispatch id / non-ready state):
+ *   the unattached terminal is stopped unless explicit preserve/debug mode
+ *   is set.
  * - The adapter never marks a Task completed locally; Orca worker lifecycle
  *   owns completion.
  */
 
-import type { PiLaunchResult } from "../pi/build-pi-launch.js";
+import {
+  buildPiLaunch,
+  type BuildPiLaunchOptions,
+  type PiLaunchResult,
+} from "../pi/build-pi-launch.js";
+import type { ResolvedPiProfile } from "../profile/types.js";
 import {
   DEFAULT_READINESS_TIMEOUT_MS,
   formatPiCommandForTerminal,
@@ -57,14 +71,26 @@ export type SpawnTaskSelection =
       readonly deps?: readonly string[];
     };
 
+/**
+ * OP1.3 launch hooks minus the worktree roots. `projectRoot`/`cwd` are
+ * always the selected worker checkout path — callers never supply them, so
+ * a prebuilt launch can never target a different checkout than the one Pi
+ * starts in.
+ */
+export type SpawnLaunchOptions = Omit<BuildPiLaunchOptions, "projectRoot" | "cwd">;
+
 /** Options for {@link spawnSupervisedPiWorker}. */
 export interface SpawnSupervisedPiWorkerOptions {
   /** Injectable Orca boundary (fake in tests, process-backed in prod). */
   readonly orca: OrcaCli;
-  /** Deterministic Pi launch from OP1.3 (`buildPiLaunch`). */
-  readonly launch: PiLaunchResult;
-  /** Resolved profile identity for the receipt (name + model). */
-  readonly profile: { readonly name: string; readonly model?: string };
+  /** Resolved Pi profile (OP1.2). The launch is rebuilt per worker checkout. */
+  readonly profile: ResolvedPiProfile;
+  /**
+   * OP1.3 launch hooks (prompt-file reader, collision-probe fs, tmpdir,
+   * env). Never includes `projectRoot`/`cwd`: those are always the selected
+   * worker checkout path.
+   */
+  readonly launchOptions?: SpawnLaunchOptions;
   /** Existing Task id or inline spec to create. */
   readonly task: SpawnTaskSelection;
   /**
@@ -81,7 +107,7 @@ export interface SpawnSupervisedPiWorkerOptions {
   /** TUI-readiness wait budget (ms). Defaults to 60s. */
   readonly readinessTimeoutMs?: number;
   /**
-   * Preserve/debug mode: skip terminal cleanup on readiness/dispatch
+   * Preserve/debug mode: skip terminal cleanup on readiness/worker-start
    * failure so the pane stays inspectable. Defaults to `false` (clean up).
    */
   readonly preserveTerminalOnFailure?: boolean;
@@ -158,16 +184,17 @@ function wrapStageError(options: {
 
 /**
  * Launch a supervised Pi worker: resolve Run, ensure Task, honor the
- * worktree policy, start a Pi terminal, wait for readiness, and
- * `dispatch --inject`.
+ * worktree policy, rebuild the OP1.3 launch against the selected checkout,
+ * start a Pi terminal, wait for readiness, and attach it with
+ * `worker-start --terminal`.
  */
 export async function spawnSupervisedPiWorker(
   options: SpawnSupervisedPiWorkerOptions,
 ): Promise<SupervisedWorkerReceipt> {
   const {
     orca,
-    launch,
     profile,
+    launchOptions,
     task,
     runId: explicitRunId,
     fromHandle,
@@ -180,10 +207,10 @@ export async function spawnSupervisedPiWorker(
 
   if (!profile.name || profile.name.length === 0) {
     throw new SupervisedWorkerError({
-      stage: "terminal-create",
+      stage: "launch-build",
       code: "invalid-input",
       message: `Invalid profile: name must be non-empty.`,
-      diagnostics: "terminal-create: profile.name is empty.",
+      diagnostics: "launch-build: profile.name is empty.",
       cleanup: { terminalClosed: false, createdNewWorktree: false },
     });
   }
@@ -279,22 +306,34 @@ export async function spawnSupervisedPiWorker(
   }
   throwIfAborted(signal, { taskId });
 
-  // 3. Choose worktree explicitly.
+  // 3. Choose worktree explicitly. The checkout path is required: step 4
+  // rebuilds the OP1.3 launch against it so cwd and absolute resource paths
+  // target the checkout Pi actually starts in.
   let worktreeSelector: string;
   let worktreeId: string;
-  let worktreePath: string | undefined;
+  let worktreePath: string;
   let worktreeDisplayName: string | undefined;
   let createdNewWorktree = false;
   try {
     if (worktreePolicy.kind === "current") {
       worktreeSelector = "active";
       const identity = await orca.resolveWorktree("active");
+      if (identity.path === undefined) {
+        throw new Error(
+          `Orca worktree ${identity.id} reported no checkout path; cannot build the Pi launch for it.`,
+        );
+      }
       worktreeId = identity.id;
       worktreePath = identity.path;
       worktreeDisplayName = identity.displayName;
     } else if (worktreePolicy.kind === "existing") {
       worktreeSelector = worktreePolicy.selector;
       const identity = await orca.resolveWorktree(worktreePolicy.selector);
+      if (identity.path === undefined) {
+        throw new Error(
+          `Orca worktree ${identity.id} reported no checkout path; cannot build the Pi launch for it.`,
+        );
+      }
       worktreeId = identity.id;
       worktreePath = identity.path;
       worktreeDisplayName = identity.displayName;
@@ -302,11 +341,19 @@ export async function spawnSupervisedPiWorker(
       const created = await orca.createWorktree({
         name: worktreePolicy.name,
         parent: worktreePolicy.kind === "new-child" ? "child" : "top-level",
+        ...(worktreePolicy.kind === "new-child"
+          ? { parentWorktree: worktreePolicy.parentWorktree ?? "active" }
+          : {}),
         ...(worktreePolicy.baseBranch !== undefined
           ? { baseBranch: worktreePolicy.baseBranch }
           : {}),
         ...(worktreePolicy.setup !== undefined ? { setup: worktreePolicy.setup } : {}),
       });
+      if (created.path === undefined) {
+        throw new Error(
+          `Orca worktree ${created.id} reported no checkout path; cannot build the Pi launch for it.`,
+        );
+      }
       createdNewWorktree = true;
       worktreeId = created.id;
       worktreePath = created.path;
@@ -314,6 +361,7 @@ export async function spawnSupervisedPiWorker(
       worktreeSelector = `id:${created.id}`;
     }
   } catch (error) {
+    if (error instanceof SupervisedWorkerError) throw error;
     const isCreate = worktreePolicy.kind === "new-child" || worktreePolicy.kind === "new-top-level";
     throw wrapStageError({
       stage: isCreate ? "worktree-create" : "worktree-resolve",
@@ -322,16 +370,55 @@ export async function spawnSupervisedPiWorker(
       error,
       taskId,
       hint: isCreate
-        ? "The Task remains undispatched; the new worktree may or may not exist — inspect `orca worktree list` before retrying."
-        : "The Task remains undispatched; verify the worktree selector and retry.",
+        ? "The Task remains unattached; the new worktree may or may not exist — inspect `orca worktree list` before retrying."
+        : "The Task remains unattached; verify the worktree selector and retry.",
       createdNewWorktree: false,
     });
   }
   throwIfAborted(signal, { taskId, worktreeId });
 
-  // 4. Create the Orca terminal running Pi. Task text is never embedded:
-  // the command carries only the OP1.3 Pi argv; `dispatch --inject` delivers
-  // the task + preamble authoritatively.
+  // 4. Build the Pi launch against the selected worker checkout. A prebuilt
+  // launch cannot be used: OP1.3 bakes `spec.cwd` and absolute
+  // skill/extension/prompt paths at build time, and a new worktree's path is
+  // unknown until Orca creates it.
+  let launch: PiLaunchResult;
+  try {
+    launch = await buildPiLaunch(profile, {
+      ...(launchOptions ?? {}),
+      projectRoot: worktreePath,
+      cwd: worktreePath,
+    });
+  } catch (error) {
+    throw wrapStageError({
+      stage: "launch-build",
+      code: "launch-build-failed",
+      stageLabel: "Pi launch build",
+      error,
+      taskId,
+      hint: "No terminal was created; fix the profile/prompt files and retry.",
+      createdNewWorktree,
+      worktreeId,
+    });
+  }
+  if (Object.keys(launch.spec.env).length > 0) {
+    throw new SupervisedWorkerError({
+      stage: "launch-build",
+      code: "launch-env-unsupported",
+      message:
+        `Pi launch for profile "${profile.name}" carries a non-empty env overlay ` +
+        `(${Object.keys(launch.spec.env).join(", ")}), which terminal command ` +
+        `serialization does not preserve yet. Remove env from launchOptions until ` +
+        `env preservation is implemented.`,
+      diagnostics: `launch-build: non-empty env (${Object.keys(launch.spec.env).length} keys) would be silently dropped.`,
+      taskId,
+      cleanup: { terminalClosed: false, createdNewWorktree, worktreeId },
+    });
+  }
+  throwIfAborted(signal, { taskId, worktreeId });
+
+  // 5. Create the Orca terminal running Pi. Task text is never embedded:
+  // the command carries only the rebuilt OP1.3 Pi argv; supervised
+  // attachment delivers the task + preamble authoritatively.
   const terminalCommand = formatPiCommandForTerminal(launch.spec);
   const launchSummary = summarizePiSpecForDiagnostics(launch.spec);
   let terminalHandle: string;
@@ -349,7 +436,7 @@ export async function spawnSupervisedPiWorker(
       stageLabel: `Terminal creation (${launchSummary})`,
       error,
       taskId,
-      hint: "The Task remains undispatched; no dispatch was attempted.",
+      hint: "The Task remains unattached; no worker was started.",
       createdNewWorktree,
       worktreeId,
     });
@@ -387,7 +474,7 @@ export async function spawnSupervisedPiWorker(
     throw error;
   }
 
-  // 5. Wait for terminal/TUI readiness.
+  // 6. Wait for terminal/TUI readiness.
   try {
     await orca.waitForTerminal(terminalHandle, { timeoutMs: readinessTimeoutMs });
   } catch (error) {
@@ -411,8 +498,8 @@ export async function spawnSupervisedPiWorker(
       createdNewWorktree,
       worktreeId,
       hint: preserveTerminalOnFailure
-        ? "The terminal was preserved for debugging (preserveTerminalOnFailure); the Task remains undispatched."
-        : "The new terminal was stopped/cleaned when safe; the Task remains undispatched and was never faked complete.",
+        ? "The terminal was preserved for debugging (preserveTerminalOnFailure); the Task remains unattached."
+        : "The new terminal was stopped/cleaned when safe; the Task remains unattached and was never faked complete.",
     });
   }
 
@@ -439,18 +526,19 @@ export async function spawnSupervisedPiWorker(
     throw error;
   }
 
-  // 6. Dispatch with `--inject` (authoritative task + preamble).
-  let dispatchId: string | undefined;
-  let unsupervised: boolean | undefined;
+  // 7. Attach the existing terminal as a supervised worker. A missing
+  // dispatch id or non-ready state is a failure, never a receipt:
+  // `dispatch --inject` would leave the worker unsupervised.
+  let dispatchId: string;
   try {
-    const dispatch = await orca.dispatch({
+    const attached = await orca.attachWorker({
       taskId,
       terminalHandle,
+      worktreeSelector,
       ...(runId !== undefined ? { runId } : {}),
       ...(fromHandle !== undefined ? { fromHandle } : {}),
     });
-    dispatchId = dispatch.dispatchId;
-    unsupervised = dispatch.unsupervised;
+    dispatchId = attached.dispatchId;
   } catch (error) {
     let cleaned = false;
     if (!preserveTerminalOnFailure) {
@@ -462,9 +550,9 @@ export async function spawnSupervisedPiWorker(
       }
     }
     throw wrapStageError({
-      stage: "dispatch",
-      code: "dispatch-failed",
-      stageLabel: "Dispatch (--inject)",
+      stage: "worker-start",
+      code: "worker-start-failed",
+      stageLabel: "Worker attach (worker-start --terminal)",
       error,
       taskId,
       terminalHandle,
@@ -473,19 +561,19 @@ export async function spawnSupervisedPiWorker(
       worktreeId,
       hint: preserveTerminalOnFailure
         ? "The terminal was preserved for debugging (preserveTerminalOnFailure); stop it with `orca terminal close` when done."
-        : "The unassigned terminal was stopped unless preserve/debug mode was requested; the Task remains undispatched.",
+        : "The unattached terminal was stopped unless preserve/debug mode was requested; the Task remains unattached.",
     });
   }
 
-  // 7. Structured receipt — Task/Dispatch/terminal/worktree/profile identity.
+  // 8. Structured receipt — Task/Dispatch/terminal/worktree/profile identity.
   return freezeSupervisedWorkerReceipt({
     taskId,
-    ...(dispatchId !== undefined ? { dispatchId } : {}),
+    dispatchId,
     terminalHandle,
     worktree: Object.freeze({
       id: worktreeId,
-      ...(worktreePath !== undefined ? { path: worktreePath } : {}),
       ...(worktreeDisplayName !== undefined ? { displayName: worktreeDisplayName } : {}),
+      path: worktreePath,
       selector: worktreeSelector,
       createdNew: createdNewWorktree,
     }),
@@ -497,6 +585,5 @@ export async function spawnSupervisedPiWorker(
     promptSource: launch.promptSource,
     promptTransport: launch.promptTransport,
     ...(runId !== undefined ? { runId } : {}),
-    ...(unsupervised !== undefined ? { unsupervised } : {}),
   });
 }

@@ -16,6 +16,14 @@ export type WorktreePolicy =
       readonly name: string;
       readonly baseBranch?: string;
       readonly setup?: WorktreeSetupPolicy;
+      /**
+       * Explicit parent selector for `--parent-worktree` (default
+       * `"active"`). Always passed explicitly so lineage never depends on
+       * the helper process happening to run in the coordinator worktree;
+       * pass an exact `id:<repo>::<path>` selector when the coordinator
+       * checkout differs from the helper's ambient worktree.
+       */
+      readonly parentWorktree?: string;
     }
   | {
       readonly kind: "new-top-level";
@@ -51,18 +59,17 @@ export interface WorktreeIdentity {
 /** Worktree creation result (`worktree create --json`). */
 export type WorktreeReceipt = WorktreeIdentity;
 
-/** Dispatch result (`orchestration dispatch --inject --json`). */
-export interface DispatchReceipt {
+/**
+ * Supervised attach result (`orchestration worker-start --terminal --json`).
+ *
+ * Unlike `dispatch --inject` (deliberately unsupervised: no
+ * `worker_dispatches` row), `worker-start --terminal` creates real worker
+ * lifecycle state, so `dispatchId` is always required.
+ */
+export interface WorkerAttachReceipt {
   readonly taskId: string;
+  readonly dispatchId: string;
   readonly terminalHandle: string;
-  /**
-   * Dispatch id when Orca reports one. `dispatch --inject` keeps an
-   * operator-started terminal unsupervised (no `worker_dispatches` row),
-   * so callers must tolerate `undefined` here.
-   */
-  readonly dispatchId?: string;
-  /** True when Orca reports the dispatch as unsupervised context-only. */
-  readonly unsupervised?: boolean;
 }
 
 /**
@@ -71,11 +78,13 @@ export interface DispatchReceipt {
  * Makes Task/Dispatch/terminal/worktree/profile identity explicit without
  * duplicating Orca's orchestration database. `piArgs` carries the effective
  * Pi argv (flag names + values) but never the assigned task text — Orca
- * injection (`dispatch --inject`) remains the authoritative task channel.
+ * supervised attachment (`worker-start --terminal`) remains the
+ * authoritative task/lifecycle channel.
  */
 export interface SupervisedWorkerReceipt {
   readonly taskId: string;
-  readonly dispatchId?: string;
+  /** Supervised dispatch id from `worker-start --terminal` (always present). */
+  readonly dispatchId: string;
   readonly terminalHandle: string;
   readonly worktree: WorktreeIdentity & {
     /** Selector that was used to target the worktree (`active`, `id:...`, ...). */
@@ -92,8 +101,6 @@ export interface SupervisedWorkerReceipt {
   readonly promptSource?: "inline" | "file" | "none";
   readonly promptTransport?: "literal" | "temp-file" | "none";
   readonly runId?: string;
-  /** True when Orca reports the dispatch as unsupervised context-only. */
-  readonly unsupervised?: boolean;
 }
 
 /** Failure stage for {@link SupervisedWorkerError}. */
@@ -102,9 +109,10 @@ export type SupervisedWorkerStage =
   | "task-create"
   | "worktree-create"
   | "worktree-resolve"
+  | "launch-build"
   | "terminal-create"
   | "terminal-readiness"
-  | "dispatch"
+  | "worker-start"
   | "cancelled";
 
 /**
