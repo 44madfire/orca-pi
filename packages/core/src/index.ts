@@ -115,6 +115,7 @@ export {
   validateProfilesDocument,
   type BuiltinProfileDefaults,
   type FieldProvenance,
+  type LaunchPreviewContext,
   type LaunchPreviewProvider,
   type PiProfileInput,
   type PiProfilesDocumentInput,

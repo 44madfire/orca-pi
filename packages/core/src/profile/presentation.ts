@@ -31,13 +31,45 @@ import type {
 } from "./types.js";
 
 /**
+ * Context for a JEF-7 launch preview. Mirrors the inputs JEF-7's async
+ * launch build requires: `buildPiLaunch(resolved, { projectRoot, cwd })`
+ * may read `systemPromptFile` before `formatPiInspect(resolved, launch)`
+ * can render file-backed prompts. JEF-11 never builds the launch itself —
+ * it only supplies this context and awaits the injected provider.
+ */
+export interface LaunchPreviewContext {
+  /** Documented project/config root used to resolve relative prompt paths. */
+  projectRoot: string;
+  /** Preserved worktree cwd for the launch spec. */
+  cwd: string;
+  /** True when the user passed `--show-prompt` (full prompt, else redacted). */
+  showFullPrompt: boolean;
+}
+
+/**
  * JEF-7-owned redacted launch-spec formatter contract.
  *
  * JEF-11 consumes this via injection — it never builds Pi argv itself.
+ * Async by design: JEF-7's `buildPiLaunch` may perform `systemPromptFile`
+ * I/O before formatting, so the provider may return a promise. JEF-7
+ * integrates as:
+ *
+ * ```ts
+ * getLaunchPreview: async (resolved, ctx) =>
+ *   formatPiInspect(
+ *     resolved,
+ *     await buildPiLaunch(resolved, { projectRoot: ctx.projectRoot, cwd: ctx.cwd }),
+ *     { showFullPrompt: ctx.showFullPrompt },
+ *   )
+ * ```
+ *
  * Implementations must be redacted, human-readable, display-only, and must
  * never be used to execute the command (see JEF-7 `process-spec.ts`).
  */
-export type LaunchPreviewProvider = (resolved: ResolvedPiProfile) => string;
+export type LaunchPreviewProvider = (
+  resolved: ResolvedPiProfile,
+  context: LaunchPreviewContext,
+) => Promise<string> | string;
 
 /** Where an effective field value came from. */
 export type ProvenanceKind = "built-in" | "user" | "project";

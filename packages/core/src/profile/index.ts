@@ -76,6 +76,7 @@ export {
   truncatePromptPreview,
   validateAllProfiles,
   type FieldProvenance,
+  type LaunchPreviewContext,
   type LaunchPreviewProvider,
   type ProfileDetail,
   type ProfileDetailField,

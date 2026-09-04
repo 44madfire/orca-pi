@@ -8,14 +8,18 @@
  * Commands (both `profile` and `profiles` accepted as aliases):
  *   orca-pi profiles list [--json]
  *   orca-pi profile show <name> [--json] [--show-prompt]
- *   orca-pi profile inspect <name> [--json] [--show-prompt] [--context-summary]
+ *   orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>]
+ *     [--user-config <path>] [--project-config <path>] [--json]
+ *     [--show-prompt] [--context-summary]
  *   orca-pi profile validate [<name>] [--json]
  *   orca-pi profile path [--project|--user] [--json]
  *
  * JEF-7 boundary: this module never builds Pi argv. `inspect` accepts an
- * optional injected {@link LaunchPreviewProvider} (JEF-7's redacted
- * launch-spec formatter); when absent it states that launch preview is
- * unavailable instead of implementing a second formatter.
+ * optional injected async {@link LaunchPreviewProvider} (JEF-7's
+ * build+format helper: `buildPiLaunch` may read `systemPromptFile`, then
+ * `formatPiInspect` renders). The provider is awaited in human and JSON
+ * paths; when absent, `inspect` states JEF-7 ownership instead of
+ * implementing a second formatter.
  */
 
 import {
@@ -46,10 +50,11 @@ export interface ProfilesCommandDeps {
   env?: NodeJS.ProcessEnv;
   homedir?: string;
   osHomedir?: () => string;
-  fs?: Pick<typeof import("node:fs/promises"), "readFile">;
+  fs?: Pick<typeof import("node:fs/promises"), "readFile" | "stat">;
   /**
-   * JEF-7 seam: redacted launch-preview formatter. When omitted, `inspect`
-   * omits argv preview with an explicit note (never builds argv itself).
+   * JEF-7 seam: async build+format helper (`buildPiLaunch` + `formatPiInspect`).
+   * May perform `systemPromptFile` I/O, so it is awaited. When omitted,
+   * `inspect` omits argv preview with an explicit note (never builds argv itself).
    */
   getLaunchPreview?: LaunchPreviewProvider;
   userConfigPathOverride?: string;
@@ -65,21 +70,34 @@ const PROFILES_USAGE = `orca-pi profiles — inspect and validate Pi role profil
 Usage:
   orca-pi profiles list [--json]
   orca-pi profile show <name> [--json] [--show-prompt]
-  orca-pi profile inspect <name> [--json] [--show-prompt] [--context-summary]
+  orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]
   orca-pi profile validate [<name>] [--json]
   orca-pi profile path [--project|--user] [--json]
 
 The CLI/profile file is authoritative (user/global < project); the UI never
 creates a second store. show/inspect redact large prompt bodies unless
 --show-prompt is given. inspect never builds Pi argv itself — launch preview
-comes from JEF-7's formatter when available.
+comes from JEF-7's async build+format helper when injected.
 `;
 
-function resolvePaths(deps: ProfilesCommandDeps): {
+const PROFILE_INSPECT_USAGE =
+  "usage: orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]\n";
+
+function resolvePaths(
+  deps: ProfilesCommandDeps,
+  overrides?: {
+    projectRoot?: string;
+    userConfigPath?: string;
+    projectConfigPath?: string;
+  },
+): {
   userPath: string;
   projectPath: string;
+  effectiveProjectRoot: string;
 } {
+  const effectiveProjectRoot = overrides?.projectRoot ?? deps.projectRoot;
   const userPath =
+    overrides?.userConfigPath ??
     deps.userConfigPathOverride ??
     getUserProfilesPath({
       env: deps.env,
@@ -87,15 +105,21 @@ function resolvePaths(deps: ProfilesCommandDeps): {
       osHomedir: deps.osHomedir,
     });
   const projectPath =
+    overrides?.projectConfigPath ??
     deps.projectConfigPathOverride ??
-    getProjectProfilesPath(deps.projectRoot);
-  return { userPath, projectPath };
+    getProjectProfilesPath(effectiveProjectRoot);
+  return { userPath, projectPath, effectiveProjectRoot };
 }
 
 async function loadLayers(
   deps: ProfilesCommandDeps,
+  overrides?: {
+    projectRoot?: string;
+    userConfigPath?: string;
+    projectConfigPath?: string;
+  },
 ): Promise<ProfileLayerContext> {
-  const { userPath, projectPath } = resolvePaths(deps);
+  const { userPath, projectPath } = resolvePaths(deps, overrides);
   const fsOpts = deps.fs ? { fs: deps.fs } : {};
   const [userDoc, projectDoc] = await Promise.all([
     loadProfilesFile(userPath, fsOpts),
@@ -114,6 +138,59 @@ async function loadLayers(
     userExists: userDoc !== undefined,
     projectExists: projectDoc !== undefined,
   };
+}
+
+/**
+ * Lightweight existence check for `profile path` (Blocking 2).
+ *
+ * `profile path` must remain usable when config is malformed: it reports
+ * authoritative locations without parsing file contents (parsing/diagnosis
+ * belongs to `profile validate`). Any successful read/stat means the file
+ * exists, even if its YAML is broken; only ENOENT (and equivalent
+ * not-found signals) means missing.
+ */
+async function fileExists(
+  filePath: string,
+  fs?: Pick<typeof import("node:fs/promises"), "readFile" | "stat">,
+): Promise<boolean> {
+  if (fs) {
+    if (typeof (fs as { stat?: unknown }).stat === "function") {
+      try {
+        await (fs as Pick<typeof import("node:fs/promises"), "stat">).stat(filePath);
+        return true;
+      } catch (error) {
+        if (isNotFoundFsError(error)) return false;
+        // Unreadable-but-present files still count as existing for `path`.
+        return true;
+      }
+    }
+    try {
+      await fs.readFile(filePath, "utf8");
+      return true;
+    } catch (error) {
+      if (isNotFoundFsError(error)) return false;
+      return true;
+    }
+  }
+  try {
+    const nodeFs = await import("node:fs/promises");
+    await nodeFs.stat(filePath);
+    return true;
+  } catch (error) {
+    if (isNotFoundFsError(error)) return false;
+    return true;
+  }
+}
+
+function isNotFoundFsError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  if (code === "ENOENT") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("ENOENT") ||
+    message.toLowerCase().includes("no such file")
+  );
 }
 
 function formatLoadError(error: unknown): string {
@@ -185,19 +262,66 @@ async function runShow(
   let showPrompt = false;
   let contextSummary = false;
   let name: string | undefined;
+  // JEF-7-aligned overrides: inspect resolves prompt files against
+  // projectRoot/cwd, so it accepts the same location flags as JEF-7's
+  // `profile inspect` (project wins over deps defaults).
+  let projectRootOverride: string | undefined;
+  let cwdOverride: string | undefined;
+  let userConfigOverride: string | undefined;
+  let projectConfigOverride: string | undefined;
   const unknown: string[] = [];
-  for (const arg of args) {
-    if (arg === "--json") asJson = true;
-    else if (arg === "--show-prompt") showPrompt = true;
-    else if (arg === "--context-summary") {
+  const takeValue = (
+    flag: string,
+    index: number,
+  ): { value?: string; consumed: number } => {
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("-")) {
+      unknown.push(`${flag} requires a path value`);
+      return { consumed: 1 };
+    }
+    return { value, consumed: 2 };
+  };
+  for (let index = 0; index < args.length;) {
+    const arg = args[index] as string;
+    if (arg === "--json") {
+      asJson = true;
+      index += 1;
+    } else if (arg === "--show-prompt") {
+      showPrompt = true;
+      index += 1;
+    } else if (arg === "--context-summary") {
       if (!options.inspect) unknown.push(arg);
       else contextSummary = true;
+      index += 1;
+    } else if (arg === "--project-root" && options.inspect) {
+      const taken = takeValue(arg, index);
+      if (taken.value !== undefined) projectRootOverride = taken.value;
+      index += taken.consumed;
+    } else if (arg === "--cwd" && options.inspect) {
+      const taken = takeValue(arg, index);
+      if (taken.value !== undefined) cwdOverride = taken.value;
+      index += taken.consumed;
+    } else if (arg === "--user-config" && options.inspect) {
+      const taken = takeValue(arg, index);
+      if (taken.value !== undefined) userConfigOverride = taken.value;
+      index += taken.consumed;
+    } else if (arg === "--project-config" && options.inspect) {
+      const taken = takeValue(arg, index);
+      if (taken.value !== undefined) projectConfigOverride = taken.value;
+      index += taken.consumed;
     } else if (isHelpFlag(arg)) {
       deps.stdout(`${PROFILES_USAGE}`);
       return { exitCode: 0 };
-    } else if (arg.startsWith("--")) unknown.push(arg);
-    else if (name === undefined) name = arg;
-    else unknown.push(arg);
+    } else if (arg.startsWith("--")) {
+      unknown.push(arg);
+      index += 1;
+    } else if (name === undefined) {
+      name = arg;
+      index += 1;
+    } else {
+      unknown.push(arg);
+      index += 1;
+    }
   }
   if (unknown.length > 0) {
     deps.stderr(
@@ -205,7 +329,7 @@ async function runShow(
     );
     deps.stderr(
       options.inspect
-        ? "usage: orca-pi profile inspect <name> [--json] [--show-prompt] [--context-summary]\n"
+        ? PROFILE_INSPECT_USAGE
         : "usage: orca-pi profile show <name> [--json] [--show-prompt]\n",
     );
     return { exitCode: 2 };
@@ -214,18 +338,36 @@ async function runShow(
     deps.stderr(`error: missing profile name\n`);
     deps.stderr(
       options.inspect
-        ? "usage: orca-pi profile inspect <name> [--json] [--show-prompt] [--context-summary]\n"
+        ? PROFILE_INSPECT_USAGE
         : "usage: orca-pi profile show <name> [--json] [--show-prompt]\n",
     );
     return { exitCode: 2 };
   }
+  const layerOverrides =
+    projectRootOverride !== undefined ||
+    userConfigOverride !== undefined ||
+    projectConfigOverride !== undefined
+      ? {
+          ...(projectRootOverride !== undefined
+            ? { projectRoot: projectRootOverride }
+            : {}),
+          ...(userConfigOverride !== undefined
+            ? { userConfigPath: userConfigOverride }
+            : {}),
+          ...(projectConfigOverride !== undefined
+            ? { projectConfigPath: projectConfigOverride }
+            : {}),
+        }
+      : undefined;
   let layers: ProfileLayerContext;
   try {
-    layers = await loadLayers(deps);
+    layers = await loadLayers(deps, layerOverrides);
   } catch (error) {
     deps.stderr(`${formatLoadError(error)}\n`);
     return { exitCode: 1 };
   }
+  const { effectiveProjectRoot } = resolvePaths(deps, layerOverrides);
+  const effectiveCwd = cwdOverride ?? effectiveProjectRoot;
   if (Object.keys(layers.mergedDoc.profiles).length === 0) {
     deps.stderr(
       `error: unknown Pi profile "${name}". No profiles found in:\n` +
@@ -282,7 +424,11 @@ async function runShow(
         let launchPreview: string | undefined;
         if (deps.getLaunchPreview) {
           try {
-            launchPreview = deps.getLaunchPreview(detail.resolved);
+            launchPreview = await deps.getLaunchPreview(detail.resolved, {
+              projectRoot: effectiveProjectRoot,
+              cwd: effectiveCwd,
+              showFullPrompt: showPrompt,
+            });
           } catch (error) {
             payload.launchPreviewError =
               error instanceof Error ? error.message : String(error);
@@ -311,7 +457,11 @@ async function runShow(
       let launchPreview: string | undefined;
       if (deps.getLaunchPreview) {
         try {
-          launchPreview = deps.getLaunchPreview(detail.resolved);
+          launchPreview = await deps.getLaunchPreview(detail.resolved, {
+            projectRoot: effectiveProjectRoot,
+            cwd: effectiveCwd,
+            showFullPrompt: showPrompt,
+          });
         } catch (error) {
           deps.stderr(
             `warning: launch preview failed: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -470,39 +620,19 @@ async function runPath(
     return { exitCode: 2 };
   }
   const { userPath, projectPath } = resolvePaths(deps);
-  // Existence is best-effort for `path` (it must work even when files are
-  // missing — its job is to say where they would live).
-  const fsOpts = deps.fs ? { fs: deps.fs } : {};
-  let userDoc: ValidatedProfilesDocument | undefined;
-  let projectDoc: ValidatedProfilesDocument | undefined;
-  try {
-    const rethrowConfigError = (error: unknown): undefined => {
-      // Surface malformed/invalid files instead of reporting "missing".
-      if (
-        error instanceof ProfileLoadError ||
-        error instanceof ProfileValidationError
-      ) {
-        throw error;
-      }
-      return undefined;
-    };
-    userDoc = await loadProfilesFile(userPath, fsOpts).then(
-      (doc) => doc,
-      rethrowConfigError,
-    );
-    projectDoc = await loadProfilesFile(projectPath, fsOpts).then(
-      (doc) => doc,
-      rethrowConfigError,
-    );
-  } catch (error) {
-    deps.stderr(`${formatLoadError(error)}\n`);
-    return { exitCode: 1 };
-  }
+  // Recovery UX (Blocking 2): `profile path` never parses file contents.
+  // It reports authoritative locations even when config is malformed —
+  // content diagnostics belong to `profile validate`. Existence is a
+  // lightweight stat/read probe only.
+  const [userExists, projectExists] = await Promise.all([
+    fileExists(userPath, deps.fs),
+    fileExists(projectPath, deps.fs),
+  ]);
   const layers = {
     userPath,
     projectPath,
-    userExists: userDoc !== undefined,
-    projectExists: projectDoc !== undefined,
+    userExists,
+    projectExists,
   };
   if (asJson) {
     if (only === "user") {

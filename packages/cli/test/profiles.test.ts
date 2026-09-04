@@ -3,11 +3,20 @@ import { run } from "../src/main.js";
 import type { CliDeps } from "../src/main.js";
 import type { CommandResult } from "@orca-pi/core";
 
-function memFs(files: Record<string, string>): Pick<typeof import("node:fs/promises"), "readFile"> {
+function memFs(
+  files: Record<string, string>,
+): Pick<typeof import("node:fs/promises"), "readFile" | "stat"> {
   return {
     async readFile(path: unknown) {
       const key = String(path);
       if (Object.hasOwn(files, key)) return files[key]!;
+      const error = new Error(`ENOENT: no such file ${key}`) as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    },
+    async stat(path: unknown) {
+      const key = String(path);
+      if (Object.hasOwn(files, key)) return { isFile: () => true } as unknown as import("node:fs").Stats;
       const error = new Error(`ENOENT: no such file ${key}`) as NodeJS.ErrnoException;
       error.code = "ENOENT";
       throw error;
@@ -157,7 +166,10 @@ describe("orca-pi profile inspect", () => {
   it("includes context policy and consumes the JEF-7 launch formatter when injected", async () => {
     const { deps, out } = makeDeps(
       { "/home/u/.pi/agent/profiles.yaml": USER_YAML },
-      { getLaunchPreview: (resolved) => `pi --model ${resolved.model} --thinking ${resolved.thinking} (redacted)` },
+      {
+        getLaunchPreview: async (resolved, ctx) =>
+          `pi --model ${resolved.model} --thinking ${resolved.thinking} (redacted, root=${ctx.projectRoot} cwd=${ctx.cwd})`,
+      },
     );
     const result = await run(["profile", "inspect", "scout", "--context-summary"], deps);
     expect(result.exitCode).toBe(0);
@@ -165,6 +177,76 @@ describe("orca-pi profile inspect", () => {
     expect(text).toContain("Context policy");
     expect(text).toContain("pi --model anthropic/claude-haiku");
     expect(text).toContain("summary:");
+  });
+
+  it("awaits an async JEF-7-style provider for file-backed prompts (systemPromptFile)", async () => {
+    const seen: { projectRoot: string; cwd: string; showFullPrompt: boolean }[] = [];
+    const { deps, out } = makeDeps(
+      {
+        "/home/u/.pi/agent/profiles.yaml":
+          "profiles:\n  filescout:\n    model: anthropic/claude-haiku\n    systemPromptFile: .pi/agents/scout.md\n",
+      },
+      {
+        getLaunchPreview: async (resolved, ctx) => {
+          seen.push({
+            projectRoot: ctx.projectRoot,
+            cwd: ctx.cwd,
+            showFullPrompt: ctx.showFullPrompt,
+          });
+          // Simulate JEF-7's async build (prompt-file I/O) + format without
+          // duplicating launch construction: echo the declared file path.
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          return `launch preview for ${resolved.name} prompt=${resolved.systemPromptFile ?? "(none)"} root=${ctx.projectRoot}`;
+        },
+      },
+    );
+    const result = await run(["profile", "inspect", "filescout", "--context-summary"], deps);
+    expect(result.exitCode).toBe(0);
+    expect(out.join("")).toContain(".pi/agents/scout.md");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.projectRoot).toBe("/repo/p");
+    expect(seen[0]?.cwd).toBe("/repo/p");
+  });
+
+  it("supports JEF-7-aligned --project-root/--cwd/--config overrides in context", async () => {
+    const seen: { projectRoot: string; cwd: string }[] = [];
+    const { deps, out } = makeDeps(
+      {
+        "/custom/user.yaml": USER_YAML,
+        "/custom/project.yaml": USER_YAML,
+      },
+      {
+        projectRoot: "/ignored",
+        userConfigPathOverride: undefined,
+        projectConfigPathOverride: undefined,
+        getLaunchPreview: async (_resolved, ctx) => {
+          seen.push({ projectRoot: ctx.projectRoot, cwd: ctx.cwd });
+          return "preview";
+        },
+      },
+    );
+    const result = await run(
+      [
+        "profile",
+        "inspect",
+        "scout",
+        "--project-root",
+        "/repo/override",
+        "--cwd",
+        "/repo/override/cwd",
+        "--user-config",
+        "/custom/user.yaml",
+        "--project-config",
+        "/custom/project.yaml",
+      ],
+      deps,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(seen[0]).toEqual({
+      projectRoot: "/repo/override",
+      cwd: "/repo/override/cwd",
+    });
+    expect(out.join("")).toContain("preview");
   });
 
   it("states JEF-7 ownership instead of building argv when no formatter is injected", async () => {
@@ -180,7 +262,7 @@ describe("orca-pi profile inspect", () => {
   it("supports --json with contextSummary and launchPreview", async () => {
     const { deps, out } = makeDeps(
       { "/home/u/.pi/agent/profiles.yaml": USER_YAML },
-      { getLaunchPreview: () => "preview" },
+      { getLaunchPreview: async () => "preview" },
     );
     const result = await run(["profile", "inspect", "scout", "--json", "--context-summary"], deps);
     expect(result.exitCode).toBe(0);
@@ -253,6 +335,27 @@ describe("orca-pi profile path", () => {
     expect((JSON.parse(second.out.join("")) as { userPath: string }).userPath).toContain(
       ".pi/agent/profiles.yaml",
     );
+  });
+
+  it("remains usable when config is malformed (recovery UX)", async () => {
+    const { deps, out } = makeDeps({
+      "/home/u/.pi/agent/profiles.yaml": "profiles:\n  bad: [unclosed\n",
+    });
+    const result = await run(["profile", "path"], deps);
+    expect(result.exitCode).toBe(0);
+    expect(out.join("")).toContain("/home/u/.pi/agent/profiles.yaml");
+    const jsonDeps = makeDeps({
+      "/home/u/.pi/agent/profiles.yaml": "profiles:\n  bad: [unclosed\n",
+    });
+    const jsonResult = await run(["profile", "path", "--json"], jsonDeps.deps);
+    expect(jsonResult.exitCode).toBe(0);
+    const parsed = JSON.parse(jsonDeps.out.join("")) as {
+      userExists: boolean;
+      projectExists: boolean;
+    };
+    // Malformed-but-present files count as existing so users can find them.
+    expect(parsed.userExists).toBe(true);
+    expect(parsed.projectExists).toBe(false);
   });
 });
 
