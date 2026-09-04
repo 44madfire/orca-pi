@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: read-only contents. No secrets are exposed to PR steps.
+permissions:
+  contents: read
+
+jobs:
+  # Stable job name so it can later be required by branch protection/rulesets.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Repo requires Node >=18 (package.json engines); @types/node tracks 22.x.
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm run lint
