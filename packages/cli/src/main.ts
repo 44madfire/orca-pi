@@ -196,6 +196,11 @@ async function runProfileInspect(
             ...(launch.promptFileAbsolutePath !== undefined
               ? { promptFileAbsolutePath: launch.promptFileAbsolutePath }
               : {}),
+            promptTransport: launch.promptTransport,
+            ...(launch.promptTempPath !== undefined
+              ? { promptTempPath: launch.promptTempPath }
+              : {}),
+            ...(launch.promptText !== undefined ? { promptText: launch.promptText } : {}),
             spec: launch.spec,
           },
           null,

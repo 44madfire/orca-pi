@@ -78,22 +78,30 @@ function promptSummary(
   options: FormatInspectOptions,
 ): string {
   const max = options.maxPromptPreview ?? DEFAULT_PREVIEW;
+  // Prefer the original intended text from the launch result (present even
+  // when transport is temp-file, where spec.args carries the temp path).
+  // Fall back to the argv value for older results without `promptText`.
   const index = spec.args.indexOf("--system-prompt");
   const hasFlag = index !== -1 && index + 1 < spec.args.length;
-  if (!hasFlag) return "(none)";
-  const full = spec.args[index + 1] as string;
+  if (!hasFlag && launch.promptText === undefined) return "(none)";
+  const original = launch.promptText ?? (hasFlag ? (spec.args[index + 1] as string) : undefined);
+  if (original === undefined) return "(none)";
   const where =
     launch.promptSource === "file"
       ? `file ${launch.promptFileRelativePath ?? "(unknown)"}`
       : launch.promptSource === "inline"
         ? "inline"
         : "unknown";
+  const viaTemp =
+    launch.promptTransport === "temp-file"
+      ? `, via temp file ${launch.promptTempPath ?? "(unknown)"} — Pi file-or-text collision avoidance`
+      : "";
   if (options.showFullPrompt) {
-    return `${where} (${full.length} chars): "${escapePreview(full)}"`;
+    return `${where} (${original.length} chars${viaTemp}): "${escapePreview(original)}"`;
   }
-  const preview = full.length > max ? full.slice(0, max) : full;
-  const suffix = full.length > max ? `... (+${full.length - max} more)` : "";
-  return `${where} (${full.length} chars): "${escapePreview(preview)}${suffix}"`;
+  const preview = original.length > max ? original.slice(0, max) : original;
+  const suffix = original.length > max ? `... (+${original.length - max} more)` : "";
+  return `${where} (${original.length} chars${viaTemp}): "${escapePreview(preview)}${suffix}"`;
 }
 
 /**
@@ -152,7 +160,14 @@ export function formatPiInspect(
       } else if (flagTakesValue && token === "--system-prompt") {
         const full = next;
         const max = opts.maxPromptPreview ?? DEFAULT_PREVIEW;
-        if (opts.showFullPrompt) {
+        if (launch.promptTransport === "temp-file") {
+          // Temp-file transport: argv carries a short temp path whose file
+          // contains the exact intended text (Pi file-or-text avoidance).
+          const originalLen = launch.promptText?.length ?? full.length;
+          lines.push(
+            `    ${token} ${quoteForDisplay(full)} (temp file carrying ${originalLen}-char prompt — Pi collision avoidance)`,
+          );
+        } else if (opts.showFullPrompt) {
           lines.push(`    ${token} ${quoteForDisplay(full)} (${full.length} chars)`);
         } else {
           const preview = full.length > max ? `${full.slice(0, max)}... (+${full.length - max} more, ${full.length} total)` : `${full} (${full.length} chars)`;

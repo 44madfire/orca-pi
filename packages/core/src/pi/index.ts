@@ -11,6 +11,14 @@ export {
   type PiLaunchResult,
 } from "./build-pi-launch.js";
 export {
+  materializePromptToTempFile,
+  resolvePromptArgValue,
+  wouldPiTreatPromptAsFile,
+  type PiPromptTransport,
+  type PiPromptTransportFs,
+  type ResolvedPromptArg,
+} from "./prompt-transport.js";
+export {
   PI_COMMAND,
   freezePiProcessSpec,
   type PiProcessSpec,

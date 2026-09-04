@@ -29,7 +29,8 @@ export interface ResolvedPrompt {
 export type PiPromptFileErrorCode =
   | "missing-prompt-file"
   | "unreadable-prompt-file"
-  | "empty-prompt-file";
+  | "empty-prompt-file"
+  | "prompt-materialization-failed";
 
 /**
  * Actionable pre-launch failure reading `systemPromptFile`.

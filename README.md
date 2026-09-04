@@ -158,6 +158,13 @@ If your Orca build reports a manifest error, update
   profiles visibly emit `--no-skills`/`--no-extensions`/`--no-context-files`
   then only explicit `--skill`/`--extension` entries; `ephemeral` emits
   `--no-session` while `fresh` emits no session flags and never resumes.
+  Pi file-or-text contract: current Pi treats `--system-prompt <value>` as
+  file-or-text (`existsSync` → read file, else literal). Non-colliding
+  prompts travel literally (common case, byte-identical); when the intended
+  text equals an existing file in `cwd`, the launcher materializes it to a
+  deterministic content-addressed temp file and passes the temp path so Pi's
+  file branch reads the exact intended text (see `prompt-transport.ts` and
+  `pi-prompt-contract.test.ts`).
 
 ## Non-goals (OP1.1 + OP1.2 + OP1.3)
 
