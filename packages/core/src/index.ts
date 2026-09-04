@@ -34,6 +34,25 @@ export {
   type ProcessRunner,
 } from "./runner.js";
 export {
+  buildPiLaunch,
+  formatPiInspect,
+  formatPiSpecCommandForDisplay,
+  freezePiProcessSpec,
+  joinProjectPath,
+  PI_COMMAND,
+  PiLaunchError,
+  quoteForDisplay,
+  resolvePromptText,
+  type BuildPiLaunchOptions,
+  type FormatInspectOptions,
+  type PiLaunchResult,
+  type PiProcessSpec,
+  type PiPromptFileErrorCode,
+  type PiPromptSource,
+  type PromptFileReader,
+  type ResolvedPrompt,
+} from "./pi/index.js";
+export {
   BUILTIN_PROFILE_DEFAULTS,
   BUILTIN_TOOLS,
   MODEL_PATTERN,
