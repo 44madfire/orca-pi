@@ -17,11 +17,12 @@ export type WorktreePolicy =
       readonly baseBranch?: string;
       readonly setup?: WorktreeSetupPolicy;
       /**
-       * Explicit parent selector for `--parent-worktree` (default
-       * `"active"`). Always passed explicitly so lineage never depends on
-       * the helper process happening to run in the coordinator worktree;
-       * pass an exact `id:<repo>::<path>` selector when the coordinator
-       * checkout differs from the helper's ambient worktree.
+       * Explicit parent selector for `--parent-worktree`. When omitted and
+       * the spawn names the coordinator terminal (`fromHandle`), the
+       * default parent is that terminal's exact worktree (`id:<repo>::<path>`);
+       * otherwise it is the helper's ambient `"active"` worktree. Always
+       * passed explicitly so lineage never depends on ambient CLI-cwd
+       * inference.
        */
       readonly parentWorktree?: string;
     }
@@ -101,6 +102,89 @@ export interface SupervisedWorkerReceipt {
   readonly promptSource?: "inline" | "file" | "none";
   readonly promptTransport?: "literal" | "temp-file" | "none";
   readonly runId?: string;
+}
+
+/**
+ * Structured `worker-start` attempt, possibly partial.
+ *
+ * Preserved even when the CLI exits non-zero: Orca intentionally returns
+ * real dispatch ids with `state: outcome_unknown` (plus `effects`,
+ * `residualResources`, and recovery commands) when start outcome is
+ * ambiguous, and the Dispatch capability may already be live because the
+ * preamble/input may have reached the agent.
+ */
+export interface WorkerStartAttempt {
+  readonly dispatchId?: string;
+  readonly state?: string;
+  readonly stage?: string;
+  readonly failedStage?: string;
+  readonly effects?: unknown;
+  readonly residualResources?: unknown;
+  readonly nextCommands?: readonly string[];
+}
+
+/**
+ * `worker-start` returned `outcome_unknown` with a real dispatch id.
+ *
+ * The worker may already be executing while Orca retains an authoritative
+ * Dispatch/capability. Callers must NOT close the terminal: inspect with
+ * `worker-show`, then fence with explicit `worker-stop` or `worker-abandon`
+ * as appropriate (see {@link WorkerStartAmbiguousError.recoveryHint}).
+ */
+export class WorkerStartAmbiguousError extends Error {
+  readonly taskId?: string;
+  readonly terminalHandle?: string;
+  readonly dispatchId: string;
+  readonly state: string;
+  readonly stage?: string;
+  readonly failedStage?: string;
+  readonly effects?: unknown;
+  readonly residualResources?: unknown;
+  readonly nextCommands?: readonly string[];
+  /** Orca recovery guidance (`worker-show`, then `worker-stop`/`worker-abandon`). */
+  readonly recoveryHint: string;
+
+  constructor(options: {
+    dispatchId: string;
+    state: string;
+    message?: string;
+    taskId?: string;
+    terminalHandle?: string;
+    stage?: string;
+    failedStage?: string;
+    effects?: unknown;
+    residualResources?: unknown;
+    nextCommands?: readonly string[];
+    recoveryHint?: string;
+    cause?: unknown;
+  }) {
+    const hint =
+      options.recoveryHint ??
+      `Outcome is unknown and Orca may retain the Dispatch capability: inspect with ` +
+        `\`orca orchestration worker-show --dispatch ${options.dispatchId} --json\`. ` +
+        `If the worker is live, leave it running; to fence without process action use ` +
+        `\`orca orchestration worker-abandon --dispatch ${options.dispatchId} --json\`, ` +
+        `or stop its terminal with ` +
+        `\`orca orchestration worker-stop --dispatch ${options.dispatchId} --json\`. ` +
+        `Do not retry worker-start blindly and do not close the terminal directly.`;
+    super(
+      options.message ??
+        `Worker start outcome unknown (dispatch ${options.dispatchId}): the worker may already be executing. ${hint}`,
+      options.cause !== undefined ? { cause: options.cause } : undefined,
+    );
+    this.name = "WorkerStartAmbiguousError";
+    this.taskId = options.taskId;
+    this.terminalHandle = options.terminalHandle;
+    this.dispatchId = options.dispatchId;
+    this.state = options.state;
+    this.stage = options.stage;
+    this.failedStage = options.failedStage;
+    this.effects = options.effects;
+    this.residualResources = options.residualResources;
+    this.nextCommands =
+      options.nextCommands !== undefined ? Object.freeze([...options.nextCommands]) : undefined;
+    this.recoveryHint = hint;
+  }
 }
 
 /** Failure stage for {@link SupervisedWorkerError}. */

@@ -15,7 +15,10 @@ import {
   worktreeSelectorForNewWorktree,
 } from "../src/orca/orca-cli.js";
 import { spawnSupervisedPiWorker } from "../src/orca/spawn-supervised-pi-worker.js";
-import { SupervisedWorkerError } from "../src/orca/receipts.js";
+import {
+  SupervisedWorkerError,
+  WorkerStartAmbiguousError,
+} from "../src/orca/receipts.js";
 import type { CommandResult, ProcessRunner } from "../src/runner.js";
 
 function ok(stdout: string): CommandResult {
@@ -75,6 +78,10 @@ function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & {
     async resolveWorktree(selector: string) {
       calls.push(`resolveWorktree:${selector}`);
       return { id: `repo::/wt/${selector}`, path: `/wt/${selector}` };
+    },
+    async resolveTerminalWorktree(handle: string) {
+      calls.push(`resolveTerminalWorktree:${handle}`);
+      return { id: `repo::/wt/coordinator`, path: `/wt/coordinator` };
     },
     async createTerminal(input) {
       calls.push(`createTerminal:${input.worktreeSelector}`);
@@ -256,6 +263,76 @@ describe("orca-cli-process argv mapping", () => {
     expect(receipt.dispatchId).toBe("dispatch_9");
     expect(receipt.taskId).toBe("t");
     expect(receipt.terminalHandle).toBe("h");
+  });
+
+  it("classifies exit-1 outcome_unknown receipts as ambiguous (dispatch retained)", async () => {
+    const runner = fakeRunner(() => ({
+      stdout: envelope({
+        dispatchId: "dispatch_7",
+        state: "outcome_unknown",
+        failedStage: "prompt",
+        effects: { created: ["terminal"] },
+        residualResources: { terminals: ["term_x"] },
+        nextCommands: ["orca orchestration worker-show --dispatch dispatch_7 --json"],
+      }),
+      stderr: "",
+      exitCode: 1,
+    }));
+    const error = await createOrcaCliProcess(runner)
+      .attachWorker({ taskId: "t", terminalHandle: "h" })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(WorkerStartAmbiguousError);
+    const ambiguous = error as WorkerStartAmbiguousError;
+    expect(ambiguous.dispatchId).toBe("dispatch_7");
+    expect(ambiguous.state).toBe("outcome_unknown");
+    expect(ambiguous.failedStage).toBe("prompt");
+    expect(ambiguous.effects).toEqual({ created: ["terminal"] });
+    expect(ambiguous.residualResources).toEqual({ terminals: ["term_x"] });
+    expect(ambiguous.nextCommands).toEqual([
+      "orca orchestration worker-show --dispatch dispatch_7 --json",
+    ]);
+    expect(ambiguous.recoveryHint).toContain("worker-show");
+    expect(ambiguous.taskId).toBe("t");
+    expect(ambiguous.terminalHandle).toBe("h");
+  });
+
+  it("treats exit-1 definite failures as generic errors (no retained capability)", async () => {
+    const failed = createOrcaCliProcess(
+      fakeRunner(() => ({
+        stdout: envelope({ dispatchId: "d9", state: "failed", failedStage: "start" }),
+        stderr: "",
+        exitCode: 1,
+      })),
+    );
+    const error = await failed
+      .attachWorker({ taskId: "t", terminalHandle: "h" })
+      .catch((e: unknown) => e);
+    expect(error).not.toBeInstanceOf(WorkerStartAmbiguousError);
+    expect(error).toBeInstanceOf(OrcaCommandError);
+  });
+
+  it("resolves a terminal worktree binding via terminal show", async () => {
+    const seen: string[][] = [];
+    const runner = fakeRunner((_exe, args) => {
+      seen.push([...args]);
+      return ok(
+        envelope({
+          terminal: {
+            handle: "term_coord",
+            worktreeId: "repo::/wt/coordinator",
+            worktreePath: "/wt/coordinator",
+          },
+        }),
+      );
+    });
+    const identity = await createOrcaCliProcess(runner).resolveTerminalWorktree(
+      "term_coord",
+    );
+    expect(identity).toMatchObject({ id: "repo::/wt/coordinator", path: "/wt/coordinator" });
+    const argv = seen[0] ?? [];
+    expect(argv.slice(0, 2)).toEqual(["terminal", "show"]);
+    expect(argv).toContain("term_coord");
+    expect(argv).toContain("--json");
   });
 
   it("fails the attach when the dispatch id is missing or the worker is not ready", async () => {
@@ -571,6 +648,187 @@ describe("spawnSupervisedPiWorker builds the launch against the selected checkou
     expect(error).toBeInstanceOf(SupervisedWorkerError);
     expect((error as SupervisedWorkerError).stage).toBe("launch-build");
     expect(orca.calls).not.toContain("createTerminal:active");
+  });
+});
+
+describe("spawnSupervisedPiWorker new-child parent lineage", () => {
+  const AMBIENT = { id: "repo::/wt/helper-ambient", path: "/wt/helper-ambient" };
+  const COORDINATOR = { id: "repo::/wt/coordinator", path: "/wt/coordinator" };
+
+  function lineageOrca() {
+    const orca = makeFakeOrca({
+      async resolveWorktree() {
+        orca.calls.push("resolveWorktree:active");
+        return { ...AMBIENT };
+      },
+      async resolveTerminalWorktree(handle: string) {
+        orca.calls.push(`resolveTerminalWorktree:${handle}`);
+        return { ...COORDINATOR };
+      },
+    });
+    return orca;
+  }
+
+  it("binds the default parent to the coordinator worktree, not helper ambient", async () => {
+    const profile = testProfile();
+    const orca = lineageOrca();
+    await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      worktree: { kind: "new-child", name: "child-w" },
+      fromHandle: "term_coordinator",
+    });
+    expect(orca.calls).toContain("resolveTerminalWorktree:term_coordinator");
+    expect(orca.worktreeCreates[0]).toMatchObject({
+      parent: "child",
+      parentWorktree: `id:${COORDINATOR.id}`,
+    });
+  });
+
+  it("lets an explicit parentWorktree win over coordinator derivation", async () => {
+    const profile = testProfile();
+    const orca = lineageOrca();
+    await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      worktree: {
+        kind: "new-child",
+        name: "child-w",
+        parentWorktree: "id:repo::/explicit-parent",
+      },
+      fromHandle: "term_coordinator",
+    });
+    expect(orca.calls).not.toContain("resolveTerminalWorktree:term_coordinator");
+    expect(orca.worktreeCreates[0]).toMatchObject({
+      parent: "child",
+      parentWorktree: "id:repo::/explicit-parent",
+    });
+  });
+
+  it("falls back to ambient active only when no coordinator handle exists", async () => {
+    const profile = testProfile();
+    const orca = lineageOrca();
+    await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      worktree: { kind: "new-child", name: "child-w" },
+    });
+    expect(orca.calls).not.toContain("resolveTerminalWorktree:term_coordinator");
+    expect(orca.worktreeCreates[0]).toMatchObject({
+      parent: "child",
+      parentWorktree: "active",
+    });
+  });
+
+  it("fails closed when the coordinator worktree cannot be resolved", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca({
+      async resolveTerminalWorktree() {
+        throw new OrcaCommandError({
+          code: "terminal_handle_stale",
+          message: "terminal-show: stale handle",
+          executable: "orca",
+          args: [],
+          diagnostics: "stale",
+        });
+      },
+    });
+    const error = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "t" },
+      worktree: { kind: "new-child", name: "child-w" },
+      fromHandle: "term_stale",
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SupervisedWorkerError);
+    expect((error as SupervisedWorkerError).stage).toBe("worktree-create");
+    expect((error as SupervisedWorkerError).code).toBe("worktree-parent-resolve-failed");
+    expect(orca.calls).not.toContain("createTerminal:active");
+  });
+});
+
+describe("spawnSupervisedPiWorker outcome_unknown keeps the worker alive", () => {
+  it("retains the dispatch id, never closes the terminal, and points at recovery", async () => {
+    const profile = testProfile();
+    const orca = makeFakeOrca({
+      async attachWorker(input) {
+        orca.calls.push(`attachWorker:${input.taskId}:${input.terminalHandle}`);
+        throw new WorkerStartAmbiguousError({
+          dispatchId: "dispatch_7",
+          state: "outcome_unknown",
+          taskId: input.taskId,
+          terminalHandle: input.terminalHandle,
+        });
+      },
+    });
+    const error = await spawnSupervisedPiWorker({
+      orca,
+      profile,
+      task: { taskId: "task_1" },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SupervisedWorkerError);
+    const staged = error as SupervisedWorkerError;
+    expect(staged.stage).toBe("worker-start");
+    expect(staged.code).toBe("worker-start-outcome-unknown");
+    expect(staged.dispatchId).toBe("dispatch_7");
+    expect(staged.terminalHandle).toBe("term_created");
+    expect(staged.cleanup.terminalClosed).toBe(false);
+    expect(staged.diagnostics).toContain("worker-show");
+    expect(orca.calls).not.toContain("closeTerminal:term_created");
+  });
+
+  it("end-to-end: exit-1 outcome_unknown receipt keeps its dispatch and skips terminal close", async () => {
+    const profile = testProfile();
+    const seen: string[][] = [];
+    const runner = fakeRunner((_exe, args) => {
+      seen.push([...args]);
+      const [group, command] = args;
+      if (group === "orchestration" && command === "run-current") {
+        return ok(envelope({ run: null }));
+      }
+      if (group === "orchestration" && command === "task-create") {
+        return ok(envelope({ task: { id: "task_e2e" } }));
+      }
+      if (group === "worktree" && command === "current") {
+        return ok(envelope({ worktree: { id: "repo::/wt/e2e", path: "/wt/e2e" } }));
+      }
+      if (group === "terminal" && command === "create") {
+        return ok(envelope({ terminal: { handle: "term_e2e" } }));
+      }
+      if (group === "terminal" && command === "wait") {
+        return ok(envelope({ waited: true }));
+      }
+      if (group === "orchestration" && command === "worker-start") {
+        return {
+          stdout: envelope({
+            dispatchId: "dispatch_e2e",
+            state: "outcome_unknown",
+            failedStage: "prompt",
+            effects: { created: ["dispatch"] },
+            residualResources: { terminals: ["term_e2e"] },
+          }),
+          stderr: "",
+          exitCode: 1,
+        };
+      }
+      return { stdout: "", stderr: `unexpected: ${args.join(" ")}`, exitCode: 1 };
+    });
+    const error = await spawnSupervisedPiWorker({
+      orca: createOrcaCliProcess(runner),
+      profile,
+      task: { spec: "e2e work" },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SupervisedWorkerError);
+    const staged = error as SupervisedWorkerError;
+    expect(staged.code).toBe("worker-start-outcome-unknown");
+    expect(staged.dispatchId).toBe("dispatch_e2e");
+    expect(staged.cleanup.terminalClosed).toBe(false);
+    // The terminal was never closed: no `terminal close` argv was issued.
+    expect(seen.some((argv) => argv[1] === "close")).toBe(false);
+    expect(seen.some((argv) => argv[1] === "worker-start")).toBe(true);
   });
 });
 

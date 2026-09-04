@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  isOutcomeUnknownState,
   ORCA_JSON_SNIPPET_LIMIT,
   OrcaJsonParseError,
   parseRunCurrentJson,
   parseTaskCreateJson,
   parseTerminalCreateJson,
+  parseTerminalShowJson,
+  parseWorkerStartAttemptJson,
   parseWorkerStartJson,
   parseWorktreeCreateJson,
   parseWorktreeShowJson,
@@ -120,6 +123,74 @@ describe("parseWorktreeCreateJson / parseWorktreeShowJson", () => {
   });
 });
 
+describe("isOutcomeUnknownState", () => {
+  it("matches outcome_unknown case-insensitively", () => {
+    expect(isOutcomeUnknownState("outcome_unknown")).toBe(true);
+    expect(isOutcomeUnknownState("Outcome_Unknown")).toBe(true);
+    expect(isOutcomeUnknownState("unknown")).toBe(true);
+  });
+
+  it("rejects ready/failed/other states", () => {
+    expect(isOutcomeUnknownState("ready")).toBe(false);
+    expect(isOutcomeUnknownState("failed")).toBe(false);
+    expect(isOutcomeUnknownState(undefined)).toBe(false);
+    expect(isOutcomeUnknownState("")).toBe(false);
+  });
+});
+
+describe("parseWorkerStartAttemptJson (lenient, non-zero exits)", () => {
+  it("extracts the full structured subset from an outcome_unknown receipt", () => {
+    const attempt = parseWorkerStartAttemptJson(
+      envelope({
+        dispatchId: "dispatch_7",
+        state: "outcome_unknown",
+        failedStage: "prompt",
+        effects: { created: ["terminal"] },
+        residualResources: { terminals: ["term_x"] },
+        nextCommands: ["orca orchestration worker-show --dispatch dispatch_7 --json"],
+      }),
+    );
+    expect(attempt).toMatchObject({
+      dispatchId: "dispatch_7",
+      state: "outcome_unknown",
+      failedStage: "prompt",
+    });
+    expect(attempt.effects).toEqual({ created: ["terminal"] });
+    expect(attempt.residualResources).toEqual({ terminals: ["term_x"] });
+    expect(attempt.nextCommands).toEqual([
+      "orca orchestration worker-show --dispatch dispatch_7 --json",
+    ]);
+  });
+
+  it("returns {} for ok:false and malformed payloads (no classification possible)", () => {
+    expect(
+      parseWorkerStartAttemptJson(
+        JSON.stringify({ ok: false, error: { code: "x", message: "y" } }),
+      ),
+    ).toEqual({});
+    expect(parseWorkerStartAttemptJson("{{{not json")).toEqual({});
+    expect(parseWorkerStartAttemptJson(envelope({ ready: true }))).toEqual({});
+  });
+});
+
+describe("parseTerminalShowJson", () => {
+  it("reads the terminal worktree binding", () => {
+    expect(
+      parseTerminalShowJson(
+        envelope({
+          terminal: { handle: "term_1", worktreeId: "repo::/wt/a", worktreePath: "/wt/a" },
+        }),
+      ),
+    ).toMatchObject({ id: "repo::/wt/a", path: "/wt/a" });
+  });
+
+  it("throws when the worktree binding is missing", () => {
+    expect(() => parseTerminalShowJson(envelope({ terminal: {} }))).toThrowError(
+      OrcaJsonParseError,
+    );
+  });
+});
+
 describe("parseRunCurrentJson", () => {
   it("returns runId when a Run is bound", () => {
     expect(
@@ -179,6 +250,15 @@ describe("parseWorkerStartJson (supervised attach)", () => {
     ).toThrowError(OrcaJsonParseError);
   });
 
+  it("accepts an explicit ready state", () => {
+    expect(
+      parseWorkerStartJson(
+        envelope({ state: "ready", dispatch: { id: "d1" } }),
+        fallback,
+      ),
+    ).toMatchObject({ dispatchId: "d1" });
+  });
+
   it("fails on non-ready state", () => {
     expect(() =>
       parseWorkerStartJson(
@@ -189,6 +269,12 @@ describe("parseWorkerStartJson (supervised attach)", () => {
     expect(() =>
       parseWorkerStartJson(
         envelope({ stage: "failed", dispatch: { id: "d1" } }),
+        fallback,
+      ),
+    ).toThrowError(OrcaJsonParseError);
+    expect(() =>
+      parseWorkerStartJson(
+        envelope({ state: "outcome_unknown", dispatch: { id: "d1" } }),
         fallback,
       ),
     ).toThrowError(OrcaJsonParseError);

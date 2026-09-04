@@ -96,6 +96,12 @@ export interface OrcaCli {
   createTask(input: TaskCreateInput): Promise<TaskReceipt>;
   createWorktree(input: WorktreeCreateInput): Promise<WorktreeReceipt>;
   resolveWorktree(selector: string): Promise<WorktreeIdentity>;
+  /**
+   * Resolve the worktree binding of one terminal (`terminal show`). Used to
+   * bind `new-child` parent lineage to the coordinator terminal's exact
+   * worktree instead of the helper's ambient worktree.
+   */
+  resolveTerminalWorktree(handle: string): Promise<WorktreeIdentity>;
   createTerminal(input: TerminalCreateInput): Promise<TerminalReceipt>;
   /** Wait for TUI readiness (`terminal wait --for tui-idle`). */
   waitForTerminal(handle: string, options?: { timeoutMs?: number }): Promise<void>;

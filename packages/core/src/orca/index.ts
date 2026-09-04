@@ -23,11 +23,14 @@ export {
   type OrcaCliProcessOptions,
 } from "./orca-cli-process.js";
 export {
+  isOutcomeUnknownState,
   ORCA_JSON_SNIPPET_LIMIT,
   OrcaJsonParseError,
   parseRunCurrentJson,
   parseTaskCreateJson,
   parseTerminalCreateJson,
+  parseTerminalShowJson,
+  parseWorkerStartAttemptJson,
   parseWorkerStartJson,
   parseWorktreeCreateJson,
   parseWorktreeShowJson,
@@ -35,11 +38,13 @@ export {
 export {
   freezeSupervisedWorkerReceipt,
   SupervisedWorkerError,
+  WorkerStartAmbiguousError,
   type SupervisedWorkerReceipt,
   type SupervisedWorkerStage,
   type TaskReceipt,
   type TerminalReceipt,
   type WorkerAttachReceipt,
+  type WorkerStartAttempt,
   type WorktreeIdentity,
   type WorktreePolicy,
   type WorktreeReceipt,

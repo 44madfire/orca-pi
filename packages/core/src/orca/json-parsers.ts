@@ -17,6 +17,7 @@ import type {
   TaskReceipt,
   TerminalReceipt,
   WorkerAttachReceipt,
+  WorkerStartAttempt,
   WorktreeIdentity,
   WorktreeReceipt,
 } from "./receipts.js";
@@ -100,6 +101,43 @@ function firstString(candidates: readonly unknown[]): string | undefined {
   for (const candidate of candidates) {
     const value = asNonEmptyString(candidate);
     if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+/** Normalize a state/stage token for comparison (`Outcome_Unknown` → `outcome_unknown`). */
+function normalizeStateToken(value: unknown): string | undefined {
+  const raw = asNonEmptyString(value);
+  if (raw === undefined) return undefined;
+  return raw.toLowerCase().replace(/[^a-z_]/g, "");
+}
+
+/** True for `outcome_unknown`/`unknown`: Orca may retain the Dispatch capability. */
+export function isOutcomeUnknownState(value: unknown): boolean {
+  const normalized = normalizeStateToken(value);
+  return normalized === "outcome_unknown" || normalized === "unknown";
+}
+
+/** True for states that are definitely not ready (failed/stopped/unknown). */
+function isNonReadyState(value: unknown): boolean {
+  const normalized = normalizeStateToken(value);
+  return (
+    normalized === "failed" ||
+    normalized === "outcome_unknown" ||
+    normalized === "unknown" ||
+    normalized === "stopped" ||
+    normalized === "failedstage"
+  );
+}
+
+function firstStringList(candidates: readonly unknown[]): readonly string[] | undefined {
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      const strings = candidate.filter(
+        (entry): entry is string => typeof entry === "string" && entry.length > 0,
+      );
+      if (strings.length > 0) return Object.freeze([...strings]);
+    }
   }
   return undefined;
 }
@@ -316,20 +354,17 @@ export function parseWorkerStartJson(
   }
   const stage = firstString([
     child(result, "stage"),
+    child(result, "state"),
     child(result, "status"),
     child(dispatch, "stage"),
+    child(dispatch, "state"),
     child(dispatch, "status"),
   ]);
-  if (
-    stage !== undefined &&
-    ["failed", "outcome_unknown", "stopped", "failedstage"].includes(
-      stage.toLowerCase().replace(/[^a-z_]/g, ""),
-    )
-  ) {
+  if (stage !== undefined && isNonReadyState(stage)) {
     throw new OrcaJsonParseError(
       context,
       snippetOf(stdout),
-      `${context}: Orca reported non-ready stage "${stage}" for dispatch ` +
+      `${context}: Orca reported non-ready state "${stage}" for dispatch ` +
         `${dispatchId}.`,
     );
   }
@@ -337,5 +372,101 @@ export function parseWorkerStartJson(
     taskId: fallback.taskId,
     dispatchId,
     terminalHandle: fallback.terminalHandle,
+  };
+}
+
+/**
+ * Lenient `worker-start` attempt extraction for non-zero exits.
+ *
+ * Orca intentionally returns structured receipts (`dispatchId`,
+ * `state: outcome_unknown`, `effects`, `residualResources`, recovery
+ * commands) with a non-zero exit when start outcome is ambiguous. This
+ * parser never throws for missing fields: it returns whatever structured
+ * subset is present (or `{}` for `ok:false`/malformed payloads) so the
+ * caller can classify `outcome_unknown` (retain the Dispatch, never close
+ * the terminal) versus definite failure. Only `dispatchId` + an unknown
+ * state together prove ambiguity.
+ */
+export function parseWorkerStartAttemptJson(stdout: string): WorkerStartAttempt {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return {};
+  }
+  if (!isRecord(parsed)) return {};
+  if (parsed["ok"] === false) return {};
+  const result = parsed["result"];
+  if (!isRecord(result)) return {};
+  const dispatch = child(result, "dispatch");
+  const worker = child(result, "worker");
+  const dispatchId = firstString([
+    child(dispatch, "id"),
+    child(dispatch, "dispatchId"),
+    child(dispatch, "dispatch_id"),
+    child(result, "dispatchId"),
+    child(result, "dispatch_id"),
+    child(worker, "dispatchId"),
+    child(worker, "dispatch_id"),
+  ]);
+  const state = firstString([
+    child(result, "state"),
+    child(result, "stage"),
+    child(result, "status"),
+    child(dispatch, "state"),
+    child(dispatch, "stage"),
+  ]);
+  const stage = firstString([child(result, "stage"), child(dispatch, "stage")]);
+  const failedStage = firstString([
+    child(result, "failedStage"),
+    child(result, "failed_stage"),
+    child(dispatch, "failedStage"),
+  ]);
+  const guide = child(result, "guide");
+  const nextCommands = firstStringList([
+    child(result, "nextCommands"),
+    child(result, "recoveryCommands"),
+    child(result, "nextSteps"),
+    child(guide, "nextSteps"),
+  ]);
+  return {
+    ...(dispatchId !== undefined ? { dispatchId } : {}),
+    ...(state !== undefined ? { state } : {}),
+    ...(stage !== undefined ? { stage } : {}),
+    ...(failedStage !== undefined ? { failedStage } : {}),
+    ...("effects" in result ? { effects: result["effects"] } : {}),
+    ...("residualResources" in result ? { residualResources: result["residualResources"] } : {}),
+    ...(nextCommands !== undefined ? { nextCommands } : {}),
+  };
+}
+
+/** Parse `terminal show --terminal ... --json` stdout (worktree binding). */
+export function parseTerminalShowJson(stdout: string): WorktreeIdentity {
+  const context = "terminal-show";
+  const result = parseEnvelopeResult(stdout, context);
+  const terminal = child(result, "terminal");
+  const worktree = child(terminal, "worktree");
+  const id = firstString([
+    child(terminal, "worktreeId"),
+    child(terminal, "worktree_id"),
+    child(worktree, "id"),
+    child(result, "worktreeId"),
+  ]);
+  if (id === undefined) {
+    missingField(
+      context,
+      stdout,
+      "terminal worktree id",
+      "result.terminal.worktreeId, result.terminal.worktree.id",
+    );
+  }
+  const path = firstString([
+    child(terminal, "worktreePath"),
+    child(terminal, "worktree_path"),
+    child(worktree, "path"),
+  ]);
+  return {
+    id,
+    ...(path !== undefined ? { path } : {}),
   };
 }

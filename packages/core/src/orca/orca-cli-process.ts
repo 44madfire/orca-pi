@@ -10,9 +10,12 @@
 
 import { isNotFoundError, type ProcessRunner } from "../runner.js";
 import {
+  isOutcomeUnknownState,
   parseRunCurrentJson,
   parseTaskCreateJson,
   parseTerminalCreateJson,
+  parseTerminalShowJson,
+  parseWorkerStartAttemptJson,
   parseWorkerStartJson,
   parseWorktreeCreateJson,
   parseWorktreeShowJson,
@@ -25,12 +28,13 @@ import type {
   WorkerAttachInput,
   WorktreeCreateInput,
 } from "./orca-cli.js";
-import type {
-  TaskReceipt,
-  TerminalReceipt,
-  WorkerAttachReceipt,
-  WorktreeIdentity,
-  WorktreeReceipt,
+import {
+  WorkerStartAmbiguousError,
+  type TaskReceipt,
+  type TerminalReceipt,
+  type WorkerAttachReceipt,
+  type WorktreeIdentity,
+  type WorktreeReceipt,
 } from "./receipts.js";
 
 /** Max stdout/stderr characters kept in command-error diagnostics. */
@@ -47,6 +51,13 @@ export class OrcaCommandError extends Error {
   readonly isMissingExecutable: boolean;
   /** True when the installed CLI does not understand the command/flag. */
   readonly isCompatibility: boolean;
+  /**
+   * Raw stdout captured with the failure, when available. Used to classify
+   * structured non-zero receipts (e.g. `worker-start` `outcome_unknown`)
+   * that still carry a real dispatch id. Never includes prompts/secrets —
+   * it is Orca's own `--json` envelope.
+   */
+  readonly stdout?: string;
 
   constructor(options: {
     code: string;
@@ -57,6 +68,7 @@ export class OrcaCommandError extends Error {
     diagnostics?: string;
     isMissingExecutable?: boolean;
     isCompatibility?: boolean;
+    stdout?: string;
     cause?: unknown;
   }) {
     super(
@@ -71,6 +83,7 @@ export class OrcaCommandError extends Error {
     this.diagnostics = options.diagnostics ?? "";
     this.isMissingExecutable = options.isMissingExecutable ?? false;
     this.isCompatibility = options.isCompatibility ?? false;
+    if (options.stdout !== undefined) this.stdout = options.stdout;
   }
 }
 
@@ -188,6 +201,7 @@ export function createOrcaCliProcess(
         exitCode: result.exitCode,
         diagnostics: `exit ${result.exitCode}. stdout: ${truncate(result.stdout)}. stderr: ${truncate(result.stderr)}`,
         isCompatibility: looksLikeCompatibilityFailure(code, detail),
+        stdout: result.stdout,
       });
     }
     // Exit 0 but payload may still be `ok:false` (RPC-level failure).
@@ -215,6 +229,7 @@ export function createOrcaCliProcess(
           exitCode: result.exitCode,
           diagnostics: `stdout: ${truncate(result.stdout)}. stderr: ${truncate(result.stderr)}`,
           isCompatibility: looksLikeCompatibilityFailure(code, detail),
+          stdout: result.stdout,
         });
       }
     } catch (error) {
@@ -345,13 +360,57 @@ export function createOrcaCliProcess(
       if (input.runId !== undefined) args.push("--run", input.runId);
       if (input.fromHandle !== undefined) args.push("--from", input.fromHandle);
       args.push("--json");
-      const stdout = await runJson(args, "worker-start");
+      let stdout: string;
+      try {
+        stdout = await runJson(args, "worker-start");
+      } catch (error) {
+        // Non-zero `worker-start` receipts can still carry a real dispatch
+        // id with `state: outcome_unknown`: the preamble/input may already
+        // have reached the agent while Orca retains the Dispatch
+        // capability. That is not proof the worker is unassigned — classify
+        // it instead of letting the generic failure path destroy the worker.
+        if (error instanceof OrcaCommandError && error.stdout !== undefined) {
+          const attempt = parseWorkerStartAttemptJson(error.stdout);
+          if (
+            attempt.dispatchId !== undefined &&
+            isOutcomeUnknownState(attempt.state)
+          ) {
+            throw new WorkerStartAmbiguousError({
+              dispatchId: attempt.dispatchId,
+              state: attempt.state as string,
+              taskId: input.taskId,
+              terminalHandle: input.terminalHandle,
+              ...(attempt.stage !== undefined ? { stage: attempt.stage } : {}),
+              ...(attempt.failedStage !== undefined
+                ? { failedStage: attempt.failedStage }
+                : {}),
+              ...(attempt.effects !== undefined ? { effects: attempt.effects } : {}),
+              ...(attempt.residualResources !== undefined
+                ? { residualResources: attempt.residualResources }
+                : {}),
+              ...(attempt.nextCommands !== undefined
+                ? { nextCommands: attempt.nextCommands }
+                : {}),
+              cause: error,
+            });
+          }
+        }
+        throw error;
+      }
       return wrapParse("worker-start", stdout, () =>
         parseWorkerStartJson(stdout, {
           taskId: input.taskId,
           terminalHandle: input.terminalHandle,
         }),
       );
+    },
+
+    async resolveTerminalWorktree(handle: string): Promise<WorktreeIdentity> {
+      const stdout = await runJson(
+        ["terminal", "show", "--terminal", handle, "--json"],
+        "terminal-show",
+      );
+      return wrapParse("terminal-show", stdout, () => parseTerminalShowJson(stdout));
     },
 
     async closeTerminal(handle: string): Promise<void> {

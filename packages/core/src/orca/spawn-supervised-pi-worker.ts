@@ -20,8 +20,18 @@
  * 6. Wait for terminal/TUI readiness.
  * 7. Attach the existing terminal as a supervised worker with
  *    `orca orchestration worker-start --terminal` (required dispatch id +
- *    ready state).
+ *    ready state). An `outcome_unknown` receipt is surfaced as a recoverable
+ *    error that retains the dispatch id — the terminal is never closed in
+ *    that state because Orca may retain the Dispatch capability.
  * 8. Return a structured receipt (task/dispatch/terminal/worktree/profile).
+ *
+ * Known public-API limitation: the two-step custom-argv path (terminal
+ * create with the OP1.3 Pi command, then `worker-start --terminal`) cannot
+ * preserve a repository's opt-in `wait-for-setup` agent-start sequencing —
+ * the later `terminal create` is not the startup owned by `worktree create`.
+ * Repositories with `wait-for-setup` should use an agent-first launcher or
+ * be handled as a compatibility follow-up; this adapter does not invent a
+ * private workaround.
  *
  * The assigned task is never passed as initial Pi argv text. Orca supervised
  * attachment remains authoritative because it provides task/dispatch IDs and
@@ -56,6 +66,7 @@ import {
 import {
   freezeSupervisedWorkerReceipt,
   SupervisedWorkerError,
+  WorkerStartAmbiguousError,
   type SupervisedWorkerReceipt,
   type SupervisedWorkerStage,
   type WorktreePolicy,
@@ -338,12 +349,39 @@ export async function spawnSupervisedPiWorker(
       worktreePath = identity.path;
       worktreeDisplayName = identity.displayName;
     } else {
+      // Bind child lineage explicitly. An explicit policy parent wins; when
+      // `fromHandle` names the coordinator terminal, the default parent is
+      // the coordinator's exact worktree (never the helper's ambient
+      // worktree); otherwise it is the helper's ambient `active` worktree.
+      let parentWorktree: string | undefined;
+      if (worktreePolicy.kind === "new-child") {
+        if (worktreePolicy.parentWorktree !== undefined) {
+          parentWorktree = worktreePolicy.parentWorktree;
+        } else if (fromHandle !== undefined) {
+          try {
+            const coordinator = await orca.resolveTerminalWorktree(fromHandle);
+            parentWorktree = `id:${coordinator.id}`;
+          } catch (error) {
+            throw wrapStageError({
+              stage: "worktree-create",
+              code: "worktree-parent-resolve-failed",
+              stageLabel: "Worktree parent resolution",
+              error,
+              taskId,
+              hint:
+                "Could not resolve the coordinator terminal's worktree to bind child lineage. " +
+                "Pass an explicit worktree.parentWorktree selector and retry; the Task remains unattached.",
+              createdNewWorktree: false,
+            });
+          }
+        } else {
+          parentWorktree = "active";
+        }
+      }
       const created = await orca.createWorktree({
         name: worktreePolicy.name,
         parent: worktreePolicy.kind === "new-child" ? "child" : "top-level",
-        ...(worktreePolicy.kind === "new-child"
-          ? { parentWorktree: worktreePolicy.parentWorktree ?? "active" }
-          : {}),
+        ...(parentWorktree !== undefined ? { parentWorktree } : {}),
         ...(worktreePolicy.baseBranch !== undefined
           ? { baseBranch: worktreePolicy.baseBranch }
           : {}),
@@ -527,8 +565,9 @@ export async function spawnSupervisedPiWorker(
   }
 
   // 7. Attach the existing terminal as a supervised worker. A missing
-  // dispatch id or non-ready state is a failure, never a receipt:
-  // `dispatch --inject` would leave the worker unsupervised.
+  // dispatch id or definite non-ready state is a failure, never a receipt.
+  // `outcome_unknown` is recoverable, not unattached: Orca may retain the
+  // Dispatch capability, so the terminal is never closed in that state.
   let dispatchId: string;
   try {
     const attached = await orca.attachWorker({
@@ -540,6 +579,28 @@ export async function spawnSupervisedPiWorker(
     });
     dispatchId = attached.dispatchId;
   } catch (error) {
+    if (error instanceof WorkerStartAmbiguousError) {
+      throw new SupervisedWorkerError({
+        stage: "worker-start",
+        code: "worker-start-outcome-unknown",
+        message:
+          `Worker attach outcome unknown (task ${taskId}, dispatch ${error.dispatchId}): ` +
+          `the worker may already be executing. ${error.recoveryHint}`,
+        diagnostics:
+          `worker-start: outcome_unknown (state=${error.state}` +
+          `${error.failedStage !== undefined ? `, failedStage=${error.failedStage}` : ""}). ` +
+          `${error.recoveryHint}`,
+        taskId,
+        terminalHandle,
+        dispatchId: error.dispatchId,
+        cleanup: {
+          terminalClosed: false,
+          createdNewWorktree,
+          worktreeId,
+        },
+        cause: error,
+      });
+    }
     let cleaned = false;
     if (!preserveTerminalOnFailure) {
       try {
