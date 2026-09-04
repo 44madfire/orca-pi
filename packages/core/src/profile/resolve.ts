@@ -37,7 +37,8 @@ export type ProfileResolveErrorCode =
   | "unknown-profile"
   | "unknown-parent"
   | "extends-cycle"
-  | "invalid-override";
+  | "invalid-override"
+  | "invalid-github-identity";
 
 /** Pre-launch resolution failure — actionable, with profile/chain context. */
 export class ProfileResolveError extends Error {
@@ -245,6 +246,24 @@ export function resolveProfile(
       throw error;
     }
     applyLayer(acc, validated);
+  }
+
+  // Authoritative resolved guard (OP1.9 / JEF-15): a reviewer identity must
+  // never resolve with source-write tools, even via `extends` inheritance.
+  // Schema validation catches same-entry violations; this catches inherited
+  // ones so production resolve/validate/show/inspect/launch all fail closed.
+  if (acc.githubIdentity === "reviewer" && acc.tools !== undefined) {
+    const offending = acc.tools.filter((tool) => tool === "edit" || tool === "write");
+    if (offending.length > 0) {
+      throw new ProfileResolveError({
+        code: "invalid-github-identity",
+        profileName: name,
+        chain,
+        available,
+        message: `Pi profile "${name}" uses reviewer githubIdentity but resolves with source-write tools (${offending.map((tool) => `"${tool}"`).join(", ")}) via ${chain.length > 1 ? `inherited chain ${chain.map((entry) => `"${entry}"`).join(" → ")}` : "its own tools"}. ` +
+          `The reviewer GitHub App holds Contents: read only — remove "edit"/"write" from this profile (reviewers describe follow-ups; they never edit files).`,
+      });
+    }
   }
 
   const resolved: ResolvedPiProfile = Object.freeze({

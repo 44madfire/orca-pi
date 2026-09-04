@@ -16,8 +16,13 @@
  * - https://docs.github.com/en/rest/checks/runs
  */
 
-import { resolveGithubCredential, toAuthError, type InstallationTokenCache } from "./github-app-auth.js";
-import { defaultTokenCache } from "./github-app-auth.js";
+import {
+  defaultTokenCache,
+  resolveGithubCredential,
+  toAuthError,
+  verifyReviewerForChecks,
+  type InstallationTokenCache,
+} from "./github-app-auth.js";
 import { redactSecretsFromText } from "./identity.js";
 import {
   AGENT_REVIEW_CHECK_NAME,
@@ -202,7 +207,17 @@ export async function listCheckRunsForRef(
   return out;
 }
 
-/** Create the deterministic check run (`in_progress`). */
+/**
+ * Create (or reuse) the deterministic check run (`in_progress`).
+ *
+ * Idempotent: when a matching `orca-pi/agent-review` run already exists for
+ * the same head SHA, it is updated back to `in_progress` and returned
+ * instead of POSTing a duplicate. Retrying `check start` for the same SHA
+ * therefore never creates duplicate deterministic checks.
+ *
+ * Production enforcement: reviewer App Bot preflight runs before any write
+ * (`--identity worker` and human PATs never reach POST/PATCH).
+ */
 export async function startAgentReviewCheck(
   identity: GithubIdentity,
   input: Omit<CheckRunInput, "status" | "conclusion"> & { status?: CheckStatus },
@@ -212,12 +227,30 @@ export async function startAgentReviewCheck(
     cache?: InstallationTokenCache;
     apiBase?: string;
   },
-): Promise<{ id: number; htmlUrl?: string }> {
+): Promise<{ id: number; htmlUrl?: string; deduped?: boolean }> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
-  const credential = resolveGithubCredential(identity, env, cache);
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
+  await verifyReviewerForChecks(identity, { fetchFn, env, cache, apiBase });
+  const credential = resolveGithubCredential(identity, env, cache);
+  // Idempotent start: reuse the matching deterministic run when present.
+  try {
+    const existing = await listCheckRunsForRef(identity, { owner: input.owner, repo: input.repo, ref: input.headSha }, { fetchFn, env, cache, apiBase });
+    const match = selectCheckRunForUpdate(existing, input.headSha);
+    if (match) {
+      const updateEndpoint = `/repos/${input.owner}/${input.repo}/check-runs/${match.id}`;
+      const updatePayload = buildCheckStartPayload({ headSha: input.headSha, summary: input.summary, text: input.text, provenance: input.provenance });
+      const updateResponse = await fetchFn(`${apiBase}${updateEndpoint}`, { method: "PATCH", headers: baseHeaders(credential.token), body: JSON.stringify(updatePayload) });
+      if (updateResponse.ok) {
+        const data = (await updateResponse.json()) as { id?: unknown; html_url?: unknown };
+        return { id: typeof data.id === "number" ? data.id : match.id, ...(typeof data.html_url === "string" ? { htmlUrl: data.html_url } : {}), deduped: true };
+      }
+      // PATCH failed (e.g. stale run) — fall through to create below.
+    }
+  } catch {
+    // Listing is best-effort idempotency — fall through to create.
+  }
   const endpoint = `/repos/${input.owner}/${input.repo}/check-runs`;
   const payload = buildCheckStartPayload({ headSha: input.headSha, summary: input.summary, text: input.text, provenance: input.provenance });
   let response;
@@ -260,9 +293,10 @@ export async function completeAgentReviewCheck(
 ): Promise<{ id: number; conclusion: CheckConclusion; htmlUrl?: string }> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
-  const credential = resolveGithubCredential(identity, env, cache);
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
+  await verifyReviewerForChecks(identity, { fetchFn, env, cache, apiBase });
+  const credential = resolveGithubCredential(identity, env, cache);
   const payload = buildCheckCompletePayload({ verdict: input.verdict, summary: input.summary, text: input.text, provenance: input.provenance });
 
   let checkRunId = input.checkRunId;

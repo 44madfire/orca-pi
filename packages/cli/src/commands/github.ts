@@ -26,7 +26,6 @@ import {
   completeAgentReviewCheck,
   describeCredentialStatus,
   GITHUB_IDENTITY_PATTERN,
-  listCheckRunsForRef,
   MAX_GITHUB_IDENTITY_LENGTH,
   parsePullRequestRef,
   parseReviewVerdict,
@@ -57,13 +56,18 @@ const GITHUB_USAGE = `orca-pi github — distinct GitHub automation identities a
 
 Usage:
   orca-pi github auth status --identity <name> [--json]
-  orca-pi github review --identity <name> --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--commit <sha>] [--task <id>] [--issue <id>] [--json]
-  orca-pi github check start --identity <name> --repo <owner/repo> --sha <sha> [--summary <text>] [--task <id>] [--issue <id>] [--json]
-  orca-pi github check complete --identity <name> --repo <owner/repo> --sha <sha> --verdict <approve|request-changes|comment> --summary <text> [--check-run-id <n>] [--task <id>] [--issue <id>] [--json]
+  orca-pi github review --identity reviewer --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--commit <sha>] [--task <id>] [--issue <id>] [--json]
+  orca-pi github check start --identity reviewer --repo <owner/repo> --sha <sha> [--summary <text>] [--task <id>] [--issue <id>] [--json]
+  orca-pi github check complete --identity reviewer --repo <owner/repo> --sha <sha> --verdict <approve|request-changes|comment> --summary <text> [--check-run-id <n>] [--task <id>] [--issue <id>] [--json]
 
-Identities are logical credential slots (e.g. "worker", "reviewer") resolved
-at runtime via env (ORCA_PI_GITHUB_<IDENTITY>_TOKEN). Tokens never appear in
-output. The reviewer App holds Contents: read only; human remains merge authority.
+Identities are logical credential slots resolved at runtime via env
+(ORCA_PI_GITHUB_<IDENTITY>_TOKEN). Tokens never appear in output.
+Formal reviews and the orca-pi/agent-review check must use --identity reviewer:
+the CLI proves the token is the reviewer App Bot (live GET /user, Bot type)
+and distinct from the PR author before any POST, so same-account PATs and
+--identity worker never reach the write APIs. Check start is idempotent
+(reuses the deterministic run for the SHA); review retries with identical
+inputs dedupe. The reviewer App holds Contents: read only; human merges.
 `;
 
 function isHelpFlag(arg: string): boolean {
@@ -371,18 +375,8 @@ async function runCheck(args: readonly string[], deps: GithubCommandDeps): Promi
       if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`Invalid --check-run-id ${JSON.stringify(checkRunIdRaw)}: expected a positive integer.`);
       checkRunId = parsed;
     }
-    // Idempotent default: when no explicit run id, reuse the matching
-    // deterministic run for this SHA instead of creating a duplicate.
-    if (checkRunId === undefined && deps.fetchFn) {
-      try {
-        const existing = await listCheckRunsForRef(resolvedIdentity, { owner, repo: repoName, ref: headSha }, baseOpts);
-        const { selectCheckRunForUpdate } = await import("@orca-pi/core");
-        const match = selectCheckRunForUpdate(existing, headSha);
-        if (match) checkRunId = match.id;
-      } catch {
-        // Best-effort only — completeAgentReviewCheck retries listing itself.
-      }
-    }
+    // Idempotency lives in completeAgentReviewCheck (list-then-update the
+    // deterministic run for this SHA); no CLI-side duplicate listing needed.
     const result = await completeAgentReviewCheck(
       resolvedIdentity,
       { owner, repo: repoName, headSha, verdict, summary, ...(checkRunId !== undefined ? { checkRunId } : {}), ...(provenance ? { provenance } : {}) },

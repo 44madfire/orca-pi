@@ -15,8 +15,13 @@
  * - https://docs.github.com/en/rest/pulls/reviews
  */
 
-import { resolveGithubCredential, toAuthError, type InstallationTokenCache } from "./github-app-auth.js";
-import { defaultTokenCache } from "./github-app-auth.js";
+import {
+  defaultTokenCache,
+  resolveGithubCredential,
+  toAuthError,
+  verifyReviewerForReview,
+  type InstallationTokenCache,
+} from "./github-app-auth.js";
 import { redactSecretsFromText } from "./identity.js";
 import {
   GithubApiError,
@@ -151,9 +156,103 @@ function defaultFetch(): GithubFetchFn {
   };
 }
 
+/** Existing PR review record (subset of `GET .../pulls/{n}/reviews`). */
+export interface ExistingPullReview {
+  id: number;
+  userLogin?: string;
+  state?: string;
+  body?: string;
+  commitId?: string;
+}
+
 /**
- * Submit a formal PR review as the given identity. The token is resolved
- * behind the identity name and sent as a Bearer header — never logged.
+ * List existing reviews for a PR (newest last in API order). Used for
+ * retry idempotency: a retry with identical `(reviewer, event, body,
+ * commit)` returns the existing review instead of POSTing a duplicate.
+ */
+export async function listPullReviews(
+  identity: GithubIdentity,
+  input: { owner: string; repo: string; pullNumber: number },
+  options?: {
+    fetchFn?: GithubFetchFn;
+    env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+    cache?: InstallationTokenCache;
+    apiBase?: string;
+  },
+): Promise<ExistingPullReview[]> {
+  const env = options?.env ?? process.env;
+  const cache = options?.cache ?? defaultTokenCache;
+  const credential = resolveGithubCredential(identity, env, cache);
+  const fetchFn = options?.fetchFn ?? defaultFetch();
+  const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
+  const endpoint = `/repos/${input.owner}/${input.repo}/pulls/${input.pullNumber}/reviews?per_page=50`;
+  const response = await fetchFn(`${apiBase}${endpoint}`, {
+    method: "GET",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${credential.token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!response.ok) {
+    const authError = toAuthError(identity, response.status, endpoint);
+    if (authError) throw authError;
+    const text = await response.text().catch(() => "");
+    throw new GithubApiError(endpoint, response.status, `GitHub list reviews failed (${response.status}): ${redactSecretsFromText(text.slice(0, 1000), [credential.token]) || "no response body"}.`);
+  }
+  const data = (await response.json()) as unknown;
+  if (!Array.isArray(data)) return [];
+  const out: ExistingPullReview[] = [];
+  for (const entry of data as Array<Record<string, unknown>>) {
+    if (typeof entry.id !== "number") continue;
+    const user = entry.user as { login?: unknown } | undefined;
+    out.push({
+      id: entry.id,
+      ...(typeof user?.login === "string" ? { userLogin: user.login } : {}),
+      ...(typeof entry.state === "string" ? { state: entry.state } : {}),
+      ...(typeof entry.body === "string" ? { body: entry.body } : {}),
+      ...(typeof entry.commit_id === "string" ? { commitId: entry.commit_id } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * Retry-idempotency selector: find an existing review by the same reviewer
+ * with the identical event/body/commit. Returns the newest match, or
+ * `undefined` when the review must be created. Body comparison uses the
+ * fully formatted body (including the provenance footer) so retries with
+ * identical inputs dedupe while genuinely new findings still POST.
+ */
+export function findDuplicateReview(
+  reviews: readonly ExistingPullReview[],
+  match: { reviewerLogin: string; event: ReviewEvent; body: string; commitId?: string },
+): ExistingPullReview | undefined {
+  const wantBody = match.body.trim();
+  const candidates = reviews.filter((review) => {
+    if (review.userLogin?.toLowerCase() !== match.reviewerLogin.toLowerCase()) return false;
+    if (review.state?.toUpperCase() !== match.event) return false;
+    if ((review.body ?? "").trim() !== wantBody) return false;
+    if (match.commitId !== undefined && review.commitId !== undefined && review.commitId !== match.commitId) return false;
+    return true;
+  });
+  if (candidates.length === 0) return undefined;
+  return candidates.reduce((a, b) => (b.id > a.id ? b : a));
+}
+
+/**
+ * Submit a formal PR review as the reviewer GitHub App (fail closed).
+ *
+ * Production enforcement (Blocking 1): before any `POST /reviews`, a live
+ * preflight proves the credential is the reviewer App Bot (`GET /user`
+ * `type: Bot`, optional `ORCA_PI_GITHUB_REVIEWER_LOGIN` match) and distinct
+ * from the PR author (`GET` PR → distinct-actor guard). `--identity worker`
+ * and human PATs in the reviewer slot never reach POST. Tokens never enter
+ * logs.
+ *
+ * Retry semantics: retries with identical `(reviewer, event, body, commit)`
+ * return the existing review instead of POSTing a duplicate (best-effort
+ * list-then-dedupe; genuinely new findings still create a new review).
  *
  * `fetchFn` is injectable for tests; `env`/`cache` thread through to
  * credential resolution. Throws `GithubAuthError` for 401/403/404
@@ -168,9 +267,15 @@ export async function submitGithubReview(
     cache?: InstallationTokenCache;
     apiBase?: string;
   },
-): Promise<{ id: number; htmlUrl?: string; submittedAt?: string }> {
+): Promise<{ id: number; htmlUrl?: string; submittedAt?: string; deduped?: boolean }> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
+  // Fail closed before any write: reviewer App Bot + distinct from author.
+  const preflight = await verifyReviewerForReview(
+    identity,
+    { owner: input.owner, repo: input.repo, pullNumber: input.pullNumber },
+    { ...(options?.fetchFn ? { fetchFn: options.fetchFn } : {}), env, cache, ...(options?.apiBase ? { apiBase: options.apiBase } : {}) },
+  );
   const credential = resolveGithubCredential(identity, env, cache);
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
@@ -181,6 +286,16 @@ export async function submitGithubReview(
     ...(input.commitId ? { commitId: input.commitId } : {}),
     ...(input.provenance ? { provenance: input.provenance } : {}),
   });
+  // Idempotent retry: identical retry returns the existing review.
+  try {
+    const existing = await listPullReviews(identity, { owner: input.owner, repo: input.repo, pullNumber: input.pullNumber }, { fetchFn, env, cache, apiBase });
+    const duplicate = findDuplicateReview(existing, { reviewerLogin: preflight.reviewerLogin, event: payload.event, body: payload.body, ...(payload.commit_id ? { commitId: payload.commit_id } : {}) });
+    if (duplicate) {
+      return { id: duplicate.id, deduped: true };
+    }
+  } catch {
+    // Listing is best-effort idempotency — fall through to POST.
+  }
 
   let response;
   try {

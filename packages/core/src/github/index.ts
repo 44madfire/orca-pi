@@ -44,21 +44,31 @@ export {
   tokenEnvVarForIdentity,
 } from "./identity.js";
 export {
+  REVIEWER_LOGIN_ENV_VAR,
+  assertReviewerIdentityForWrites,
   authHeaderForCredential,
   createInstallationTokenCache,
   defaultTokenCache,
   describeCredentialStatus,
+  fetchAuthenticatedActor,
+  fetchPullRequestAuthor,
   resolveGithubCredential,
+  verifyReviewerForChecks,
+  verifyReviewerForReview,
+  type AuthenticatedGithubActor,
   type InstallationTokenCache,
   type TokenCacheEntry,
 } from "./github-app-auth.js";
 export {
   buildReviewPayload,
+  findDuplicateReview,
   formatReviewBody,
+  listPullReviews,
   parsePullRequestRef,
   parseReviewVerdict,
   submitGithubReview,
   verdictToReviewEvent,
+  type ExistingPullReview,
 } from "./review.js";
 export {
   buildCheckCompletePayload,

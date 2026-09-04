@@ -19,11 +19,14 @@
  */
 
 import {
+  assertDistinctGithubActors,
   expiryEnvVarForIdentity,
+  redactSecretsFromText,
   redactTokenLikeValues,
   tokenEnvVarForIdentity,
 } from "./identity.js";
 import {
+  GithubApiError,
   GithubAuthError,
   type GithubIdentity,
   type ResolvedGithubCredential,
@@ -251,6 +254,182 @@ export function authHeaderForCredential(
   credential: Pick<ResolvedGithubCredential, "token">,
 ): Record<string, string> {
   return { Authorization: `Bearer ${credential.token}` };
+}
+
+/** Verified reviewer App login slot (operator-set outside LLM context, safe to log the name). */
+export const REVIEWER_LOGIN_ENV_VAR = "ORCA_PI_GITHUB_REVIEWER_LOGIN";
+
+/** Authenticated GitHub actor (`GET /user` subset). */
+export interface AuthenticatedGithubActor {
+  login: string;
+  type?: string;
+}
+
+function apiBaseUrl(apiBase?: string): string {
+  return (apiBase ?? "https://api.github.com").replace(/\/+$/, "");
+}
+
+function baseHeaders(token: string): Record<string, string> {
+  return {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+}
+
+type FetchInit = { method: string; headers: Record<string, string>; body?: string };
+type FetchFn = (url: string, init: FetchInit) => Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>;
+
+function defaultFetchFn(): FetchFn {
+  const globalFetch = (globalThis as { fetch?: unknown }).fetch;
+  if (typeof globalFetch !== "function") {
+    throw new Error("No fetch implementation available — pass an explicit fetchFn (Node >= 18 provides global fetch).");
+  }
+  return async (url, init) => {
+    const response = await (globalFetch as typeof fetch)(url, { method: init.method, headers: init.headers, body: init.body });
+    return { ok: response.ok, status: response.status, json: () => response.json() as Promise<unknown>, text: () => response.text() };
+  };
+}
+
+/**
+ * Reject non-reviewer identities for formal review/check writes (fail closed).
+ *
+ * Formal `REQUEST_CHANGES`/`APPROVE` reviews and the deterministic
+ * `orca-pi/agent-review` check must come from the dedicated reviewer GitHub
+ * App (distinct actor). `--identity worker` (or any non-reviewer slot) can
+ * create/update PRs but must never submit formal reviews — that is the
+ * same-account failure mode JEF-15 prevents.
+ */
+export function assertReviewerIdentityForWrites(identity: string): void {
+  if (identity !== "reviewer") {
+    throw new GithubAuthError(
+      identity,
+      "unauthorized-installation",
+      `Refusing GitHub review/check write as identity "${identity}" — formal reviews and the orca-pi/agent-review check must use the dedicated reviewer GitHub App (distinct actor). ` +
+        `Use --identity reviewer with ORCA_PI_GITHUB_REVIEWER_TOKEN (installation token, Contents: read / Pull requests: write / Checks: write). ` +
+        `Same-account PATs are not distinct identities.`,
+    );
+  }
+}
+
+/**
+ * Live preflight: resolve the authenticated actor for an identity via
+ * `GET /user`. Proves *which* GitHub account the token acts as — never
+ * inferred from token prefixes. Used to reject human PATs in the reviewer
+ * slot (type `User`) and to verify the token matches the operator-configured
+ * reviewer App login when `ORCA_PI_GITHUB_REVIEWER_LOGIN` is set.
+ */
+export async function fetchAuthenticatedActor(
+  identity: string,
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+): Promise<AuthenticatedGithubActor> {
+  const env = options?.env ?? process.env;
+  const cache = options?.cache ?? defaultTokenCache;
+  const credential = resolveGithubCredential(identity, env, cache);
+  const fetchFn = options?.fetchFn ?? defaultFetchFn();
+  const base = apiBaseUrl(options?.apiBase);
+  const endpoint = "/user";
+  let response;
+  try {
+    response = await fetchFn(`${base}${endpoint}`, { method: "GET", headers: baseHeaders(credential.token) });
+  } catch (error) {
+    throw new GithubAuthError(identity, "helper-failed", `Could not verify GitHub actor for "${identity}" (${endpoint}): ${redactSecretsFromText(error instanceof Error ? error.message : String(error), [credential.token])}`);
+  }
+  if (!response.ok) {
+    const authError = toAuthError(identity, response.status, endpoint);
+    if (authError) throw authError;
+    const text = await response.text().catch(() => "");
+    throw new GithubApiError(endpoint, response.status, `Could not verify GitHub actor for "${identity}" (${response.status}): ${redactSecretsFromText(text.slice(0, 1000), [credential.token]) || "no response body"}.`);
+  }
+  const data = (await response.json()) as { login?: unknown; type?: unknown };
+  if (typeof data.login !== "string" || !data.login.trim()) {
+    throw new GithubApiError(endpoint, response.status, `GitHub /user returned no login for identity "${identity}" — cannot prove distinct reviewer actor. Mint a fresh installation token outside LLM context and retry.`);
+  }
+  return { login: data.login.trim(), ...(typeof data.type === "string" ? { type: data.type } : {}) };
+}
+
+/** Fetch the PR author login (`GET /repos/{o}/{r}/pulls/{n}` → `user.login`). */
+export async function fetchPullRequestAuthor(
+  input: { owner: string; repo: string; pullNumber: number },
+  options?: { fetchFn?: FetchFn; token?: string; identity?: string; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+): Promise<string> {
+  const identity = options?.identity ?? "reviewer";
+  const env = options?.env ?? process.env;
+  const cache = options?.cache ?? defaultTokenCache;
+  let token = options?.token;
+  if (!token) token = resolveGithubCredential(identity, env, cache).token;
+  const fetchFn = options?.fetchFn ?? defaultFetchFn();
+  const base = apiBaseUrl(options?.apiBase);
+  const endpoint = `/repos/${input.owner}/${input.repo}/pulls/${input.pullNumber}`;
+  const response = await fetchFn(`${base}${endpoint}`, { method: "GET", headers: baseHeaders(token) });
+  if (!response.ok) {
+    const authError = toAuthError(identity, response.status, endpoint);
+    if (authError) throw authError;
+    const text = await response.text().catch(() => "");
+    throw new GithubApiError(endpoint, response.status, `Could not load PR author for ${input.owner}/${input.repo}#${input.pullNumber} (${response.status}): ${redactSecretsFromText(text.slice(0, 1000), [token as string]) || "no response body"}.`);
+  }
+  const data = (await response.json()) as { user?: { login?: unknown } };
+  const login = data.user?.login;
+  if (typeof login !== "string" || !login.trim()) {
+    throw new GithubApiError(endpoint, response.status, `PR ${input.owner}/${input.repo}#${input.pullNumber} returned no author login — cannot prove reviewer is distinct from the PR author.`);
+  }
+  return login.trim();
+}
+
+/**
+ * Review preflight (fail closed): proves the reviewer credential is the
+ * configured App Bot and distinct from the PR author *before* any
+ * `POST /reviews`. Never infers from token prefixes — uses live `GET /user`
+ * (`type` + `login`) plus `GET` PR author, then the distinct-actor guard.
+ *
+ * - Rejects `--identity worker` (and any non-reviewer slot).
+ * - Rejects human PATs in the reviewer slot (`type: User`).
+ * - When `ORCA_PI_GITHUB_REVIEWER_LOGIN` is set, requires an exact
+ *   (case-insensitive) match — the secret-provider verified-identity path.
+ * - Rejects same-actor reviewer/author pairs (separate PATs, same user).
+ */
+export async function verifyReviewerForReview(
+  identity: string,
+  pr: { owner: string; repo: string; pullNumber: number },
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+): Promise<{ reviewerLogin: string; prAuthorLogin: string }> {
+  assertReviewerIdentityForWrites(identity);
+  const env = options?.env ?? process.env;
+  const actor = await fetchAuthenticatedActor(identity, options);
+  if (actor.type !== undefined && actor.type.toLowerCase() !== "bot") {
+    // Human PAT in the reviewer slot — fail with the distinct-actor message
+    // (same-account PATs are not distinct identities).
+    assertDistinctGithubActors({ workerLogin: actor.login, reviewerLogin: actor.login });
+  }
+  const expected = env[REVIEWER_LOGIN_ENV_VAR]?.trim();
+  if (expected && actor.login.toLowerCase() !== expected.toLowerCase()) {
+    throw new GithubAuthError(identity, "unauthorized-installation", `Reviewer credential acts as "${actor.login}" but the configured reviewer App login is "${expected}" (${REVIEWER_LOGIN_ENV_VAR}). Mint the installation token for the configured App outside LLM context and retry — never paste tokens into prompts.`);
+  }
+  const prAuthorLogin = await fetchPullRequestAuthor(pr, { ...(options ?? {}), identity });
+  assertDistinctGithubActors({ workerLogin: prAuthorLogin, reviewerLogin: actor.login });
+  return { reviewerLogin: actor.login, prAuthorLogin };
+}
+
+/**
+ * Check-write preflight (fail closed): proves the check writer is the
+ * reviewer App Bot via live `GET /user` before any check-run POST/PATCH.
+ */
+export async function verifyReviewerForChecks(
+  identity: string,
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+): Promise<{ reviewerLogin: string }> {
+  assertReviewerIdentityForWrites(identity);
+  const env = options?.env ?? process.env;
+  const actor = await fetchAuthenticatedActor(identity, options);
+  if (actor.type !== undefined && actor.type.toLowerCase() !== "bot") {
+    assertDistinctGithubActors({ workerLogin: actor.login, reviewerLogin: actor.login });
+  }
+  const expected = env[REVIEWER_LOGIN_ENV_VAR]?.trim();
+  if (expected && actor.login.toLowerCase() !== expected.toLowerCase()) {
+    throw new GithubAuthError(identity, "unauthorized-installation", `Reviewer credential acts as "${actor.login}" but the configured reviewer App login is "${expected}" (${REVIEWER_LOGIN_ENV_VAR}). Mint the installation token for the configured App outside LLM context and retry.`);
+  }
+  return { reviewerLogin: actor.login };
 }
 
 /**

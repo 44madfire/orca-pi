@@ -102,18 +102,36 @@ describe("github identity: reviewer cannot request source-write", () => {
     expect(doc.profiles.worker?.githubIdentity).toBe("worker");
   });
 
-  it("resolved guard catches inherited write tools via extends", () => {
+  it("Blocking 2: resolve fails closed for inherited reviewer write tools (authoritative boundary)", async () => {
     const doc = validateProfilesDocument(
       {
         profiles: {
           base: { tools: ["read", "edit"] },
-          reviewer: { extends: "base", githubIdentity: "reviewer" },
+          audit: { extends: "base", githubIdentity: "reviewer" },
         },
       },
       "inherited.yaml",
     );
-    const resolved = resolveProfile("reviewer", doc);
-    expect(() => assertReviewerHasNoWriteTools(resolved)).toThrow(/source-write tools/i);
+    // resolveProfile itself throws (not just the optional helper) so every
+    // production path (validate/show/inspect/launch) fails closed.
+    let error: unknown;
+    try {
+      resolveProfile("audit", doc);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as { code?: string }).code).toBe("invalid-github-identity");
+    expect(String((error as Error).message)).toMatch(/source-write tools/i);
+    // The helper remains for direct ResolvedPiProfile checks (defense in depth).
+    const { ProfileResolveError } = await import("../src/profile/resolve.js");
+    expect(error).toBeInstanceOf(ProfileResolveError);
+    // validateAllProfiles marks the profile invalid via the same boundary.
+    const { validateAllProfiles } = await import("../src/profile/presentation.js");
+    const entries = validateAllProfiles({ mergedDoc: doc });
+    const audit = entries.find((entry) => entry.name === "audit");
+    expect(audit?.valid).toBe(false);
+    expect(audit?.code).toBe("invalid-github-identity");
   });
 
   it("builtin reviewer passes the guard; builtins carry logical identities", () => {
