@@ -173,6 +173,7 @@ interface MutableAccumulator {
   discoverSkills?: boolean;
   discoverExtensions?: boolean;
   session?: ResolvedPiProfile["session"];
+  githubIdentity?: string;
   displayName?: string;
   description?: string;
 }
@@ -198,6 +199,7 @@ function applyLayer(acc: MutableAccumulator, layer: ValidatedPiProfile): void {
   if (layer.discoverSkills !== undefined) acc.discoverSkills = layer.discoverSkills;
   if (layer.discoverExtensions !== undefined) acc.discoverExtensions = layer.discoverExtensions;
   if (layer.session !== undefined) acc.session = layer.session;
+  if (layer.githubIdentity !== undefined) acc.githubIdentity = layer.githubIdentity;
   if (layer.displayName !== undefined) acc.displayName = layer.displayName;
   if (layer.description !== undefined) acc.description = layer.description;
 }
@@ -265,6 +267,7 @@ export function resolveProfile(
     discoverSkills: acc.discoverSkills ?? BUILTIN_PROFILE_DEFAULTS.discoverSkills,
     discoverExtensions: acc.discoverExtensions ?? BUILTIN_PROFILE_DEFAULTS.discoverExtensions,
     session: acc.session ?? BUILTIN_PROFILE_DEFAULTS.session,
+    ...(acc.githubIdentity !== undefined ? { githubIdentity: acc.githubIdentity } : {}),
     ...(acc.displayName !== undefined ? { displayName: acc.displayName } : {}),
     ...(acc.description !== undefined ? { description: acc.description } : {}),
   });

@@ -135,6 +135,23 @@ export const MAX_PATH_LENGTH = 512;
 export const MAX_DISPLAY_NAME_LENGTH = 100;
 export const MAX_DESCRIPTION_LENGTH = 1000;
 
+/**
+ * Logical GitHub automation identities (OP1.9 / JEF-15).
+ *
+ * A profile references a credential slot (`"worker"`, `"reviewer"`),
+ * never a secret. The secret provider/helper resolves the slot to a token
+ * at launch/runtime. Custom identities match the same safe grammar so
+ * future apps (e.g. a worker GitHub App) can be added without schema churn.
+ */
+export const GITHUB_IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+export const MAX_GITHUB_IDENTITY_LENGTH = 64;
+/** Canonical reviewer identity: read-only contents, PR/checks write. */
+export const REVIEWER_GITHUB_IDENTITY = "reviewer";
+/** Canonical worker/human identity for PR creation and pushes. */
+export const WORKER_GITHUB_IDENTITY = "worker";
+/** Pi tools that imply source-write; forbidden for reviewer identities. */
+export const REVIEWER_FORBIDDEN_TOOLS: readonly string[] = ["edit", "write"] as const;
+
 const PROFILE_FIELDS: readonly (keyof PiProfileInput)[] = [
   "extends",
   "provider",
@@ -150,6 +167,7 @@ const PROFILE_FIELDS: readonly (keyof PiProfileInput)[] = [
   "discoverSkills",
   "discoverExtensions",
   "session",
+  "githubIdentity",
   "displayName",
   "description",
 ] as const;
@@ -630,6 +648,42 @@ function validateSingleProfile(
     } else {
       profile.session = sessionRaw as SessionMode;
     }
+  }
+
+  // githubIdentity (OP1.9 / JEF-15): logical credential slot, never a secret.
+  const githubIdentityRaw = get("githubIdentity");
+  if (githubIdentityRaw !== undefined) {
+    if (
+      typeof githubIdentityRaw !== "string" ||
+      githubIdentityRaw.length === 0 ||
+      githubIdentityRaw.length > MAX_GITHUB_IDENTITY_LENGTH ||
+      !GITHUB_IDENTITY_PATTERN.test(githubIdentityRaw)
+    ) {
+      issues.push({
+        path: `${basePath}.githubIdentity`,
+        message: `expected a logical GitHub identity matching ${GITHUB_IDENTITY_PATTERN} (e.g. "worker", "reviewer"), got ${preview(githubIdentityRaw)}. Identities name a credential slot resolved at launch/runtime — never place tokens, private keys, or secrets here; keep credentials in env vars or a helper process.`,
+      });
+      failed = true;
+    } else {
+      profile.githubIdentity = githubIdentityRaw;
+    }
+  }
+
+  // Reviewer guard (OP1.9 / JEF-15): the reviewer GitHub App must never
+  // hold Contents: write, so a reviewer profile must not request Pi
+  // source-write tools either. Enforced per-document-entry here; resolved
+  // (inherited) violations are caught by `assertReviewerHasNoWriteTools`
+  // in the github module so `extends` cannot smuggle `edit`/`write` in.
+  if (
+    profile.githubIdentity === REVIEWER_GITHUB_IDENTITY &&
+    profile.tools !== undefined &&
+    profile.tools.some((tool) => (REVIEWER_FORBIDDEN_TOOLS as readonly string[]).includes(tool))
+  ) {
+    issues.push({
+      path: `${basePath}.tools`,
+      message: `reviewer githubIdentity must not request source-write tools (got ${preview(profile.tools)}). The reviewer GitHub App holds Contents: read only — remove "edit"/"write" from this profile (reviewers describe follow-ups; they never edit files).`,
+    });
+    failed = true;
   }
 
   // display metadata (never affects execution)

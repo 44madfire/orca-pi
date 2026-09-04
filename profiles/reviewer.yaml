@@ -39,5 +39,6 @@ profiles:
     discoverSkills: false
     discoverExtensions: false
     session: ephemeral
+    githubIdentity: reviewer
     displayName: Reviewer
     description: Independent review with blocking vs non-blocking findings.

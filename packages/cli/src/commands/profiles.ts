@@ -453,6 +453,7 @@ async function runShow(
         discoverSkills: detail.discoverSkills.provenance.display,
         discoverExtensions: detail.discoverExtensions.provenance.display,
         session: detail.session.provenance.display,
+        githubIdentity: detail.githubIdentity.provenance.display,
       };
       const payload: Record<string, unknown> = {
         profile: jsonResolved,

@@ -30,6 +30,7 @@ import {
   type ProcessRunner,
   type ResolvedPiProfile,
 } from "@orca-pi/core";
+import { runGithubCommand } from "./commands/github.js";
 import { runProfilesCommand } from "./commands/profiles.js";
 import { runOrchestrationCommand } from "./commands/orchestration.js";
 
@@ -37,6 +38,7 @@ export interface CliDeps {
   runner: ProcessRunner;
   stdout: (text: string) => void;
   stderr: (text: string) => void;
+  fetchFn?: import("@orca-pi/core").GithubFetchFn;
   version?: string;
   /** Project root for profile lookup (defaults to `process.cwd()`). */
   projectRoot?: string;
@@ -88,6 +90,9 @@ Usage:
   orca-pi send --worker <handle> --message <text> [--json]
   orca-pi wait (--worker <handle>|--task <id>) [--timeout <duration>] [--json]
   orca-pi stop --worker <handle> [--json]
+  orca-pi github auth status --identity <name> [--json]
+  orca-pi github review --identity reviewer --pr <url|number> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]
+  orca-pi github check start|complete --identity reviewer --repo <owner/repo> --sha <sha> ...
 
 Commands:
   doctor        Verify \`orca\` and \`pi\` are on PATH and report versions (read-only).
@@ -98,6 +103,7 @@ Commands:
   send          Send coordinator follow-up mail to one worker (structured inbox, not injection).
   wait          Wait for worker/task settlement with bounded polling/backoff/timeout.
   stop          Fence one worker terminal idempotently (never marks the Task complete).
+  github        Distinct GitHub identities: formal PR reviews + orca-pi/agent-review check (reviewer App; human merges).
 
 Profile config is authoritative (builtins < user/global < project); the UI never
 creates a second store. show/inspect redact large prompt bodies unless
@@ -228,6 +234,15 @@ export async function run(
       ...(deps.projectConfigPathOverride !== undefined
         ? { projectConfigPathOverride: deps.projectConfigPathOverride }
         : {}),
+    });
+  }
+  if (command === "github") {
+    return await runGithubCommand(rest, {
+      stdout: deps.stdout,
+      stderr: deps.stderr,
+      ...(deps.env !== undefined ? { env: deps.env } : {}),
+      ...(deps.fs !== undefined ? { fs: deps.fs } : {}),
+      ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}),
     });
   }
   if (command === "profile" || command === "profiles") {
