@@ -90,16 +90,24 @@ describe("orca-pi profiles list", () => {
       profiles: { name: string }[];
       config: { userExists: boolean; projectExists: boolean };
     };
-    expect(parsed.profiles.map((entry) => entry.name)).toEqual(["scout"]);
+    // Fresh-install built-ins merge with the user file layer.
+    expect(parsed.profiles.map((entry) => entry.name)).toEqual([
+      "reviewer",
+      "scout",
+      "worker",
+    ]);
     expect(parsed.config.userExists).toBe(true);
     expect(parsed.config.projectExists).toBe(false);
   });
 
-  it("reports no profiles with config locations when both files are missing", async () => {
+  it("exposes fresh-install built-ins when both files are missing", async () => {
     const { deps, out } = makeDeps({});
     const result = await run(["profiles", "list"], deps);
     expect(result.exitCode).toBe(0);
-    expect(out.join("")).toContain("No Pi profiles found");
+    const text = out.join("");
+    expect(text).toContain("scout");
+    expect(text).toContain("worker");
+    expect(text).toContain("reviewer");
   });
 
   it("rejects unknown list flags with exit 2", async () => {
@@ -176,7 +184,8 @@ describe("orca-pi profile inspect", () => {
     const text = out.join("");
     expect(text).toContain("Context policy");
     expect(text).toContain("pi --model anthropic/claude-haiku");
-    expect(text).toContain("summary:");
+    // Single JEF-10 context-summary contract.
+    expect(text).toContain("estimates, not provider billing");
   });
 
   it("awaits an async JEF-7-style provider for file-backed prompts (systemPromptFile)", async () => {
@@ -291,10 +300,12 @@ describe("orca-pi profile inspect", () => {
     const result = await run(["profile", "inspect", "scout", "--json", "--context-summary"], deps);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(out.join("")) as {
-      contextSummary: { thinking: string };
+      contextSummary: { profileName: string; promptChars: number };
       launchPreview: string;
     };
-    expect(parsed.contextSummary.thinking).toBe("low");
+    // Single JEF-10 context-summary contract (prompt chars/words/lines).
+    expect(parsed.contextSummary.profileName).toBe("scout");
+    expect(parsed.contextSummary.promptChars).toBeGreaterThan(0);
     expect(parsed.launchPreview).toBe("preview");
   });
 });
@@ -306,7 +317,15 @@ describe("orca-pi profile validate", () => {
     });
     const result = await run(["profile", "validate"], deps);
     expect(result.exitCode).toBe(0);
-    expect(out.join("")).toContain("All 1 profile valid");
+    // User scout merges with built-in scout: reviewer + scout + worker.
+    expect(out.join("")).toContain("All 3 profiles valid");
+  });
+
+  it("validates fresh-install built-ins with no config files", async () => {
+    const { deps, out } = makeDeps({});
+    const result = await run(["profile", "validate"], deps);
+    expect(result.exitCode).toBe(0);
+    expect(out.join("")).toContain("All 3 profiles valid");
   });
 
   it("exits 1 with file/source/field diagnostics for invalid profiles", async () => {
@@ -380,6 +399,44 @@ describe("orca-pi profile path", () => {
     // Malformed-but-present files count as existing so users can find them.
     expect(parsed.userExists).toBe(true);
     expect(parsed.projectExists).toBe(false);
+  });
+});
+
+describe("fresh-install defaults through JEF-11 commands (JEF-10 built-ins)", () => {
+  it("profile show reports built-in provenance with no config files", async () => {
+    const { deps, out } = makeDeps({});
+    const result = await run(["profile", "show", "scout"], deps);
+    expect(result.exitCode).toBe(0);
+    const text = out.join("");
+    expect(text).toContain("scout");
+    expect(text).toContain("[built-in]");
+  });
+
+  it("profile show --json marks role fields built-in on fresh installs", async () => {
+    const { deps, out } = makeDeps({});
+    const result = await run(["profile", "show", "reviewer", "--json"], deps);
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(out.join("")) as {
+      profile: { name: string; thinking: string };
+      provenance: Record<string, string>;
+    };
+    expect(parsed.profile.name).toBe("reviewer");
+    expect(parsed.profile.thinking).toBe("high");
+    expect(parsed.provenance.thinking).toBe("built-in");
+    expect(parsed.provenance.tools).toBe("built-in");
+  });
+
+  it("profile inspect --context-summary uses the JEF-10 contract on fresh installs", async () => {
+    const { deps, out, err } = makeDeps({});
+    const result = await run(
+      ["profile", "inspect", "scout", "--context-summary"],
+      deps,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(err.join("")).toBe("");
+    const text = out.join("");
+    expect(text).toContain("estimates, not provider billing");
+    expect(text).toContain("profile: scout");
   });
 });
 

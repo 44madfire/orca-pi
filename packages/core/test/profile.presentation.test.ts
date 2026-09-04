@@ -15,21 +15,26 @@ import {
   type ProfileLayerContext,
 } from "../src/profile/presentation.js";
 import {
+  getBuiltinProfilesDocument,
+} from "../src/profile/builtins.js";
+import {
   mergeValidatedDocuments,
   parseAndValidateProfilesText,
 } from "../src/profile/load.js";
 
 function layersFor(userText?: string, projectText?: string): ProfileLayerContext {
+  const builtinDoc = getBuiltinProfilesDocument();
   const userDoc = userText
     ? parseAndValidateProfilesText(userText, "/home/u/.pi/agent/profiles.yaml")
     : undefined;
   const projectDoc = projectText
     ? parseAndValidateProfilesText(projectText, "/repo/p/.pi/profiles.yaml")
     : undefined;
-  const docs = [userDoc, projectDoc].filter((doc) => doc !== undefined);
+  const docs = [builtinDoc, userDoc, projectDoc].filter((doc) => doc !== undefined);
   const mergedDoc = mergeValidatedDocuments(docs);
   return {
     mergedDoc,
+    builtinDoc,
     ...(userDoc ? { userDoc } : {}),
     ...(projectDoc ? { projectDoc } : {}),
     userPath: "/home/u/.pi/agent/profiles.yaml",
@@ -40,17 +45,45 @@ function layersFor(userText?: string, projectText?: string): ProfileLayerContext
 }
 
 describe("presentation: provenance", () => {
-  it("attributes built-in defaults when no profile defines the field", () => {
+  it("attributes compiled defaults when no layer defines the field", () => {
     const layers = layersFor(
-      "profiles:\n  scout:\n    model: anthropic/claude-haiku\n",
+      "profiles:\n  custom:\n    model: anthropic/claude-haiku\n",
       undefined,
     );
-    const detail = describeProfile("scout", layers);
+    const detail = describeProfile("custom", layers);
     expect(detail.thinking.value).toBe("medium");
     expect(detail.thinking.provenance.kind).toBe("built-in");
     expect(detail.thinking.provenance.display).toBe("built-in");
     expect(detail.model.value).toBe("anthropic/claude-haiku");
     expect(detail.model.provenance.kind).toBe("user");
+  });
+
+  it("attributes JEF-10 built-in role fields as built-in on fresh installs", () => {
+    const layers = layersFor(undefined, undefined);
+    const detail = describeProfile("scout", layers);
+    expect(detail.resolved.thinking).toBe("low");
+    expect(detail.thinking.provenance.kind).toBe("built-in");
+    expect(detail.thinking.provenance.display).toBe("built-in");
+    expect(detail.tools.value).toEqual(["read", "grep", "find", "ls"]);
+    expect(detail.tools.provenance.kind).toBe("built-in");
+    expect(detail.systemPrompt.value).toContain("repository scout");
+    expect(detail.systemPrompt.provenance.kind).toBe("built-in");
+    // No model in the model-agnostic built-ins.
+    expect(detail.model.value).toBeUndefined();
+  });
+
+  it("keeps role policy built-in under a sparse user model override", () => {
+    const layers = layersFor(
+      "profiles:\n  scout:\n    model: anthropic/claude-haiku\n",
+      undefined,
+    );
+    const detail = describeProfile("scout", layers);
+    expect(detail.model.value).toBe("anthropic/claude-haiku");
+    expect(detail.model.provenance.display).toBe("user config");
+    expect(detail.thinking.value).toBe("low");
+    expect(detail.thinking.provenance.kind).toBe("built-in");
+    expect(detail.tools.provenance.kind).toBe("built-in");
+    expect(detail.systemPrompt.provenance.kind).toBe("built-in");
   });
 
   it("prefers project config over user config for the same profile field", () => {
@@ -143,9 +176,10 @@ describe("presentation: source-precedence display", () => {
       "profiles:\n  worker:\n    model: anthropic/claude-sonnet\n    thinking: high\n",
     );
     const summaries = summarizeAllProfiles(layers);
-    expect(summaries.map((entry) => entry.name)).toEqual(["scout", "worker"]);
+    // Fresh-install builtins (reviewer/scout/worker) merge with file layers.
+    expect(summaries.map((entry) => entry.name)).toEqual(["reviewer", "scout", "worker"]);
     const text = formatProfilesList(summaries, layers, {});
-    expect(text).toContain("Pi profiles (2)");
+    expect(text).toContain("Pi profiles (3)");
     expect(text).toContain("scout");
     expect(text).toContain("worker");
     expect(text).toContain("precedence");
@@ -195,7 +229,8 @@ describe("presentation: validation UX", () => {
   it("reports all-valid with per-profile sources", () => {
     const layers = layersFor("profiles:\n  s:\n    model: x\n", undefined);
     const report = formatValidationReport(validateAllProfiles(layers), layers, {});
-    expect(report).toContain("All 1 profile valid");
+    // Custom profile plus the three fresh-install built-ins.
+    expect(report).toContain("All 4 profiles valid");
   });
 
   it("inspect includes context policy and JEF-7 launch note when no provider", () => {
@@ -210,11 +245,11 @@ describe("presentation: validation UX", () => {
     expect(text).toContain("never builds argv itself");
     const withPreview = formatProfileInspect(detail, layers, {
       launchPreview: "pi --model x --thinking medium (redacted)",
-      contextSummary: true,
+      contextSummaryText: "context summary for profile \"s\" (estimates, not provider billing):\n  prompt: 0 chars",
     });
     expect(withPreview).toContain("Launch preview");
     expect(withPreview).toContain("pi --model");
-    expect(withPreview).toContain("summary:");
+    expect(withPreview).toContain("estimates, not provider billing");
   });
 
   it("toPanelModel is metadata-only (no prompt bodies)", () => {
@@ -223,8 +258,8 @@ describe("presentation: validation UX", () => {
       undefined,
     );
     const model = toPanelModel(layers);
-    expect(model.profiles[0]?.name).toBe("s");
-    expect(model.profiles[0]?.skillCount).toBe(2);
+    const entry = model.profiles.find((profile) => profile.name === "s");
+    expect(entry?.skillCount).toBe(2);
     expect(JSON.stringify(model)).not.toContain("inline secret body");
     expect(model.validation.ok).toBe(true);
   });

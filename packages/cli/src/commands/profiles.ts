@@ -25,18 +25,23 @@
 import {
   describeProfile,
   formatConfigPaths,
+  formatContextSummary,
   formatProfileInspect,
   formatProfileShow,
   formatProfilesList,
   formatValidationReport,
+  getBuiltinProfilesDocument,
   getProjectProfilesPath,
   getUserProfilesPath,
   loadProfilesFile,
   mergeValidatedDocuments,
   normalizeLaunchPreview,
   summarizeAllProfiles,
+  summarizeProfileContext,
   validateAllProfiles,
   type LaunchPreviewProvider,
+  type LaunchPreviewResult,
+  type ProfileContextSummary,
   type ProfileLayerContext,
   type ValidatedProfilesDocument,
 } from "@orca-pi/core";
@@ -75,10 +80,11 @@ Usage:
   orca-pi profile validate [<name>] [--json]
   orca-pi profile path [--project|--user] [--json]
 
-The CLI/profile file is authoritative (user/global < project); the UI never
-creates a second store. show/inspect redact large prompt bodies unless
---show-prompt is given. inspect never builds Pi argv itself — launch preview
-comes from JEF-7's async build+format helper when injected.
+Configuration precedence (low → high): builtins < user/global < project.
+Fresh installs expose built-in scout/worker/reviewer with no config files.
+show/inspect redact large prompt bodies unless --show-prompt is given.
+inspect never builds Pi argv itself — launch preview comes from JEF-7's
+async build+format helper when injected.
 `;
 
 const PROFILE_INSPECT_USAGE =
@@ -126,12 +132,17 @@ async function loadLayers(
     loadProfilesFile(userPath, fsOpts),
     loadProfilesFile(projectPath, fsOpts),
   ]);
-  const docs: ValidatedProfilesDocument[] = [];
+  // JEF-10 built-in layer (lowest precedence): fresh installs expose
+  // scout/worker/reviewer even when both config files are absent. Same
+  // merge policy as `loadMergedProfiles` (builtins < user < project).
+  const builtinDoc = getBuiltinProfilesDocument();
+  const docs: ValidatedProfilesDocument[] = [builtinDoc];
   if (userDoc) docs.push(userDoc);
   if (projectDoc) docs.push(projectDoc);
   const mergedDoc = mergeValidatedDocuments(docs);
   return {
     mergedDoc,
+    builtinDoc,
     ...(userDoc ? { userDoc } : {}),
     ...(projectDoc ? { projectDoc } : {}),
     userPath,
@@ -385,6 +396,37 @@ async function runShow(
   try {
     const detail = describeProfile(name, layers);
     const home = deps.homedir;
+    // Fetch the JEF-7 launch preview once for inspect (async: may read
+    // prompt files). Its prompt text/source also feeds JEF-10's context
+    // summary so there is one contract for both.
+    let previewResult: LaunchPreviewResult | undefined;
+    if (options.inspect && deps.getLaunchPreview) {
+      try {
+        previewResult = normalizeLaunchPreview(
+          await deps.getLaunchPreview(detail.resolved, {
+            projectRoot: effectiveProjectRoot,
+            cwd: effectiveCwd,
+            showFullPrompt: showPrompt,
+          }),
+        );
+      } catch (error) {
+        // Production launch failures (e.g. missing prompt file) are
+        // actionable exit-1 errors, matching JEF-7's inspect contract.
+        deps.stderr(
+          `error: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        return { exitCode: 1 };
+      }
+    }
+    const contextSummaryFor = (): ProfileContextSummary | undefined => {
+      if (!contextSummary) return undefined;
+      const source = previewResult?.promptSource;
+      return summarizeProfileContext(
+        detail.resolved,
+        previewResult?.promptText,
+        source === "inline" || source === "file" || source === "none" ? source : undefined,
+      );
+    };
     if (asJson) {
       // JSON stays redacted unless --show-prompt: large prompt bodies are
       // replaced with a truncated preview plus an explicit flag.
@@ -426,80 +468,40 @@ async function runShow(
         ...(promptTruncated ? { promptTruncated: true } : {}),
       };
       if (options.inspect) {
-        if (deps.getLaunchPreview) {
-          try {
-            const preview = normalizeLaunchPreview(
-              await deps.getLaunchPreview(detail.resolved, {
-                projectRoot: effectiveProjectRoot,
-                cwd: effectiveCwd,
-                showFullPrompt: showPrompt,
-              }),
-            );
-            payload.launchPreview = preview.preview;
-            // Structured JEF-7 launch fields stay top-level so `--json`
-            // keeps the `{ profile, spec, promptSource, … }` contract.
-            for (const key of [
-              "spec",
-              "promptSource",
-              "promptFileRelativePath",
-              "promptFileAbsolutePath",
-              "promptTransport",
-              "promptTempPath",
-              "promptText",
-            ] as const) {
-              const value = preview[key];
-              if (value !== undefined) payload[key] = value;
-            }
-          } catch (error) {
-            deps.stderr(
-              `error: ${error instanceof Error ? error.message : String(error)}\n`,
-            );
-            return { exitCode: 1 };
+        if (previewResult) {
+          payload.launchPreview = previewResult.preview;
+          // Structured JEF-7 launch fields stay top-level so `--json`
+          // keeps the `{ profile, spec, promptSource, … }` contract.
+          for (const key of [
+            "spec",
+            "promptSource",
+            "promptFileRelativePath",
+            "promptFileAbsolutePath",
+            "promptTransport",
+            "promptTempPath",
+            "promptText",
+          ] as const) {
+            const value = previewResult[key];
+            if (value !== undefined) payload[key] = value;
           }
         } else {
           payload.launchPreview = null;
           payload.launchPreviewNote =
             "unavailable — deterministic Pi argv is owned by JEF-7 (ResolvedPiProfile → ProcessSpec + redacted formatter)";
         }
-        if (contextSummary) {
-          payload.contextSummary = {
-            thinking: detail.resolved.thinking,
-            toolCount: detail.resolved.tools?.length,
-            skillCount: detail.resolved.skills?.length ?? 0,
-            extensionCount: detail.resolved.extensions?.length ?? 0,
-            contextFiles: detail.resolved.contextFiles,
-            session: detail.resolved.session,
-          };
-        }
+        const summary = contextSummaryFor();
+        if (summary) payload.contextSummary = summary;
       }
       deps.stdout(`${JSON.stringify(payload, null, 2)}\n`);
       return { exitCode: 0 };
     }
     if (options.inspect) {
-      let launchPreview: string | undefined;
-      if (deps.getLaunchPreview) {
-        try {
-          launchPreview = normalizeLaunchPreview(
-            await deps.getLaunchPreview(detail.resolved, {
-              projectRoot: effectiveProjectRoot,
-              cwd: effectiveCwd,
-              showFullPrompt: showPrompt,
-            }),
-          ).preview;
-        } catch (error) {
-          // Production launch failures (e.g. missing prompt file) are
-          // actionable exit-1 errors, matching JEF-7's inspect contract.
-          deps.stderr(
-            `error: ${error instanceof Error ? error.message : String(error)}\n`,
-          );
-          return { exitCode: 1 };
-        }
-      }
+      const summary = contextSummaryFor();
       deps.stdout(
         `${formatProfileInspect(detail, layers, {
           showPrompt,
-          contextSummary,
-          ...(launchPreview !== undefined ? { launchPreview } : {}),
+          ...(summary ? { contextSummaryText: formatContextSummary(summary) } : {}),
+          ...(previewResult !== undefined ? { launchPreview: previewResult.preview } : {}),
           ...(home !== undefined ? { home } : {}),
         })}\n`,
       );

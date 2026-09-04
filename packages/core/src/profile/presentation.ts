@@ -21,6 +21,7 @@
  *   command, whose purpose is to locate configuration.
  */
 
+import { BUILTIN_PROFILES_SOURCE } from "./builtins.js";
 import { BUILTIN_PROFILE_DEFAULTS } from "./schema.js";
 import { resolveProfile } from "./resolve.js";
 import type {
@@ -123,6 +124,8 @@ export interface FieldProvenance {
 
 export interface ProfileLayerContext {
   mergedDoc: ValidatedProfilesDocument;
+  /** JEF-10 built-in defaults (lowest layer; always present in CLI use). */
+  builtinDoc: ValidatedProfilesDocument;
   userDoc?: ValidatedProfilesDocument;
   projectDoc?: ValidatedProfilesDocument;
   userPath: string;
@@ -316,9 +319,10 @@ function fieldDefinedIn(
  * Determine per-field provenance for one resolved profile.
  *
  * Walks the `extends` chain root-first (last definition wins), then attributes
- * the winning definition to the user or project layer (project wins when both
- * define the same profile field, mirroring `mergeValidatedDocuments`). Fields
- * no profile defines are `built-in` defaults.
+ * the winning definition to the project, user, or built-in layer (project wins
+ * over user wins over JEF-10 builtins, mirroring `mergeValidatedDocuments`).
+ * Fields from JEF-10's built-in document (`BUILTIN_PROFILES_SOURCE`) report
+ * `built-in`, as do fields no profile defines (compiled `BUILTIN_DEFAULTS`).
  */
 export function getFieldProvenance(
   profileName: string,
@@ -326,7 +330,7 @@ export function getFieldProvenance(
   chain: readonly string[],
   layers: Pick<
     ProfileLayerContext,
-    "mergedDoc" | "userDoc" | "projectDoc" | "userPath" | "projectPath"
+    "mergedDoc" | "builtinDoc" | "userDoc" | "projectDoc" | "userPath" | "projectPath"
   >,
 ): FieldProvenance {
   let definer: string | undefined;
@@ -352,22 +356,30 @@ export function getFieldProvenance(
   } else if (fieldDefinedIn(layers.userDoc, definer, field)) {
     kind = "user";
     configPath = layers.userPath;
+  } else if (fieldDefinedIn(layers.builtinDoc, definer, field)) {
+    kind = "built-in";
+    configPath = undefined;
   } else {
     // Layer docs unavailable (e.g. single-file callers): fall back to the
     // merged entry's source label without inventing a layer.
     const mergedEntry = layers.mergedDoc.profiles[definer];
     const label = mergedEntry?.sourceLabel ?? layers.mergedDoc.sourceLabel;
-    const looksProject =
-      label === layers.projectPath || label.includes(layers.projectPath);
-    kind = looksProject ? "project" : "user";
-    configPath = looksProject ? layers.projectPath : layers.userPath;
+    if (label === BUILTIN_PROFILES_SOURCE) {
+      kind = "built-in";
+      configPath = undefined;
+    } else {
+      const looksProject =
+        label === layers.projectPath || label.includes(layers.projectPath);
+      kind = looksProject ? "project" : "user";
+      configPath = looksProject ? layers.projectPath : layers.userPath;
+    }
   }
   const inherited = definer !== profileName;
   if (inherited) {
     return {
       kind,
       definedIn: definer,
-      configPath,
+      ...(configPath !== undefined ? { configPath } : {}),
       inherited: true,
       display: `inherited profile "${definer}" (${layerDisplay(kind)})`,
     };
@@ -375,7 +387,7 @@ export function getFieldProvenance(
   return {
     kind,
     definedIn: definer,
-    configPath,
+    ...(configPath !== undefined ? { configPath } : {}),
     inherited: false,
     display: layerDisplay(kind),
   };
@@ -690,17 +702,25 @@ export function formatProfileShow(
     lines.push("Note: inline prompt truncated (redacted display). Re-run with --show-prompt for the full text.");
   }
   lines.push("");
-  lines.push("Provenance: built-in = compiled defaults; user/project config = file layer; inherited profile = ancestor in extends chain.");
+  lines.push("Provenance: built-in = compiled defaults or JEF-10 role defaults; user/project config = file layer; inherited profile = ancestor in extends chain.");
   return lines.join("\n");
 }
 
-/** Human-readable `profile inspect` — `show` plus context policy and optional JEF-7 launch preview. */
+/**
+ * Human-readable `profile inspect` — `show` plus context policy, optional
+ * JEF-10 context summary, and optional JEF-7 launch preview.
+ *
+ * The context summary text comes from JEF-10's `formatContextSummary()`
+ * (one contract, one test set); callers compute it via
+ * `summarizeProfileContext()` and pass the rendered block here.
+ */
 export function formatProfileInspect(
   detail: ProfileDetail,
   layers: Pick<ProfileLayerContext, "userPath" | "projectPath">,
   options?: {
     showPrompt?: boolean;
-    contextSummary?: boolean;
+    /** Rendered `formatContextSummary()` block (JEF-10 contract). */
+    contextSummaryText?: string;
     launchPreview?: string;
     home?: string;
   },
@@ -727,11 +747,9 @@ export function formatProfileInspect(
   );
   for (const extension of extensions.slice(0, 20)) lines.push(`    - ${extension}`);
   if (extensions.length > 20) lines.push(`    … and ${extensions.length - 20} more`);
-  if (options?.contextSummary) {
+  if (options?.contextSummaryText !== undefined) {
     lines.push("");
-    lines.push(
-      `  summary: thinking=${detail.resolved.thinking}, tools=${detail.resolved.tools?.length ?? "default"}, skills=${skills.length}, extensions=${extensions.length}, session=${detail.resolved.session}`,
-    );
+    lines.push(options.contextSummaryText);
   }
   lines.push("");
   if (options?.launchPreview !== undefined) {
