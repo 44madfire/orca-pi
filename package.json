@@ -16,7 +16,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "doctor": "node packages/cli/dist/main.js doctor",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "check:skill-size": "node scripts/check-skill-size.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",

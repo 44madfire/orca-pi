@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * `orca-pi` companion CLI (OP1.1 scaffold + OP1.2 profiles + OP1.3 launcher
- * + OP1.6 / JEF-10 defaults + OP1.7 UX).
+ * + OP1.6 / JEF-10 defaults + OP1.7 UX + OP1.5 / JEF-9 compact orchestration).
  *
  * Owns profile loading, deterministic Pi argv construction (JEF-7), profile
  * management UX (JEF-11: list/show/inspect/validate/path with provenance),
@@ -31,6 +31,7 @@ import {
   type ResolvedPiProfile,
 } from "@orca-pi/core";
 import { runProfilesCommand } from "./commands/profiles.js";
+import { runOrchestrationCommand } from "./commands/orchestration.js";
 
 export interface CliDeps {
   runner: ProcessRunner;
@@ -55,6 +56,16 @@ export interface CliDeps {
   getLaunchPreview?: LaunchPreviewProvider;
   userConfigPathOverride?: string;
   projectConfigPathOverride?: string;
+  /**
+   * JEF-9 seam: injectable Orca boundary (fake in tests, process-backed in
+   * prod via `createOrcaCliProcess(runner)`). When omitted, orchestration
+   * commands build one from `runner`.
+   */
+  orca?: import("@orca-pi/core").OrcaCli;
+  /** Override the Orca executable name (default "orca"). */
+  orcaExecutable?: string;
+  /** Injectable worker-mapping file store (tests); defaults to node:fs. */
+  mappingFs?: import("@orca-pi/core").MappingFs;
 }
 
 export interface CliResult {
@@ -72,15 +83,26 @@ Usage:
   orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]
   orca-pi profile validate [<name>] [--json]
   orca-pi profile path [--project|--user] [--json]
+  orca-pi spawn <profile> (--task <spec> | --task-id <id>) [--worktree <policy>] [--json]
+  orca-pi status [--worker <handle>|--task <id>] [--json]
+  orca-pi send --worker <handle> --message <text> [--json]
+  orca-pi wait (--worker <handle>|--task <id>) [--timeout <duration>] [--json]
+  orca-pi stop --worker <handle> [--json]
 
 Commands:
   doctor        Verify \`orca\` and \`pi\` are on PATH and report versions (read-only).
   profiles      List Pi role profiles (effective model/thinking/tools/skills).
   profile       Show/inspect/validate one profile or locate config files (inspect includes deterministic Pi argv, read-only, never launches Pi).
+  spawn         Launch a role-specialized Orca-supervised Pi worker (Orca owns Task/Dispatch/worktree).
+  status        Inspect worker/task state via Orca (never terminal-text inference).
+  send          Send coordinator follow-up mail to one worker (structured inbox, not injection).
+  wait          Wait for worker/task settlement with bounded polling/backoff/timeout.
+  stop          Fence one worker terminal idempotently (never marks the Task complete).
 
 Profile config is authoritative (builtins < user/global < project); the UI never
 creates a second store. show/inspect redact large prompt bodies unless
---show-prompt is given.
+--show-prompt is given. Choose profiles by role (scout, worker, reviewer);
+Orca owns Tasks/Dispatches/worktrees and completion.
 `;
 
 function usage(deps: CliDeps): CliResult {
@@ -180,6 +202,33 @@ export async function run(
   }
   if (command === "doctor") {
     return await runDoctor(rest, deps);
+  }
+  if (
+    command === "spawn" ||
+    command === "status" ||
+    command === "send" ||
+    command === "wait" ||
+    command === "stop"
+  ) {
+    return await runOrchestrationCommand(command, rest, {
+      stdout: deps.stdout,
+      stderr: deps.stderr,
+      projectRoot: defaultProjectRoot(deps),
+      runner: deps.runner,
+      ...(deps.orca !== undefined ? { orca: deps.orca } : {}),
+      ...(deps.orcaExecutable !== undefined ? { orcaExecutable: deps.orcaExecutable } : {}),
+      ...(deps.env !== undefined ? { env: deps.env } : {}),
+      ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir !== undefined ? { osHomedir: deps.osHomedir } : {}),
+      ...(deps.fs !== undefined ? { fs: deps.fs } : {}),
+      ...(deps.mappingFs !== undefined ? { mappingFs: deps.mappingFs } : {}),
+      ...(deps.userConfigPathOverride !== undefined
+        ? { userConfigPathOverride: deps.userConfigPathOverride }
+        : {}),
+      ...(deps.projectConfigPathOverride !== undefined
+        ? { projectConfigPathOverride: deps.projectConfigPathOverride }
+        : {}),
+    });
   }
   if (command === "profile" || command === "profiles") {
     return await runProfilesCommand(rest, {

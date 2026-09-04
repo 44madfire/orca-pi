@@ -3,11 +3,13 @@
 Orca–Pi orchestration (**OP1.1 / JEF-5** scaffold + **OP1.2 / JEF-6** Pi agent
 profiles + **OP1.3 / JEF-7** deterministic Pi argv launcher + **OP1.6 / JEF-10**
 default scout/worker/reviewer profiles + **OP1.7 / JEF-11** profile management
-UX): a thin Orca plugin
+UX + **OP1.4 / JEF-8** supervised worker adapter + **OP1.5 / JEF-9** compact
+Pi-facing orchestration CLI/skill): a thin Orca plugin
 plus a separately testable companion `orca-pi` CLI/library.
 
-Later tickets add Orca Tasks/Dispatches — without coupling orchestration logic
-to Orca's experimental plugin-worker internals.
+Orca owns Runs/Tasks/Dispatches/worktrees and completion; `orca-pi` is a thin
+Pi-facing wrapper that never couples orchestration logic to Orca's
+experimental plugin-worker internals.
 
 Ownership boundary: JEF-7 owns `ResolvedPiProfile` → `ProcessSpec` and the
 redacted launch-spec formatter; JEF-11 owns CLI commands,
@@ -23,17 +25,21 @@ consumes JEF-7's formatter via injection rather than implementing another one.
    the plugin is explicitly **not** a long-term dependency.
 2. **Companion `orca-pi` CLI/library** (`packages/cli/` + `packages/core/`) —
    owns version reporting, `doctor` diagnostics, profile loading,
-   deterministic Pi argv construction (OP1.3 / JEF-7), and calls to the
-   public `orca` CLI in later tickets.
+   deterministic Pi argv construction (OP1.3 / JEF-7), supervised Pi worker
+   launches (OP1.4 / JEF-8), and the compact Pi-facing orchestration surface
+   (OP1.5 / JEF-9: `spawn`/`status`/`send`/`wait`/`stop` plus the
+   `orca-pi-orchestration` skill). All Orca calls use the public `orca` CLI
+   (`--json`).
 
 ```text
 orca-pi/
 ├── packages/
-│   ├── core/          # version + doctor + plugin-manifest validator + Pi profiles + Pi launcher (no Electron)
+│   ├── core/          # version + doctor + manifest validator + profiles + launcher + supervised adapter + compact orchestration (no Electron)
 │   ├── cli/           # `orca-pi` executable (thin wrapper over core)
 │   └── orca-plugin/   # Orca manifest, panel/skill/command contributions
 ├── profiles/          # Pi agent profile schema docs + defaults + examples (OP1.2 / JEF-6 + OP1.6 / JEF-10)
 ├── prompts/           # Default scout/worker/reviewer role prompts (OP1.6 / JEF-10)
+├── scripts/           # skill-size regression guard (OP1.5 / JEF-9)
 ├── docs/              # targeted Orca plugin API/version notes + manual evals
 └── README.md
 ```
@@ -90,6 +96,8 @@ node packages/cli/dist/main.js profile inspect scout --project-root .
 node packages/cli/dist/main.js profile inspect scout --project-root . --context-summary
 node packages/cli/dist/main.js profile validate
 node packages/cli/dist/main.js profile path
+node packages/cli/dist/main.js status --json
+node scripts/check-skill-size.mjs
 ```
 
 Or link it globally for the `orca-pi` name:
@@ -139,6 +147,33 @@ orca-pi doctor
   user/global and project locations (script-friendly with `--project`/`--user`).
   Never parses file contents, so it stays usable when config is malformed
   (recovery UX; content diagnostics belong to `validate`).
+- `orca-pi spawn <profile> (--task <spec>|--task-id <id>) [--worktree <policy>] [--json]`
+  resolves the role profile pre-launch (unknown profiles fail before any Orca
+  effects) then launches an Orca-supervised Pi worker via JEF-8's adapter.
+  Returns one frozen receipt (`taskId`, `dispatchId`, `terminalHandle`,
+  worktree, Pi argv). `--worktree` is `current` (default), `new-child` /
+  `new-top-level` (require `--name`), or an existing selector (`active`,
+  `id:…`, `name:…`, `path:…`). Exit `1` on profile/Orca failures.
+- `orca-pi status [--worker <dispatch|terminal>|--task <id>] [--json]`
+  inspects Orca Task/Dispatch state (never terminal-text inference). Bare
+  `status` sweeps workers (plus tasks when a Run is bound). Exit `0` with a
+  stable receipt; exit `1` for unknown workers/tasks.
+- `orca-pi send --worker <handle> --message <text> [--subject <text>] [--json]`
+  delivers coordinator follow-up mail (`send --to dispatch:<id>`), preserving
+  provenance. Never sends `worker_done`/`heartbeat` (worker-owned signals).
+- `orca-pi wait (--worker <handle>|--task <id>) [--timeout <duration>] [--json]`
+  polls Orca state with backoff until `completed`/`failed` or timeout
+  (`500ms`, `30s`, `5m`, `1h`; plain numbers mean seconds; default `15m`).
+  Exit `0` on `completed`, `1` on `failed`/`timeout`. Timeouts mean
+  "still running", never failure.
+- `orca-pi stop --worker <handle> [--json]` fences one worker terminal
+  (`worker-stop`) idempotently (`alreadyStopped` on repeats). It never marks
+  the Task complete/failed — Orca owns completion; the observed `taskStatus`
+  is reported unchanged.
+
+Compact orchestration keeps only minimal handle mappings
+(`<projectRoot>/.pi/orca-pi-workers.json`, best-effort); Orca remains the
+source of truth for completion/status.
 
 ## Orca plugin
 
@@ -163,9 +198,18 @@ orca-pi doctor
   host's closed built-in list — so a command waits for a later ticket with a
   real worker or a suitable built-in action.
 - The plugin is declarative-only: no `main` worker entry, `capabilities: []`.
-- Placeholder skill `skills/orca-pi-doctor/SKILL.md`. Note: manifest v1 has
-  no `skills` contribution point, so the skill ships as repo documentation
-  and is installed through Orca's skill flow, not the plugin manifest.
+- Skills (`skills/`, installed through Orca's skill flow, not the plugin
+  manifest — v1 has no `skills` contribution point):
+  - `orca-pi-doctor/SKILL.md` (OP1.1) — read-only `doctor` diagnostics.
+  - `orca-pi-orchestration/SKILL.md` (OP1.5 / JEF-9) — compact Pi-facing
+    orchestration: when to use `orca-pi`, the five semantic commands, role
+    profiles, worktree policy, and Orca-authority rules. No model/tool
+    lists, no full orchestration guide copy. Load in Pi via
+    `pi --skill packages/orca-plugin/skills/orca-pi-orchestration`.
+    Size: ~3.4KB (~840 tokens, 83 lines) vs upstream
+    `orca skills get orchestration --full` ~42.5KB (~10.6k tokens, 440
+    lines) — ~8%. Guarded by `node scripts/check-skill-size.mjs`
+    (budget ≤6000 bytes / ≤1600 tokens).
 - Dependency-free entry `src/index.ts` (`activate()`, `renderPluginStatus()`)
   proves the artifact loads without Electron.
 
@@ -222,12 +266,45 @@ If your Orca build reports a manifest error, update
   production preview as `formatPiInspect(resolved, await buildPiLaunch(…))`
   via async `LaunchPreviewProvider` injection (JEF-11 never builds argv).
 
-## Non-goals (OP1.1 + OP1.2 + OP1.3 + OP1.7)
+## Compact orchestration (OP1.5 / JEF-9): scout → worker → reviewer with only compact commands
 
-- No Orca Tasks/Dispatches yet (OP1.4 / JEF-8 owns the supervised adapter).
+A Pi coordinator runs the normal worker lifecycle without loading Orca's
+full orchestration guide — only `orca-pi` plus the `orca-pi-orchestration`
+skill:
+
+```sh
+# 1. Scout (read-only inspection, evidence-backed handoff)
+orca-pi spawn scout --task "Map the auth flow; cite files/symbols and uncertainties" --json
+orca-pi wait --task <scout-task-id> --timeout 10m --json
+
+# 2. Worker (bounded implementation)
+orca-pi spawn worker --task "Implement the fix per the scout handoff; keep the diff scoped" --json
+orca-pi send --worker <worker-dispatch> --message "Prefer approach X; see file Y for the pattern" --json
+orca-pi wait --worker <worker-dispatch> --timeout 15m --json
+
+# 3. Reviewer (independent evaluation, no edits)
+orca-pi spawn reviewer --task "Review the diff for <worker-task-id> against acceptance criteria" --json
+orca-pi wait --task <reviewer-task-id> --timeout 10m --json
+
+# Fence a worker terminal when done (idempotent; never marks the Task complete)
+orca-pi stop --worker <worker-dispatch> --json
+
+# Inspect at any time (Orca-state only, never terminal text)
+orca-pi status --worker <dispatch> --json
+orca-pi status --task <task-id> --json
+```
+
+Orca owns completion/status throughout: `status`/`wait` read
+Task/Dispatch state, `send` is structured inbox mail (not injection),
+and `stop` fences the terminal without completing the Task.
+
+## Non-goals (OP1.1 + OP1.2 + OP1.3 + OP1.7 + OP1.4 + OP1.5)
+
 - No transcript parsing.
 - No Orca core fork.
 - No panel-local config store or undocumented filesystem/network bridge.
+- No coordinator-side completion authority (Orca Task/Dispatch state only).
+- No role-specific model/tool duplication outside profile config.
 
 ## Upstream references
 
