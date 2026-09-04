@@ -1,0 +1,8 @@
+{
+  "id": "fixture-worker-show-running",
+  "ok": true,
+  "result": {
+    "dispatch": { "id": "dispatch_abc", "task_id": "task_123", "status": "dispatched" },
+    "worker": { "state": "running", "stage": "executing", "agent_terminal_handle": "term_xyz" }
+  }
+}

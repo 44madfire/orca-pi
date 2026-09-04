@@ -1,0 +1,7 @@
+{
+  "id": "fixture-dispatch-show",
+  "ok": true,
+  "result": {
+    "dispatch": { "id": "dispatch_1", "task_id": "task_1", "status": "dispatched" }
+  }
+}

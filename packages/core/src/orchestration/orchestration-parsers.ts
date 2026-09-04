@@ -6,6 +6,18 @@
  * nested fields that vary across Orca versions. Parsers return normalized
  * summaries plus the raw `result` for forward compatibility — they never
  * echo prompts/secrets and never infer completion from terminal text.
+ *
+ * Current Orca contract (verified against live `orca ... --json`):
+ * - `worker-show`: `dispatch: { id, task_id, status }` plus
+ *   `worker: { state, stage, agent_terminal_handle }`. Dispatch status and
+ *   worker state are separate concepts and are kept separate here.
+ * - `worker-list`: rows expose direct `workerState`, `dispatchStatus`,
+ *   `agentTerminalHandle`, and `terminalState` (plus legacy nested shapes).
+ * - `dispatch-show`: `{ dispatch: { id, task_id, status } | null }` (plus
+ *   optional preamble). It carries no authoritative Task status — callers
+ *   fall back to `task-list` for `taskStatus`.
+ * - Worker settled states: `succeeded`, `failed`, `stopped`, `abandoned`.
+ *   Task settled statuses: `completed`, `failed`, `blocked` (unchanged).
  */
 
 import { ORCA_JSON_SNIPPET_LIMIT, OrcaJsonParseError } from "../orca/json-parsers.js";
@@ -74,17 +86,35 @@ function parseEnvelopeResult(stdout: string, context: string): unknown {
   return parsed["result"];
 }
 
-/** Normalized `worker-show --dispatch` view (Orca-state only, no terminal-text inference). */
+/**
+ * Normalized `worker-show --dispatch` view (Orca-state only).
+ *
+ * Keeps Dispatch status (`dispatch.status`) and worker lifecycle state
+ * (`worker.state`/`worker.stage`) separate: `dispatchStatus` is the
+ * Dispatch attempt status, `workerState` is the worker lifecycle state
+ * (`succeeded`/`failed`/`stopped`/`abandoned` when settled). Never maps
+ * one onto the other.
+ */
 export interface ParsedWorkerShow {
   readonly dispatchId: string;
   readonly taskId?: string;
+  /** Dispatch attempt status (`dispatch.status`), separate from worker state. */
+  readonly dispatchStatus?: string;
+  /** Worker lifecycle state (`worker.state`, fallback `worker.stage`). */
   readonly workerState?: string;
+  /** Worker stage detail (`worker.stage`) when present. */
+  readonly stage?: string;
   readonly terminalHandle?: string;
   readonly supervised?: boolean;
   readonly raw: unknown;
 }
 
-/** Parse `orchestration worker-show --dispatch ... --json` stdout. */
+/**
+ * Parse `orchestration worker-show --dispatch ... --json` stdout.
+ *
+ * Current shape: `dispatch: { id, task_id, status }` plus
+ * `worker: { state, stage, agent_terminal_handle }`.
+ */
 export function parseWorkerShowJson(stdout: string, fallbackDispatchId: string): ParsedWorkerShow {
   const context = "worker-show";
   const result = parseEnvelopeResult(stdout, context);
@@ -102,33 +132,37 @@ export function parseWorkerShowJson(stdout: string, fallbackDispatchId: string):
       child(worker, "dispatch_id"),
     ]) ?? fallbackDispatchId;
   const taskId = firstString([
-    child(dispatch, "taskId"),
     child(dispatch, "task_id"),
+    child(dispatch, "taskId"),
     child(dispatch, "task"),
     child(result, "taskId"),
     child(result, "task_id"),
     child(worker, "taskId"),
     child(worker, "task_id"),
   ]);
-  const workerState = firstString([
+  // Dispatch status first from its own object only — never from worker state.
+  const dispatchStatus = firstString([
+    child(dispatch, "status"),
     child(dispatch, "state"),
     child(dispatch, "stage"),
-    child(dispatch, "status"),
-    child(result, "state"),
-    child(result, "stage"),
-    child(result, "status"),
+  ]);
+  // Worker lifecycle state only from worker/observation — never dispatch.status.
+  const workerState = firstString([
     child(worker, "state"),
     child(worker, "status"),
     child(observation, "state"),
+    child(result, "workerState"),
+    child(result, "state"),
   ]);
+  const stage = firstString([child(worker, "stage"), child(result, "stage")]);
   const terminalHandle = firstString([
+    child(worker, "agent_terminal_handle"),
+    child(worker, "agentTerminalHandle"),
+    child(worker, "terminalHandle"),
+    child(worker, "terminal_handle"),
     child(dispatch, "terminalHandle"),
     child(dispatch, "terminal_handle"),
     child(dispatch, "agentTerminalHandle"),
-    child(worker, "terminalHandle"),
-    child(worker, "terminal_handle"),
-    child(worker, "agent_terminal_handle"),
-    child(worker, "agentTerminalHandle"),
     child(result, "terminalHandle"),
     child(result, "agentTerminalHandle"),
   ]);
@@ -141,19 +175,24 @@ export function parseWorkerShowJson(stdout: string, fallbackDispatchId: string):
   return {
     dispatchId,
     ...(taskId !== undefined ? { taskId } : {}),
+    ...(dispatchStatus !== undefined ? { dispatchStatus } : {}),
     ...(workerState !== undefined ? { workerState } : {}),
+    ...(stage !== undefined ? { stage } : {}),
     ...(terminalHandle !== undefined ? { terminalHandle } : {}),
     ...(supervised !== undefined ? { supervised } : {}),
     raw: result,
   };
 }
 
-/** One normalized worker-list row. */
+/** One normalized worker-list row (dispatch status vs worker state kept separate). */
 export interface ParsedWorkerListEntry {
   readonly dispatchId?: string;
   readonly taskId?: string;
   readonly terminalHandle?: string;
   readonly terminalState?: string;
+  /** Dispatch attempt status (row `dispatchStatus` or nested `dispatch.status`). */
+  readonly dispatchStatus?: string;
+  /** Worker lifecycle state (row `workerState` or nested `worker.state`). */
   readonly workerState?: string;
   readonly supervised?: boolean;
 }
@@ -177,34 +216,50 @@ export function parseWorkerListJson(stdout: string): { entries: ParsedWorkerList
       child(worker, "dispatchId"),
     ]);
     const taskId = firstString([
+      child(dispatch, "task_id"),
       child(dispatch, "taskId"),
       child(row, "taskId"),
       child(row, "task_id"),
       child(worker, "taskId"),
     ]);
     const terminalHandle = firstString([
-      child(dispatch, "terminalHandle"),
-      child(worker, "terminalHandle"),
+      child(row, "agentTerminalHandle"),
+      child(row, "agent_terminal_handle"),
+      child(row, "terminalHandle"),
       child(worker, "agent_terminal_handle"),
       child(worker, "agentTerminalHandle"),
+      child(worker, "terminalHandle"),
+      child(dispatch, "terminalHandle"),
       child(terminal, "handle"),
-      child(row, "terminalHandle"),
-      child(row, "agentTerminalHandle"),
     ]);
-    const terminalState = firstString([child(row, "terminalState"), child(row, "terminal_state")]);
+    const terminalState = firstString([
+      child(row, "terminalState"),
+      child(row, "terminal_state"),
+      child(terminal, "state"),
+    ]);
+    // Direct row fields first (current contract), then nested legacy shapes.
+    // Worker state never falls back to dispatch status and vice versa.
     const workerState = firstString([
-      child(dispatch, "state"),
-      child(row, "state"),
-      child(row, "status"),
+      child(row, "workerState"),
+      child(row, "worker_state"),
       child(worker, "state"),
+      child(worker, "status"),
     ]);
-    const unsupervisedRaw = child(dispatch, "unsupervised") ?? child(row, "unsupervised");
+    const dispatchStatus = firstString([
+      child(row, "dispatchStatus"),
+      child(row, "dispatch_status"),
+      child(dispatch, "status"),
+      child(dispatch, "state"),
+    ]);
+    const unsupervisedRaw =
+      child(dispatch, "unsupervised") ?? child(row, "unsupervised") ?? child(worker, "unsupervised");
     const supervised = unsupervisedRaw === true ? false : undefined;
     return {
       ...(dispatchId !== undefined ? { dispatchId } : {}),
       ...(taskId !== undefined ? { taskId } : {}),
       ...(terminalHandle !== undefined ? { terminalHandle } : {}),
       ...(terminalState !== undefined ? { terminalState } : {}),
+      ...(dispatchStatus !== undefined ? { dispatchStatus } : {}),
       ...(workerState !== undefined ? { workerState } : {}),
       ...(supervised !== undefined ? { supervised } : {}),
     };
@@ -212,10 +267,21 @@ export function parseWorkerListJson(stdout: string): { entries: ParsedWorkerList
   return { entries: Object.freeze(entries) as ParsedWorkerListEntry[], raw: result };
 }
 
-/** Normalized `dispatch-show --task` view. */
+/**
+ * Normalized `dispatch-show --task` view.
+ *
+ * Current shape is only `{ dispatch: { id, task_id, status } | null }`
+ * (plus optional preamble). It carries the Dispatch identity/status but no
+ * authoritative Task status — callers must fall back to `task-list` for
+ * `taskStatus`. `dispatch.status` is exposed as `dispatchStatus` only and
+ * is never relabeled as worker or task state.
+ */
 export interface ParsedDispatchShow {
   readonly taskId: string;
   readonly dispatchId?: string;
+  /** Dispatch attempt status (`dispatch.status`), separate from task/worker state. */
+  readonly dispatchStatus?: string;
+  /** Authoritative Task status — always undefined from dispatch-show alone. */
   readonly taskStatus?: string;
   readonly workerState?: string;
   readonly terminalHandle?: string;
@@ -227,12 +293,11 @@ export function parseDispatchShowJson(stdout: string, fallbackTaskId: string): P
   const context = "dispatch-show";
   const result = parseEnvelopeResult(stdout, context);
   const dispatch = child(result, "dispatch");
-  const task = child(result, "task");
   const worker = child(result, "worker");
+  // `dispatch` may be null when no attempt exists yet — taskId then falls back.
   const taskId =
     firstString([
-      child(task, "id"),
-      child(task, "taskId"),
+      child(dispatch, "task_id"),
       child(dispatch, "taskId"),
       child(result, "taskId"),
       child(result, "task_id"),
@@ -244,36 +309,27 @@ export function parseDispatchShowJson(stdout: string, fallbackTaskId: string): P
     child(result, "dispatch_id"),
     child(worker, "dispatchId"),
   ]);
-  const taskStatus = firstString([
-    child(task, "status"),
-    child(task, "state"),
-    child(result, "taskStatus"),
-    child(dispatch, "taskStatus"),
-  ]);
-  const workerState = firstString([
-    child(dispatch, "state"),
-    child(dispatch, "status"),
-    child(result, "state"),
-    child(result, "status"),
-    child(worker, "state"),
-  ]);
+  const dispatchStatus = firstString([child(dispatch, "status"), child(dispatch, "state")]);
+  // dispatch-show carries no task object and no worker lifecycle state in the
+  // current contract; worker/terminal detail (when present) is best-effort only.
+  const workerState = firstString([child(worker, "state"), child(worker, "status")]);
   const terminalHandle = firstString([
-    child(dispatch, "terminalHandle"),
-    child(worker, "terminalHandle"),
     child(worker, "agent_terminal_handle"),
+    child(worker, "agentTerminalHandle"),
+    child(dispatch, "terminalHandle"),
     child(result, "terminalHandle"),
   ]);
   return {
     taskId,
     ...(dispatchId !== undefined ? { dispatchId } : {}),
-    ...(taskStatus !== undefined ? { taskStatus } : {}),
+    ...(dispatchStatus !== undefined ? { dispatchStatus } : {}),
     ...(workerState !== undefined ? { workerState } : {}),
     ...(terminalHandle !== undefined ? { terminalHandle } : {}),
     raw: result,
   };
 }
 
-/** One normalized task-list row. */
+/** One normalized task-list row (authoritative Task status source). */
 export interface ParsedTaskListEntry {
   readonly taskId: string;
   readonly status?: string;
@@ -336,15 +392,20 @@ export function isSuccessfulTaskStatus(status: unknown): boolean {
   return typeof status === "string" && status.toLowerCase() === "completed";
 }
 
-/** True when a worker/dispatch state means the terminal is settled. */
+/**
+ * True when a worker lifecycle state means settled.
+ *
+ * Current Orca worker states settle on `succeeded`, `failed`, `stopped`,
+ * or `abandoned`. Dispatch attempt statuses and Task statuses use their
+ * own vocabularies and are classified separately.
+ */
 export function isSettledWorkerState(state: unknown): boolean {
   if (typeof state !== "string") return false;
   const normalized = state.toLowerCase().replace(/[^a-z_]/g, "");
   return (
-    normalized === "completed" ||
+    normalized === "succeeded" ||
     normalized === "failed" ||
     normalized === "stopped" ||
-    normalized === "released" ||
-    normalized === "releaseready"
+    normalized === "abandoned"
   );
 }

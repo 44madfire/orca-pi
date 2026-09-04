@@ -1,0 +1,25 @@
+{
+  "id": "fixture-worker-list",
+  "ok": true,
+  "result": {
+    "workers": [
+      {
+        "dispatchId": "dispatch_1",
+        "taskId": "task_1",
+        "workerState": "running",
+        "dispatchStatus": "dispatched",
+        "agentTerminalHandle": "term_1",
+        "terminalState": "active"
+      },
+      {
+        "dispatchId": "dispatch_2",
+        "taskId": "task_2",
+        "workerState": "succeeded",
+        "dispatchStatus": "completed",
+        "agentTerminalHandle": "term_2",
+        "terminalState": "active"
+      }
+    ],
+    "counts": {}
+  }
+}

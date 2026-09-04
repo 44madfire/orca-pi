@@ -50,7 +50,14 @@ function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & { calls: string[]
     },
     async showWorker(dispatchId: string) {
       calls.push(`showWorker:${dispatchId}`);
-      return { dispatchId, taskId: "task_1", workerState: "ready", terminalHandle: "term_1", raw: {} };
+      return {
+        dispatchId,
+        taskId: "task_1",
+        dispatchStatus: "dispatched",
+        workerState: "running",
+        terminalHandle: "term_1",
+        raw: {},
+      };
     },
     async listWorkers() {
       calls.push("listWorkers");
@@ -58,11 +65,11 @@ function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & { calls: string[]
     },
     async showDispatch(taskId: string) {
       calls.push(`showDispatch:${taskId}`);
-      return { taskId, dispatchId: "dispatch_1", taskStatus: "dispatched", raw: {} };
+      return { taskId, dispatchId: "dispatch_1", dispatchStatus: "dispatched", raw: {} };
     },
     async listTasks() {
       calls.push("listTasks");
-      return { entries: [], raw: {} };
+      return { entries: [{ taskId: "task_1", status: "dispatched" }], raw: {} };
     },
     async sendToDispatch(input) {
       calls.push(`sendToDispatch:${input.dispatchId}`);
@@ -110,12 +117,36 @@ describe("spawnCompactWorker selects the correct profile", () => {
 });
 
 describe("getCompactStatus uses Orca state, not terminal text", () => {
-  it("reads a single worker via worker-show + dispatch-show", async () => {
+  it("reads a single worker via worker-show + task-list (dispatch status kept separate)", async () => {
     const orca = makeFakeOrca();
     const receipt = await getCompactStatus({ orca, worker: "dispatch_1" });
     expect(receipt.kind).toBe("worker");
     expect(receipt.status?.dispatchId).toBe("dispatch_1");
+    expect(receipt.status?.dispatchStatus).toBe("dispatched");
+    expect(receipt.status?.workerState).toBe("running");
+    expect(receipt.status?.taskStatus).toBe("dispatched");
     expect(receipt.status?.settled).toBe(false);
+  });
+
+  it("resolves settled workers via task completed + worker succeeded", async () => {
+    const orca = makeFakeOrca({
+      async showWorker(dispatchId: string) {
+        return {
+          dispatchId,
+          taskId: "task_1",
+          dispatchStatus: "completed",
+          workerState: "succeeded",
+          terminalHandle: "term_1",
+          raw: {},
+        };
+      },
+      async listTasks() {
+        return { entries: [{ taskId: "task_1", status: "completed" }], raw: {} };
+      },
+    });
+    const receipt = await getCompactStatus({ orca, worker: "dispatch_1" });
+    expect(receipt.status?.settled).toBe(true);
+    expect(receipt.status?.ok).toBe(true);
   });
 
   it("reads a task via dispatch-show", async () => {
@@ -148,10 +179,17 @@ describe("waitCompact success/timeout/failed", () => {
   it("returns completed when the task reports completed", async () => {
     const orca = makeFakeOrca({
       async showWorker(dispatchId: string) {
-        return { dispatchId, taskId: "task_1", workerState: "ready", terminalHandle: "term_1", raw: {} };
+        return {
+          dispatchId,
+          taskId: "task_1",
+          dispatchStatus: "completed",
+          workerState: "succeeded",
+          terminalHandle: "term_1",
+          raw: {},
+        };
       },
-      async showDispatch(taskId: string) {
-        return { taskId, dispatchId: "dispatch_1", taskStatus: "completed", raw: {} };
+      async listTasks() {
+        return { entries: [{ taskId: "task_1", status: "completed" }], raw: {} };
       },
     });
     const receipt = await waitCompact({
@@ -171,8 +209,8 @@ describe("waitCompact success/timeout/failed", () => {
 
   it("returns failed when the task reports failed", async () => {
     const orca = makeFakeOrca({
-      async showDispatch(taskId: string) {
-        return { taskId, dispatchId: "dispatch_1", taskStatus: "failed", raw: {} };
+      async listTasks() {
+        return { entries: [{ taskId: "task_1", status: "failed" }], raw: {} };
       },
     });
     const receipt = await waitCompact({
@@ -226,8 +264,8 @@ describe("stopCompact idempotency", () => {
 
   it("distinguishes terminal stop from Task completion (task status observed, never set)", async () => {
     const orca = makeFakeOrca({
-      async showDispatch(taskId: string) {
-        return { taskId, dispatchId: "dispatch_1", taskStatus: "dispatched", raw: {} };
+      async listTasks() {
+        return { entries: [{ taskId: "task_1", status: "dispatched" }], raw: {} };
       },
     });
     const receipt = await stopCompact({ orca, worker: "dispatch_1" });

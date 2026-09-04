@@ -152,7 +152,9 @@ export interface OrcaCli {
   showWorker(dispatchId: string): Promise<{
     readonly dispatchId: string;
     readonly taskId?: string;
+    readonly dispatchStatus?: string;
     readonly workerState?: string;
+    readonly stage?: string;
     readonly terminalHandle?: string;
     readonly supervised?: boolean;
     readonly raw: unknown;
@@ -164,6 +166,7 @@ export interface OrcaCli {
       readonly taskId?: string;
       readonly terminalHandle?: string;
       readonly terminalState?: string;
+      readonly dispatchStatus?: string;
       readonly workerState?: string;
       readonly supervised?: boolean;
     }[];
@@ -176,6 +179,7 @@ export interface OrcaCli {
   ): Promise<{
     readonly taskId: string;
     readonly dispatchId?: string;
+    readonly dispatchStatus?: string;
     readonly taskStatus?: string;
     readonly workerState?: string;
     readonly terminalHandle?: string;

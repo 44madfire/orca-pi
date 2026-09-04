@@ -122,8 +122,13 @@ function formatStatusHuman(receipt: import("@orca-pi/core").CompactStatusReceipt
     } else {
       lines.push(`workers (${workers.length}):`);
       for (const w of workers) {
+        const stateBits = [
+          w.taskStatus ? `task ${w.taskStatus}` : null,
+          w.dispatchStatus ? `dispatch ${w.dispatchStatus}` : null,
+          w.workerState ? `worker ${w.workerState}` : null,
+        ].filter((bit): bit is string => bit !== null);
         lines.push(
-          `  ${w.dispatchId ?? w.terminalHandle ?? "(unknown)"} · task ${w.taskId ?? "?"} (${w.taskStatus ?? w.workerState ?? "state unknown"}) · terminal ${w.terminalHandle ?? "?"} · ${w.settled ? "settled" : "running"}`,
+          `  ${w.dispatchId ?? w.terminalHandle ?? "(unknown)"} · task ${w.taskId ?? "?"} (${stateBits.join(", ") || "state unknown"}) · terminal ${w.terminalHandle ?? "?"} · ${w.settled ? "settled" : "running"}`,
         );
       }
     }

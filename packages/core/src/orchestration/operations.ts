@@ -170,6 +170,7 @@ function summarizeWorkerStatus(input: {
   dispatchId?: string;
   taskId?: string;
   taskStatus?: string;
+  dispatchStatus?: string;
   workerState?: string;
   terminalHandle?: string;
 }): CompactWorkerStatus {
@@ -181,6 +182,7 @@ function summarizeWorkerStatus(input: {
   const parts: string[] = [];
   if (input.dispatchId) parts.push(`dispatch ${input.dispatchId}`);
   if (input.taskId) parts.push(`task ${input.taskId} (${input.taskStatus ?? "status unknown"})`);
+  if (input.dispatchStatus) parts.push(`dispatch ${input.dispatchStatus}`);
   if (input.workerState) parts.push(`worker ${input.workerState}`);
   if (input.terminalHandle) parts.push(`terminal ${input.terminalHandle}`);
   parts.push(settled ? "settled" : "running");
@@ -188,6 +190,7 @@ function summarizeWorkerStatus(input: {
     ...(input.dispatchId !== undefined ? { dispatchId: input.dispatchId } : {}),
     ...(input.taskId !== undefined ? { taskId: input.taskId } : {}),
     ...(input.taskStatus !== undefined ? { taskStatus: input.taskStatus } : {}),
+    ...(input.dispatchStatus !== undefined ? { dispatchStatus: input.dispatchStatus } : {}),
     ...(input.workerState !== undefined ? { workerState: input.workerState } : {}),
     ...(input.terminalHandle !== undefined ? { terminalHandle: input.terminalHandle } : {}),
     settled,
@@ -210,17 +213,29 @@ export async function resolveWorkerToDispatch(
       diagnostics: "worker-resolve: empty handle.",
     });
   }
-  // 1. Local mapping first (no Orca call).
+  // 1. Local mapping is a hint only — Orca stays authoritative. When a
+  // mapping hits, still prove the mapped Dispatch is live before trusting it
+  // (especially for side-effecting `send`); stale mappings fall through to
+  // live resolution below.
   if (options?.projectRoot) {
     try {
       const table = await loadWorkerMappings(options.projectRoot, options.mappingFs);
       const hit = resolveMapping(table, trimmed);
       if (hit) {
-        return {
-          dispatchId: hit.dispatchId,
-          terminalHandle: hit.terminalHandle,
-          taskId: hit.taskId,
-        };
+        try {
+          const validated = await orca.showWorker(hit.dispatchId);
+          return {
+            dispatchId: validated.dispatchId,
+            ...(validated.terminalHandle !== undefined
+              ? { terminalHandle: validated.terminalHandle }
+              : { terminalHandle: hit.terminalHandle }),
+            ...(validated.taskId !== undefined
+              ? { taskId: validated.taskId }
+              : { taskId: hit.taskId }),
+          };
+        } catch {
+          // Stale mapping — fall through to live resolution.
+        }
       }
     } catch {
       // Fall through to live Orca resolution.
@@ -288,32 +303,25 @@ export async function getCompactStatus(
       ...(options.mappingFs !== undefined ? { mappingFs: options.mappingFs } : {}),
     });
     const shown = await orca.showWorker(resolved.dispatchId);
+    // Authoritative Task status comes from task-list; dispatch-show carries
+    // only Dispatch identity/status in the current contract.
     let taskStatus: string | undefined;
     if (shown.taskId) {
       try {
-        const dispatch = await orca.showDispatch(shown.taskId, {
+        const listed = await orca.listTasks({
+          ...(options.runId !== undefined ? { runId: options.runId } : {}),
           ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
         });
-        taskStatus = dispatch.taskStatus;
+        taskStatus = listed.entries.find((entry) => entry.taskId === shown.taskId)?.status;
       } catch {
-        // Task detail is best-effort; worker-show already proved liveness.
-      }
-      if (taskStatus === undefined) {
-        try {
-          const listed = await orca.listTasks({
-            ...(options.runId !== undefined ? { runId: options.runId } : {}),
-            ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
-          });
-          taskStatus = listed.entries.find((entry) => entry.taskId === shown.taskId)?.status;
-        } catch {
-          // run_required (no Run bound) means tasks are unavailable; worker state stands alone.
-        }
+        // run_required (no Run bound) means tasks are unavailable; worker state stands alone.
       }
     }
     const status = summarizeWorkerStatus({
       dispatchId: shown.dispatchId,
       ...(shown.taskId !== undefined ? { taskId: shown.taskId } : {}),
       ...(taskStatus !== undefined ? { taskStatus } : {}),
+      ...(shown.dispatchStatus !== undefined ? { dispatchStatus: shown.dispatchStatus } : {}),
       ...(shown.workerState !== undefined ? { workerState: shown.workerState } : {}),
       ...(shown.terminalHandle !== undefined ? { terminalHandle: shown.terminalHandle } : {}),
     });
@@ -331,24 +339,40 @@ export async function getCompactStatus(
         diagnostics: "status: empty task id.",
       });
     }
+    // dispatch-show carries Dispatch identity/status only in the current
+    // contract — authoritative Task status always comes from task-list.
     const dispatch = await orca.showDispatch(taskId, {
       ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
     });
     let workerState = dispatch.workerState;
     let terminalHandle = dispatch.terminalHandle;
+    let dispatchStatus = dispatch.dispatchStatus;
     if (dispatch.dispatchId && (workerState === undefined || terminalHandle === undefined)) {
       try {
         const shown = await orca.showWorker(dispatch.dispatchId);
         workerState = workerState ?? shown.workerState;
         terminalHandle = terminalHandle ?? shown.terminalHandle;
+        dispatchStatus = dispatchStatus ?? shown.dispatchStatus;
       } catch {
         // dispatch-show already proved the task exists; worker detail is best-effort.
       }
     }
+    let taskStatus: string | undefined;
+    try {
+      const listed = await orca.listTasks({
+        ...(options.runId !== undefined ? { runId: options.runId } : {}),
+        ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
+      });
+      taskStatus = listed.entries.find((entry) => entry.taskId === dispatch.taskId)?.status;
+    } catch (error) {
+      if (!isRunRequired(error)) throw error;
+      // No Run bound: Dispatch identity still answers; task status stays unknown.
+    }
     const status = summarizeWorkerStatus({
       ...(dispatch.dispatchId !== undefined ? { dispatchId: dispatch.dispatchId } : {}),
       taskId: dispatch.taskId,
-      ...(dispatch.taskStatus !== undefined ? { taskStatus: dispatch.taskStatus } : {}),
+      ...(taskStatus !== undefined ? { taskStatus } : {}),
+      ...(dispatchStatus !== undefined ? { dispatchStatus } : {}),
       ...(workerState !== undefined ? { workerState } : {}),
       ...(terminalHandle !== undefined ? { terminalHandle } : {}),
     });
@@ -365,6 +389,7 @@ export async function getCompactStatus(
     summarizeWorkerStatus({
       ...(entry.dispatchId !== undefined ? { dispatchId: entry.dispatchId } : {}),
       ...(entry.taskId !== undefined ? { taskId: entry.taskId } : {}),
+      ...(entry.dispatchStatus !== undefined ? { dispatchStatus: entry.dispatchStatus } : {}),
       ...(entry.workerState !== undefined ? { workerState: entry.workerState } : {}),
       ...(entry.terminalHandle !== undefined ? { terminalHandle: entry.terminalHandle } : {}),
     }),
@@ -477,37 +502,33 @@ async function readStatusForWait(
   orca: OrcaCli,
   target: { dispatchId?: string; taskId?: string },
   options: Pick<WaitOperationOptions, "runId" | "fromHandle">,
-): Promise<{ taskStatus?: string; workerState?: string; terminalHandle?: string }> {
+): Promise<{
+  taskStatus?: string;
+  dispatchStatus?: string;
+  workerState?: string;
+  terminalHandle?: string;
+}> {
   let taskStatus: string | undefined;
+  let dispatchStatus: string | undefined;
   let workerState: string | undefined;
   let terminalHandle: string | undefined;
   if (target.dispatchId) {
     try {
       const shown = await orca.showWorker(target.dispatchId);
       workerState = shown.workerState;
+      dispatchStatus = shown.dispatchStatus;
       terminalHandle = shown.terminalHandle;
       const taskId = shown.taskId ?? target.taskId;
       if (taskId) {
+        // Authoritative Task status comes from task-list in the current contract.
         try {
-          const dispatch = await orca.showDispatch(taskId, {
+          const listed = await orca.listTasks({
+            ...(options.runId !== undefined ? { runId: options.runId } : {}),
             ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
           });
-          taskStatus = dispatch.taskStatus;
-          workerState = workerState ?? dispatch.workerState;
-          terminalHandle = terminalHandle ?? dispatch.terminalHandle;
-        } catch {
-          // Fall through to task-list sweep below.
-        }
-        if (taskStatus === undefined) {
-          try {
-            const listed = await orca.listTasks({
-              ...(options.runId !== undefined ? { runId: options.runId } : {}),
-              ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
-            });
-            taskStatus = listed.entries.find((entry) => entry.taskId === taskId)?.status;
-          } catch (error) {
-            if (!isRunRequired(error)) throw error;
-          }
+          taskStatus = listed.entries.find((entry) => entry.taskId === taskId)?.status;
+        } catch (error) {
+          if (!isRunRequired(error)) throw error;
         }
       }
     } catch (error) {
@@ -526,32 +547,33 @@ async function readStatusForWait(
     const dispatch = await orca.showDispatch(target.taskId, {
       ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
     });
-    taskStatus = dispatch.taskStatus;
+    dispatchStatus = dispatch.dispatchStatus;
     workerState = dispatch.workerState;
     terminalHandle = dispatch.terminalHandle;
-    if (dispatch.dispatchId && (workerState === undefined || taskStatus === undefined)) {
+    if (dispatch.dispatchId && workerState === undefined) {
       try {
         const shown = await orca.showWorker(dispatch.dispatchId);
         workerState = workerState ?? shown.workerState;
         terminalHandle = terminalHandle ?? shown.terminalHandle;
+        dispatchStatus = dispatchStatus ?? shown.dispatchStatus;
       } catch {
         // dispatch-show already answered; worker detail is best-effort.
       }
     }
-    if (taskStatus === undefined) {
-      try {
-        const listed = await orca.listTasks({
-          ...(options.runId !== undefined ? { runId: options.runId } : {}),
-          ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
-        });
-        taskStatus = listed.entries.find((entry) => entry.taskId === target.taskId)?.status;
-      } catch (error) {
-        if (!isRunRequired(error)) throw error;
-      }
+    // Authoritative Task status always comes from task-list.
+    try {
+      const listed = await orca.listTasks({
+        ...(options.runId !== undefined ? { runId: options.runId } : {}),
+        ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
+      });
+      taskStatus = listed.entries.find((entry) => entry.taskId === target.taskId)?.status;
+    } catch (error) {
+      if (!isRunRequired(error)) throw error;
     }
   }
   return {
     ...(taskStatus !== undefined ? { taskStatus } : {}),
+    ...(dispatchStatus !== undefined ? { dispatchStatus } : {}),
     ...(workerState !== undefined ? { workerState } : {}),
     ...(terminalHandle !== undefined ? { terminalHandle } : {}),
   };
@@ -656,6 +678,7 @@ export async function waitCompact(options: WaitOperationOptions): Promise<Compac
         ...(target.dispatchId !== undefined ? { dispatchId: target.dispatchId } : {}),
         ...(target.taskId !== undefined ? { taskId: target.taskId } : {}),
         ...(state.taskStatus !== undefined ? { taskStatus: state.taskStatus } : {}),
+        ...(state.dispatchStatus !== undefined ? { dispatchStatus: state.dispatchStatus } : {}),
         ...(state.workerState !== undefined ? { workerState: state.workerState } : {}),
         elapsedMs,
         timedOut: false,
@@ -670,6 +693,7 @@ export async function waitCompact(options: WaitOperationOptions): Promise<Compac
         ...(target.dispatchId !== undefined ? { dispatchId: target.dispatchId } : {}),
         ...(target.taskId !== undefined ? { taskId: target.taskId } : {}),
         ...(state.taskStatus !== undefined ? { taskStatus: state.taskStatus } : {}),
+        ...(state.dispatchStatus !== undefined ? { dispatchStatus: state.dispatchStatus } : {}),
         ...(state.workerState !== undefined ? { workerState: state.workerState } : {}),
         elapsedMs,
         timedOut: true,
@@ -701,14 +725,15 @@ export async function stopCompact(options: StopOperationOptions): Promise<Compac
     ...(options.mappingFs !== undefined ? { mappingFs: options.mappingFs } : {}),
   });
   const stopped = await options.orca.stopWorker(resolved.dispatchId);
+  // Observed via task-list (authoritative); dispatch-show carries no Task status.
   let taskStatus: string | undefined;
   const taskId = resolved.taskId;
   if (taskId) {
     try {
-      const dispatch = await options.orca.showDispatch(taskId, {
+      const listed = await options.orca.listTasks({
         ...(options.fromHandle !== undefined ? { fromHandle: options.fromHandle } : {}),
       });
-      taskStatus = dispatch.taskStatus;
+      taskStatus = listed.entries.find((entry) => entry.taskId === taskId)?.status;
     } catch {
       // Task detail is best-effort after a successful fence.
     }

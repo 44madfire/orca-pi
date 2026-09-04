@@ -57,13 +57,15 @@ export interface CompactWorkerStatus {
   readonly dispatchId?: string;
   /** Task id when known. */
   readonly taskId?: string;
-  /** Normalized task status (`pending|ready|dispatched|completed|failed|blocked`) when known. */
+  /** Authoritative Task status (`pending|ready|dispatched|completed|failed|blocked`) from `task-list`. */
   readonly taskStatus?: string;
-  /** Normalized dispatch/worker state (`ready|failed|stopped|outcome_unknown|...`) when known. */
+  /** Dispatch attempt status (`dispatch.status`), separate from worker lifecycle state. */
+  readonly dispatchStatus?: string;
+  /** Worker lifecycle state (`worker.state`: `succeeded|failed|stopped|abandoned` when settled). */
   readonly workerState?: string;
   /** Terminal handle when known. */
   readonly terminalHandle?: string;
-  /** True when the worker is settled (completed/failed/stopped). */
+  /** True when settled (Task `completed|failed|blocked` or worker `succeeded|failed|stopped|abandoned`). */
   readonly settled: boolean;
   /** True when the outcome is successful (task completed). */
   readonly ok?: boolean;
@@ -99,6 +101,7 @@ export interface CompactWaitReceipt {
   readonly dispatchId?: string;
   readonly taskId?: string;
   readonly taskStatus?: string;
+  readonly dispatchStatus?: string;
   readonly workerState?: string;
   readonly elapsedMs: number;
   readonly timedOut: boolean;

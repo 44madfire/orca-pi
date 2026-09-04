@@ -60,7 +60,14 @@ function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & { calls: string[]
     },
     async showWorker(dispatchId: string) {
       calls.push(`showWorker:${dispatchId}`);
-      return { dispatchId, taskId: "task_1", workerState: "ready", terminalHandle: "term_1", raw: {} };
+      return {
+        dispatchId,
+        taskId: "task_1",
+        dispatchStatus: "dispatched",
+        workerState: "running",
+        terminalHandle: "term_1",
+        raw: {},
+      };
     },
     async listWorkers() {
       calls.push("listWorkers");
@@ -68,11 +75,11 @@ function makeFakeOrca(overrides?: Partial<OrcaCli>): OrcaCli & { calls: string[]
     },
     async showDispatch(taskId: string) {
       calls.push(`showDispatch:${taskId}`);
-      return { taskId, dispatchId: "dispatch_1", taskStatus: "dispatched", raw: {} };
+      return { taskId, dispatchId: "dispatch_1", dispatchStatus: "dispatched", raw: {} };
     },
     async listTasks() {
       calls.push("listTasks");
-      return { entries: [], raw: {} };
+      return { entries: [{ taskId: "task_1", status: "dispatched" }], raw: {} };
     },
     async sendToDispatch(input) {
       calls.push(`sendToDispatch:${input.dispatchId}`);
