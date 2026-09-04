@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * `orca-pi` companion CLI (OP1.1 scaffold + OP1.2 profiles + OP1.3 launcher).
+ * `orca-pi` companion CLI (OP1.1 scaffold + OP1.2 profiles + OP1.3 launcher
+ * + OP1.6 / JEF-10 default scout/worker/reviewer + context summary).
  *
  * Owns profile loading, deterministic Pi argv construction (JEF-7), and
  * calls to the public `orca` CLI. The thin Orca plugin shell delegates to
@@ -15,11 +16,13 @@ import {
   buildPiLaunch,
   createNodeRunner,
   doctor,
+  formatContextSummary,
   formatDoctorReport,
   formatPiInspect,
   loadMergedProfiles,
   ORCA_PI_VERSION,
   resolveProfile,
+  summarizeProfileContext,
   type ProcessRunner,
 } from "@orca-pi/core";
 
@@ -45,14 +48,14 @@ Usage:
   orca-pi --version | -V
   orca-pi --help | -h
   orca-pi doctor [--json]
-  orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt]
+  orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]
 
 Commands:
   doctor        Verify \`orca\` and \`pi\` are on PATH and report versions (read-only).
   profile       Inspect resolved Pi agent profiles and their deterministic Pi argv (read-only, never launches Pi).
 `;
 
-const PROFILE_INSPECT_USAGE = `usage: orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt]
+const PROFILE_INSPECT_USAGE = `usage: orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]
 `;
 
 function usage(deps: CliDeps): CliResult {
@@ -100,6 +103,7 @@ async function runProfileInspect(
   let projectConfigPath: string | undefined;
   let asJson = false;
   let showPrompt = false;
+  let contextSummary = false;
 
   let i = 0;
   if (args[i] === "--help" || args[i] === "-h") {
@@ -117,6 +121,9 @@ async function runProfileInspect(
       i++;
     } else if (arg === "--show-prompt") {
       showPrompt = true;
+      i++;
+    } else if (arg === "--context-summary") {
+      contextSummary = true;
       i++;
     } else if (arg === "--project-root") {
       const value = args[i + 1];
@@ -184,6 +191,11 @@ async function runProfileInspect(
       projectRoot: resolvedProjectRoot,
       cwd: resolvedCwd,
     });
+    const summary = summarizeProfileContext(
+      resolved,
+      launch.promptText,
+      launch.promptSource,
+    );
     if (asJson) {
       deps.stdout(
         `${JSON.stringify(
@@ -202,10 +214,17 @@ async function runProfileInspect(
               : {}),
             ...(launch.promptText !== undefined ? { promptText: launch.promptText } : {}),
             spec: launch.spec,
+            ...(contextSummary ? { contextSummary: summary } : {}),
           },
           null,
           2,
         )}\n`,
+      );
+    } else if (contextSummary) {
+      // Summary-first output for regression/debug use; still read-only and
+      // never launches Pi. Includes the full inspect below for context.
+      deps.stdout(
+        `${formatContextSummary(summary)}\n\n${formatPiInspect(resolved, launch, { showFullPrompt: showPrompt })}\n`,
       );
     } else {
       // Display-only formatter — never executed. Execution always uses

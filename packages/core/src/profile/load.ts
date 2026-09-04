@@ -12,9 +12,17 @@
  * The parser is content-sniffed (JSON when the trimmed text starts with
  * `{`), so the file extension never changes semantics. Malformed input
  * throws {@link ProfileLoadError} with line/column context where available.
+ *
+ * Precedence (low → high, OP1.2 / JEF-6 + OP1.6 / JEF-10 builtins):
+ *   0. built-in defaults (`getBuiltinProfilesDocument()`: scout/worker/
+ *      reviewer, model-agnostic) — always first unless `includeBuiltins`
+ *      is explicitly false (tests).
+ *   1. user/global config (`$PI_CODING_AGENT_DIR/profiles.yaml`)
+ *   2. project config (`<projectRoot>/.pi/profiles.yaml`)
  */
 
 import { parse as parseYaml } from "yaml";
+import { getBuiltinProfilesDocument } from "./builtins.js";
 import {
   ProfileValidationError,
   validateProfilesDocument,
@@ -108,10 +116,11 @@ export function parseAndValidateProfilesText(
 
 /**
  * Merge validated documents in precedence order (earlier = lower
- * precedence, later wins). Used for user/global → project layering:
+ * precedence, later wins). Used for builtins → user/global → project
+ * layering:
  *
  * ```ts
- * mergeValidatedDocuments([userDoc, projectDoc])
+ * mergeValidatedDocuments([builtinsDoc, userDoc, projectDoc])
  * ```
  *
  * Same-profile fields merge per-field with later documents overriding
@@ -233,7 +242,8 @@ export function getProjectProfilesPath(projectRoot: string): string {
 /**
  * Ordered candidate paths, low → high precedence:
  * `[user/global, project]`. Callers load existing files in this order and
- * merge with {@link mergeValidatedDocuments}.
+ * merge with {@link mergeValidatedDocuments}. Built-in defaults (JEF-10)
+ * sit below both and need no file path.
  */
 export function getCandidateConfigPaths(options: {
   projectRoot: string;
@@ -302,10 +312,14 @@ function isEnoent(error: unknown): boolean {
 }
 
 /**
- * Load and merge user/global + project configs in precedence order.
+ * Load and merge built-in defaults + user/global + project configs in
+ * precedence order (OP1.6 / JEF-10: fresh installs expose `scout`, `worker`,
+ * and `reviewer` even when no config files exist).
+ *
  * Missing files are skipped; malformed/invalid files throw. Returns the
- * merged document (possibly empty when no files exist). Never reads
- * prompt/skill file contents.
+ * merged document (builtins only when no files exist). Never reads
+ * prompt/skill file contents. Pass `includeBuiltins: false` only in tests
+ * that assert raw file-layer behavior without defaults.
  */
 export async function loadMergedProfiles(options: {
   projectRoot: string;
@@ -315,12 +329,18 @@ export async function loadMergedProfiles(options: {
   homedir?: string;
   osHomedir?: () => string;
   fs?: Pick<typeof import("node:fs/promises"), "readFile">;
+  /** Include built-in scout/worker/reviewer defaults (default true). */
+  includeBuiltins?: boolean;
 }): Promise<ValidatedProfilesDocument> {
+  const includeBuiltins = options.includeBuiltins ?? true;
   const userPath =
     options.userConfigPath ??
     getUserProfilesPath({ env: options.env, homedir: options.homedir, osHomedir: options.osHomedir });
   const projectPath = options.projectConfigPath ?? getProjectProfilesPath(options.projectRoot);
   const documents: ValidatedProfilesDocument[] = [];
+  if (includeBuiltins) {
+    documents.push(getBuiltinProfilesDocument());
+  }
   for (const filePath of [userPath, projectPath]) {
     const document = await loadProfilesFile(filePath, { fs: options.fs });
     if (document) documents.push(document);

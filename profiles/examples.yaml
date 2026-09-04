@@ -1,10 +1,23 @@
-# Example Pi agent profiles (OP1.2 / JEF-6).
+# Example Pi agent profiles (OP1.2 / JEF-6 + OP1.6 / JEF-10 defaults).
 #
-# Copy to `$PI_CODING_AGENT_DIR/profiles.yaml` (user/global) or
-# `<projectRoot>/.pi/profiles.yaml` (project) and adapt models/paths.
+# Fresh installs already expose built-in `scout`, `worker`, and `reviewer`
+# (model-agnostic, see `profiles/scout.yaml`, `worker.yaml`, `reviewer.yaml`
+# and `prompts/*.md`). Copy the blocks below into
+# `$PI_CODING_AGENT_DIR/profiles.yaml` (user/global) or
+# `<projectRoot>/.pi/profiles.yaml` (project) to select models or add
+# project-specific skills while retaining the default role policy:
+#
+#   profiles:
+#     scout:
+#       model: <fast-model>
+#     worker:
+#       model: <coding-model>
+#     reviewer:
+#       model: <reasoning-model>
+#
 # Validate with:
-#   node -e "import('@orca-pi/core').then(async (m) => { ... })"
-# or wait for JEF-7's `orca-pi launch --profile <name>` (deterministic argv).
+#   orca-pi profile inspect scout --project-root .
+#   orca-pi profile inspect scout --project-root . --context-summary
 #
 # Rules: `extends` is single-parent (cycles/unknown parents fail pre-launch);
 # arrays replace wholesale in v1; `systemPrompt`/`systemPromptFile` are
@@ -40,3 +53,17 @@ profiles:
     contextFiles: true
     displayName: Worker
     description: Coding worker with full tool access.
+
+  reviewer:
+    model: anthropic/claude-sonnet
+    thinking: high
+    systemPromptFile: .pi/agents/reviewer.md
+    tools: [read, grep, find, ls, bash]
+    skills: []
+    extensions: []
+    contextFiles: false
+    discoverSkills: false
+    discoverExtensions: false
+    session: ephemeral
+    displayName: Reviewer
+    description: Independent review with blocking vs non-blocking findings.

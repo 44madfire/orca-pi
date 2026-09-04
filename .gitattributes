@@ -1,0 +1,5 @@
+# Enforce LF for prompt/profile text files so builtin prompt sync tests
+# stay byte-identical across Windows/macOS/Linux checkouts.
+prompts/*.md text eol=lf
+profiles/*.yaml text eol=lf
+packages/core/test/fixtures/profiles/* text eol=lf
