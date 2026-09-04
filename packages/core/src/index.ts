@@ -99,6 +99,7 @@ export {
   mergeValidatedDocuments,
   normalizeLaunchPreview,
   normalizeProjectRelativePath,
+  sanitizeLaunchPreviewForDisplay,
   parseAndValidateProfilesText,
   parseProfilesText,
   ProfileLoadError,

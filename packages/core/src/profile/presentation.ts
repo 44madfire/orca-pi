@@ -98,6 +98,8 @@ export interface LaunchPreviewResult {
   promptTransport?: unknown;
   promptTempPath?: string;
   promptText?: string;
+  /** Set by {@link sanitizeLaunchPreviewForDisplay} when truncation applied. */
+  promptTruncated?: boolean;
 }
 
 /** Normalize a provider return into its structured form. */
@@ -105,6 +107,53 @@ export function normalizeLaunchPreview(
   value: LaunchPreviewResult | string,
 ): LaunchPreviewResult {
   return typeof value === "string" ? { preview: value } : value;
+}
+
+/**
+ * Display-only JSON sanitizer for structured launch previews (JEF-11).
+ *
+ * The human `preview` string is already redacted by JEF-7's formatter, but
+ * the structured fields (`promptText`, `spec.args` after `--system-prompt`)
+ * carry the full prompt. When `showFullPrompt` is false, this returns a copy
+ * with long prompt bodies truncated (same 240-char preview policy as
+ * {@link formatPromptForDisplay}) so default `inspect --json` honors the
+ * `redacted: true` contract. Never mutates its input or the executable
+ * `PiProcessSpec` — `spec.args` is copied before redaction. Pass
+ * `showFullPrompt: true` (`--show-prompt`) to expose full values.
+ */
+export function sanitizeLaunchPreviewForDisplay(
+  preview: LaunchPreviewResult,
+  options?: { showFullPrompt?: boolean; limit?: number },
+): LaunchPreviewResult {
+  if (options?.showFullPrompt) return preview;
+  const limit = options?.limit ?? PROMPT_PREVIEW_LIMIT;
+  let truncated = false;
+  const redactText = (text: string): string => {
+    if (text.length <= limit) return text;
+    truncated = true;
+    return `${text.slice(0, limit)}…`;
+  };
+  const out: LaunchPreviewResult = { ...preview };
+  if (typeof out.promptText === "string") {
+    const redacted = redactText(out.promptText);
+    if (redacted !== out.promptText) out.promptText = redacted;
+  }
+  const spec = out.spec as { args?: unknown } | undefined;
+  if (spec && typeof spec === "object" && Array.isArray(spec.args)) {
+    const args = spec.args as unknown[];
+    const index = args.indexOf("--system-prompt");
+    if (index !== -1 && index + 1 < args.length && typeof args[index + 1] === "string") {
+      const full = args[index + 1] as string;
+      const redacted = redactText(full);
+      if (redacted !== full) {
+        const nextArgs = [...args];
+        nextArgs[index + 1] = redacted;
+        out.spec = { ...spec, args: nextArgs };
+      }
+    }
+  }
+  if (truncated) out.promptTruncated = true;
+  return out;
 }
 
 /** Where an effective field value came from. */

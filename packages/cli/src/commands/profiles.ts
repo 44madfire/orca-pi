@@ -36,6 +36,7 @@ import {
   loadProfilesFile,
   mergeValidatedDocuments,
   normalizeLaunchPreview,
+  sanitizeLaunchPreviewForDisplay,
   summarizeAllProfiles,
   summarizeProfileContext,
   validateAllProfiles,
@@ -469,7 +470,13 @@ async function runShow(
       };
       if (options.inspect) {
         if (previewResult) {
-          payload.launchPreview = previewResult.preview;
+          // Redact structured launch bodies at the presentation boundary
+          // so default JSON honors `redacted: true` (spec stays executable
+          // in structure; only the displayed copy is truncated).
+          const visible = showPrompt
+            ? previewResult
+            : sanitizeLaunchPreviewForDisplay(previewResult);
+          payload.launchPreview = visible.preview;
           // Structured JEF-7 launch fields stay top-level so `--json`
           // keeps the `{ profile, spec, promptSource, … }` contract.
           for (const key of [
@@ -480,8 +487,9 @@ async function runShow(
             "promptTransport",
             "promptTempPath",
             "promptText",
+            "promptTruncated",
           ] as const) {
-            const value = previewResult[key];
+            const value = visible[key];
             if (value !== undefined) payload[key] = value;
           }
         } else {

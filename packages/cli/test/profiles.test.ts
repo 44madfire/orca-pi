@@ -402,6 +402,91 @@ describe("orca-pi profile path", () => {
   });
 });
 
+describe("inspect --json prompt redaction (production provider)", () => {
+  const INLINE_SECRET = `TOPSECRET-INLINE-${"z".repeat(500)}`;
+
+  it("omits a long inline prompt from default JSON, exposes it with --show-prompt", async () => {
+    const files = {
+      "/home/u/.pi/agent/profiles.yaml":
+        `profiles:\n  leakcheck:\n    model: anthropic/claude-haiku\n    systemPrompt: "${INLINE_SECRET}"\n`,
+    };
+    const { deps, out } = makeDeps(files);
+    const result = await run(["profile", "inspect", "leakcheck", "--json"], deps);
+    expect(result.exitCode).toBe(0);
+    const text = out.join("");
+    const parsed = JSON.parse(text) as {
+      redacted: boolean;
+      promptTruncated?: boolean;
+      launchPromptTruncated?: boolean;
+      promptText?: string;
+      spec: { args: string[] };
+    };
+    expect(parsed.redacted).toBe(true);
+    // Full body appears nowhere: profile, promptText, or spec args.
+    expect(text).not.toContain(INLINE_SECRET.slice(100));
+    expect(parsed.promptText ?? "").not.toContain(INLINE_SECRET.slice(100));
+    const promptIndex = parsed.spec.args.indexOf("--system-prompt");
+    expect(promptIndex).toBeGreaterThan(-1);
+    expect(parsed.spec.args[promptIndex + 1] ?? "").not.toContain(INLINE_SECRET.slice(100));
+
+    const shown = makeDeps(files);
+    const shownResult = await run(
+      ["profile", "inspect", "leakcheck", "--json", "--show-prompt"],
+      shown.deps,
+    );
+    expect(shownResult.exitCode).toBe(0);
+    expect(shown.out.join("")).toContain(INLINE_SECRET);
+  });
+
+  it("omits file-backed prompt contents from default JSON, exposes them with --show-prompt", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const FILE_SECRET = `TOPSECRET-FILE-${"y".repeat(500)}`;
+    const dir = mkdtempSync(join(tmpdir(), "orca-pi-redact-"));
+    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
+    writeFileSync(
+      join(dir, ".pi/profiles.yaml"),
+      "profiles:\n  filecheck:\n    model: anthropic/claude-haiku\n    systemPromptFile: .pi/agents/secret.md\n",
+      "utf8",
+    );
+    writeFileSync(join(dir, ".pi/agents/secret.md"), FILE_SECRET, "utf8");
+    const makeRealDeps = (): { deps: CliDeps; out: string[]; err: string[] } => {
+      const out: string[] = [];
+      const err: string[] = [];
+      return {
+        deps: {
+          runner: {
+            async run(): Promise<CommandResult> {
+              throw new Error("inspect must never spawn processes");
+            },
+          },
+          stdout: (text: string) => out.push(text),
+          stderr: (text: string) => err.push(text),
+          version: "0.1.0-test",
+          projectRoot: dir,
+          userConfigPathOverride: join(dir, "no-such-user.yaml"),
+          projectConfigPathOverride: join(dir, ".pi/profiles.yaml"),
+        },
+        out,
+        err,
+      };
+    };
+    const { deps, out } = makeRealDeps();
+    const result = await run(["profile", "inspect", "filecheck", "--json"], deps);
+    expect(result.exitCode).toBe(0);
+    const text = out.join("");
+    expect(text).not.toContain(FILE_SECRET.slice(100));
+    const shown = makeRealDeps();
+    const shownResult = await run(
+      ["profile", "inspect", "filecheck", "--json", "--show-prompt"],
+      shown.deps,
+    );
+    expect(shownResult.exitCode).toBe(0);
+    expect(shown.out.join("")).toContain(FILE_SECRET);
+  });
+});
+
 describe("fresh-install defaults through JEF-11 commands (JEF-10 built-ins)", () => {
   it("profile show reports built-in provenance with no config files", async () => {
     const { deps, out } = makeDeps({});

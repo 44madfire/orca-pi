@@ -70,6 +70,7 @@ export {
   formatValidationReport,
   getFieldProvenance,
   normalizeLaunchPreview,
+  sanitizeLaunchPreviewForDisplay,
   shortenHomeForDisplay,
   summarizeAllProfiles,
   summarizeResolvedProfile,

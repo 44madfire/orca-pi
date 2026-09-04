@@ -7,6 +7,7 @@ import {
   formatProfilesList,
   formatPromptForDisplay,
   formatValidationReport,
+  sanitizeLaunchPreviewForDisplay,
   shortenHomeForDisplay,
   summarizeAllProfiles,
   toPanelModel,
@@ -250,6 +251,27 @@ describe("presentation: validation UX", () => {
     expect(withPreview).toContain("Launch preview");
     expect(withPreview).toContain("pi --model");
     expect(withPreview).toContain("estimates, not provider billing");
+  });
+
+  it("sanitizeLaunchPreviewForDisplay redacts prompt bodies without mutating input", () => {
+    const secret = `TOPSECRET-UNIT-${"z".repeat(500)}`;
+    const input = {
+      preview: "pi --model x (redacted)",
+      spec: { command: "pi", args: ["--model", "x", "--system-prompt", secret], cwd: "/repo" },
+      promptSource: "inline",
+      promptText: secret,
+    };
+    const snapshot = JSON.parse(JSON.stringify(input)) as unknown;
+    const sanitized = sanitizeLaunchPreviewForDisplay(input);
+    expect(sanitized.promptText).not.toContain(secret.slice(100));
+    expect((sanitized.spec as { args: string[] }).args[3]).not.toContain(secret.slice(100));
+    expect(sanitized.promptTruncated).toBe(true);
+    expect(sanitized.preview).toBe("pi --model x (redacted)");
+    // Input (executable spec) untouched.
+    expect(input).toEqual(snapshot);
+    // Short bodies pass through; --show-prompt passes everything through.
+    expect(sanitizeLaunchPreviewForDisplay({ preview: "p", promptText: "short" }).promptText).toBe("short");
+    expect(sanitizeLaunchPreviewForDisplay(input, { showFullPrompt: true })).toBe(input);
   });
 
   it("toPanelModel is metadata-only (no prompt bodies)", () => {
