@@ -1,8 +1,15 @@
-# Orca plugin API target (OP1.1)
+# Orca plugin API target (OP1.1 + OP1.7 profiles sidebar)
 
 This scaffold targets the Orca plugin surface as of **Orca app `1.4.196`**
 (`orca` CLI reporting `result.runtime.appVersion: 1.4.196`), verified against
 the upstream manifest schema on `main` (2026-09-03).
+
+OP1.7 (JEF-11) adds a second declarative panel (`orca-pi-profiles` →
+`panel/profiles.html`): a read-only profiles sidebar backed by the companion
+CLI. Both panels stay sandboxed HTML with no `main` worker and no
+capabilities; `detectPanelSupport()` in `packages/orca-plugin/src/panel.ts`
+reports read-only support vs `cli-only` fallback so unsupported hosts degrade
+gracefully without a hidden panel-local store.
 
 ## Manifest v1
 

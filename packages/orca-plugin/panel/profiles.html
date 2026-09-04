@@ -1,0 +1,98 @@
+<!doctype html>
+<!--
+  Orca–Pi profiles panel (OP1.7 / JEF-11, read-only).
+  Static by design: the thin plugin must not depend on unrestricted
+  child_process, filesystem, or network access in the panel/worker. The
+  CLI/profile file is authoritative; this panel never creates a second
+  config store and never edits files.
+
+  Live data comes from the companion CLI:
+    orca-pi profiles list --json
+    orca-pi profile show <name>
+    orca-pi profile inspect <name> --context-summary
+    orca-pi profile validate
+    orca-pi profile path [--project|--user]
+
+  When a host bridge provides JSON (window.__ORCA_PI_PROFILES__), the
+  inline script below renders it. Otherwise the panel shows CLI fallback
+  content — no undocumented filesystem/process access is attempted.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orca–Pi Profiles</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 16px; line-height: 1.5; }
+      code { background: rgba(127,127,127,.15); padding: 1px 5px; border-radius: 4px; }
+      .card { border: 1px solid rgba(127,127,127,.35); border-radius: 8px; padding: 12px 14px; max-width: 640px; }
+      .muted { opacity: .75; }
+      ul { padding-left: 1.25em; }
+      #profiles-summary ul { margin: 0.5em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Orca–Pi Profiles</h2>
+      <p class="muted">
+        Read-only summary of Pi role profiles: effective model/thinking, tool
+        count, skill names/count, extension count, context-file policy, and
+        validation state. The CLI/profile file is authoritative.
+      </p>
+      <div id="profiles-summary">
+        <p><strong>No live data in the panel.</strong></p>
+        <p>Run in a terminal for live diagnostics (read-only):</p>
+        <pre><code>orca-pi profiles list
+orca-pi profile show &lt;name&gt;
+orca-pi profile inspect &lt;name&gt; --context-summary
+orca-pi profile validate
+orca-pi profile path</code></pre>
+        <p class="muted">
+          Conservative actions: validate profiles, show/open/copy config
+          location (<code>orca-pi profile path</code>), refresh/reload
+          configuration (<code>orca-pi profiles list</code>). Editing happens
+          in config files only — the panel keeps no local store.
+        </p>
+      </div>
+      <p class="muted">Targets Orca app 1.4.196 (pluginApi 1). See docs/ORCA_PLUGIN_API.md.</p>
+    </div>
+    <script>
+      // Render host-provided JSON only; never fetch, spawn, or touch the
+      // filesystem. Hosts without a supported bridge keep the CLI fallback.
+      (function () {
+        try {
+          var data = window.__ORCA_PI_PROFILES__;
+          if (!data || !data.profiles) return;
+          var root = document.getElementById("profiles-summary");
+          if (!root) return;
+          var esc = function (s) {
+            return String(s)
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .replace(/"/g, "&quot;")
+              .replace(/'/g, "&#39;");
+          };
+          if (data.profiles.length === 0) {
+            root.innerHTML = "<p><strong>No Pi profiles found.</strong> Run <code>orca-pi profile path</code> to locate configuration.</p>";
+            return;
+          }
+          var html = "<ul>";
+          for (var i = 0; i < data.profiles.length; i++) {
+            var p = data.profiles[i];
+            var tools = p.toolCount !== undefined ? p.toolCount + " tools" : "default tools";
+            var status = p.valid === false ? " — <strong>INVALID</strong>" : "";
+            html += "<li><code>" + esc(p.name) + "</code>: " + esc(p.model || "(no model)") +
+              " / " + esc(p.thinking) + " — " + esc(tools) +
+              ", " + p.skillCount + " skills, " + p.extensionCount + " extensions" + status + "</li>";
+          }
+          html += "</ul>";
+          html += "<p class=\"muted\">Live data provided by host. Refresh via <code>orca-pi profiles list --json</code>.</p>";
+          root.innerHTML = html;
+        } catch (e) {
+          // Keep CLI fallback on any error — never block the panel.
+        }
+      })();
+    </script>
+  </body>
+</html>

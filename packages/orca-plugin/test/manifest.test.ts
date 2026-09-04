@@ -69,7 +69,7 @@ describe("orca-plugin artifact", () => {
     expect(activate()).toEqual({
       plugin: "44madfire.orca-pi",
       commands: [],
-      panels: ["orca-pi-status"],
+      panels: ["orca-pi-status", "orca-pi-profiles"],
     });
     const text = renderPluginStatus({
       pluginVersion: "0.1.0",

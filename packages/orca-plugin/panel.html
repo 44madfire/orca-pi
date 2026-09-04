@@ -1,10 +1,11 @@
 <!doctype html>
 <!--
-  Orca–Pi status panel (OP1.1 scaffold placeholder).
+  Orca–Pi status panel (OP1.1 scaffold + OP1.7 profiles link).
   Static by design: the thin plugin must not depend on unrestricted
   child_process access in the plugin worker. Run `orca-pi doctor` in a
-  terminal for live diagnostics; future tickets may wire this panel to the
-  companion CLI through a supported Orca capability.
+  terminal for live diagnostics. Pi profile inspection lives in the
+  companion CLI and the read-only `Orca-Pi Profiles` sidebar
+  (panel/profiles.html); this panel never spawns processes.
 -->
 <html lang="en">
   <head>
@@ -29,7 +30,14 @@
       <p>Live diagnostics live in the companion CLI (read-only):</p>
       <pre><code>orca-pi --version
 orca-pi doctor
-orca-pi doctor --json</code></pre>
+orca-pi doctor --json
+orca-pi profiles list
+orca-pi profile validate</code></pre>
+      <p>
+        Pi role profiles have their own read-only sidebar
+        (<strong>Orca–Pi Profiles</strong>, <code>panel/profiles.html</code>)
+        backed by <code>orca-pi profile show|inspect|validate|path</code>.
+      </p>
       <p class="muted">Targets Orca app 1.4.196. See docs/ORCA_PLUGIN_API.md.</p>
     </div>
   </body>

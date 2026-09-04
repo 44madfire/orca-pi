@@ -4,7 +4,7 @@
   "publisher": "44madfire",
   "name": "Orca–Pi Orchestration",
   "version": "0.1.0",
-  "description": "Thin Orca UI shell over the companion orca-pi CLI. OP1.1 scaffold: status panel only; no role spawning yet.",
+  "description": "Thin Orca UI shell over the companion orca-pi CLI. Status panel plus read-only Pi profiles sidebar (CLI authoritative).",
   "repository": "https://github.com/44madfire/orca-pi",
   "engines": {
     "orca": ">=1.4.0"
@@ -16,6 +16,11 @@
         "id": "orca-pi-status",
         "title": "Orca-Pi Status",
         "entry": "panel.html"
+      },
+      {
+        "id": "orca-pi-profiles",
+        "title": "Orca-Pi Profiles",
+        "entry": "panel/profiles.html"
       }
     ],
     "commands": []
