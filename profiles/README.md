@@ -101,8 +101,8 @@ inheritance and applies overrides last.
   configs stay portable and cannot reference outside the project.
 - Listing (`listProfileNames`) and resolving (`resolveProfile`) never read
   prompt/skill file contents and never mutate their inputs; resolved
-  profiles keep normalized relative paths for the launcher (JEF-7) to read
-  at launch time.
+  profiles keep normalized relative paths for the launcher (`buildPiLaunch`
+  in `packages/core/src/pi/`, OP1.3 / JEF-7) to read at launch time.
 - Parsing never executes shell or interpolates `$VAR`/backticks — all
   strings are literal; model/tool/path grammars reject shell metacharacters.
 - Invalid config fails before any Pi/Orca process starts:
@@ -112,6 +112,16 @@ inheritance and applies overrides last.
 
 ## Pi references
 
+- Launcher (`packages/core/src/pi/`): `buildPiLaunch(resolved, { projectRoot, cwd })`
+  → frozen `{ command: "pi", args, cwd, env }`. Inspect with
+  `orca-pi profile inspect <name> [--project-root <path>] [--json] [--show-prompt]`
+  (redacted display-only formatter; execution always uses structured args).
+- Prompt transport (`prompt-transport.ts`): current Pi treats
+  `--system-prompt <value>` as file-or-text (`existsSync` → read file, else
+  literal). Non-colliding prompts travel literally; colliding prompts
+  (intended text equals an existing file in launch `cwd`) are materialized
+  to a deterministic temp file so Pi reads the exact intended text.
+  Contract tests in `pi-prompt-contract.test.ts` simulate Pi resolution.
 - CLI options (`--model`, `--thinking`, `--tools`, `--skill`,
   `--extension`, `--no-context-files`, session flags):
   <https://github.com/up0to1/pi-mono/blob/main/packages/coding-agent/README.md>

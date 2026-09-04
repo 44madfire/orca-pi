@@ -1,12 +1,11 @@
 # orca-pi
 
 Orca–Pi orchestration (**OP1.1 / JEF-5** scaffold + **OP1.2 / JEF-6** Pi agent
-profiles): a thin Orca plugin plus a separately testable companion `orca-pi`
-CLI/library.
+profiles + **OP1.3 / JEF-7** deterministic Pi argv launcher): a thin Orca plugin
+plus a separately testable companion `orca-pi` CLI/library.
 
-Later tickets add deterministic Pi argv launching (JEF-7) and Orca
-Tasks/Dispatches — without coupling orchestration logic to Orca's
-experimental plugin-worker internals.
+Later tickets add Orca Tasks/Dispatches — without coupling orchestration logic
+to Orca's experimental plugin-worker internals.
 
 ## Architectural split
 
@@ -16,13 +15,14 @@ experimental plugin-worker internals.
    (`stablyai/orca#15637`), so unrestricted Node `child_process` access inside
    the plugin is explicitly **not** a long-term dependency.
 2. **Companion `orca-pi` CLI/library** (`packages/cli/` + `packages/core/`) —
-   owns version reporting, `doctor` diagnostics today, and profile loading, Pi
-   argv construction, and calls to the public `orca` CLI in later tickets.
+   owns version reporting, `doctor` diagnostics, profile loading,
+   deterministic Pi argv construction (OP1.3 / JEF-7), and calls to the
+   public `orca` CLI in later tickets.
 
 ```text
 orca-pi/
 ├── packages/
-│   ├── core/          # version + doctor + plugin-manifest validator + Pi profiles (no Electron)
+│   ├── core/          # version + doctor + plugin-manifest validator + Pi profiles + Pi launcher (no Electron)
 │   ├── cli/           # `orca-pi` executable (thin wrapper over core)
 │   └── orca-plugin/   # Orca manifest, panel/skill/command contributions
 ├── profiles/          # Pi agent profile schema docs + examples (OP1.2 / JEF-6)
@@ -76,6 +76,7 @@ Run the CLI from source after building:
 node packages/cli/dist/main.js --version
 node packages/cli/dist/main.js doctor
 node packages/cli/dist/main.js doctor --json
+node packages/cli/dist/main.js profile inspect scout --project-root .
 ```
 
 Or link it globally for the `orca-pi` name:
@@ -96,6 +97,12 @@ orca-pi doctor
   - Exit `0` when both CLIs report versions; exit `1` with actionable install
     hints when either is missing or versionless.
 - `orca-pi --help` prints usage; unknown commands/flags exit `2`.
+- `orca-pi profile inspect <name>` prints the resolved profile plus its
+  deterministic Pi argv in redacted human-readable form (read-only, never
+  launches Pi). `--json` prints the full structured `{ profile, spec }`;
+  `--show-prompt` prints the full prompt text (default truncates to a
+  preview + length). The display formatter is never used for execution —
+  launching always uses the structured `{ command, args, cwd, env }` array.
 
 ## Orca plugin
 
@@ -130,7 +137,7 @@ If your Orca build reports a manifest error, update
 `docs/ORCA_PLUGIN_API.md` together — they are tested as a unit
 (`packages/orca-plugin/test/manifest.test.ts`).
 
-## Profiles (OP1.2 / JEF-6)
+## Profiles (OP1.2 / JEF-6) + deterministic launcher (OP1.3 / JEF-7)
 
 - Declarative roles (`scout`, `worker`, `reviewer`, …) in
   `profiles/examples.yaml` (copy to `$PI_CODING_AGENT_DIR/profiles.yaml` or
@@ -141,12 +148,27 @@ If your Orca build reports a manifest error, update
   `ResolvedPiProfile`. Invalid config fails pre-launch with dotted-path
   diagnostics; see `profiles/README.md` for fields, precedence, and
   security rules.
-- Deterministic Pi argv launching from resolved profiles is JEF-7 (not yet).
+- Deterministic Pi argv launcher in `@orca-pi/core` (`packages/core/src/pi/`):
+  `buildPiLaunch(resolved, { projectRoot, cwd })` → frozen
+  `{ command: "pi", args, cwd, env }` (structured, no shell strings).
+  `systemPromptFile` is read against `projectRoot` and passed explicitly via
+  `--system-prompt`; relative skill/extension paths resolve against
+  `projectRoot`; `cwd` preserves the Orca worktree selection; task text is
+  never embedded (Orca `dispatch --inject` owns injection in JEF-8); lean
+  profiles visibly emit `--no-skills`/`--no-extensions`/`--no-context-files`
+  then only explicit `--skill`/`--extension` entries; `ephemeral` emits
+  `--no-session` while `fresh` emits no session flags and never resumes.
+  Pi file-or-text contract: current Pi treats `--system-prompt <value>` as
+  file-or-text (`existsSync` → read file, else literal). Non-colliding
+  prompts travel literally (common case, byte-identical); when the intended
+  text equals an existing file in `cwd`, the launcher materializes it to a
+  deterministic content-addressed temp file and passes the temp path so Pi's
+  file branch reads the exact intended text (see `prompt-transport.ts` and
+  `pi-prompt-contract.test.ts`).
 
-## Non-goals (OP1.1 + OP1.2)
+## Non-goals (OP1.1 + OP1.2 + OP1.3)
 
-- No Pi argv launcher yet (OP1.3 / JEF-7 owns it).
-- No Orca Tasks/Dispatches.
+- No Orca Tasks/Dispatches yet (OP1.4 / JEF-8 owns the supervised adapter).
 - No transcript parsing.
 - No Orca core fork.
 
