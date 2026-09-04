@@ -87,21 +87,43 @@ export const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 export const MAX_PROVIDER_LENGTH = 64;
 
 /**
- * Pi `--model` IDs/patterns (canonical v1 representation).
+ * Pi single `--model` IDs (canonical v1 representation).
  *
- * Supports `provider/id` and glob/fuzzy patterns (`anthropic/*`,
- * `*sonnet*`). Allows alphanumerics
- * plus `/ - _ . * + @ ? ~` in any position — everything else (whitespace,
+ * Supports `provider/id` and Pi's exact/fuzzy matching (e.g. `sonnet`
+ * matching a Sonnet model by partial name). Glob/minimatch syntax (`*`, `?`)
+ * belongs to Pi's separate multi-model `--models` scope and is rejected here
+ * so JEF-7's `--model <value>` mapping keeps Pi semantics. Colons are allowed
+ * for legitimate variant-bearing IDs (e.g. `openrouter/foo:exacto`,
+ * `openai/gpt-4o:extended`); only an ambiguous terminal recognized thinking
+ * suffix is rejected (see MODEL_THINKING_SUFFIX_PATTERN). Allows alphanumerics
+ * plus `/ - _ . : + @ ~` in any position — everything else (whitespace,
  * shell metacharacters such as `; | & $ ` ' " \\ ! ( ) < >`) is rejected
  * so a model string can never inject shell.
  *
- * The Pi `:<thinking>` suffix (e.g. `sonnet:high`) is intentionally rejected:
- * `resolveProfile()` fills an omitted `thinking` with the built-in default
- * and JEF-7 translates both fields to `--model <model> --thinking <thinking>`,
- * where explicit `--thinking` silently overrides the suffix. Use the separate
- * `thinking:` field instead (`{ model: "sonnet", thinking: "high" }`).
+ * A terminal recognized thinking suffix (e.g. `sonnet:high`) is rejected even
+ * though other colons are allowed: `resolveProfile()` fills an omitted
+ * `thinking` with the built-in default and JEF-7 translates both fields to
+ * `--model <model> --thinking <thinking>`, where explicit `--thinking`
+ * silently overrides the suffix. Use the separate `thinking:` field instead
+ * (`{ model: "sonnet", thinking: "high" }`). Known v1 limitation: a model ID
+ * that literally ends in `:off`, `:minimal`, `:low`, `:medium`, `:high`,
+ * `:xhigh`, or `:max` cannot be expressed; no such IDs are known today.
  */
-export const MODEL_PATTERN: RegExp = new RegExp("^[A-Za-z0-9._/*@?+~-]+$");
+export const MODEL_PATTERN: RegExp = new RegExp("^[A-Za-z0-9._/:@+~-]+$");
+
+/**
+ * Ambiguous terminal Pi thinking suffix: a colon followed by exactly one
+ * recognized thinking level at the end of the model string (e.g. `:high` in
+ * `sonnet:high`). Pi tries the full model ID first and only then interprets
+ * such a suffix, but a profile always pairs `model` with an explicit
+ * `thinking` (default-filled), which would silently override the suffix under
+ * JEF-7's `--model <model> --thinking <thinking>` mapping. Rejected with a
+ * pointer to the separate `thinking` field; all other colons (e.g.
+ * `openrouter/foo:exacto`) remain valid.
+ */
+export const MODEL_THINKING_SUFFIX_PATTERN: RegExp = new RegExp(
+  ":(off|minimal|low|medium|high|xhigh|max)$",
+);
 export const MAX_MODEL_LENGTH = 256;
 
 /** Tool names: built-ins plus custom/extension tools share one safe grammar. */
@@ -441,6 +463,12 @@ function validateSingleProfile(
         message: `"extends" is not allowed here: CLI overrides apply after inheritance, so re-parenting via overrides is rejected. Edit the profile's "extends" in config instead.`,
       });
       failed = true;
+    } else if (typeof extendsRaw === "string" && RESERVED_PROFILE_NAMES.has(extendsRaw)) {
+      issues.push({
+        path: `${basePath}.extends`,
+        message: `reserved parent profile name ${preview(extendsRaw)}: "__proto__", "constructor", and "prototype" must never become profile map keys. Rename the parent profile.`,
+      });
+      failed = true;
     } else if (typeof extendsRaw !== "string" || !PROFILE_NAME_PATTERN.test(extendsRaw) || extendsRaw.length > MAX_PROFILE_NAME_LENGTH) {
       issues.push({
         path: `${basePath}.extends`,
@@ -478,7 +506,13 @@ function validateSingleProfile(
     if (typeof modelRaw !== "string" || modelRaw.length === 0 || modelRaw.length > MAX_MODEL_LENGTH || !MODEL_PATTERN.test(modelRaw)) {
       issues.push({
         path: `${basePath}.model`,
-        message: `expected a Pi model ID/pattern (e.g. "anthropic/claude-sonnet", "openai/gpt-4o", "anthropic/*"), got ${preview(modelRaw)}. Model strings are passed literally to Pi --model and must not contain whitespace, shell metacharacters, or the Pi ":<thinking>" suffix (use the separate "thinking" field instead, e.g. { model: "sonnet", thinking: "high" }).`,
+        message: `expected a Pi --model ID (e.g. "anthropic/claude-sonnet", "openai/gpt-4o", "openrouter/foo:exacto"), got ${preview(modelRaw)}. Model strings are passed literally to Pi --model: no whitespace, shell metacharacters, or glob characters ("*", "?") -- globs belong to Pi's separate --models scope.`,
+      });
+      failed = true;
+    } else if (MODEL_THINKING_SUFFIX_PATTERN.test(modelRaw)) {
+      issues.push({
+        path: `${basePath}.model`,
+        message: `ambiguous Pi model ${preview(modelRaw)}: a terminal ":<thinking>" suffix (e.g. ":high") would be silently overridden by the explicit "--thinking" flag JEF-7 always emits (Pi lets explicit --thinking win). Use the separate "thinking" field instead (e.g. { model: "sonnet", thinking: "high" }); other colons such as "openrouter/foo:exacto" remain valid.`,
       });
       failed = true;
     } else {

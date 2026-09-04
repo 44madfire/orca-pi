@@ -299,22 +299,20 @@ describe("profile resolve: prototype safety", () => {
     }
   });
 
-  it("extends: constructor is unknown-parent (reserved names cannot exist)", () => {
-    const doc = parseAndValidateProfilesText(
-      `profiles:
+  it("extends: constructor is rejected at validation (reserved parent)", () => {
+    // Reserved parents never reach resolution (re-review test/validator
+    // agreement); non-reserved phantoms like `toString` still resolve to
+    // `unknown-parent` above via own-property lookup.
+    expect(() =>
+      parseAndValidateProfilesText(
+        `profiles:
   s:
     extends: constructor
     model: anthropic/claude-haiku
 `,
-      "ctor.yaml",
-    );
-    try {
-      resolveProfile("s", doc);
-      expect.unreachable();
-    } catch (error) {
-      expect(error).toBeInstanceOf(ProfileResolveError);
-      expect((error as ProfileResolveError).code).toBe("unknown-parent");
-    }
+        "ctor.yaml",
+      ),
+    ).toThrow(/reserved/i);
   });
 
   it("defining toString explicitly creates a safe own entry", () => {

@@ -46,9 +46,12 @@ export interface PiProfileInput {
   /** Pi `--provider` value (e.g. `"anthropic"`, `"openai-codex"`). */
   provider?: string;
   /**
-   * Pi `--model` ID/pattern (supports `provider/id` and globs).
-   * The Pi `:<thinking>` suffix is rejected; use the separate `thinking`
-   * field so JEF-7 never emits a contradictory `--model X:high --thinking Y`.
+   * Pi single `--model` ID (supports `provider/id` and Pi exact/fuzzy
+   * matching; variant colons such as `openrouter/foo:exacto` are allowed).
+   * Glob characters (`*`, `?`) belong to Pi's separate `--models` scope and
+   * are rejected, as is a terminal recognized thinking suffix (`:high`,
+   * `:low`, ...); use the separate `thinking` field so JEF-7 never emits a
+   * contradictory `--model X:high --thinking Y`.
    */
   model?: string;
   /** Pi `--thinking` level. */

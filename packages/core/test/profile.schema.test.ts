@@ -166,27 +166,41 @@ describe("profile schema: rejection cases", () => {
     }
   });
 
-  it("accepts model globs and provider/id patterns", () => {
+  it("accepts single --model IDs incl. variant colons, rejects globs", () => {
+    // Pi single `--model` uses exact/fuzzy matching; glob syntax belongs to
+    // the separate multi-model `--models` scope (re-review blocking 2).
     const doc = validateProfilesDocument(
       {
         profiles: {
-          a: { model: "anthropic/*" },
-          b: { model: "*sonnet*" },
-          c: { model: "openai/gpt-4o" },
-          d: { model: "sonnet" },
+          a: { model: "anthropic/claude-sonnet" },
+          b: { model: "openai/gpt-4o" },
+          c: { model: "sonnet" },
+          d: { model: "openrouter/foo:exacto" },
+          e: { model: "openai/gpt-4o:extended" },
         },
       },
       "models.yaml",
     );
-    expect(Object.keys(doc.profiles).sort()).toEqual(["a", "b", "c", "d"]);
+    expect(Object.keys(doc.profiles).sort()).toEqual(["a", "b", "c", "d", "e"]);
+    for (const bad of ["anthropic/*", "*sonnet*", "model?", "a*b"]) {
+      expectInvalid({ profiles: { s: { model: bad } } }, "model-glob.yaml", "model");
+    }
   });
 
-  it("rejects the Pi :<thinking> suffix in model (canonical thinking field only)", () => {
+  it("rejects only a terminal recognized thinking suffix, not all colons", () => {
     // Regression for PR2 Blocking 1: `model: sonnet:high` with omitted
     // `thinking` used to resolve to `thinking: medium`, so JEF-7 would emit
     // `pi --model sonnet:high --thinking medium` (Pi lets explicit
     // `--thinking` win, silently running at medium instead of high).
-    for (const bad of ["sonnet:high", "anthropic/claude:low", "openai/gpt-4o:xhigh"]) {
+    // Re-review: only the ambiguous terminal suffix is rejected; other
+    // colons (OpenRouter-style variants) stay valid.
+    for (const bad of [
+      "sonnet:high",
+      "anthropic/claude:low",
+      "openai/gpt-4o:xhigh",
+      "foo:off",
+      "foo:max",
+    ]) {
       const error = expectInvalid(
         { profiles: { s: { model: bad } } },
         "model-thinking.yaml",
@@ -194,13 +208,24 @@ describe("profile schema: rejection cases", () => {
       );
       expect(error.message).toContain("thinking");
     }
-    // Colon is rejected even alongside an explicit thinking field: one
+    // Suffix rejected even alongside an explicit thinking field: one
     // canonical representation only.
     expectInvalid(
       { profiles: { s: { model: "sonnet:high", thinking: "high" } } },
       "model-thinking.yaml",
       "model",
     );
+    // Non-thinking colons remain valid.
+    const doc = validateProfilesDocument(
+      {
+        profiles: {
+          a: { model: "openrouter/foo:exacto" },
+          b: { model: "openai/gpt-4o:extended" },
+        },
+      },
+      "model-colon.yaml",
+    );
+    expect(doc.profiles.a?.model).toBe("openrouter/foo:exacto");
   });
 
   it("rejects reserved profile names that would endanger the profile map", () => {
@@ -212,6 +237,16 @@ describe("profile schema: rejection cases", () => {
         { profiles: { [reserved]: { model: "anthropic/claude-haiku" } } },
         "reserved.yaml",
         `profiles.${reserved}`,
+      );
+      expect(error.message).toMatch(/reserved/i);
+    }
+    // Reserved names are rejected as `extends` parents too (re-review:
+    // validator/test agreement), so they can never reach resolution.
+    for (const reserved of ["__proto__", "constructor", "prototype"]) {
+      const error = expectInvalid(
+        { profiles: { s: { extends: reserved, model: "x" } } },
+        "reserved-extends.yaml",
+        "extends",
       );
       expect(error.message).toMatch(/reserved/i);
     }

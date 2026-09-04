@@ -54,7 +54,7 @@ Profile names matching `^[A-Za-z0-9][A-Za-z0-9_-]*$` are accepted except the res
 |---|---|---|
 | `extends` | — | Optional single parent; cycles/unknown parents fail pre-launch. |
 | `provider` | `--provider` | Optional (e.g. `anthropic`, `openai-codex`). |
-| `model` | `--model` | Model ID/pattern (`provider/id`, globs). The Pi `:<thinking>` suffix is rejected; use the separate `thinking:` field. Literal — never shell-expanded. |
+| `model` | `--model` | Single model ID (`provider/id`, Pi exact/fuzzy match; variant colons like `openrouter/foo:exacto` allowed). Globs (`*`, `?`) belong to Pi's separate `--models` scope and are rejected, as is a terminal recognized thinking suffix (`:high`, ...); use the separate `thinking:` field. Literal — never shell-expanded. |
 | `thinking` | `--thinking` | `off\|minimal\|low\|medium\|high\|xhigh\|max`. |
 | `systemPrompt` | `--system-prompt` | Inline text. Mutually exclusive with `systemPromptFile`. |
 | `systemPromptFile` | `--system-prompt` (via file read at launch) | Project-relative path (e.g. `.pi/agents/scout.md`). Listing/resolving never reads file contents. |
