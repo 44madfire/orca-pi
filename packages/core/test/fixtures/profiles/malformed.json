@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "scout": {
+      "model": "anthropic/claude-haiku",
+      "thinking": "low",
+      "tools": ["read", "grep"]
+    }
+  }

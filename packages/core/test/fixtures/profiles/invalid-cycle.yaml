@@ -1,0 +1,8 @@
+# Invalid: extends cycle (a -> b -> a).
+profiles:
+  a:
+    extends: b
+    model: anthropic/claude-haiku
+  b:
+    extends: a
+    model: anthropic/claude-sonnet

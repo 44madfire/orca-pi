@@ -1,0 +1,4 @@
+# Minimal profile — only a model, everything else falls back to built-in defaults.
+profiles:
+  scout:
+    model: anthropic/claude-haiku

@@ -1,10 +1,11 @@
 # orca-pi
 
-Orca–Pi orchestration scaffold (**OP1.1 / JEF-5**): a thin Orca plugin plus a
-separately testable companion `orca-pi` CLI.
+Orca–Pi orchestration (**OP1.1 / JEF-5** scaffold + **OP1.2 / JEF-6** Pi agent
+profiles): a thin Orca plugin plus a separately testable companion `orca-pi`
+CLI/library.
 
-Later tickets add Pi agent profiles (JEF-6), deterministic Pi argv launching,
-and Orca Tasks/Dispatches — without coupling orchestration logic to Orca's
+Later tickets add deterministic Pi argv launching (JEF-7) and Orca
+Tasks/Dispatches — without coupling orchestration logic to Orca's
 experimental plugin-worker internals.
 
 ## Architectural split
@@ -21,10 +22,10 @@ experimental plugin-worker internals.
 ```text
 orca-pi/
 ├── packages/
-│   ├── core/          # version + doctor + plugin-manifest validator (no Electron)
+│   ├── core/          # version + doctor + plugin-manifest validator + Pi profiles (no Electron)
 │   ├── cli/           # `orca-pi` executable (thin wrapper over core)
 │   └── orca-plugin/   # Orca manifest, panel/skill/command contributions
-├── profiles/          # reserved for OP1.2 (no profiles yet)
+├── profiles/          # Pi agent profile schema docs + examples (OP1.2 / JEF-6)
 ├── docs/              # targeted Orca plugin API/version notes
 └── README.md
 ```
@@ -115,9 +116,22 @@ If your Orca build reports a manifest error, update
 `docs/ORCA_PLUGIN_API.md` together — they are tested as a unit
 (`packages/orca-plugin/test/manifest.test.ts`).
 
-## Non-goals (OP1.1)
+## Profiles (OP1.2 / JEF-6)
 
-- No agent profiles yet (OP1.2 / JEF-6 owns `profiles/`).
+- Declarative roles (`scout`, `worker`, `reviewer`, …) in
+  `profiles/examples.yaml` (copy to `$PI_CODING_AGENT_DIR/profiles.yaml` or
+  `<projectRoot>/.pi/profiles.yaml`).
+- Schema/loader/resolver in `@orca-pi/core` (`packages/core/src/profile/`):
+  `validateProfilesDocument`, `parseAndValidateProfilesText`,
+  `mergeValidatedDocuments`, `resolveProfile` → one frozen
+  `ResolvedPiProfile`. Invalid config fails pre-launch with dotted-path
+  diagnostics; see `profiles/README.md` for fields, precedence, and
+  security rules.
+- Deterministic Pi argv launching from resolved profiles is JEF-7 (not yet).
+
+## Non-goals (OP1.1 + OP1.2)
+
+- No Pi argv launcher yet (OP1.3 / JEF-7 owns it).
 - No Orca Tasks/Dispatches.
 - No transcript parsing.
 - No Orca core fork.

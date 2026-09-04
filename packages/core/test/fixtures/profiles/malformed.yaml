@@ -1,0 +1,5 @@
+# Invalid YAML: bad indentation / unclosed list.
+profiles:
+  scout:
+      model: [unclosed
+    thinking: low

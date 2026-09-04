@@ -1,0 +1,17 @@
+# Full profile exercising every v1 execution field plus display metadata.
+profiles:
+  worker:
+    provider: anthropic
+    model: anthropic/claude-sonnet
+    thinking: high
+    systemPromptFile: .pi/agents/worker.md
+    tools: [read, grep, find, ls, bash, edit, write]
+    excludeTools: [powershell]
+    skills: [.pi/skills/project, .pi/skills/testing]
+    extensions: [.pi/extensions/example.ts]
+    contextFiles: true
+    discoverSkills: false
+    discoverExtensions: false
+    session: fresh
+    displayName: Worker
+    description: Coding worker with full tool access.

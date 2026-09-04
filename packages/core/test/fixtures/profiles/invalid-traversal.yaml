@@ -1,0 +1,6 @@
+# Invalid: project-relative paths must not escape the project root.
+profiles:
+  scout:
+    model: anthropic/claude-haiku
+    systemPromptFile: ../../etc/passwd
+    skills: [/abs/path, ../escape]

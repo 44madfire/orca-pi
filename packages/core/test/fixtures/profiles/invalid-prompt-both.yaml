@@ -1,0 +1,6 @@
+# Invalid: systemPrompt and systemPromptFile are mutually exclusive.
+profiles:
+  scout:
+    model: anthropic/claude-haiku
+    systemPrompt: You are a scout.
+    systemPromptFile: .pi/agents/scout.md
