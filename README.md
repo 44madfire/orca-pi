@@ -2,11 +2,17 @@
 
 Orca–Pi orchestration (**OP1.1 / JEF-5** scaffold + **OP1.2 / JEF-6** Pi agent
 profiles + **OP1.3 / JEF-7** deterministic Pi argv launcher + **OP1.6 / JEF-10**
-default scout/worker/reviewer profiles): a thin Orca plugin
+default scout/worker/reviewer profiles + **OP1.7 / JEF-11** profile management
+UX): a thin Orca plugin
 plus a separately testable companion `orca-pi` CLI/library.
 
 Later tickets add Orca Tasks/Dispatches — without coupling orchestration logic
 to Orca's experimental plugin-worker internals.
+
+Ownership boundary: JEF-7 owns `ResolvedPiProfile` → `ProcessSpec` and the
+redacted launch-spec formatter; JEF-11 owns CLI commands,
+provenance/display presentation, validation UX, and the Orca sidebar, and
+consumes JEF-7's formatter via injection rather than implementing another one.
 
 ## Architectural split
 
@@ -78,8 +84,12 @@ Run the CLI from source after building:
 node packages/cli/dist/main.js --version
 node packages/cli/dist/main.js doctor
 node packages/cli/dist/main.js doctor --json
+node packages/cli/dist/main.js profiles list
+node packages/cli/dist/main.js profile show scout
 node packages/cli/dist/main.js profile inspect scout --project-root .
 node packages/cli/dist/main.js profile inspect scout --project-root . --context-summary
+node packages/cli/dist/main.js profile validate
+node packages/cli/dist/main.js profile path
 ```
 
 Or link it globally for the `orca-pi` name:
@@ -100,9 +110,16 @@ orca-pi doctor
   - Exit `0` when both CLIs report versions; exit `1` with actionable install
     hints when either is missing or versionless.
 - `orca-pi --help` prints usage; unknown commands/flags exit `2`.
-- `orca-pi profile inspect <name>` prints the resolved profile plus its
+- `orca-pi profiles list [--json]` lists merged profiles with effective
+  model/thinking/tool/skill counts plus user/project precedence and file
+  locations. Exit `0` even when no profiles exist (with creation hints).
+- `orca-pi profile show <name> [--json] [--show-prompt]` shows effective
+  values plus provenance (`built-in`, user config, project config,
+  inherited profile). Redacts large prompt bodies unless `--show-prompt`.
+- `orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]`
+  prints JEF-11 presentation (provenance, context policy) plus JEF-7's
   deterministic Pi argv in redacted human-readable form (read-only, never
-  launches Pi). `--json` prints the full structured `{ profile, spec }`;
+  launches Pi). `--json` prints structured `{ profile, provenance, spec, … }`;
   `--show-prompt` prints the full prompt text (default truncates to a
   preview + length). `--context-summary` adds a context-budget estimate
   (prompt chars/words/lines, ~tokens, tool/skill/extension counts,
@@ -115,15 +132,32 @@ orca-pi doctor
   `prompts/*.md`). Override models while retaining role policy:
   `profiles: { scout: { model: <fast-model> } }`. See `profiles/README.md`
   and `docs/EVALS.md` for role policy and manual evals.
+- `orca-pi profile validate [<name>] [--json]` validates all (or one)
+  profile with file/source/field diagnostics. Exit `0` when valid, `1` when
+  invalid or unreadable.
+- `orca-pi profile path [--project|--user] [--json]` prints the authoritative
+  user/global and project locations (script-friendly with `--project`/`--user`).
+  Never parses file contents, so it stays usable when config is malformed
+  (recovery UX; content diagnostics belong to `validate`).
 
 ## Orca plugin
 
 - Manifest: `packages/orca-plugin/orca-plugin.json` (manifest v1:
   `manifestVersion: 1`, `pluginApi: 1`, `engines.orca: ">=1.4.0"`, no
   capabilities). Install identity: `44madfire.orca-pi`.
-- Placeholder panel `panel.html` (`contributes.panels`: `orca-pi-status`)
-  showing the plugin/CLI version and pointing at `orca-pi doctor` for live
-  diagnostics.
+- Panels (`contributes.panels`, declarative sandboxed HTML, no worker):
+  - `orca-pi-status` (`panel.html`) — plugin/CLI version plus `orca-pi doctor`
+    and profile CLI pointers.
+  - `orca-pi-profiles` (`panel/profiles.html`, OP1.7 / JEF-11) — read-only
+    Pi profiles sidebar: effective model/thinking, tool count, skill
+    names/count, extension count, context-file policy, validation state.
+    Live data comes from `orca-pi profiles list --json`; without a supported
+    host bridge the panel shows CLI fallback content. Conservative actions
+    only: validate, show/open/copy config location, refresh/reload. Editing
+    happens in config files — the panel keeps no local store.
+  - Feature detection (`detectPanelSupport()` in `src/panel.ts`) reports
+    read-only support vs `cli-only` fallback; unsupported APIs degrade
+    gracefully without blocking orchestration.
 - No commands yet: manifest v1 treats action-less commands as worker
   commands requiring a `main` entry, and `action` aliases must come from the
   host's closed built-in list — so a command waits for a later ticket with a
@@ -149,7 +183,7 @@ If your Orca build reports a manifest error, update
 `docs/ORCA_PLUGIN_API.md` together — they are tested as a unit
 (`packages/orca-plugin/test/manifest.test.ts`).
 
-## Profiles (OP1.2 / JEF-6) + deterministic launcher (OP1.3 / JEF-7) + defaults (OP1.6 / JEF-10)
+## Profiles (OP1.2 / JEF-6) + deterministic launcher (OP1.3 / JEF-7) + defaults (OP1.6 / JEF-10) + management UX (OP1.7 / JEF-11)
 
 - Built-in model-agnostic defaults (`scout`, `worker`, `reviewer`) in
   `packages/core/src/profile/builtins.ts` (fresh installs work with no config
@@ -180,12 +214,20 @@ If your Orca build reports a manifest error, update
   deterministic content-addressed temp file and passes the temp path so Pi's
   file branch reads the exact intended text (see `prompt-transport.ts` and
   `pi-prompt-contract.test.ts`).
+- Presentation (`packages/core/src/profile/presentation.ts`, JEF-11):
+  effective values plus per-field provenance, redacted prompt display
+  (`--show-prompt` reveals), `toPanelModel()` metadata-only sidebar model.
+  Never loads skill/prompt file contents for metadata; shortens `~` in human
+  output except in explicit `profile path`. `profile inspect` wires the
+  production preview as `formatPiInspect(resolved, await buildPiLaunch(…))`
+  via async `LaunchPreviewProvider` injection (JEF-11 never builds argv).
 
-## Non-goals (OP1.1 + OP1.2 + OP1.3)
+## Non-goals (OP1.1 + OP1.2 + OP1.3 + OP1.7)
 
 - No Orca Tasks/Dispatches yet (OP1.4 / JEF-8 owns the supervised adapter).
 - No transcript parsing.
 - No Orca core fork.
+- No panel-local config store or undocumented filesystem/network bridge.
 
 ## Upstream references
 

@@ -9,6 +9,16 @@
  */
 import type { DoctorReport } from "@orca-pi/core";
 
+export {
+  detectPanelSupport,
+  escapeHtml,
+  PROFILES_PANEL_ID,
+  renderProfilesPanelHtml,
+  renderProfilesStatusText,
+  type PanelSupport,
+  type PanelSupportInput,
+} from "./panel.js";
+
 /** Canonical install identity: `<publisher>.<id>` (also the install dir name). */
 export const PLUGIN_KEY = "44madfire.orca-pi";
 export const PANEL_ID = "orca-pi-status";
@@ -47,12 +57,16 @@ export function renderPluginStatus(input: PluginStatusInput): string {
 /**
  * Placeholder activation record. A future Orca plugin host can call this to
  * prove the artifact loads; it performs no I/O and requests no capabilities.
+ *
+ * OP1.7 adds the read-only `orca-pi-profiles` sidebar alongside the status
+ * panel. Both panels are declarative sandboxed HTML; live data comes from
+ * the companion CLI, never from a worker bridge.
  */
 export function activate(): { plugin: string; commands: string[]; panels: string[] } {
   return {
     plugin: PLUGIN_KEY,
     // No commands in OP1.1 (see PLUGIN_COMMAND_ID note above).
     commands: [],
-    panels: [PANEL_ID],
+    panels: [PANEL_ID, "orca-pi-profiles"],
   };
 }
