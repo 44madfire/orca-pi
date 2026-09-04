@@ -56,6 +56,20 @@ npm run lint       # eslint .
 npm test           # vitest run
 ```
 
+## Continuous integration
+
+GitHub Actions workflow `.github/workflows/ci.yml` runs on every pull
+request targeting `main` and on pushes to `main` (single stable `verify`
+job, `contents: read`). To reproduce CI locally, run from the repo root
+with Node 22:
+
+```sh
+npm ci
+npm run build
+npm test
+npm run lint
+```
+
 Run the CLI from source after building:
 
 ```sh
