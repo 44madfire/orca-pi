@@ -250,13 +250,37 @@ describe("orca-pi profile inspect", () => {
   });
 
   it("states JEF-7 ownership instead of building argv when no formatter is injected", async () => {
-    const { deps, out } = makeDeps({
+    // Production `run()` always wires JEF-7's provider; the no-provider
+    // fallback lives in `runProfilesCommand` directly (no hidden store).
+    const { runProfilesCommand } = await import("../src/commands/profiles.js");
+    const out: string[] = [];
+    const err: string[] = [];
+    const { fs, projectRoot } = makeDeps({
+      "/home/u/.pi/agent/profiles.yaml": USER_YAML,
+    }).deps;
+    const result = await runProfilesCommand(["inspect", "scout"], {
+      stdout: (text: string) => out.push(text),
+      stderr: (text: string) => err.push(text),
+      projectRoot: projectRoot ?? "/repo/p",
+      ...(fs !== undefined ? { fs } : {}),
+      userConfigPathOverride: "/home/u/.pi/agent/profiles.yaml",
+      projectConfigPathOverride: "/repo/p/.pi/profiles.yaml",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(out.join("")).toContain("JEF-7");
+    expect(out.join("")).toContain("never builds argv");
+  });
+
+  it("wires JEF-7 production preview by default (no stub needed)", async () => {
+    const { deps, out, err } = makeDeps({
       "/home/u/.pi/agent/profiles.yaml": USER_YAML,
     });
     const result = await run(["profile", "inspect", "scout"], deps);
     expect(result.exitCode).toBe(0);
-    expect(out.join("")).toContain("JEF-7");
-    expect(out.join("")).toContain("never builds argv");
+    expect(err.join("")).toBe("");
+    // Real JEF-7 formatter output: deterministic argv + DO NOT EXECUTE.
+    expect(out.join("")).toContain("--model");
+    expect(out.join("")).toContain("DO NOT EXECUTE");
   });
 
   it("supports --json with contextSummary and launchPreview", async () => {

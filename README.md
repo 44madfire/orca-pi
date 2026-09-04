@@ -137,7 +137,6 @@ orca-pi doctor
   invalid or unreadable.
 - `orca-pi profile path [--project|--user] [--json]` prints the authoritative
   user/global and project locations (script-friendly with `--project`/`--user`).
-<<<<<<< HEAD
   Never parses file contents, so it stays usable when config is malformed
   (recovery UX; content diagnostics belong to `validate`).
 

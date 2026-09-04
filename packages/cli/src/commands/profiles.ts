@@ -33,6 +33,7 @@ import {
   getUserProfilesPath,
   loadProfilesFile,
   mergeValidatedDocuments,
+  normalizeLaunchPreview,
   summarizeAllProfiles,
   validateAllProfiles,
   type LaunchPreviewProvider,
@@ -335,7 +336,11 @@ async function runShow(
     return { exitCode: 2 };
   }
   if (!name) {
-    deps.stderr(`error: missing profile name\n`);
+    deps.stderr(
+      options.inspect
+        ? `error: profile inspect requires a profile name\n`
+        : `error: profile show requires a profile name\n`,
+    );
     deps.stderr(
       options.inspect
         ? PROFILE_INSPECT_USAGE
@@ -421,24 +426,41 @@ async function runShow(
         ...(promptTruncated ? { promptTruncated: true } : {}),
       };
       if (options.inspect) {
-        let launchPreview: string | undefined;
         if (deps.getLaunchPreview) {
           try {
-            launchPreview = await deps.getLaunchPreview(detail.resolved, {
-              projectRoot: effectiveProjectRoot,
-              cwd: effectiveCwd,
-              showFullPrompt: showPrompt,
-            });
+            const preview = normalizeLaunchPreview(
+              await deps.getLaunchPreview(detail.resolved, {
+                projectRoot: effectiveProjectRoot,
+                cwd: effectiveCwd,
+                showFullPrompt: showPrompt,
+              }),
+            );
+            payload.launchPreview = preview.preview;
+            // Structured JEF-7 launch fields stay top-level so `--json`
+            // keeps the `{ profile, spec, promptSource, … }` contract.
+            for (const key of [
+              "spec",
+              "promptSource",
+              "promptFileRelativePath",
+              "promptFileAbsolutePath",
+              "promptTransport",
+              "promptTempPath",
+              "promptText",
+            ] as const) {
+              const value = preview[key];
+              if (value !== undefined) payload[key] = value;
+            }
           } catch (error) {
-            payload.launchPreviewError =
-              error instanceof Error ? error.message : String(error);
+            deps.stderr(
+              `error: ${error instanceof Error ? error.message : String(error)}\n`,
+            );
+            return { exitCode: 1 };
           }
         } else {
           payload.launchPreview = null;
           payload.launchPreviewNote =
             "unavailable — deterministic Pi argv is owned by JEF-7 (ResolvedPiProfile → ProcessSpec + redacted formatter)";
         }
-        if (launchPreview !== undefined) payload.launchPreview = launchPreview;
         if (contextSummary) {
           payload.contextSummary = {
             thinking: detail.resolved.thinking,
@@ -457,15 +479,20 @@ async function runShow(
       let launchPreview: string | undefined;
       if (deps.getLaunchPreview) {
         try {
-          launchPreview = await deps.getLaunchPreview(detail.resolved, {
-            projectRoot: effectiveProjectRoot,
-            cwd: effectiveCwd,
-            showFullPrompt: showPrompt,
-          });
+          launchPreview = normalizeLaunchPreview(
+            await deps.getLaunchPreview(detail.resolved, {
+              projectRoot: effectiveProjectRoot,
+              cwd: effectiveCwd,
+              showFullPrompt: showPrompt,
+            }),
+          ).preview;
         } catch (error) {
+          // Production launch failures (e.g. missing prompt file) are
+          // actionable exit-1 errors, matching JEF-7's inspect contract.
           deps.stderr(
-            `warning: launch preview failed: ${error instanceof Error ? error.message : String(error)}\n`,
+            `error: ${error instanceof Error ? error.message : String(error)}\n`,
           );
+          return { exitCode: 1 };
         }
       }
       deps.stdout(

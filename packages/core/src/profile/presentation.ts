@@ -55,21 +55,56 @@ export interface LaunchPreviewContext {
  * integrates as:
  *
  * ```ts
- * getLaunchPreview: async (resolved, ctx) =>
- *   formatPiInspect(
- *     resolved,
- *     await buildPiLaunch(resolved, { projectRoot: ctx.projectRoot, cwd: ctx.cwd }),
- *     { showFullPrompt: ctx.showFullPrompt },
- *   )
+ * getLaunchPreview: async (resolved, ctx) => {
+ *   const launch = await buildPiLaunch(resolved, { projectRoot: ctx.projectRoot, cwd: ctx.cwd });
+ *   return {
+ *     preview: formatPiInspect(resolved, launch, { showFullPrompt: ctx.showFullPrompt }),
+ *     spec: launch.spec,
+ *     promptSource: launch.promptSource,
+ *     ...
+ *   };
+ * }
  * ```
+ * (see `productionGetLaunchPreview` in `packages/cli/src/main.ts`).
  *
- * Implementations must be redacted, human-readable, display-only, and must
- * never be used to execute the command (see JEF-7 `process-spec.ts`).
+ * Providers may return a bare string (preview only); structured results
+ * additionally populate `profile inspect --json` fields (`spec`,
+ * `promptSource`, …) so the JSON contract keeps JEF-7's
+ * `{ profile, spec, promptSource, … }` shape alongside JEF-11 presentation
+ * fields. Implementations must be redacted, human-readable, display-only,
+ * and must never be used to execute the command (see JEF-7 `process-spec.ts`).
  */
 export type LaunchPreviewProvider = (
   resolved: ResolvedPiProfile,
   context: LaunchPreviewContext,
-) => Promise<string> | string;
+) => Promise<LaunchPreviewResult | string> | LaunchPreviewResult | string;
+
+/**
+ * Structured launch-preview result (JEF-7 owns the fields; JEF-11 renders them).
+ *
+ * `preview` is the redacted display-only string (human output + JSON
+ * `launchPreview`). The remaining fields are JEF-7's structured launch data,
+ * merged top-level into `profile inspect --json` so the JSON contract keeps
+ * `{ profile, spec, promptSource, … }`. Display output must never be executed
+ * — launchers use `spec.args` structurally.
+ */
+export interface LaunchPreviewResult {
+  preview: string;
+  spec?: unknown;
+  promptSource?: string;
+  promptFileRelativePath?: string;
+  promptFileAbsolutePath?: string;
+  promptTransport?: unknown;
+  promptTempPath?: string;
+  promptText?: string;
+}
+
+/** Normalize a provider return into its structured form. */
+export function normalizeLaunchPreview(
+  value: LaunchPreviewResult | string,
+): LaunchPreviewResult {
+  return typeof value === "string" ? { preview: value } : value;
+}
 
 /** Where an effective field value came from. */
 export type ProvenanceKind = "built-in" | "user" | "project";
