@@ -78,6 +78,7 @@ export {
 export {
   buildCheckCompletePayload,
   buildCheckStartPayload,
+  buildCheckStartUpdatePayload,
   completeAgentReviewCheck,
   listCheckRunsForRef,
   selectCheckRunForUpdate,

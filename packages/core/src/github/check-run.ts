@@ -84,6 +84,32 @@ export function buildCheckStartPayload(input: {
   };
 }
 
+/**
+ * Build a `PATCH .../check-runs/{id}` payload that re-arms an existing
+ * deterministic run back to `in_progress` (idempotent `check start` retry).
+ *
+ * Update-only shape: `name`, `status`, and `output` are accepted by
+ * Update-a-check-run; `head_sha` is create-only (`POST /check-runs`) and
+ * must never be sent on PATCH. Callers needing the SHA for run selection
+ * already have it from the list step — it is not part of this body.
+ */
+export function buildCheckStartUpdatePayload(input: {
+  summary?: string;
+  text?: string;
+  provenance?: ReviewProvenance;
+}): Record<string, unknown> {
+  const summary = (input.summary ?? "Agent review in progress…").trim() || "Agent review in progress…";
+  return {
+    name: AGENT_REVIEW_CHECK_NAME,
+    status: "in_progress" satisfies CheckStatus,
+    output: {
+      title: "Agent review in progress",
+      summary: `${summary}${provenanceSuffix(input.provenance)}`.slice(0, 65000),
+      ...(input.text ? { text: input.text.slice(0, 65000) } : {}),
+    },
+  };
+}
+
 /** Build a `PATCH .../check-runs/{id}` payload for the `complete` step. */
 export function buildCheckCompletePayload(input: {
   verdict: ReviewVerdict;
@@ -240,7 +266,7 @@ export async function startAgentReviewCheck(
     const match = selectCheckRunForUpdate(existing, input.headSha);
     if (match) {
       const updateEndpoint = `/repos/${input.owner}/${input.repo}/check-runs/${match.id}`;
-      const updatePayload = buildCheckStartPayload({ headSha: input.headSha, summary: input.summary, text: input.text, provenance: input.provenance });
+      const updatePayload = buildCheckStartUpdatePayload({ summary: input.summary, text: input.text, provenance: input.provenance });
       const updateResponse = await fetchFn(`${apiBase}${updateEndpoint}`, { method: "PATCH", headers: baseHeaders(credential.token), body: JSON.stringify(updatePayload) });
       if (updateResponse.ok) {
         const data = (await updateResponse.json()) as { id?: unknown; html_url?: unknown };

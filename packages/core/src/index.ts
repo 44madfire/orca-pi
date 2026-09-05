@@ -253,6 +253,7 @@ export {
   authHeaderForCredential,
   buildCheckCompletePayload,
   buildCheckStartPayload,
+  buildCheckStartUpdatePayload,
   buildReviewPayload,
   collectSecretsFromEnv,
   completeAgentReviewCheck,

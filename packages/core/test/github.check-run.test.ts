@@ -3,6 +3,7 @@ import { createInstallationTokenCache } from "../src/github/github-app-auth.js";
 import {
   buildCheckCompletePayload,
   buildCheckStartPayload,
+  buildCheckStartUpdatePayload,
   completeAgentReviewCheck,
   selectCheckRunForUpdate,
   startAgentReviewCheck,
@@ -83,6 +84,26 @@ describe("check-run: payloads", () => {
     expect(payload.head_sha).toBe(SHA);
   });
 
+  it("Blocking: update payloads never send create-only head_sha (PATCH contract)", () => {
+    // GitHub Update-a-check-run accepts name/details_url/external_id/
+    // started_at/status/conclusion/output — head_sha is create-only.
+    const update = buildCheckStartUpdatePayload({ summary: "retry" }) as Record<string, unknown>;
+    expect(update).not.toHaveProperty("head_sha");
+    expect(update.name).toBe("orca-pi/agent-review");
+    expect(update.status).toBe("in_progress");
+    expect(update).toHaveProperty("output");
+    const allowed = new Set(["name", "details_url", "external_id", "started_at", "status", "conclusion", "output"]);
+    for (const key of Object.keys(update)) {
+      expect(allowed.has(key)).toBe(true);
+    }
+    // Create payload keeps head_sha for POST /check-runs.
+    const create = buildCheckStartPayload({ headSha: SHA }) as Record<string, unknown>;
+    expect(create.head_sha).toBe(SHA);
+    // Complete payload is update-safe too (no head_sha).
+    const complete = buildCheckCompletePayload({ verdict: "approve", summary: "ok" }) as Record<string, unknown>;
+    expect(complete).not.toHaveProperty("head_sha");
+  });
+
   it("complete payload maps request-changes to failure", () => {
     const payload = buildCheckCompletePayload({ verdict: "request-changes", summary: "2 blocking findings." }) as {
       status: string;
@@ -133,9 +154,17 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
   });
 
   it("Blocking 3: repeating start for the same SHA reuses the run (no duplicate POST)", async () => {
-    const { fetchFn, calls } = mockChecksFetch({
+    const patchBodies: Record<string, unknown>[] = [];
+    const base = mockChecksFetch({
       existing: [{ id: 5001, name: AGENT_REVIEW_CHECK_NAME, head_sha: SHA, status: "in_progress" }],
     });
+    const fetchFn: typeof base.fetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
+      if (init.method === "PATCH") {
+        patchBodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
+      }
+      return base.fetchFn(url, init);
+    });
+    const { calls } = base;
     const first = await startAgentReviewCheck(
       "reviewer",
       { owner: "o", repo: "r", headSha: SHA, summary: "in progress" },
@@ -152,6 +181,13 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
     // No POST creates at all — both starts PATCHed the existing run.
     expect(calls.filter((c) => c.startsWith("POST"))).toEqual([]);
     expect(calls.filter((c) => c.startsWith("PATCH")).length).toBe(2);
+    // PATCH bodies must be update-safe: no create-only head_sha.
+    expect(patchBodies.length).toBe(2);
+    for (const body of patchBodies) {
+      expect(body).not.toHaveProperty("head_sha");
+      expect(body.status).toBe("in_progress");
+      expect(body.name).toBe(AGENT_REVIEW_CHECK_NAME);
+    }
   });
 
   it("complete updates the same run created by start (no duplicates)", async () => {
