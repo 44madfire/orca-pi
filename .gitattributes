@@ -8,3 +8,4 @@ scripts/*.mjs text eol=lf
 packages/pi-rpc/fixtures/*.jsonl text eol=lf
 packages/pi-rpc/fixtures/*.json text eol=lf
 packages/pi-rpc/docs/*.md text eol=lf
+packages/structured-bridge/docs/*.md text eol=lf
