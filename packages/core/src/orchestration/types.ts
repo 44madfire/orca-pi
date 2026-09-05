@@ -42,6 +42,12 @@ export interface CompactSpawnOptions {
   readonly readinessTimeoutMs?: number;
   readonly preserveTerminalOnFailure?: boolean;
   readonly signal?: AbortSignal;
+  /**
+   * Explicit GitHub identity override (diagnostics/admin only, OP1.12).
+   * Must match the profile's `githubIdentity` when fixed — cross-role
+   * overrides are refused (no privilege escalation).
+   */
+  readonly githubIdentityOverride?: string;
 }
 
 /**

@@ -94,6 +94,8 @@ export interface SupervisedWorkerReceipt {
     readonly createdNew: boolean;
   };
   readonly profileName: string;
+  /** Effective GitHub identity inherited from the resolved profile (OP1.12). */
+  readonly githubIdentity?: string;
   /** Resolved Pi `--model` value when the profile sets one. */
   readonly piModel?: string;
   readonly piCommand: string;
