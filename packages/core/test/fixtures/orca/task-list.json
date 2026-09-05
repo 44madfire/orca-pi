@@ -1,0 +1,10 @@
+{
+  "id": "fixture-task-list",
+  "ok": true,
+  "result": {
+    "tasks": [
+      { "id": "task_1", "status": "dispatched", "spec": "Implement the fix per the scout handoff" },
+      { "id": "task_2", "status": "completed", "spec": "Map the auth flow" }
+    ]
+  }
+}

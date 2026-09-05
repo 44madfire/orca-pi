@@ -3,3 +3,5 @@
 prompts/*.md text eol=lf
 profiles/*.yaml text eol=lf
 packages/core/test/fixtures/profiles/* text eol=lf
+packages/orca-plugin/skills/**/SKILL.md text eol=lf
+scripts/*.mjs text eol=lf

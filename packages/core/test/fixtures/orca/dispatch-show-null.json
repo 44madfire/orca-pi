@@ -1,0 +1,7 @@
+{
+  "id": "fixture-dispatch-show-null",
+  "ok": true,
+  "result": {
+    "dispatch": null
+  }
+}

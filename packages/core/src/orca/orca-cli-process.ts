@@ -21,8 +21,18 @@ import {
   parseWorktreeShowJson,
   OrcaJsonParseError,
 } from "./json-parsers.js";
+import {
+  parseDispatchShowJson,
+  parseSendJson,
+  parseTaskListJson,
+  parseWorkerListJson,
+  parseWorkerShowJson,
+  parseWorkerStopJson,
+} from "../orchestration/orchestration-parsers.js";
 import type {
+  ListTasksInput,
   OrcaCli,
+  SendToDispatchInput,
   TaskCreateInput,
   TerminalCreateInput,
   WorkerAttachInput,
@@ -435,5 +445,114 @@ export function createOrcaCliProcess(
         throw error;
       }
     },
+
+    async showWorker(dispatchId: string) {
+      const stdout = await runJson(
+        ["orchestration", "worker-show", "--dispatch", dispatchId, "--json"],
+        "worker-show",
+      );
+      return wrapParse("worker-show", stdout, () => parseWorkerShowJson(stdout, dispatchId));
+    },
+
+    async listWorkers(options?: { runId?: string }) {
+      const args: string[] = ["orchestration", "worker-list"];
+      if (options?.runId !== undefined) args.push("--run", options.runId);
+      args.push("--json");
+      const stdout = await runJson(args, "worker-list");
+      return wrapParse("worker-list", stdout, () => parseWorkerListJson(stdout));
+    },
+
+    async showDispatch(taskId: string, options?: { fromHandle?: string }) {
+      const args: string[] = ["orchestration", "dispatch-show", "--task", taskId];
+      if (options?.fromHandle !== undefined) args.push("--from", options.fromHandle);
+      args.push("--json");
+      const stdout = await runJson(args, "dispatch-show");
+      return wrapParse("dispatch-show", stdout, () => parseDispatchShowJson(stdout, taskId));
+    },
+
+    async listTasks(options?: ListTasksInput) {
+      const args: string[] = ["orchestration", "task-list"];
+      if (options?.status !== undefined) args.push("--status", options.status);
+      if (options?.runId !== undefined) args.push("--run", options.runId);
+      if (options?.fromHandle !== undefined) args.push("--from", options.fromHandle);
+      args.push("--json");
+      const stdout = await runJson(args, "task-list");
+      return wrapParse("task-list", stdout, () => parseTaskListJson(stdout));
+    },
+
+    async sendToDispatch(input: SendToDispatchInput) {
+      const loweredType = input.type?.trim().toLowerCase();
+      if (loweredType === "worker_done" || loweredType === "heartbeat") {
+        throw new OrcaCommandError({
+          code: "compact-send-forbidden-type",
+          message:
+            `compact send: --type "${input.type}" is a Dispatch-scoped worker signal and cannot be sent by the coordinator. Omit --type for a normal follow-up; worker_done/heartbeat belong to the worker's own terminal with its injected IDs.`,
+          executable,
+          args: [],
+          diagnostics: `forbidden send type: ${input.type}`,
+        });
+      }
+      const args: string[] = [
+        "orchestration",
+        "send",
+        "--to",
+        `dispatch:${input.dispatchId}`,
+        "--subject",
+        input.subject,
+        "--body",
+        input.body,
+      ];
+      if (input.type !== undefined && input.type.trim().length > 0) args.push("--type", input.type);
+      if (input.runId !== undefined) args.push("--run", input.runId);
+      if (input.fromHandle !== undefined) args.push("--from", input.fromHandle);
+      args.push("--json");
+      const stdout = await runJson(args, "send");
+      return wrapParse("send", stdout, () => parseSendJson(stdout));
+    },
+
+    async stopWorker(dispatchId: string) {
+      let stdout: string;
+      try {
+        stdout = await runJson(
+          ["orchestration", "worker-stop", "--dispatch", dispatchId, "--json"],
+          "worker-stop",
+        );
+      } catch (error) {
+        // Idempotent fence: an already-settled/stale dispatch means there is
+        // nothing to stop, which is the desired end state. Never convert a
+        // definite failure into success — only stale/settled signals.
+        if (error instanceof OrcaCommandError) {
+          const probe = `${error.code} ${error.message} ${error.diagnostics}`.toLowerCase();
+          if (
+            probe.includes("stale") ||
+            probe.includes("not_found") ||
+            probe.includes("notfound") ||
+            probe.includes("already") ||
+            probe.includes("released") ||
+            probe.includes("settled") ||
+            probe.includes("no such dispatch") ||
+            probe.includes("dispatch_not_found") ||
+            probe.includes("dispatch_handle_stale")
+          ) {
+            return { raw: error.stdout !== undefined ? tryParseRaw(error.stdout) : {}, alreadyStopped: true as const };
+          }
+        }
+        throw error;
+      }
+      const parsed = wrapParse("worker-stop", stdout, () => parseWorkerStopJson(stdout));
+      return { raw: parsed.raw, alreadyStopped: false as const };
+    },
   };
+}
+
+function tryParseRaw(stdout: string): unknown {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    if (parsed && typeof parsed === "object" && "result" in (parsed as Record<string, unknown>)) {
+      return (parsed as Record<string, unknown>)["result"];
+    }
+    return parsed;
+  } catch {
+    return {};
+  }
 }

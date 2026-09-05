@@ -1,5 +1,6 @@
 /**
- * Injectable Orca CLI boundary for supervised Pi workers (OP1.4 / JEF-8).
+ * Injectable Orca CLI boundary for supervised Pi workers (OP1.4 / JEF-8)
+ * plus compact Pi-facing orchestration reads (OP1.5 / JEF-9).
  *
  * The spawn orchestrator (`spawn-supervised-pi-worker.ts`) depends only on
  * this interface, so unit tests inject a fake without spawning `orca`. The
@@ -9,6 +10,12 @@
  * Public-contract rule: only `orca` CLI commands with `--json` are used.
  * No duplicate orchestration database is introduced — Orca owns Runs, Tasks,
  * and Dispatches; this layer only carries their identities.
+ *
+ * JEF-9 additions (`showWorker`, `listWorkers`, `showDispatch`,
+ * `listTasks`, `sendToDispatch`, `stopWorker`) are thin read/message/fence
+ * wrappers over the same public contracts. They never infer
+ * completion/status from terminal text — Orca Task/Dispatch state is
+ * authoritative.
  */
 
 import type { PiProcessSpec } from "../pi/process-spec.js";
@@ -85,6 +92,28 @@ export interface WorkerAttachInput {
   readonly fromHandle?: string;
 }
 
+/** Input for `orchestration send --to dispatch:<id> --subject/--body --json` (JEF-9). */
+export interface SendToDispatchInput {
+  readonly dispatchId: string;
+  readonly subject: string;
+  readonly body: string;
+  readonly fromHandle?: string;
+  readonly runId?: string;
+  /**
+   * Optional explicit message type. Coordinator follow-ups default to
+   * Orca's default (no `--type`); `worker_done`/`heartbeat` are rejected
+   * because those are Dispatch-scoped worker signals with provenance rules.
+   */
+  readonly type?: string;
+}
+
+/** Input for `orchestration task-list --json` (JEF-9 status/wait). */
+export interface ListTasksInput {
+  readonly runId?: string;
+  readonly fromHandle?: string;
+  readonly status?: string;
+}
+
 /** Injectable Orca surface used by the spawn orchestrator. */
 export interface OrcaCli {
   /**
@@ -116,6 +145,69 @@ export interface OrcaCli {
    * closing an already-closed/stale handle succeeds.
    */
   closeTerminal(handle: string): Promise<void>;
+  /**
+   * Inspect one supervised worker Dispatch (`worker-show --dispatch --json`, JEF-9).
+   * Orca-state only; never terminal-text inference.
+   */
+  showWorker(dispatchId: string): Promise<{
+    readonly dispatchId: string;
+    readonly taskId?: string;
+    readonly dispatchStatus?: string;
+    readonly workerState?: string;
+    readonly stage?: string;
+    readonly terminalHandle?: string;
+    readonly supervised?: boolean;
+    readonly raw: unknown;
+  }>;
+  /** List supervised worker accounting (`worker-list --json`, JEF-9). */
+  listWorkers(options?: { runId?: string }): Promise<{
+    readonly entries: readonly {
+      readonly dispatchId?: string;
+      readonly taskId?: string;
+      readonly terminalHandle?: string;
+      readonly terminalState?: string;
+      readonly dispatchStatus?: string;
+      readonly workerState?: string;
+      readonly supervised?: boolean;
+    }[];
+    readonly raw: unknown;
+  }>;
+  /** Show dispatch context for a task (`dispatch-show --task --json`, JEF-9). */
+  showDispatch(
+    taskId: string,
+    options?: { fromHandle?: string },
+  ): Promise<{
+    readonly taskId: string;
+    readonly dispatchId?: string;
+    readonly dispatchStatus?: string;
+    readonly taskStatus?: string;
+    readonly workerState?: string;
+    readonly terminalHandle?: string;
+    readonly raw: unknown;
+  }>;
+  /** List tasks (`task-list --json`, JEF-9). May throw `run_required` when no Run is bound. */
+  listTasks(options?: ListTasksInput): Promise<{
+    readonly entries: readonly {
+      readonly taskId: string;
+      readonly status?: string;
+      readonly specTruncated?: string;
+    }[];
+    readonly raw: unknown;
+  }>;
+  /**
+   * Send coordinator follow-up mail (`send --to dispatch:<id> --json`, JEF-9).
+   * Structured inbox mail, not prompt injection; preserves provenance via
+   * `--from` when the coordinator handle is known. Never sends
+   * `worker_done`/`heartbeat` (Dispatch-scoped worker signals).
+   */
+  sendToDispatch(input: SendToDispatchInput): Promise<{ readonly raw: unknown }>;
+  /**
+   * Fence one Dispatch and stop its terminal (`worker-stop --dispatch --json`, JEF-9).
+   * Idempotent: already-settled/stale dispatches succeed with
+   * `alreadyStopped: true` instead of failing. Never marks the Task
+   * completed/failed — Orca worker lifecycle owns completion.
+   */
+  stopWorker(dispatchId: string): Promise<{ readonly raw: unknown; readonly alreadyStopped: boolean }>;
 }
 
 /** Default TUI-readiness wait when the caller does not specify one. */

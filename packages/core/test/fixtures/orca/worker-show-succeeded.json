@@ -1,0 +1,8 @@
+{
+  "id": "fixture-worker-show-succeeded",
+  "ok": true,
+  "result": {
+    "dispatch": { "id": "dispatch_abc", "task_id": "task_123", "status": "completed" },
+    "worker": { "state": "succeeded", "stage": "done", "agent_terminal_handle": "term_xyz" }
+  }
+}
