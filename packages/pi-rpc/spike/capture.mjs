@@ -21,7 +21,7 @@
  * Always uses an isolated PI_CODING_AGENT_DIR (auth copied, settings
  * minimal) so global user settings are never mutated.
  */
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -37,9 +37,42 @@ const only = onlyIdx !== -1 ? process.argv[onlyIdx + 1] : null;
 function enabled(name) {
   return only === null || only === name;
 }
-// Prefer `pi` on PATH; fall back to the local npm bundle path (Windows dev box).
-const PI_BUNDLE = "C:/Users/jeffr/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
-const USE_BUNDLE = fs.existsSync(PI_BUNDLE);
+// Pi resolution order: explicit PI_RPC_PI_CLI env override (a `pi` binary or
+// its `dist/bundle/cli.js`), then `pi` on PATH (verified with --version),
+// then the global npm bundle. No hardcoded user paths: the authoritative
+// baseline is whatever binary answers here. On Windows git-bash boxes the
+// extensionless shims are not directly executable, so set PI_RPC_PI_CLI to
+// the bundle cli.js, e.g. PI_RPC_PI_CLI=".../pi-coding-agent/dist/bundle/cli.js".
+function npmGlobalBundle() {
+  try {
+    const root = execFileSync("npm", ["root", "-g"], { timeout: 15000, encoding: "utf8" }).trim();
+    const cli = path.join(root, "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+    return fs.existsSync(cli) ? cli : null;
+  } catch {
+    return null;
+  }
+}
+function piWorks(cmd) {
+  try {
+    execFileSync(cmd, ["--version"], { timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function resolvePi() {
+  const override = process.env.PI_RPC_PI_CLI;
+  if (override) {
+    // A bundle cli.js must be run under node; a real binary runs directly.
+    if (override.endsWith(".js")) return { piCommand: process.execPath, bundle: override };
+    return { piCommand: override, bundle: null };
+  }
+  if (piWorks("pi")) return { piCommand: "pi", bundle: null };
+  const bundle = npmGlobalBundle();
+  if (bundle) return { piCommand: process.execPath, bundle };
+  throw new Error("cannot locate a pi binary: set PI_RPC_PI_CLI or put pi on PATH");
+}
+let PI = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -59,7 +92,12 @@ function isolatedEnv() {
     path.join(agentDir, "settings.json"),
     JSON.stringify({ defaultProvider: "opencode-go", defaultModel: "muse-spark-1.3-contributor" }),
   );
-  return { tmp, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir } };
+  // Isolated working directory so captures never depend on the repo cwd.
+  // Deterministic tool-input file for the tool-execution scenario.
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.writeFileSync(path.join(cwd, "probe-note.json"), JSON.stringify({ name: "pi-rpc-probe", kind: "fixture-input" }, null, 2) + "\n");
+  return { tmp, cwd, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir } };
 }
 
 function writeFixture(name, records, normalizer) {
@@ -69,18 +107,26 @@ function writeFixture(name, records, normalizer) {
   console.log(`wrote ${name}: ${records.length} records (${s2c} s2c)`);
 }
 
-async function runSession(piArgs, env, script) {
-  const client = USE_BUNDLE
-    ? new SpikeClient({ piCommand: process.execPath, piArgs: [PI_BUNDLE, ...piArgs], env })
-    : new SpikeClient({ piCommand: "pi", piArgs, env });
+// Ambient flags shared by every capture session: disable skills, prompt
+// templates, extension discovery (explicit --extension still loads), and
+// project context files so regeneration is machine-independent.
+const AMBIENT_OFF = ["--no-skills", "--no-prompt-templates", "--no-extensions", "--no-context-files"];
+let CAPTURE_CWD = null;
+async function runSession(piArgs, env, script, opts = {}) {
+  if (!PI) PI = resolvePi();
+  const cwd = opts.cwd ?? CAPTURE_CWD;
+  const client = PI.bundle
+    ? new SpikeClient({ piCommand: process.execPath, piArgs: [PI.bundle, ...piArgs], env, ...(cwd ? { cwd } : {}) })
+    : new SpikeClient({ piCommand: PI.piCommand, piArgs, env, ...(cwd ? { cwd } : {}) });
   await client.start();
   await sleep(2500);
+  let exit = null;
   try {
     await script(client);
   } finally {
-    await client.close(2000);
+    exit = await client.close(2000);
   }
-  return client.records;
+  return { records: client.records, exit };
 }
 
 async function autoRespondDialogs(client, seen, respond) {
@@ -120,8 +166,9 @@ function dialogResponder(p) {
 
 function piVersion() {
   return new Promise((resolve) => {
-    const cmd = USE_BUNDLE ? process.execPath : "pi";
-    const args = USE_BUNDLE ? [PI_BUNDLE, "--version"] : ["--version"];
+    if (!PI) PI = resolvePi();
+    const cmd = PI.bundle ? process.execPath : PI.piCommand;
+    const args = PI.bundle ? [PI.bundle, "--version"] : ["--version"];
     execFile(cmd, args, { timeout: 15000 }, (_e, stdout, stderr) => {
       const out = `${stdout}\n${stderr}`;
       resolve(/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/.exec(out)?.[1] ?? out.trim());
@@ -131,12 +178,13 @@ function piVersion() {
 
 async function main() {
   console.log(`capture --full=${full}`);
-  const { tmp, env } = isolatedEnv();
+  const { tmp, cwd, env } = isolatedEnv();
+  CAPTURE_CWD = cwd;
   console.log(`isolated agent dir under ${tmp}`);
   try {
     // ---- startup-idle (no LLM) ----
     if (enabled("startup-idle")) {
-      const records = await runSession(["--no-session", "--offline"], env, async (c) => {
+      const { records } = await runSession(["--no-session", "--offline", ...AMBIENT_OFF], env, async (c) => {
         for (const cmd of [
           { id: "s1", type: "get_state" },
           { id: "s2", type: "get_entries" },
@@ -156,7 +204,7 @@ async function main() {
 
     // ---- bash-rpc incl. U+2028/U+2029 (no LLM) ----
     if (enabled("bash-rpc")) {
-      const records = await runSession(["--no-session", "--offline"], env, async (c) => {
+      const { records } = await runSession(["--no-session", "--offline", ...AMBIENT_OFF], env, async (c) => {
         await c.waitResponse({ id: "u1", type: "bash", command: "echo hello-pi-rpc" }, { timeoutMs: 15000 });
         await sleep(300);
         await c.waitResponse(
@@ -171,7 +219,7 @@ async function main() {
 
     // ---- models-thinking + queue modes (no LLM) ----
     if (enabled("models-thinking")) {
-      const records = await runSession(["--no-session", "--provider", "opencode-go", "--model", "glm-5.3-flash"], env, async (c) => {
+      const { records } = await runSession(["--no-session", "--provider", "opencode-go", "--model", "glm-5.3-flash", ...AMBIENT_OFF], env, async (c) => {
         await c.waitResponse({ id: "m1", type: "get_available_models" }, { timeoutMs: 20000 });
         await c.waitResponse({ id: "m2", type: "set_model", provider: "opencode-go", modelId: "glm-5.3-flash" }, { timeoutMs: 20000 });
         await c.waitResponse({ id: "m3", type: "set_model", provider: "nope", modelId: "nope" }, { timeoutMs: 20000 });
@@ -192,9 +240,9 @@ async function main() {
       writeFixture("models-thinking.jsonl", records, createRecordNormalizer());
     }
 
-    // ---- malformed + exit notes (no LLM) ----
+    // ---- malformed + observed process exit (no LLM) ----
     if (enabled("malformed-exit")) {
-      const records = await runSession(["--no-session", "--offline"], env, async (c) => {
+      const { records, exit } = await runSession(["--no-session", "--offline", ...AMBIENT_OFF], env, async (c) => {
         c.sendRaw("not-json\n");
         await sleep(600);
         await c.waitResponse({ id: "x1", type: "unknown_cmd_xyz" }, { timeoutMs: 15000 });
@@ -206,11 +254,11 @@ async function main() {
         await sleep(500);
         await c.waitResponse({ id: "x8", type: "export_html", outputPath: `${tmp}/probe.html` }, { timeoutMs: 15000 });
         await c.waitResponse({ id: "x9", type: "get_state" }, { timeoutMs: 15000 });
-      });
-      // Append prompt-while-streaming rejection + exit notes (streaming case
-      // needs an LLM turn; rejection text verified live — see contract doc).
-      records.push({ seq: records.length, dir: "sys", payload: { event: "stdin-eof", result: "process exits 0" } });
-      records.push({ seq: records.length, dir: "sys", payload: { event: "process-exit", code: 0, signal: null, note: "Closing stdin (EOF) exits cleanly 0; SIGTERM fallback kills when EOF is ignored." } });
+      }, { cwd });
+      // Lifecycle row comes from the observed close result (EOF on stdin),
+      // not an asserted constant. The prompt-while-streaming rejection is
+      // captured live in the abort-queue full scenario.
+      records.push({ seq: records.length, dir: "sys", payload: { event: "process-exit", code: exit.exitCode, signal: exit.signal, note: "Observed close result after stdin EOF; SIGTERM fallback kills when EOF is ignored." } });
       writeFixture("malformed-exit.jsonl", records, createRecordNormalizer());
     }
 
@@ -220,7 +268,7 @@ async function main() {
       let models = [];
       let thinkingLevels = [];
       try {
-        const recs = await runSession(["--no-session", "--provider", "opencode-go", "--model", "glm-5.3-flash"], env, async (c) => {
+        const { records: recs } = await runSession(["--no-session", "--provider", "opencode-go", "--model", "glm-5.3-flash", ...AMBIENT_OFF], env, async (c) => {
           const m = await c.waitResponse({ id: "b1", type: "get_available_models" }, { timeoutMs: 20000 });
           models = m.data?.models ?? [];
           const t = await c.waitResponse({ id: "b2", type: "get_available_thinking_levels" }, { timeoutMs: 15000 });
@@ -257,11 +305,11 @@ async function main() {
       return;
     }
 
-    const MODEL_ARGS = ["--provider", "opencode-go", "--model", "glm-5.3-flash", "--thinking", "low"];
+    const MODEL_ARGS = ["--provider", "opencode-go", "--model", "glm-5.3-flash", "--thinking", "low", ...AMBIENT_OFF];
 
     // ---- text-streaming ----
     if (enabled("text-streaming")) {
-      const records = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
+      const { records } = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
         await c.waitResponse({ id: "p1", type: "prompt", message: "Reply with exactly the 3 words: alpha beta gamma. No tools." }, { timeoutMs: 20000 });
         await waitSettledWithDialogs(c, dialogResponder);
         await c.waitResponse({ id: "p2", type: "get_last_assistant_text" }, { timeoutMs: 15000 });
@@ -271,7 +319,7 @@ async function main() {
 
     // ---- thinking (high) ----
     if (enabled("thinking")) {
-      const records = await runSession(["--no-session", "--provider", "opencode-go", "--model", "glm-5.3-flash", "--thinking", "high"], env, async (c) => {
+      const { records } = await runSession(["--no-session", "--provider", "opencode-go", "--model", "glm-5.3-flash", "--thinking", "high", ...AMBIENT_OFF], env, async (c) => {
         await c.waitResponse({ id: "h1", type: "prompt", message: "Think step by step then reply with exactly: done. Keep reasoning brief." }, { timeoutMs: 20000 });
         await waitSettledWithDialogs(c, dialogResponder);
       });
@@ -280,8 +328,8 @@ async function main() {
 
     // ---- tool-execution (read + streaming bash) ----
     if (enabled("tool-execution")) {
-      const records = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
-        await c.waitResponse({ id: "q1", type: "prompt", message: "Use the read tool to read package.json in the current directory and reply with just its name field value. No other tools." }, { timeoutMs: 20000 });
+      const { records } = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
+        await c.waitResponse({ id: "q1", type: "prompt", message: "Use the read tool to read probe-note.json in the current directory and reply with just its name field value. No other tools." }, { timeoutMs: 20000 });
         await waitSettledWithDialogs(c, dialogResponder);
         await c.waitResponse({ id: "q2", type: "prompt", message: "Use the bash tool to run this exact command: echo tick-1; echo tick-2; echo tick-3 and then reply DONE. Only that tool." }, { timeoutMs: 20000 });
         await waitSettledWithDialogs(c, dialogResponder);
@@ -291,16 +339,17 @@ async function main() {
 
     // ---- abort-queue ----
     if (enabled("abort-queue")) {
-      const records = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
+      const { records } = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
         await c.waitResponse({ id: "ab1", type: "prompt", message: "Write a 100-word essay about the history of JSON Lines. Do not use tools." }, { timeoutMs: 20000 });
-        // Abort as soon as the first streamed delta arrives: deterministic
-        // mid-stream abort with a small fixture regardless of model speed.
+        // While ab1 streams, a bare prompt must be rejected live (captures
+        // the exact streaming-rejection text), then abort mid-stream.
         const t0 = Date.now();
         for (;;) {
           const streaming = c.records.some((r) => r.dir === "s2c" && r.payload?.type === "message_update");
           if (streaming || Date.now() - t0 > 25000) break;
           await sleep(150);
         }
+        await c.waitResponse({ id: "ab0x", type: "prompt", message: "This should fail while streaming" }, { timeoutMs: 15000 });
         await c.waitResponse({ id: "ab2", type: "abort" }, { timeoutMs: 30000 });
         await sleep(1500);
         await c.waitResponse({ id: "ab3", type: "steer", message: "idle steer" }, { timeoutMs: 15000 });
@@ -313,8 +362,11 @@ async function main() {
     }
 
     // ---- state-tree (one text turn, then state reads — one coherent session) ----
+    // Uses --session-dir so get_state carries sessionFile (contract claim).
     if (enabled("state-tree")) {
-      const records = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
+      const stateDir = path.join(tmp, "state-sessions");
+      fs.mkdirSync(stateDir, { recursive: true });
+      const { records } = await runSession([...MODEL_ARGS, "--session-dir", stateDir], env, async (c) => {
         await c.waitResponse({ id: "st0", type: "prompt", message: "Say IDLE-OK" }, { timeoutMs: 20000 });
         await waitSettledWithDialogs(c, dialogResponder);
         await c.waitResponse({ id: "st1", type: "set_session_name", name: "snc1-probe" }, { timeoutMs: 15000 });
@@ -336,7 +388,7 @@ async function main() {
     // ---- images ----
     if (enabled("images")) {
       const png1px = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-      const records = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
+      const { records } = await runSession(["--no-session", ...MODEL_ARGS], env, async (c) => {
         await c.waitResponse({ id: "i1", type: "prompt", message: "What is in this image? Reply with exactly: ONE-PIXEL.", images: [{ type: "image", data: png1px, mimeType: "image/png" }] }, { timeoutMs: 20000 });
         await waitSettledWithDialogs(c, dialogResponder);
         await c.waitResponse({ id: "i2", type: "get_entries" }, { timeoutMs: 15000 });
@@ -358,7 +410,7 @@ async function main() {
       ].join("\n");
       const extPath = path.join(tmp, "rpc-dialog-ext.mjs");
       fs.writeFileSync(extPath, extCode);
-      const records = await runSession(["--no-session", ...MODEL_ARGS, "--extension", extPath], env, async (c) => {
+      const { records } = await runSession(["--no-session", ...MODEL_ARGS, "--extension", extPath], env, async (c) => {
         await c.waitResponse({ id: "e1", type: "get_commands" }, { timeoutMs: 15000 });
         const seenExt = new Set();
         for (const [id, msg] of [["e2", "/rpc-ask"], ["e3", "/rpc-confirm"], ["e4", "/rpc-input"], ["e5", "/rpc-editor"], ["e6", "/rpc-cancel"]]) {
@@ -382,7 +434,7 @@ async function main() {
       const sessionDir = path.join(tmp, "sessions");
       fs.mkdirSync(sessionDir, { recursive: true });
       let sessionFile = null;
-      const records = await runSession([...MODEL_ARGS, "--session-dir", sessionDir], env, async (c) => {
+      const { records } = await runSession([...MODEL_ARGS, "--session-dir", sessionDir], env, async (c) => {
         await c.waitResponse({ id: "r0", type: "prompt", message: "Say FIRST." }, { timeoutMs: 20000 });
         await waitSettledWithDialogs(c, dialogResponder);
         const st = await c.waitResponse({ id: "r1", type: "get_state" }, { timeoutMs: 15000 });
@@ -390,7 +442,7 @@ async function main() {
         await c.waitResponse({ id: "r2", type: "get_entries" }, { timeoutMs: 15000 });
       });
       if (sessionFile) {
-        const records2 = await runSession(["--no-session", "--offline"], env, async (c) => {
+        const { records: records2 } = await runSession(["--no-session", "--offline", ...AMBIENT_OFF], env, async (c) => {
           await c.waitResponse({ id: "r3", type: "switch_session", sessionPath: sessionFile }, { timeoutMs: 15000 });
           await c.waitResponse({ id: "r4", type: "get_entries" }, { timeoutMs: 15000 });
           await c.waitResponse({ id: "r5", type: "get_last_assistant_text" }, { timeoutMs: 15000 });

@@ -36,10 +36,10 @@ maps to the same alias, so `parentId` chains, `since` cursors, `leafId`, and
 - Extension UI request ids → `<EXT_UI_1>`, `<EXT_UI_2>`, … — a request and
   its matching `extension_ui_response` share the number.
 - Provider `responseId` → `<RESPONSE_1>`, …
-- ISO timestamp strings → `<TIMESTAMP_ISO>`. Numeric epoch-ms message
-  timestamps stay raw live values: replacing a JSON number with a string
-  placeholder would break protocol shape, and the values carry no identity
-  or secret (ordering within a trace is preserved by record order).
+- ISO timestamp strings → `<TIMESTAMP_ISO>`; numeric epoch-ms `timestamp`
+  fields → the fixed sentinel `1700000000000` (shape-preserving: a string
+  placeholder would change the JSON type). Other numbers (usage, costs,
+  counts) stay raw as representative protocol data.
 - Absolute paths → `<SESSION_FILE>` / `<HOME>` / `<TMP>`.
 - Base64 image bytes → `<IMAGE_DATA>` (mimeType + shape kept).
 - Usage/cost numbers are preserved as representative real values.

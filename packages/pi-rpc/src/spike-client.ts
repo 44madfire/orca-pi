@@ -133,9 +133,10 @@ export class SpikeClient {
     this.proc.stdin.write(serializeJsonLine(command));
   }
 
-  /** Send raw bytes (for malformed-input probes). */
+  /** Send raw bytes (for malformed-input probes). Recorded as a c2s `{raw}` envelope. */
   sendRaw(text: string): void {
     if (!this.proc?.stdin) throw new Error("SpikeClient not started");
+    this.records.push({ seq: this.seq++, dir: "c2s", payload: { raw: text } });
     this.proc.stdin.write(text);
   }
 

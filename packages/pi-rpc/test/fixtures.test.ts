@@ -69,6 +69,13 @@ describe("pi-rpc fixtures (real-Pi, normalized, secret-free)", () => {
       expect(text, `${name} api key`).not.toMatch(/sk-(?:proj-)?[A-Za-z0-9\-_]{16,}/);
       // Legacy collapsed placeholders must not appear; aliases are numbered.
       expect(text, `${name} legacy placeholder`).not.toMatch(/<(SESSION_ID|ENTRY_ID|PARENT_ID|LEAF_ID|CALL_ID|EXT_UI_ID|RESPONSE_ID)>/);
+      // No raw epoch-ms timestamps: numeric `timestamp` fields normalize to
+      // the fixed 1700000000000 sentinel (baseline.json carries no epochs).
+      const epochs = text.match(/\b1[678]\d{11}\b/g) ?? [];
+      expect(
+        epochs.filter((n) => n !== "1700000000000"),
+        `${name} raw epoch-ms`,
+      ).toEqual([]);
     }
   });
 

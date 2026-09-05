@@ -11,9 +11,15 @@ describe("fixture normalization + secret hygiene", () => {
       sessionFile: "C:\\Users\\someone\\AppData\\Local\\Temp\\pi-rpc-x\\sessions\\a.jsonl",
       nested: { id: "8252cf90", parentId: "329506df", toolCallId: "call_90eb177fe4494c41a85183d7" },
       usage: { input: 1513, output: 5 },
+      sentAt: 1788619977010,
+      stamp: { timestamp: 1788619977010 },
     }) as Record<string, unknown>;
     expect(out["sessionId"]).toBe("<SESSION_1>");
     expect(out["leafId"]).toBe("<ENTRY_1>");
+    // Numeric epoch-ms under a timestamp key becomes the fixed sentinel…
+    expect((out["stamp"] as Record<string, unknown>)["timestamp"]).toBe(1700000000000);
+    // …while other numbers (usage, unrelated keys) stay raw.
+    expect((out as Record<string, unknown>)["sentAt"]).toBe(1788619977010);
     expect(out["usage"]).toEqual({ input: 1513, output: 5 });
     expect(JSON.stringify(out)).not.toContain("01a0720e");
     expect(JSON.stringify(out)).not.toContain("C:\\Users");

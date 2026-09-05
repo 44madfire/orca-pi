@@ -15,7 +15,9 @@ Minimal strict LF-only client + live capture against a real Pi binary.
 
 ## Prerequisites
 
-- `pi` on PATH (validated: `0.85.1`; falls back to the local npm bundle).
+- A Pi binary: `PI_RPC_PI_CLI` env override (binary or bundle `cli.js`),
+  else `pi` on PATH (verified with `--version`), else the global npm
+  bundle. Validated against `0.85.1`.
 - Provider auth in `~/.pi/agent` (copied into an isolated temp
   `PI_CODING_AGENT_DIR` per run) for `--full`.
 - Network for LLM turns and the model catalog; `--offline-only` needs none
@@ -32,14 +34,21 @@ node packages/pi-rpc/spike/capture.mjs --full --only abort-queue  # one fixture
 ```
 
 `--offline-only` captures `startup-idle`, `bash-rpc`, `models-thinking`,
-`malformed-exit`, and `baseline.json` — no LLM calls. `--full` additionally
-captures `text-streaming`, `thinking`, `tool-execution`, `abort-queue`,
-`state-tree`, `images`, `extension-ui` (temp extension exercising
-select/confirm/input/editor/cancel, auto-answered), and `resume-branch`
-(session dir + switch/fork/clone/new). Every run uses an isolated temp
+`malformed-exit` (with the observed stdin-EOF exit row), and `baseline.json`
+— no LLM calls. `--full` additionally captures `text-streaming`,
+`thinking`, `tool-execution`, `abort-queue` (incl. the live
+prompt-while-streaming rejection on the aborted turn), `state-tree` (with
+`--session-dir`, so `sessionFile` is present), `images`, `extension-ui`
+(temp extension exercising select/confirm/input/editor/cancel,
+auto-answered), and `resume-branch` (session dir +
+switch/fork/clone/new). Every run uses an isolated temp
 `PI_CODING_AGENT_DIR` (auth copied, settings minimal) so global
 `~/.pi/agent/settings.json` is never mutated by `set_steering_mode` /
-`set_auto_compaction` probes. Each fixture print shows record counts.
+`set_auto_compaction` probes, plus an isolated cwd with a deterministic
+`probe-note.json` tool-input file and ambient-off flags
+(`--no-skills --no-prompt-templates --no-extensions --no-context-files`,
+explicit `--extension` still loads) so regeneration is machine-independent.
+Each fixture print shows record counts.
 
 Cost control for `--full`: short constrained prompts on
 `opencode-go/glm-5.3-flash` with `low` thinking except the thinking probe

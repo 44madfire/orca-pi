@@ -18,8 +18,10 @@
  *   `extension_ui_request` / `extension_ui_response`).
  * - `<RESPONSE_1>`, … — provider `responseId` values.
  *
- * Singleton placeholders (no identity needed):
- * - `<TIMESTAMP_MS>`, `<TIMESTAMP_ISO>`
+ * Singleton placeholders (no identity needed): `<TIMESTAMP_ISO>` (ISO strings).
+ * Numeric epoch-ms `timestamp` fields map to the fixed sentinel number
+ * `1700000000000` (shape-preserving: a string placeholder would change the
+ * JSON type). Other numbers (usage, costs, counts) stay raw.
  * - `<SESSION_FILE>`, `<HOME>`, `<TMP>`, `<CWD>`
  * - `<IMAGE_DATA>` (base64 payloads are replaced; shape + mimeType kept)
  *
@@ -43,7 +45,7 @@ const UUID_RE =
 const HEX8_RE = /\b[0-9a-f]{8}\b/g;
 const CALL_RE = /\bcall_[A-Za-z0-9]+\b/g;
 const ISO_TS_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g;
-const EPOCH_MS_RE = /(?<!\d)(1[678]\d{12})(?!\d)/g;
+const EPOCH_MS_RE = /(?<!\d)(1[678]\d{11})(?!\d)/g;
 const WIN_ABS_RE = /[A-Za-z]:\\(?:[^"\\\n]+\\)*[^"\\\n]*/g;
 const UNIX_HOME_RE = /\/(?:home|Users)\/[A-Za-z0-9._-]+/g;
 // Any raw Windows user path, regardless of placeholders elsewhere on the line.
@@ -142,7 +144,16 @@ export function createRecordNormalizer() {
       }
       return normalizeStringWithMaps(value);
     }
-    if (typeof value === "number" || typeof value === "boolean" || value === null) {
+    if (typeof value === "number") {
+      // Volatile epoch-ms timestamps become a fixed sentinel so fixtures are
+      // deterministic across recapture; other numbers (usage, costs, counts)
+      // are representative protocol data and stay raw.
+      if (key.toLowerCase() === "timestamp" && /^(1[678]\d{11})$/.test(String(value))) {
+        return 1700000000000;
+      }
+      return value;
+    }
+    if (typeof value === "boolean" || value === null) {
       return value;
     }
     return normalize(value);
