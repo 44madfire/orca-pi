@@ -61,13 +61,17 @@ Usage:
   orca-pi github check complete --identity reviewer --repo <owner/repo> --sha <sha> --verdict <approve|request-changes|comment> --summary <text> [--check-run-id <n>] [--task <id>] [--issue <id>] [--json]
 
 Identities are logical credential slots resolved at runtime via env
-(ORCA_PI_GITHUB_<IDENTITY>_TOKEN). Tokens never appear in output.
+(ORCA_PI_GITHUB_<IDENTITY>_TOKEN plus verified ORCA_PI_GITHUB_REVIEWER_LOGIN /
+ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID for the reviewer App, all outside LLM
+context). Tokens never appear in output.
 Formal reviews and the orca-pi/agent-review check must use --identity reviewer:
-the CLI proves the token is the reviewer App Bot (live GET /user, Bot type)
-and distinct from the PR author before any POST, so same-account PATs and
+the CLI proves installation-token class (GET /installation/repositories, which
+supports IATs unlike GET /user) for the trusted configured App login and
+distinctness from the PR author before any POST, so same-account PATs and
 --identity worker never reach the write APIs. Check start is idempotent
 (reuses the deterministic run for the SHA); review retries with identical
-inputs dedupe. The reviewer App holds Contents: read only; human merges.
+inputs dedupe via response-state matching. The reviewer App holds Contents:
+read only; human merges.
 `;
 
 function isHelpFlag(arg: string): boolean {

@@ -157,7 +157,7 @@ profiles:
 
 - Reviewer App permissions: Contents: read, Pull requests: write, Checks: write, Metadata: read. Never Contents: write.
 - Tokens resolve at runtime (`ORCA_PI_GITHUB_<IDENTITY>_TOKEN` + optional `..._EXPIRES_AT` ISO-8601, optional verified `ORCA_PI_GITHUB_REVIEWER_LOGIN`); mint/refresh outside LLM context. Never place keys/tokens/secrets in prompts, task text, logs, or Linear.
-- Same-account PATs are not distinct actors — install the reviewer App for a separate actor. Review/check writes fail closed: reviewer Bot proof (`GET /user` type) + PR-author distinctness before any POST; `--identity worker` is refused.
+- Same-account PATs are not distinct actors — install the reviewer App for a separate actor. Review/check writes fail closed: installation-token proof (`GET /installation/repositories`, IAT-supported) for the trusted configured App login (`ORCA_PI_GITHUB_REVIEWER_LOGIN` + `..._INSTALLATION_ID`) + PR-author distinctness before any POST; `--identity worker` is refused; never `GET /user` (unsupported for IATs), never token-prefix inference.
 - Resolved profiles fail closed too: `githubIdentity: reviewer` with inherited `edit`/`write` (via `extends`) is rejected at resolve/validate/show/inspect/launch time (`invalid-github-identity`).
 - CLI: `orca-pi github auth status --identity reviewer`, `orca-pi github review ...`, `orca-pi github check start|complete ...` (see root `README.md`). `check start` is idempotent (reuses the run for the SHA); identical review retries dedupe. Helpers redact token-like values from output/errors.
 

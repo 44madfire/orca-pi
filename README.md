@@ -183,9 +183,11 @@ source of truth for completion/status.
   formal `COMMENT`/`REQUEST_CHANGES`/`APPROVE` reviews and publishes the deterministic
   `orca-pi/agent-review` check (`in_progress` → `success`/`failure`) for branch
   protection/rulesets. Human remains merge authority (no auto-merge). Review/check
-  writes fail closed: `--identity reviewer` only, live `GET /user` Bot proof +
-  distinct-from-PR-author guard before any POST (same-account PATs never write);
-  `check start` reuses the deterministic run (idempotent), review retries dedupe.
+  writes fail closed: `--identity reviewer` only, installation-token proof
+  (`GET /installation/repositories`, IAT-supported unlike `GET /user`) for the
+  trusted configured App login + distinct-from-PR-author guard before any POST
+  (same-account PATs never write); `check start` reuses the deterministic run
+  (idempotent), review retries dedupe via response-state matching.
   - `orca-pi github auth status --identity reviewer [--json]` — credential presence
     (source label + expiry, never values).
   - `orca-pi github review --identity reviewer --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]`

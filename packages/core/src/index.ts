@@ -245,6 +245,7 @@ export type {
 } from "./orchestration/index.js";
 export {
   AGENT_REVIEW_CHECK_NAME,
+  REVIEWER_INSTALLATION_ID_ENV_VAR,
   REVIEWER_LOGIN_ENV_VAR,
   assertDistinctGithubActors,
   assertReviewerHasNoWriteTools,
@@ -270,9 +271,12 @@ export {
   listPullReviews,
   parsePullRequestRef,
   parseReviewVerdict,
+  proveInstallationTokenClass,
   redactSecretsFromText,
   redactTokenLikeValues,
   resolveGithubCredential,
+  resolveReviewerAppMetadata,
+  reviewEventToState,
   sanitizeErrorForDisplay,
   selectCheckRunForUpdate,
   startAgentReviewCheck,
@@ -294,6 +298,7 @@ export {
   type CheckStatus,
   type ExistingCheckRun,
   type ExistingPullReview,
+  type ReviewerAppMetadata,
   type GithubFetchFn,
   type GithubHttpResponse,
   type GithubIdentity,

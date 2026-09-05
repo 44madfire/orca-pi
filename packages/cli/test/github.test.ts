@@ -22,20 +22,24 @@ function makeDeps(overrides?: Partial<GithubCommandDeps> & { fetchImpl?: GithubF
 }
 
 const REVIEWER_BOT = "orca-pi-reviewer[bot]";
+const REVIEWER_ENV = {
+  ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_secret-12345678",
+  ORCA_PI_GITHUB_REVIEWER_LOGIN: REVIEWER_BOT,
+  ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123456",
+};
 
-/** Full mocked GitHub REST for review/check writes (preflight + idempotency). */
+/** Full mocked GitHub REST for review/check writes (IAT preflight + idempotency). Never mocks GET /user. */
 function mockGithubFetch(options?: {
   prAuthor?: string;
-  reviewerLogin?: string;
-  reviewerType?: string;
   existingReviews?: unknown[];
   existingChecks?: unknown[];
 }): { fetchFn: GithubFetchFn; posts: string[] } {
   const posts: string[] = [];
   const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
     const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
-    if (url.endsWith("/user") && init.method === "GET") {
-      return ok({ login: options?.reviewerLogin ?? REVIEWER_BOT, type: options?.reviewerType ?? "Bot" }, 200);
+    if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
+    if (url.includes("/installation/repositories") && init.method === "GET") {
+      return ok({ total_count: 1, repositories: [{ id: 1, full_name: "o/r" }] }, 200);
     }
     if (/\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url) && init.method === "GET") {
       return ok({ user: { login: options?.prAuthor ?? "human-user" } }, 200);
@@ -118,7 +122,7 @@ describe("orca-pi github auth status", () => {
 describe("orca-pi github review", () => {
   it("submits a review via the reviewer identity (mocked fetch + preflight)", async () => {
     const { fetchFn } = mockGithubFetch();
-    const { deps, out } = makeDeps({ env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_secret-12345678" }, fetchFn });
+    const { deps, out } = makeDeps({ env: { ...REVIEWER_ENV }, fetchFn });
     const result = await runGithubCommand(
       ["review", "--identity", "reviewer", "--pr", "https://github.com/octo/hello-world/pull/9", "--verdict", "approve", "--body", "Looks good."],
       deps,
@@ -129,9 +133,9 @@ describe("orca-pi github review", () => {
     expect(out.join("")).not.toContain("ghs_secret-12345678");
   });
 
-  it("Blocking 1: same-user reviewer never reaches POST (exit 1, no duplicate)", async () => {
-    const { fetchFn, posts } = mockGithubFetch({ reviewerLogin: "human-user", reviewerType: "User", prAuthor: "human-user" });
-    const { deps, err } = makeDeps({ env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghp_same-user-12345678" }, fetchFn });
+  it("Blocking 1: same configured reviewer as author never reaches POST (exit 1, no duplicate)", async () => {
+    const { fetchFn, posts } = mockGithubFetch({ prAuthor: "orca-pi-reviewer[bot]" });
+    const { deps, err } = makeDeps({ env: { ...REVIEWER_ENV }, fetchFn });
     const result = await runGithubCommand(
       ["review", "--identity", "reviewer", "--pr", "octo/hello-world#9", "--verdict", "comment", "--body", "hi"],
       deps,
@@ -158,7 +162,7 @@ describe("orca-pi github review", () => {
   it("reads --body @file", async () => {
     const { fetchFn } = mockGithubFetch();
     const { deps, out } = makeDeps({
-      env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_secret-12345678" },
+      env: { ...REVIEWER_ENV },
       fs: { readFile: async () => "file body findings" },
       fetchFn,
     });
@@ -182,7 +186,7 @@ describe("orca-pi github check", () => {
   it("starts a check run (idempotent create when none exists)", async () => {
     const { fetchFn } = mockGithubFetch({ existingChecks: [] });
     const { deps, out } = makeDeps({
-      env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_secret-12345678" },
+      env: { ...REVIEWER_ENV },
       fetchFn,
     });
     const result = await runGithubCommand(
@@ -199,7 +203,8 @@ describe("orca-pi github check", () => {
     const posts: string[] = [];
     const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
       const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
-      if (url.endsWith("/user")) return ok({ login: REVIEWER_BOT, type: "Bot" }, 200);
+      if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
+      if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
       if (url.includes("/check-runs?")) return ok({ check_runs: existing }, 200);
       if (url.endsWith("/check-runs") && init.method === "POST") {
         posts.push(url);
@@ -208,7 +213,7 @@ describe("orca-pi github check", () => {
       if (/\/check-runs\/\d+$/.test(url)) return ok({ id: 3001 }, 200);
       throw new Error(`unexpected ${init.method} ${url}`);
     });
-    const env = { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_secret-12345678" };
+    const env = { ...REVIEWER_ENV };
     const first = await runGithubCommand(["check", "start", "--identity", "reviewer", "--repo", "o/r", "--sha", sha], makeDeps({ env, fetchFn }).deps);
     const second = await runGithubCommand(["check", "start", "--identity", "reviewer", "--repo", "o/r", "--sha", sha], makeDeps({ env, fetchFn }).deps);
     expect(first.exitCode).toBe(0);
@@ -222,7 +227,7 @@ describe("orca-pi github check", () => {
       return fetchFn;
     };
     const sha = "abc1234def5678abc1234def5678abc1234def56";
-    const { deps: d1, out: o1 } = makeDeps({ env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_x-12345678" }, fetchFn: mkFetch() });
+    const { deps: d1, out: o1 } = makeDeps({ env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_x-12345678", ORCA_PI_GITHUB_REVIEWER_LOGIN: REVIEWER_BOT, ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "1" }, fetchFn: mkFetch() });
     const r1 = await runGithubCommand(
       ["check", "complete", "--identity", "reviewer", "--repo", "o/r", "--sha", sha, "--verdict", "request-changes", "--summary", "blocking", "--check-run-id", "10", "--json"],
       d1,
@@ -230,7 +235,7 @@ describe("orca-pi github check", () => {
     expect(r1.exitCode).toBe(0);
     expect(JSON.parse(o1.join("")).conclusion).toBe("failure");
 
-    const { deps: d2, out: o2 } = makeDeps({ env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_x-12345678" }, fetchFn: mkFetch() });
+    const { deps: d2, out: o2 } = makeDeps({ env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_x-12345678", ORCA_PI_GITHUB_REVIEWER_LOGIN: REVIEWER_BOT, ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "1" }, fetchFn: mkFetch() });
     const r2 = await runGithubCommand(
       ["check", "complete", "--identity", "reviewer", "--repo", "o/r", "--sha", sha, "--verdict", "approve", "--summary", "clean", "--check-run-id", "11", "--json"],
       d2,

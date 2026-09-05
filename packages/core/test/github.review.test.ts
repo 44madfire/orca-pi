@@ -7,12 +7,17 @@ import {
   listPullReviews,
   parsePullRequestRef,
   parseReviewVerdict,
+  reviewEventToState,
   submitGithubReview,
   verdictToReviewEvent,
 } from "../src/github/review.js";
 import { GithubAuthError, type GithubFetchFn } from "../src/github/types.js";
 
-const ENV = { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_reviewer-token-12345678" };
+const ENV = {
+  ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_reviewer-token-12345678",
+  ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]",
+  ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123456",
+};
 const REVIEWER_BOT = "orca-pi-reviewer[bot]";
 const PR_AUTHOR = "human-user";
 
@@ -26,33 +31,36 @@ function jsonResponse(data: unknown, status = 200) {
 }
 
 /**
- * Mock GitHub REST for the review path (production preflight included):
- * - GET /user → reviewer App Bot (distinct actor)
- * - GET /repos/{o}/{r}/pulls/{n} → PR author (human)
- * - GET .../reviews?per_page → [] (no duplicate by default)
+ * Mock GitHub REST for the review path (IAT-compatible preflight):
+ * - GET /installation/repositories → IAT class proof (real IAT shape)
+ * - GET /repos/{o}/{r}/pulls/{n} → PR author (human, IAT-supported)
+ * - GET .../reviews?per_page → [] (no duplicate by default, real states)
  * - POST .../reviews → created review
+ * Never mocks GET /user for the reviewer flow (unsupported for IATs — the
+ * mock throws if called, proving the contract).
  */
 function mockReviewFetch(options?: {
-  reviewerLogin?: string;
-  reviewerType?: string;
   prAuthor?: string;
   existingReviews?: unknown[];
   onPost?: (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => void;
-  failGet?: { userStatus?: number; prStatus?: number };
+  failInstallationStatus?: number;
+  failPrStatus?: number;
+  env?: Record<string, string | undefined>;
 }): GithubFetchFn {
-  const reviewerLogin = options?.reviewerLogin ?? REVIEWER_BOT;
-  const reviewerType = options?.reviewerType ?? "Bot";
   const prAuthor = options?.prAuthor ?? PR_AUTHOR;
   return vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
-    if (url.endsWith("/user") && init.method === "GET") {
-      if (options?.failGet?.userStatus) {
-        return { ok: false, status: options.failGet.userStatus, json: async () => ({}), text: async () => "denied" };
+    if (url === "https://api.github.com/user" && init.method === "GET") {
+      throw new Error("GET /user must never be called for installation tokens (use /installation/repositories + trusted metadata)");
+    }
+    if (url.includes("/installation/repositories") && init.method === "GET") {
+      if (options?.failInstallationStatus) {
+        return { ok: false, status: options.failInstallationStatus, json: async () => ({}), text: async () => "denied" };
       }
-      return jsonResponse({ login: reviewerLogin, type: reviewerType }, 200);
+      return jsonResponse({ total_count: 1, repositories: [{ id: 1, full_name: "octo/hello-world" }] }, 200);
     }
     if (/\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url) && init.method === "GET") {
-      if (options?.failGet?.prStatus) {
-        return { ok: false, status: options.failGet.prStatus, json: async () => ({}), text: async () => "denied" };
+      if (options?.failPrStatus) {
+        return { ok: false, status: options.failPrStatus, json: async () => ({}), text: async () => "denied" };
       }
       return jsonResponse({ user: { login: prAuthor } }, 200);
     }
@@ -168,12 +176,19 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     expect(postCalls.length).toBe(1);
   });
 
-  it("Blocking 1: same-user separate PATs cannot reach POST /reviews", async () => {
+  it("maps request events to response states (Blocking 2 contract)", () => {
+    expect(reviewEventToState("APPROVE")).toBe("APPROVED");
+    expect(reviewEventToState("REQUEST_CHANGES")).toBe("CHANGES_REQUESTED");
+    expect(reviewEventToState("COMMENT")).toBe("COMMENTED");
+  });
+
+  it("Blocking 1: same configured reviewer as PR author cannot reach POST /reviews", async () => {
+    // Trusted metadata equals the PR author (operator misconfiguration or
+    // same-account setup) → distinct-actor guard fires before POST.
+    const sameEnv = { ...ENV, ORCA_PI_GITHUB_REVIEWER_LOGIN: "human-user[bot]" };
     let posted = 0;
     const fetchFn = mockReviewFetch({
-      reviewerLogin: PR_AUTHOR, // same login as PR author, different token
-      reviewerType: "User",
-      prAuthor: PR_AUTHOR,
+      prAuthor: "human-user[bot]",
       onPost: () => {
         posted += 1;
       },
@@ -183,7 +198,7 @@ describe("review: submit via reviewer App identity (production preflight)", () =
       await submitGithubReview(
         "reviewer",
         { owner: "o", repo: "r", pullNumber: 1, verdict: "comment", body: "hi" },
-        { fetchFn, env: ENV, cache: createInstallationTokenCache() },
+        { fetchFn, env: sameEnv, cache: createInstallationTokenCache() },
       );
     } catch (caught) {
       error = caught;
@@ -192,6 +207,18 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     expect((error as Error).message).toMatch(/same actor|distinct/i);
     expect(posted).toBe(0);
     expect((error as Error).message).not.toContain(ENV.ORCA_PI_GITHUB_REVIEWER_TOKEN);
+  });
+
+  it("Blocking 1: non-IAT token (installation proof 403) cannot reach POST", async () => {
+    let posted = 0;
+    const fetchFn = mockReviewFetch({
+      failInstallationStatus: 403,
+      onPost: () => {
+        posted += 1;
+      },
+    });
+    await expect(submitGithubReview("reviewer", { owner: "o", repo: "r", pullNumber: 1, verdict: "comment", body: "hi" }, { fetchFn, env: ENV, cache: createInstallationTokenCache() })).rejects.toThrow(/installation.token|Reviewer GitHub App/i);
+    expect(posted).toBe(0);
   });
 
   it("Blocking 1: --identity worker can never submit a formal review (no network write)", async () => {
@@ -213,11 +240,10 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it("Blocking 1: human PAT in the reviewer slot (type User) is rejected before POST", async () => {
+  it("Blocking 1: human login in the reviewer slot is refused before POST", async () => {
     let posted = 0;
+    const humanEnv = { ...ENV, ORCA_PI_GITHUB_REVIEWER_LOGIN: "human-user" };
     const fetchFn = mockReviewFetch({
-      reviewerLogin: "human-user",
-      reviewerType: "User",
       prAuthor: "other-author",
       onPost: () => {
         posted += 1;
@@ -227,17 +253,29 @@ describe("review: submit via reviewer App identity (production preflight)", () =
       submitGithubReview(
         "reviewer",
         { owner: "o", repo: "r", pullNumber: 1, verdict: "approve", body: "hi" },
-        { fetchFn, env: ENV, cache: createInstallationTokenCache() },
+        { fetchFn, env: humanEnv, cache: createInstallationTokenCache() },
       ),
-    ).rejects.toThrow(/same actor|distinct/i);
+    ).rejects.toThrow(/does not look like a GitHub App bot/i);
+    expect(posted).toBe(0);
+  });
+
+  it("Blocking 1: missing App metadata fails closed before any POST", async () => {
+    let posted = 0;
+    const fetchFn = mockReviewFetch({
+      onPost: () => {
+        posted += 1;
+      },
+    });
+    await expect(submitGithubReview("reviewer", { owner: "o", repo: "r", pullNumber: 1, verdict: "comment", body: "hi" }, { fetchFn, env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: ENV.ORCA_PI_GITHUB_REVIEWER_TOKEN }, cache: createInstallationTokenCache() })).rejects.toThrow(/Missing verified reviewer App identity/);
     expect(posted).toBe(0);
   });
 
   it("retry with identical inputs dedupes instead of POSTing a duplicate review", async () => {
+    // Real GitHub response shape: state CHANGES_REQUESTED (not REQUEST_CHANGES).
     const formattedBody = "Blocking finding.\n\n---\n🤖 orca-pi agent-review (profile: reviewer) · human remains merge authority";
     let posts = 0;
     const fetchFn = mockReviewFetch({
-      existingReviews: [{ id: 555, user: { login: REVIEWER_BOT }, state: "REQUEST_CHANGES", body: formattedBody }],
+      existingReviews: [{ id: 555, user: { login: REVIEWER_BOT }, state: "CHANGES_REQUESTED", body: formattedBody, commit_id: null }],
       onPost: () => {
         posts += 1;
       },
@@ -252,30 +290,36 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     expect(posts).toBe(0);
   });
 
-  it("findDuplicateReview matches same reviewer/event/body, ignores others", () => {
+  it("findDuplicateReview matches response states, ignores others (Blocking 2)", () => {
+    // Real GitHub listing shapes: APPROVED / CHANGES_REQUESTED / COMMENTED.
     const reviews = [
-      { id: 1, userLogin: REVIEWER_BOT, state: "APPROVE", body: "ok" },
-      { id: 2, userLogin: REVIEWER_BOT, state: "REQUEST_CHANGES", body: "blocking" },
-      { id: 3, userLogin: "someone-else", state: "REQUEST_CHANGES", body: "blocking" },
+      { id: 1, userLogin: REVIEWER_BOT, state: "APPROVED", body: "ok" },
+      { id: 2, userLogin: REVIEWER_BOT, state: "CHANGES_REQUESTED", body: "blocking" },
+      { id: 3, userLogin: "someone-else", state: "CHANGES_REQUESTED", body: "blocking" },
+      { id: 4, userLogin: REVIEWER_BOT, state: "PENDING", body: "blocking" },
+      { id: 5, userLogin: REVIEWER_BOT, state: "DISMISSED", body: "blocking" },
     ];
     expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking" })?.id).toBe(2);
     expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "APPROVE", body: "different" })).toBeUndefined();
+    // Request-event spellings from old mocks must NOT match response states.
+    expect(findDuplicateReview([{ id: 9, userLogin: REVIEWER_BOT, state: "REQUEST_CHANGES", body: "blocking" }], { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking" })).toBeUndefined();
+    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "COMMENT", body: "blocking" })).toBeUndefined();
   });
 
-  it("listPullReviews parses the API shape", async () => {
+  it("listPullReviews parses the API shape (real states)", async () => {
     const fetchFn: GithubFetchFn = async (url, init) => {
       expect(url).toContain("/reviews?");
       expect(init.method).toBe("GET");
-      return jsonResponse([{ id: 1, user: { login: REVIEWER_BOT }, state: "APPROVE", body: "ok", commit_id: "abc" }], 200);
+      return jsonResponse([{ id: 1, user: { login: REVIEWER_BOT }, state: "APPROVED", body: "ok", commit_id: "abc" }], 200);
     };
     const reviews = await listPullReviews("reviewer", { owner: "o", repo: "r", pullNumber: 1 }, { fetchFn, env: ENV, cache: createInstallationTokenCache() });
-    expect(reviews).toEqual([{ id: 1, userLogin: REVIEWER_BOT, state: "APPROVE", body: "ok", commitId: "abc" }]);
+    expect(reviews).toEqual([{ id: 1, userLogin: REVIEWER_BOT, state: "APPROVED", body: "ok", commitId: "abc" }]);
   });
 
-  it("401/403/404 during preflight map to actionable auth errors", async () => {
+  it("401/403/404 during installation proof map to actionable auth errors", async () => {
     for (const status of [401, 403, 404]) {
       const fetchFn: GithubFetchFn = async (url) => {
-        if (url.endsWith("/user")) {
+        if (url.includes("/installation/repositories")) {
           return { ok: false, status, json: async () => ({ message: "denied" }), text: async () => "denied" };
         }
         throw new Error(`unexpected ${url}`);
@@ -297,7 +341,7 @@ describe("review: submit via reviewer App identity (production preflight)", () =
 
   it("never leaks the token into error text", async () => {
     const fetchFn: GithubFetchFn = async (url) => {
-      if (url.endsWith("/user")) {
+      if (url.includes("/installation/repositories")) {
         throw new Error(`boom with ${ENV.ORCA_PI_GITHUB_REVIEWER_TOKEN} inside`);
       }
       throw new Error(`unexpected ${url}`);

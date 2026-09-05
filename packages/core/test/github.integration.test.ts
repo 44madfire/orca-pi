@@ -20,7 +20,11 @@ import type { GithubFetchFn } from "../src/github/types.js";
 describe("github integration: worker PR -> reviewer review/check -> human-ready", () => {
   it("cross-identity review flow stays distinct and deterministic", async () => {
     const workerEnv = { ORCA_PI_GITHUB_WORKER_TOKEN: "ghp_worker-human-token-12345678" };
-    const reviewerEnv = { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_reviewer-app-token-12345678" };
+    const reviewerEnv = {
+      ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_reviewer-app-token-12345678",
+      ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]",
+      ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123456",
+    };
     const workerCache = createInstallationTokenCache();
     const reviewerCache = createInstallationTokenCache();
     const sha = "feedfacefeedfacefeedfacefeedfacefeedface";
@@ -38,13 +42,17 @@ describe("github integration: worker PR -> reviewer review/check -> human-ready"
     let nextReviewId = 1001;
     const fetchFn: GithubFetchFn = vi.fn(async (url, init) => {
       calls.push({ method: init.method, url, auth: init.headers.Authorization ?? "", body: init.body ?? "" });
-      if (url.endsWith("/user") && init.method === "GET") {
-        return { ok: true, status: 200, json: async () => ({ login: reviewerBot, type: "Bot" }), text: async () => "{}" };
+      if (url === "https://api.github.com/user") {
+        throw new Error("GET /user must never be called for installation tokens");
+      }
+      if (url.includes("/installation/repositories") && init.method === "GET") {
+        return { ok: true, status: 200, json: async () => ({ total_count: 1, repositories: [{ id: 1, full_name: "octo/hello-world" }] }), text: async () => "{}" };
       }
       if (/\/repos\/[^/]+\/[^/]+\/pulls\/7$/.test(url) && init.method === "GET") {
         return { ok: true, status: 200, json: async () => ({ user: { login: prAuthor } }), text: async () => "{}" };
       }
       if (url.includes("/pulls/7/reviews?") && init.method === "GET") {
+        // Real listing shape with response states.
         return { ok: true, status: 200, json: async () => [], text: async () => "{}" };
       }
       if (url.includes("/pulls/7/reviews") && init.method === "POST") {
@@ -132,12 +140,22 @@ describe("github integration: worker PR -> reviewer review/check -> human-ready"
   });
 
   it("same-account reviewer is rejected before any review/check POST", async () => {
-    const reviewerEnv = { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghp_same-user-pat-12345678" };
+    // Configured reviewer login equals the PR author → distinctness fails.
+    // (IAT class proof still uses the installation endpoint; no GET /user.)
+    const reviewerEnv = {
+      ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_same-installation-12345678",
+      ORCA_PI_GITHUB_REVIEWER_LOGIN: "human-user[bot]",
+      ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123456",
+    };
     const cache = createInstallationTokenCache();
     const posts: string[] = [];
     const fetchFn: GithubFetchFn = vi.fn(async (url, init) => {
-      if (url.endsWith("/user")) {
-        return { ok: true, status: 200, json: async () => ({ login: "human-user", type: "User" }), text: async () => "{}" };
+      if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
+      if (url.includes("/installation/repositories")) {
+        return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+      }
+      if (/\/repos\/[^/]+\/[^/]+\/pulls\/1$/.test(url)) {
+        return { ok: true, status: 200, json: async () => ({ user: { login: "human-user[bot]" } }), text: async () => "{}" };
       }
       if (init.method === "POST") posts.push(url);
       throw new Error(`must not POST: ${init.method} ${url}`);

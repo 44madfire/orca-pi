@@ -11,8 +11,11 @@ import {
 } from "../src/github/check-run.js";
 import { AGENT_REVIEW_CHECK_NAME, GithubAuthError, type GithubFetchFn } from "../src/github/types.js";
 
-const ENV = { ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_reviewer-token-12345678" };
-const REVIEWER_BOT = "orca-pi-reviewer[bot]";
+const ENV = {
+  ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_reviewer-token-12345678",
+  ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]",
+  ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123456",
+};
 const SHA = "abc1234def5678abc1234def5678abc1234def56";
 
 function jsonResponse(data: unknown, status = 200) {
@@ -29,16 +32,19 @@ function jsonResponse(data: unknown, status = 200) {
 function mockChecksFetch(options?: {
   existing?: Array<{ id: number; name?: string; head_sha?: string; status?: string }>;
   createdId?: number;
-  failUserStatus?: number;
+  failInstallationStatus?: number;
 }): { fetchFn: GithubFetchFn; calls: string[] } {
   const calls: string[] = [];
   const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
     calls.push(`${init.method} ${url}`);
-    if (url.endsWith("/user") && init.method === "GET") {
-      if (options?.failUserStatus) {
-        return { ok: false, status: options.failUserStatus, json: async () => ({}), text: async () => "denied" };
+    if (url === "https://api.github.com/user" && init.method === "GET") {
+      throw new Error("GET /user must never be called for installation tokens");
+    }
+    if (url.includes("/installation/repositories") && init.method === "GET") {
+      if (options?.failInstallationStatus) {
+        return { ok: false, status: options.failInstallationStatus, json: async () => ({}), text: async () => "denied" };
       }
-      return jsonResponse({ login: REVIEWER_BOT, type: "Bot" }, 200);
+      return jsonResponse({ total_count: 1, repositories: [{ id: 1, full_name: "o/r" }] }, 200);
     }
     if (url.includes("/check-runs?") && init.method === "GET") {
       return jsonResponse({ check_runs: options?.existing ?? [] }, 200);
@@ -199,22 +205,44 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it("Blocking 1: human PAT in the reviewer slot cannot write checks", async () => {
+  it("Blocking 1: human login in the reviewer slot cannot write checks", async () => {
     const calls: string[] = [];
+    const humanEnv = { ...ENV, ORCA_PI_GITHUB_REVIEWER_LOGIN: "human-user" };
     const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
       calls.push(`${init.method} ${url}`);
-      if (url.endsWith("/user")) return jsonResponse({ login: "human-user", type: "User" }, 200);
       throw new Error(`must not reach ${init.method} ${url}`);
     });
     await expect(
-      startAgentReviewCheck("reviewer", { owner: "o", repo: "r", headSha: SHA, summary: "x" }, { fetchFn, env: ENV, cache: createInstallationTokenCache() }),
-    ).rejects.toThrow(/same actor|distinct/i);
+      startAgentReviewCheck("reviewer", { owner: "o", repo: "r", headSha: SHA, summary: "x" }, { fetchFn, env: humanEnv, cache: createInstallationTokenCache() }),
+    ).rejects.toThrow(/does not look like a GitHub App bot/i);
     expect(calls.filter((c) => c.startsWith("POST")).length).toBe(0);
     expect(calls.filter((c) => c.startsWith("PATCH")).length).toBe(0);
   });
 
+  it("Blocking 1: non-IAT token fails installation proof before any write", async () => {
+    const { fetchFn, calls } = mockChecksFetch({ failInstallationStatus: 403 });
+    await expect(startAgentReviewCheck("reviewer", { owner: "o", repo: "r", headSha: SHA, summary: "x" }, { fetchFn, env: ENV, cache: createInstallationTokenCache() })).rejects.toThrow(/installation.token|Reviewer GitHub App/i);
+    expect(calls.filter((c) => c.startsWith("POST")).length).toBe(0);
+  });
+
+  it("contract: reviewer flow never calls GET /user (IAT-unsupported)", async () => {
+    const seen: string[] = [];
+    const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
+      seen.push(`${init.method} ${url}`);
+      if (url === "https://api.github.com/user") throw new Error("contract violation: GET /user called for IAT flow");
+      if (url.includes("/installation/repositories")) return jsonResponse({ repositories: [] }, 200);
+      if (url.includes("/check-runs?")) return jsonResponse({ check_runs: [] }, 200);
+      if (url.endsWith("/check-runs")) return jsonResponse({ id: 9001 }, 201);
+      throw new Error(`unexpected ${init.method} ${url}`);
+    });
+    const started = await startAgentReviewCheck("reviewer", { owner: "o", repo: "r", headSha: SHA, summary: "x" }, { fetchFn, env: ENV, cache: createInstallationTokenCache() });
+    expect(started.id).toBe(9001);
+    expect(seen.some((c) => c === "GET https://api.github.com/user")).toBe(false);
+    expect(seen.some((c) => c.includes("/installation/repositories"))).toBe(true);
+  });
+
   it("403 during preflight maps to actionable unauthorized-installation error", async () => {
-    const { fetchFn } = mockChecksFetch({ failUserStatus: 403 });
+    const { fetchFn } = mockChecksFetch({ failInstallationStatus: 403 });
     let error: unknown;
     try {
       await startAgentReviewCheck("reviewer", { owner: "o", repo: "r", headSha: SHA, summary: "x" }, { fetchFn, env: ENV, cache: createInstallationTokenCache() });

@@ -46,6 +46,26 @@ export function verdictToReviewEvent(verdict: ReviewVerdict): ReviewEvent {
   }
 }
 
+/**
+ * Map a create-review request `event` to the `state` GitHub returns when
+ * listing reviews (`GET .../pulls/{n}/reviews`).
+ *
+ * Request events (`APPROVE`, `REQUEST_CHANGES`, `COMMENT`) differ from
+ * response states (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, plus
+ * `PENDING`/`DISMISSED`). Dedupe must compare against the response spelling
+ * or real retries never match and always duplicate.
+ */
+export function reviewEventToState(event: ReviewEvent): string {
+  switch (event) {
+    case "APPROVE":
+      return "APPROVED";
+    case "REQUEST_CHANGES":
+      return "CHANGES_REQUESTED";
+    case "COMMENT":
+      return "COMMENTED";
+  }
+}
+
 /** Parse `--verdict` CLI values (accepts `request_changes` alias). */
 export function parseReviewVerdict(raw: string): ReviewVerdict {
   const normalized = raw.trim().toLowerCase().replace(/_/g, "-");
@@ -223,15 +243,20 @@ export async function listPullReviews(
  * `undefined` when the review must be created. Body comparison uses the
  * fully formatted body (including the provenance footer) so retries with
  * identical inputs dedupe while genuinely new findings still POST.
+ *
+ * Compares against GitHub response `state` spelling (`APPROVED` /
+ * `CHANGES_REQUESTED` / `COMMENTED` via `reviewEventToState`), not the
+ * request `event` spelling — otherwise real retries never match.
  */
 export function findDuplicateReview(
   reviews: readonly ExistingPullReview[],
   match: { reviewerLogin: string; event: ReviewEvent; body: string; commitId?: string },
 ): ExistingPullReview | undefined {
   const wantBody = match.body.trim();
+  const wantState = reviewEventToState(match.event);
   const candidates = reviews.filter((review) => {
     if (review.userLogin?.toLowerCase() !== match.reviewerLogin.toLowerCase()) return false;
-    if (review.state?.toUpperCase() !== match.event) return false;
+    if ((review.state ?? "").toUpperCase() !== wantState) return false;
     if ((review.body ?? "").trim() !== wantBody) return false;
     if (match.commitId !== undefined && review.commitId !== undefined && review.commitId !== match.commitId) return false;
     return true;
@@ -241,14 +266,14 @@ export function findDuplicateReview(
 }
 
 /**
- * Submit a formal PR review as the reviewer GitHub App (fail closed).
+ * Submit a formal PR review as the reviewer GitHub App (fail closed, IAT-compatible).
  *
- * Production enforcement (Blocking 1): before any `POST /reviews`, a live
- * preflight proves the credential is the reviewer App Bot (`GET /user`
- * `type: Bot`, optional `ORCA_PI_GITHUB_REVIEWER_LOGIN` match) and distinct
- * from the PR author (`GET` PR → distinct-actor guard). `--identity worker`
- * and human PATs in the reviewer slot never reach POST. Tokens never enter
- * logs.
+ * Production enforcement: before any `POST /reviews`, an installation-token
+ * preflight proves IAT class (`GET /installation/repositories`) for the
+ * trusted configured App login and distinctness from the PR author (`GET` PR
+ * → distinct-actor guard). Never calls `GET /user` (unsupported for IATs).
+ * `--identity worker` and human PATs in the reviewer slot never reach POST.
+ * Tokens never enter logs.
  *
  * Retry semantics: retries with identical `(reviewer, event, body, commit)`
  * return the existing review instead of POSTing a duplicate (best-effort

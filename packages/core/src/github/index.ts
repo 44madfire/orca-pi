@@ -44,6 +44,7 @@ export {
   tokenEnvVarForIdentity,
 } from "./identity.js";
 export {
+  REVIEWER_INSTALLATION_ID_ENV_VAR,
   REVIEWER_LOGIN_ENV_VAR,
   assertReviewerIdentityForWrites,
   authHeaderForCredential,
@@ -52,11 +53,14 @@ export {
   describeCredentialStatus,
   fetchAuthenticatedActor,
   fetchPullRequestAuthor,
+  proveInstallationTokenClass,
   resolveGithubCredential,
+  resolveReviewerAppMetadata,
   verifyReviewerForChecks,
   verifyReviewerForReview,
   type AuthenticatedGithubActor,
   type InstallationTokenCache,
+  type ReviewerAppMetadata,
   type TokenCacheEntry,
 } from "./github-app-auth.js";
 export {
@@ -66,6 +70,7 @@ export {
   listPullReviews,
   parsePullRequestRef,
   parseReviewVerdict,
+  reviewEventToState,
   submitGithubReview,
   verdictToReviewEvent,
   type ExistingPullReview,

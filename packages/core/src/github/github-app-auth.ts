@@ -256,8 +256,88 @@ export function authHeaderForCredential(
   return { Authorization: `Bearer ${credential.token}` };
 }
 
-/** Verified reviewer App login slot (operator-set outside LLM context, safe to log the name). */
+/**
+ * Verified reviewer App identity slots (operator-set outside LLM context,
+ * safe to log the names — never the values).
+ *
+ * The out-of-LLM credential provider (operator/helper that mints the
+ * installation token) must also supply this verified App/installation
+ * metadata. Production review/check writes compare the trusted configured
+ * login against the PR author for distinctness — never `GET /user`, which
+ * does not support installation access tokens (see `fetchAuthenticatedActor`
+ * below), and never token-prefix inference.
+ */
 export const REVIEWER_LOGIN_ENV_VAR = "ORCA_PI_GITHUB_REVIEWER_LOGIN";
+export const REVIEWER_INSTALLATION_ID_ENV_VAR = "ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID";
+
+/** Trusted reviewer App/installation identity (from env, outside LLM context). */
+export interface ReviewerAppMetadata {
+  login: string;
+  installationId: string;
+}
+
+/**
+ * Resolve trusted reviewer App metadata (fail closed when unconfigured).
+ *
+ * Both `ORCA_PI_GITHUB_REVIEWER_LOGIN` (e.g. `"orca-pi-reviewer[bot]"`) and
+ * `ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID` must be set by the operator or
+ * credential helper outside LLM context alongside
+ * `ORCA_PI_GITHUB_REVIEWER_TOKEN`. Prints var names, never values.
+ */
+export function resolveReviewerAppMetadata(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+): ReviewerAppMetadata {
+  const login = env[REVIEWER_LOGIN_ENV_VAR]?.trim();
+  const installationId = env[REVIEWER_INSTALLATION_ID_ENV_VAR]?.trim();
+  const missing: string[] = [];
+  if (!login) missing.push(REVIEWER_LOGIN_ENV_VAR);
+  if (!installationId) missing.push(REVIEWER_INSTALLATION_ID_ENV_VAR);
+  if (missing.length > 0) {
+    throw new GithubAuthError(
+      "reviewer",
+      "missing-credential",
+      `Missing verified reviewer App identity (${missing.join(", ")}). Install the Orca-Pi Reviewer GitHub App on the repository outside LLM context, then export ${REVIEWER_LOGIN_ENV_VAR} (App bot login, e.g. "orca-pi-reviewer[bot]") and ${REVIEWER_INSTALLATION_ID_ENV_VAR} (numeric installation id) alongside ORCA_PI_GITHUB_REVIEWER_TOKEN. Never place private keys, installation tokens, PATs, or webhook secrets in prompts, task text, logs, or Linear descriptions.`,
+    );
+  }
+  return { login: login as string, installationId: installationId as string };
+}
+
+/**
+ * Prove the reviewer token is an installation access token (IAT class).
+ *
+ * Uses `GET /installation/repositories?per_page=1`, an endpoint that
+ * supports installation access tokens (unlike `GET /user`, which lists only
+ * user access tokens/fine-grained PATs and must never be used to verify an
+ * IAT). A 200 proves IAT class; 401/403/404 map to actionable
+ * expired/unauthorized-installation errors. Human PATs in the reviewer slot
+ * fail here (or later at the distinct-actor comparison) — never by token
+ * prefix.
+ */
+export async function proveInstallationTokenClass(
+  identity: string,
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+): Promise<void> {
+  const env = options?.env ?? process.env;
+  const cache = options?.cache ?? defaultTokenCache;
+  const credential = resolveGithubCredential(identity, env, cache);
+  const fetchFn = options?.fetchFn ?? defaultFetchFn();
+  const base = apiBaseUrl(options?.apiBase);
+  const endpoint = "/installation/repositories?per_page=1";
+  let response;
+  try {
+    response = await fetchFn(`${base}${endpoint}`, { method: "GET", headers: baseHeaders(credential.token) });
+  } catch (error) {
+    throw new GithubAuthError(identity, "helper-failed", `Could not prove installation token class for "${identity}" (${endpoint}): ${redactSecretsFromText(error instanceof Error ? error.message : String(error), [credential.token])}`);
+  }
+  if (!response.ok) {
+    const authError = toAuthError(identity, response.status, endpoint);
+    if (authError) {
+      throw new GithubAuthError(identity, authError.code, `${authError.message} (installation-token proof via ${endpoint} failed — the reviewer slot must hold a GitHub App installation access token, not a human PAT.)`);
+    }
+    const text = await response.text().catch(() => "");
+    throw new GithubApiError(endpoint, response.status, `Could not prove installation token class for "${identity}" (${response.status}): ${redactSecretsFromText(text.slice(0, 1000), [credential.token]) || "no response body"}.`);
+  }
+}
 
 /** Authenticated GitHub actor (`GET /user` subset). */
 export interface AuthenticatedGithubActor {
@@ -314,11 +394,15 @@ export function assertReviewerIdentityForWrites(identity: string): void {
 }
 
 /**
- * Live preflight: resolve the authenticated actor for an identity via
- * `GET /user`. Proves *which* GitHub account the token acts as — never
- * inferred from token prefixes. Used to reject human PATs in the reviewer
- * slot (type `User`) and to verify the token matches the operator-configured
- * reviewer App login when `ORCA_PI_GITHUB_REVIEWER_LOGIN` is set.
+ * PAT/user-token actor lookup via `GET /user` (NOT for installation tokens).
+ *
+ * GitHub's Get-the-authenticated-user endpoint supports GitHub App *user*
+ * access tokens and fine-grained PATs, but NOT GitHub App *installation*
+ * access tokens (IATs) — the credential model JEF-15 targets for the
+ * reviewer. Reviewer preflight must therefore use
+ * `proveInstallationTokenClass` + trusted `resolveReviewerAppMetadata`
+ * instead of this helper. This function remains for worker/PAT diagnostics
+ * and tests only.
  */
 export async function fetchAuthenticatedActor(
   identity: string,
@@ -378,58 +462,56 @@ export async function fetchPullRequestAuthor(
 }
 
 /**
- * Review preflight (fail closed): proves the reviewer credential is the
- * configured App Bot and distinct from the PR author *before* any
- * `POST /reviews`. Never infers from token prefixes — uses live `GET /user`
- * (`type` + `login`) plus `GET` PR author, then the distinct-actor guard.
+ * Review preflight (fail closed, IAT-compatible): proves the reviewer
+ * credential is an installation token for the configured App and distinct
+ * from the PR author *before* any `POST /reviews`. Never calls `GET /user`
+ * (unsupported for IATs) and never infers from token prefixes.
  *
- * - Rejects `--identity worker` (and any non-reviewer slot).
- * - Rejects human PATs in the reviewer slot (`type: User`).
- * - When `ORCA_PI_GITHUB_REVIEWER_LOGIN` is set, requires an exact
- *   (case-insensitive) match — the secret-provider verified-identity path.
- * - Rejects same-actor reviewer/author pairs (separate PATs, same user).
+ * 1. Rejects `--identity worker` (and any non-reviewer slot).
+ * 2. Requires trusted App metadata (`ORCA_PI_GITHUB_REVIEWER_LOGIN` +
+ *    `ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID`) from the out-of-LLM
+ *    credential provider; validates the configured login looks like an App
+ *    bot (`[bot]` suffix — config validation, not token inference).
+ * 3. Proves IAT class via `GET /installation/repositories` (human PATs fail
+ *    here with 401/403).
+ * 4. Loads the PR author (`GET` PR, IAT-supported) and enforces
+ *    distinctness against the *configured* reviewer login.
  */
 export async function verifyReviewerForReview(
   identity: string,
   pr: { owner: string; repo: string; pullNumber: number },
   options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
-): Promise<{ reviewerLogin: string; prAuthorLogin: string }> {
+): Promise<{ reviewerLogin: string; prAuthorLogin: string; installationId: string }> {
   assertReviewerIdentityForWrites(identity);
   const env = options?.env ?? process.env;
-  const actor = await fetchAuthenticatedActor(identity, options);
-  if (actor.type !== undefined && actor.type.toLowerCase() !== "bot") {
-    // Human PAT in the reviewer slot — fail with the distinct-actor message
-    // (same-account PATs are not distinct identities).
-    assertDistinctGithubActors({ workerLogin: actor.login, reviewerLogin: actor.login });
+  const metadata = resolveReviewerAppMetadata(env);
+  if (!metadata.login.toLowerCase().endsWith("[bot]")) {
+    throw new GithubAuthError(identity, "unauthorized-installation", `Configured reviewer login "${metadata.login}" (${REVIEWER_LOGIN_ENV_VAR}) does not look like a GitHub App bot (expected a "[bot]" suffix, e.g. "orca-pi-reviewer[bot]"). Refusing to review — a human login must never occupy the reviewer slot (same-account PATs are not distinct identities). Fix the App configuration outside LLM context and retry.`);
   }
-  const expected = env[REVIEWER_LOGIN_ENV_VAR]?.trim();
-  if (expected && actor.login.toLowerCase() !== expected.toLowerCase()) {
-    throw new GithubAuthError(identity, "unauthorized-installation", `Reviewer credential acts as "${actor.login}" but the configured reviewer App login is "${expected}" (${REVIEWER_LOGIN_ENV_VAR}). Mint the installation token for the configured App outside LLM context and retry — never paste tokens into prompts.`);
-  }
+  await proveInstallationTokenClass(identity, options);
   const prAuthorLogin = await fetchPullRequestAuthor(pr, { ...(options ?? {}), identity });
-  assertDistinctGithubActors({ workerLogin: prAuthorLogin, reviewerLogin: actor.login });
-  return { reviewerLogin: actor.login, prAuthorLogin };
+  assertDistinctGithubActors({ workerLogin: prAuthorLogin, reviewerLogin: metadata.login });
+  return { reviewerLogin: metadata.login, prAuthorLogin, installationId: metadata.installationId };
 }
 
 /**
- * Check-write preflight (fail closed): proves the check writer is the
- * reviewer App Bot via live `GET /user` before any check-run POST/PATCH.
+ * Check-write preflight (fail closed, IAT-compatible): proves an
+ * installation token for the configured App before any check-run POST/PATCH.
+ * Same metadata + IAT-class proof as review preflight, minus the PR-author
+ * comparison (checks address a head SHA, not a PR number).
  */
 export async function verifyReviewerForChecks(
   identity: string,
   options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
-): Promise<{ reviewerLogin: string }> {
+): Promise<{ reviewerLogin: string; installationId: string }> {
   assertReviewerIdentityForWrites(identity);
   const env = options?.env ?? process.env;
-  const actor = await fetchAuthenticatedActor(identity, options);
-  if (actor.type !== undefined && actor.type.toLowerCase() !== "bot") {
-    assertDistinctGithubActors({ workerLogin: actor.login, reviewerLogin: actor.login });
+  const metadata = resolveReviewerAppMetadata(env);
+  if (!metadata.login.toLowerCase().endsWith("[bot]")) {
+    throw new GithubAuthError(identity, "unauthorized-installation", `Configured reviewer login "${metadata.login}" (${REVIEWER_LOGIN_ENV_VAR}) does not look like a GitHub App bot (expected a "[bot]" suffix). Refusing check write — fix the App configuration outside LLM context and retry.`);
   }
-  const expected = env[REVIEWER_LOGIN_ENV_VAR]?.trim();
-  if (expected && actor.login.toLowerCase() !== expected.toLowerCase()) {
-    throw new GithubAuthError(identity, "unauthorized-installation", `Reviewer credential acts as "${actor.login}" but the configured reviewer App login is "${expected}" (${REVIEWER_LOGIN_ENV_VAR}). Mint the installation token for the configured App outside LLM context and retry.`);
-  }
-  return { reviewerLogin: actor.login };
+  await proveInstallationTokenClass(identity, options);
+  return { reviewerLogin: metadata.login, installationId: metadata.installationId };
 }
 
 /**
