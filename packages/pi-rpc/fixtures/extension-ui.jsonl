@@ -1,0 +1,29 @@
+{"v":1,"dir":"c2s","payload":{"id":"e1","type":"get_commands"}}
+{"v":1,"dir":"s2c","payload":{"id":"e1","type":"response","command":"get_commands","success":true,"data":{"commands":[{"name":"rpc-ask","description":"Trigger select dialog","source":"extension","sourceInfo":{"path":"<TMP>","source":"cli","scope":"temporary","origin":"top-level"}},{"name":"rpc-confirm","description":"Trigger confirm","source":"extension","sourceInfo":{"path":"<TMP>","source":"cli","scope":"temporary","origin":"top-level"}},{"name":"rpc-input","description":"Trigger input dialog","source":"extension","sourceInfo":{"path":"<TMP>","source":"cli","scope":"temporary","origin":"top-level"}},{"name":"rpc-editor","description":"Trigger editor dialog","source":"extension","sourceInfo":{"path":"<TMP>","source":"cli","scope":"temporary","origin":"top-level"}},{"name":"rpc-cancel","description":"Trigger cancelled select","source":"extension","sourceInfo":{"path":"<TMP>","source":"cli","scope":"temporary","origin":"top-level"}},{"name":"llama","description":"Manage llama.cpp router models","source":"extension","sourceInfo":{"path":"<inline:llama.cpp>","source":"inline","scope":"temporary","origin":"top-level"}}]}}}
+{"v":1,"dir":"c2s","payload":{"id":"e2","type":"prompt","message":"/rpc-ask"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_1>","method":"select","title":"Pick a fruit","options":["Apple","Banana"]}}
+{"v":1,"dir":"c2s","payload":{"type":"extension_ui_response","id":"<EXT_UI_1>","value":"Apple"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_2>","method":"notify","message":"Chose: Apple","notifyType":"info"}}
+{"v":1,"dir":"s2c","payload":{"id":"e2","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"e3","type":"prompt","message":"/rpc-confirm"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_3>","method":"confirm","title":"Proceed?","message":"Are you sure?"}}
+{"v":1,"dir":"c2s","payload":{"type":"extension_ui_response","id":"<EXT_UI_3>","confirmed":true}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_4>","method":"notify","message":"Confirmed: true","notifyType":"info"}}
+{"v":1,"dir":"s2c","payload":{"id":"e3","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"e4","type":"prompt","message":"/rpc-input"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_5>","method":"input","title":"Enter a nickname","placeholder":"e.g. orca"}}
+{"v":1,"dir":"c2s","payload":{"type":"extension_ui_response","id":"<EXT_UI_5>","value":"orca-nick"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_6>","method":"notify","message":"Input got: orca-nick","notifyType":"info"}}
+{"v":1,"dir":"s2c","payload":{"id":"e4","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"e5","type":"prompt","message":"/rpc-editor"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_7>","method":"editor","title":"Edit notes","prefill":"line one\nline two"}}
+{"v":1,"dir":"c2s","payload":{"type":"extension_ui_response","id":"<EXT_UI_7>","value":"edited-a\nedited-b\nedited-c"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_8>","method":"notify","message":"Editor lines: 3","notifyType":"info"}}
+{"v":1,"dir":"s2c","payload":{"id":"e5","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"e6","type":"prompt","message":"/rpc-cancel"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_9>","method":"select","title":"Pick one","options":["A","B"]}}
+{"v":1,"dir":"c2s","payload":{"type":"extension_ui_response","id":"<EXT_UI_9>","cancelled":true}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_10>","method":"notify","message":"Select got: undefined","notifyType":"info"}}
+{"v":1,"dir":"s2c","payload":{"id":"e6","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"e7","type":"get_entries"}}
+{"v":1,"dir":"s2c","payload":{"id":"e7","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"model_change","id":"<ENTRY_1>","parentId":null,"timestamp":"<TIMESTAMP_ISO>","provider":"opencode-go","modelId":"glm-5.3-flash"},{"type":"thinking_level_change","id":"<ENTRY_2>","parentId":"<ENTRY_1>","timestamp":"<TIMESTAMP_ISO>","thinkingLevel":"low"}],"leafId":"<ENTRY_2>"}}}

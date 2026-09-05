@@ -1,0 +1,21 @@
+{
+  "name": "@orca-pi/pi-rpc",
+  "version": "0.1.0",
+  "description": "SNC1.1: authoritative Pi RPC contract proofs — strict LF-only JSONL spike client, real-session fixtures, and compatibility matrix (real Pi validated).",
+  "type": "commonjs",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "fixtures",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src test"
+  },
+  "dependencies": {}
+}

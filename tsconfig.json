@@ -6,7 +6,8 @@
   "references": [
     { "path": "./packages/core" },
     { "path": "./packages/cli" },
-    { "path": "./packages/orca-plugin" }
+    { "path": "./packages/orca-plugin" },
+    { "path": "./packages/pi-rpc" }
   ],
   "include": []
 }
