@@ -61,7 +61,15 @@ export type PiRpcSpawnFn = (
 export interface PiRpcConnectionOptions {
   /** Pi executable (default `"pi"`). */
   readonly piCommand?: string;
-  /** Extra argv before `--mode rpc` (provider/model/thinking/session …). */
+  /**
+   * Extra argv before `--mode rpc` (provider/model/thinking/session …).
+   *
+   * Prefer passing an already-resolved spec from core's `buildPiLaunch()`
+   * (the single profile compiler) through `toPiRpcProcessSpec()` rather
+   * than hand-building argv here, so JEF-7 prompt collision/path semantics
+   * are preserved. `--mode rpc` is appended idempotently when missing.
+   * See `launch.ts` for the single-compiler rule.
+   */
   readonly piArgs?: readonly string[];
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
@@ -69,6 +77,16 @@ export interface PiRpcConnectionOptions {
   readonly defaultTimeoutMs?: number;
   /** Spawn/startup classification window (default 15s outer, 50ms grace). */
   readonly startupTimeoutMs?: number;
+  /**
+   * Verify RPC readiness during `start()` with a bounded internal
+   * `get_state` round-trip (default true). When false, `start()` resolves
+   * after OS spawn classification only (unit-test framing mode; not for
+   * production use — early Pi failures would surface as `process-exited`
+   * instead of `startup-failed`).
+   */
+  readonly startupProbe?: boolean;
+  /** Deadline for the internal startup probe (default min(5s, remainder)). */
+  readonly startupProbeTimeoutMs?: number;
   /** Stderr ring-buffer bound in chars (default 16_384). */
   readonly stderrMaxBytes?: number;
   readonly spawnFn?: PiRpcSpawnFn;
@@ -99,6 +117,7 @@ interface PendingEntry {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
+const DEFAULT_STARTUP_PROBE_TIMEOUT_MS = 5_000;
 const STARTUP_GRACE_MS = 50;
 const DEFAULT_STDERR_MAX = 16_384;
 const CLOSE_TERM_GRACE_MS = 2_000;
@@ -141,6 +160,8 @@ export class PiRpcConnection {
   private readonly generateId: () => string;
   private readonly defaultTimeoutMs: number;
   private readonly startupTimeoutMs: number;
+  private readonly startupProbe: boolean;
+  private readonly startupProbeTimeoutMs: number | undefined;
   private readonly stderrMaxBytes: number;
   private started = false;
   private closed = false;
@@ -154,6 +175,8 @@ export class PiRpcConnection {
     this.generateId = options.generateId ?? defaultIdFactory();
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
+    this.startupProbe = options.startupProbe ?? true;
+    this.startupProbeTimeoutMs = options.startupProbeTimeoutMs;
     this.stderrMaxBytes = options.stderrMaxBytes ?? DEFAULT_STDERR_MAX;
   }
 
@@ -191,8 +214,14 @@ export class PiRpcConnection {
    *
    * Classifies startup failures: spawn errors (ENOENT/EACCES → helpful
    * `spawn-failed`), early non-zero exits (`startup-failed` with stderr
-   * tail), and outer timeouts (`startup-timeout`). Never leaks the child on
-   * failure (kills + detaches before throwing).
+   * tail), and outer timeouts (`startup-timeout`). Readiness is gated on a
+   * real RPC round-trip (bounded internal `get_state` probe) unless
+   * `startupProbe: false`: in Node, `spawn` only means the OS process was
+   * created, so a Pi invocation with invalid args/config can emit `spawn`
+   * and then exit non-zero on the next turn. Without the probe, `start()`
+   * would resolve on `spawn` and the early exit would surface only as a
+   * steady-state `process-exited`. Never leaks the child on failure (kills
+   * + detaches before throwing).
    */
   async start(): Promise<void> {
     if (this.closed) {
@@ -208,7 +237,7 @@ export class PiRpcConnection {
       );
     }
     const command = this.options.piCommand ?? "pi";
-    // Idempotent `--mode rpc`: callers may pass `buildPiRpcLaunch()` args
+    // Idempotent `--mode rpc`: callers pass `toPiRpcProcessSpec()` args
     // (which already end with `--mode rpc`) or raw extra args (which the
     // connection completes). Never emit the flag twice.
     const extra = [...(this.options.piArgs ?? [])];
@@ -230,10 +259,13 @@ export class PiRpcConnection {
     }
     this.proc = proc;
     this.attach(proc);
+    const startWall = Date.now();
 
-    // Startup classification: resolve on `spawn`, reject on `error`/early
-    // `exit`, assume success after a short grace (covers fake processes in
-    // tests that emit neither), bound by the outer startup timeout.
+    // Phase 1 — OS spawn classification: resolve on `spawn`, reject on
+    // `error`/early `exit`, assume success after a short grace (covers
+    // fake processes in tests that emit neither), bound by the outer
+    // startup timeout. Phase 1 alone cannot prove Pi is speaking RPC
+    // (spawn fires before invalid args/config fail), so phase 2 probes.
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const done = (fn: () => void): void => {
@@ -298,6 +330,85 @@ export class PiRpcConnection {
       // before `once` attached), the persistent handler in `attach()` will
       // have recorded it — re-check on the next tick via grace resolution.
     });
+
+    // Phase 2 — RPC readiness probe (unless explicitly disabled for
+    // framing-only unit tests). A bounded internal `get_state` round-trip
+    // proves Pi is actually speaking RPC; an exit before/during the probe
+    // becomes `startup-failed` and a silent process becomes
+    // `startup-timeout`. Any well-formed response (even `success: false`)
+    // proves liveness — the bridge re-reads state itself afterwards.
+    if (!this.startupProbe) {
+      this.started = true;
+      return;
+    }
+    const elapsed = Date.now() - startWall;
+    const remaining = this.startupTimeoutMs - elapsed;
+    if (remaining <= 0) {
+      this.detachAndKill();
+      throw new PiRpcError(
+        {
+          code: "startup-timeout",
+          ambiguous: false,
+          timeoutMs: this.startupTimeoutMs,
+          stderrTail: this.stderrTail,
+        },
+        `pi did not become ready within ${this.startupTimeoutMs}ms`,
+      );
+    }
+    const probeTimeout = Math.min(
+      this.startupProbeTimeoutMs ?? DEFAULT_STARTUP_PROBE_TIMEOUT_MS,
+      remaining,
+    );
+    try {
+      await this.requestRaw({ type: "get_state" }, { timeoutMs: probeTimeout });
+    } catch (error) {
+      if (error instanceof PiRpcError && error.code === "rejected") {
+        // Pi answered (with a rejection) → the transport is live.
+      } else if (
+        error instanceof PiRpcError &&
+        (error.code === "process-exited" || error.code === "transport-closed")
+      ) {
+        // handleExit() already rejected the probe as ambiguous and (for
+        // unexpected death) finalized the connection; reclassify for
+        // startup callers who never got a ready connection.
+        throw new PiRpcError(
+          {
+            code: "startup-failed",
+            ambiguous: false,
+            exitCode: error.exitCode,
+            signal: error.signal,
+            stderrTail: this.stderrTail,
+          },
+          `pi exited before RPC readiness ` +
+            `(code=${String(error.exitCode)} signal=${String(error.signal)})` +
+            (this.stderrTail ? `: ${this.stderrTail}` : ""),
+        );
+      } else if (error instanceof PiRpcError && error.code === "request-timeout") {
+        this.detachAndKill();
+        throw new PiRpcError(
+          {
+            code: "startup-timeout",
+            ambiguous: false,
+            timeoutMs: probeTimeout,
+            stderrTail: this.stderrTail,
+          },
+          `pi did not answer RPC readiness probe within ${probeTimeout}ms`,
+        );
+      } else if (error instanceof PiRpcError && error.code === "write-failed") {
+        this.detachAndKill();
+        throw new PiRpcError(
+          {
+            code: "startup-failed",
+            ambiguous: false,
+            stderrTail: this.stderrTail,
+          },
+          `pi transport failed before RPC readiness: ${error.message}`,
+        );
+      } else {
+        this.detachAndKill();
+        throw error;
+      }
+    }
 
     this.started = true;
   }
@@ -540,10 +651,12 @@ export class PiRpcConnection {
         ),
       );
     }
-    // Unexpected death outside close(): mark closed so further requests
-    // fail fast, but leave stdio cleanup to close().
-    this.closed = true;
-    this.detachAll();
+    // Unexpected death outside close(): funnel through the same
+    // finalization as close() (no leaked children/listeners) while keeping
+    // the `process-exited` ambiguity semantics established above. Notify
+    // user listeners first, then release process ownership + subscriptions
+    // so post-mortem assertions observe a fully cleaned-up transport.
+    // `close()` afterwards returns the cached exit info immediately.
     for (const h of [...this.exitHandlers]) {
       try {
         h(this.exitInfo);
@@ -551,6 +664,21 @@ export class PiRpcConnection {
         // Ignore.
       }
     }
+    this.closed = true;
+    this.detachAll();
+    const proc = this.proc;
+    this.proc = null;
+    try {
+      proc?.stdout?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    try {
+      proc?.stderr?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    this.removeAllListeners();
   }
 
   // -------------------------------------------------------------------------
@@ -821,12 +949,32 @@ export class PiRpcConnection {
   }
 
   /**
-   * Abort the streaming turn. Note the response may arrive *after*
-   * `agent_settled` — await both the response and settle before re-enabling
-   * input (Esc-pattern: `clearQueue()` then `abort()`).
+   * Abort the streaming turn. The response may arrive *after*
+   * `agent_settled` (proven in `abort-queue.jsonl`), so awaiting abort and
+   * settle **sequentially** (`await abort(); await waitForSettled()`)
+   * necessarily waits for the *next* settle and can time out. Register the
+   * settle waiter **before** sending abort — or use
+   * `abortAndWaitForSettled()`, which does exactly that. Esc-pattern:
+   * `clearQueue()` then `abortAndWaitForSettled()`.
    */
   async abort(opts: PiRpcRequestOptions = {}): Promise<void> {
     await this.request({ type: "abort" }, opts);
+  }
+
+  /**
+   * Abort and wait for the streaming turn to settle without the sequential
+   * footgun: the `agent_settled` waiter is registered *before* the `abort`
+   * request is sent, so an `agent_settled` that arrives before the `abort`
+   * response (the proven order) still resolves. Awaits both the abort
+   * response and the next settle concurrently.
+   */
+  async abortAndWaitForSettled(
+    opts: PiRpcRequestOptions & { settleTimeoutMs?: number } = {},
+  ): Promise<void> {
+    const { settleTimeoutMs, ...abortOpts } = opts;
+    const settled = this.waitForSettled(settleTimeoutMs);
+    await this.abort(abortOpts);
+    await settled;
   }
 
   async abortBash(opts: PiRpcRequestOptions = {}): Promise<void> {

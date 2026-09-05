@@ -56,12 +56,11 @@ export {
   type PiRpcErrorDetails,
 } from "./errors.js";
 export {
-  buildPiRpcLaunch,
   resolvePiRpcEnv,
+  toPiRpcProcessSpec,
   TUI_ONLY_FLAGS,
-  type PiRpcLaunchOptions,
-  type PiRpcLaunchProfile,
   type PiRpcProcessSpec,
+  type ResolvedPiSpecLike,
 } from "./launch.js";
 export {
   isExtensionUiDialog,

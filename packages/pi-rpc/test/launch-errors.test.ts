@@ -1,11 +1,17 @@
 /**
- * Transport-neutral launch + secret-safe error tests (SNC1.2).
+ * RPC spec adapter + secret-safe error tests (SNC1.2).
+ *
+ * Single-compiler rule: profiles are compiled only by core's
+ * `buildPiLaunch()` (JEF-7). `toPiRpcProcessSpec()` adapts an
+ * already-resolved spec to RPC transport without recompiling, so prompt
+ * collision fallback (literal vs content-addressed temp path) and
+ * projectRoot-relative path resolution are preserved by construction.
  */
 
 import { describe, expect, it } from "vitest";
 import {
-  buildPiRpcLaunch,
   resolvePiRpcEnv,
+  toPiRpcProcessSpec,
   TUI_ONLY_FLAGS,
 } from "../src/launch.js";
 import {
@@ -16,81 +22,64 @@ import {
   rejectedError,
 } from "../src/errors.js";
 
-describe("buildPiRpcLaunch (transport-neutral, TUI excluded)", () => {
-  it("builds deterministic pi --mode rpc argv in fixed order", () => {
-    const spec = buildPiRpcLaunch({
-      profile: {
-        provider: "opencode-go",
-        model: "glm-5.3-flash",
-        thinking: "low",
-        systemPrompt: "Be brief.",
-        tools: ["read", "bash"],
-        excludeTools: ["ask_question"],
-        discoverSkills: false,
-        skills: ["s1"],
-        discoverExtensions: false,
-        extensions: ["e1"],
-        discoverPromptTemplates: false,
-        contextFiles: false,
-        session: "persistent",
-        sessionDir: "/tmp/sess",
-        sessionName: "demo",
-      },
-      cwd: "/work",
-      piCommand: "pi",
-    });
+describe("toPiRpcProcessSpec (single-compiler adapter, TUI excluded)", () => {
+  it("appends --mode rpc idempotently and freezes", () => {
+    const spec = toPiRpcProcessSpec({ command: "pi", args: ["--offline"] });
     expect(spec.command).toBe("pi");
-    expect(spec.args).toEqual([
-      "--provider", "opencode-go",
-      "--model", "glm-5.3-flash",
-      "--thinking", "low",
-      "--system-prompt", "Be brief.",
-      "--tools", "read,bash",
-      "--exclude-tools", "ask_question",
-      "--no-skills", "--skill", "s1",
-      "--no-extensions", "--extension", "e1",
-      "--no-prompt-templates",
-      "--no-context-files",
-      "--session-dir", "/tmp/sess",
-      "--name", "demo",
-      "--mode", "rpc",
-    ]);
+    expect(spec.args).toEqual(["--offline", "--mode", "rpc"]);
+    expect(Object.isFrozen(spec)).toBe(true);
     expect(Object.isFrozen(spec.args)).toBe(true);
-    // Deterministic: same input → same output.
-    expect(buildPiRpcLaunch({
-      profile: { provider: "opencode-go", model: "glm-5.3-flash", thinking: "low" },
-    }).args).toEqual(
-      buildPiRpcLaunch({
-        profile: { provider: "opencode-go", model: "glm-5.3-flash", thinking: "low" },
-      }).args,
-    );
+    // Already-RPC args are never doubled (core may hand back an RPC spec).
+    expect(toPiRpcProcessSpec(spec).args).toEqual(["--offline", "--mode", "rpc"]);
   });
 
-  it("maps explicit [] tools to --no-tools and ephemeral to --no-session", () => {
-    const spec = buildPiRpcLaunch({ profile: { tools: [], session: "ephemeral", thinking: "low" } });
-    expect(spec.args).toContain("--no-tools");
-    expect(spec.args).toContain("--no-session");
-    expect(spec.args).not.toContain("--session-dir");
+  it("preserves core-resolved absolute paths and collision-safe prompt values untouched", () => {
+    // Simulates core's buildPiLaunch() output: relative skills/extensions
+    // already resolved against projectRoot to absolute paths, and a
+    // colliding literal prompt already materialized to a content-addressed
+    // temp path (JEF-7 prompt-transport semantics).
+    const coreResolved = {
+      command: "pi",
+      args: [
+        "--provider", "opencode-go",
+        "--model", "glm-5.3-flash",
+        "--thinking", "low",
+        "--system-prompt", "/tmp/orca-pi-prompts/orca-pi-prompt-worker-abc123.md",
+        "--no-skills", "--skill", "/work/.pi/skills/repo-search",
+        "--no-extensions", "--extension", "/work/.pi/extensions/custom.mjs",
+        "--no-context-files",
+      ],
+      cwd: "/work",
+      env: {},
+    };
+    const rpc = toPiRpcProcessSpec(coreResolved);
+    // Absolute resource paths and the temp prompt path survive verbatim.
+    expect(rpc.args).toContain("/work/.pi/skills/repo-search");
+    expect(rpc.args).toContain("/work/.pi/extensions/custom.mjs");
+    expect(rpc.args).toContain("/tmp/orca-pi-prompts/orca-pi-prompt-worker-abc123.md");
+    expect(rpc.args.slice(-2)).toEqual(["--mode", "rpc"]);
+    expect(rpc.cwd).toBe("/work");
   });
 
-  it("passes prompt text as a single argv element (no shell quoting)", () => {
-    const tricky = `say "hi" && rm -rf / ; echo 'x'\nline2`;
-    const spec = buildPiRpcLaunch({ profile: { systemPrompt: tricky } });
-    const idx = spec.args.indexOf("--system-prompt");
+  it("preserves literal prompts with shell metachars as one argv element", () => {
+    const tricky = 'say "hi" && rm -rf / ; echo \'x\'\nline2';
+    const rpc = toPiRpcProcessSpec({ command: "pi", args: ["--system-prompt", tricky] });
+    const idx = rpc.args.indexOf("--system-prompt");
     expect(idx).toBeGreaterThanOrEqual(0);
-    expect(spec.args[idx + 1]).toBe(tricky);
+    expect(rpc.args[idx + 1]).toBe(tricky);
   });
 
-  it("rejects TUI-only flags in extraArgs", () => {
+  it("rejects TUI-only flags from resolved specs", () => {
     for (const flag of ["--theme", "--use-theme", "--tui-mode", "--verbose", "--print", "--export", "--models", "--approve", "--continue", "--resume"]) {
       expect(TUI_ONLY_FLAGS.has(flag)).toBe(true);
-      expect(() => buildPiRpcLaunch({ extraArgs: [flag] })).toThrow(/TUI-only/);
+      expect(() => toPiRpcProcessSpec({ command: "pi", args: [flag] })).toThrow(/TUI-only/);
     }
-    // Non-TUI passthrough is allowed (e.g. --offline, --session-dir).
-    expect(() =>
-      buildPiRpcLaunch({ extraArgs: ["--offline"] }),
-    ).not.toThrow();
-    expect(buildPiRpcLaunch({ extraArgs: ["--offline"] }).args).toContain("--offline");
+    // Transport-neutral passthrough stays allowed.
+    expect(toPiRpcProcessSpec({ command: "pi", args: ["--offline"] }).args).toContain("--offline");
+  });
+
+  it("requires a resolved command", () => {
+    expect(() => toPiRpcProcessSpec({ command: "", args: [] })).toThrow(/non-empty command/);
   });
 
   it("resolves env overlays without implicit process.env merging surprises", () => {

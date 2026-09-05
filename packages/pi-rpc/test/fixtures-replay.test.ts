@@ -98,7 +98,7 @@ describe("PiRpcConnection fixture replay (all #11 fixtures)", () => {
     it(`replays ${name} with matching accepted/rejected outcomes`, async () => {
       const envelopes = readEnvelopes(name);
       const h = createHarness();
-      const conn = new PiRpcConnection({ spawnFn: h.spawnFn, defaultTimeoutMs: 5_000 });
+      const conn = new PiRpcConnection({ spawnFn: h.spawnFn, defaultTimeoutMs: 5_000, startupProbe: false });
       await conn.start();
 
       const events: Record<string, unknown>[] = [];
@@ -181,7 +181,7 @@ describe("PiRpcConnection fixture replay (all #11 fixtures)", () => {
   it("replays fragmented multi-record chunks for a full fixture", async () => {
     const envelopes = readEnvelopes("text-streaming.jsonl");
     const h = createHarness();
-    const conn = new PiRpcConnection({ spawnFn: h.spawnFn, defaultTimeoutMs: 5_000 });
+    const conn = new PiRpcConnection({ spawnFn: h.spawnFn, defaultTimeoutMs: 5_000, startupProbe: false });
     await conn.start();
 
     const s2cPayloads = envelopes.filter((e) => e.dir === "s2c").map((e) => e.payload);
@@ -213,7 +213,7 @@ describe("PiRpcConnection fixture replay (all #11 fixtures)", () => {
   it("keeps state-tree coherent through the transport (entries/leaf/tree)", async () => {
     const envelopes = readEnvelopes("state-tree.jsonl");
     const h = createHarness();
-    const conn = new PiRpcConnection({ spawnFn: h.spawnFn, defaultTimeoutMs: 5_000 });
+    const conn = new PiRpcConnection({ spawnFn: h.spawnFn, defaultTimeoutMs: 5_000, startupProbe: false });
     await conn.start();
     const byId = new Map<string, PiResponse>();
     conn.onResponse((r) => {

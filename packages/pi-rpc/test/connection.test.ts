@@ -96,7 +96,10 @@ async function startedConnection(
   fake: FakeProc,
   opts: ConstructorParameters<typeof PiRpcConnection>[0] = {},
 ): Promise<PiRpcConnection> {
-  const conn = new PiRpcConnection({ spawnFn: fake.spawnFn, ...opts });
+  // Framing/correlation unit tests skip the RPC readiness probe (they test
+  // transport behavior in isolation); dedicated startup tests below enable
+  // the probe explicitly.
+  const conn = new PiRpcConnection({ spawnFn: fake.spawnFn, startupProbe: false, ...opts });
   await conn.start();
   return conn;
 }
@@ -464,5 +467,141 @@ describe("PiRpcConnection transport", () => {
     await expect(conn.start()).rejects.toMatchObject({ code: "already-started" });
     await conn.close();
     await expect(conn.start()).rejects.toMatchObject({ code: "already-closed" });
+  });
+});
+
+describe("PiRpcConnection startup probe (readiness gating)", () => {
+  it("start() proves RPC readiness with a get_state round-trip", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({
+      spawnFn: fake.spawnFn,
+      startupProbe: true,
+      startupProbeTimeoutMs: 1000,
+    });
+    const starting = conn.start();
+    // The first write must be the internal readiness probe.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fake.written).toHaveLength(1);
+    const probe = JSON.parse(fake.written[0] as string) as { id: string; type: string };
+    expect(probe.type).toBe("get_state");
+    fake.emitStdout(
+      serializeJsonLine({ id: probe.id, type: "response", command: "get_state", success: true, data: {} }),
+    );
+    await expect(starting).resolves.toBeUndefined();
+    expect(conn.isStarted).toBe(true);
+    await conn.close(200);
+  });
+
+  it("start() rejects startup-failed when Pi emits spawn then exits 1 before answering", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({
+      spawnFn: fake.spawnFn,
+      startupProbe: true,
+      startupProbeTimeoutMs: 1000,
+    });
+    const starting = conn.start();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fake.written).toHaveLength(1); // probe was sent
+    // Invalid args/config: OS spawn succeeded, then Pi dies non-zero.
+    fake.emitStderr("FATAL: bad args\n");
+    fake.emitExit(1, null);
+    const error = await starting.then(
+      () => null,
+      (e) => e as PiRpcError,
+    );
+    expect(error?.code).toBe("startup-failed");
+    expect(error?.exitCode).toBe(1);
+    expect(error?.stderrTail).toContain("FATAL");
+    expect(conn.isStarted).toBe(false);
+  });
+
+  it("start() rejects startup-timeout when Pi stays silent", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({
+      spawnFn: fake.spawnFn,
+      startupProbe: true,
+      startupProbeTimeoutMs: 40,
+      startupTimeoutMs: 500,
+    });
+    const error = await conn.start().then(
+      () => null,
+      (e) => e as PiRpcError,
+    );
+    expect(error?.code).toBe("startup-timeout");
+    expect(conn.isStarted).toBe(false);
+  });
+
+  it("even a rejected get_state probe proves liveness", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({
+      spawnFn: fake.spawnFn,
+      startupProbe: true,
+      startupProbeTimeoutMs: 1000,
+    });
+    const starting = conn.start();
+    await new Promise((r) => setTimeout(r, 60));
+    const probe = JSON.parse(fake.written[0] as string) as { id: string };
+    fake.emitStdout(
+      serializeJsonLine({ id: probe.id, type: "response", command: "get_state", success: false, error: "weird" }),
+    );
+    await expect(starting).resolves.toBeUndefined();
+    expect(conn.isStarted).toBe(true);
+    await conn.close(200);
+  });
+});
+
+describe("PiRpcConnection unexpected-exit cleanup", () => {
+  it("releases stdio/process refs/subscriptions after unexpected death", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({ spawnFn: fake.spawnFn, startupProbe: false });
+    await conn.start();
+    const events: unknown[] = [];
+    conn.onEvent((e) => events.push(e));
+    conn.onResponse(() => undefined);
+    conn.onExtensionUiRequest(() => undefined);
+    const exits: unknown[] = [];
+    conn.onExit((r) => exits.push(r));
+    // In-flight request becomes ambiguous process-exited.
+    const pending = conn.request({ id: "u1", type: "get_state" }, { timeoutMs: 5000 });
+    fake.emitExit(1, null);
+    const error = await pending.then(
+      () => null,
+      (e) => e as PiRpcError,
+    );
+    expect(error?.code).toBe("process-exited");
+    expect(error?.ambiguous).toBe(true);
+    expect(exits).toHaveLength(1);
+    // Full cleanup assertions: no leaked children/listeners.
+    expect(conn.isClosed).toBe(true);
+    expect(conn.pendingCount).toBe(0);
+    expect(fake.proc.listenerCount("exit")).toBe(0);
+    expect(fake.stdout.listenerCount("data")).toBe(0);
+    expect(fake.stderr.listenerCount("data")).toBe(0);
+    expect(fake.proc.stdout.destroy).toHaveBeenCalled();
+    expect(fake.proc.stderr.destroy).toHaveBeenCalled();
+    // Subscriptions released: new events do not reach old handlers.
+    fake.emitStdout(serializeJsonLine({ type: "agent_settled" }));
+    expect(events).toHaveLength(0);
+    // close() after unexpected death returns the cached exit info fast.
+    const result = await conn.close(200);
+    expect(result.exitCode).toBe(1);
+    void events;
+  });
+});
+
+describe("PiRpcConnection abort sequencing", () => {
+  it("abortAndWaitForSettled resolves when settle arrives before the abort response", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({ spawnFn: fake.spawnFn, startupProbe: false });
+    await conn.start();
+    const done = conn.abortAndWaitForSettled({ timeoutMs: 1000, settleTimeoutMs: 1000 });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fake.written).toHaveLength(1);
+    const abortId = (JSON.parse(fake.written[0] as string) as { id: string }).id;
+    // Proven order: agent_settled first, abort response after.
+    fake.emitStdout(serializeJsonLine({ type: "agent_settled" }));
+    fake.emitStdout(serializeJsonLine({ id: abortId, type: "response", command: "abort", success: true }));
+    await expect(done).resolves.toBeUndefined();
+    await conn.close(200);
   });
 });
