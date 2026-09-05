@@ -60,6 +60,7 @@ export {
   verifyReviewerForReview,
   type AuthenticatedGithubActor,
   type InstallationTokenCache,
+  type PullRequestMeta,
   type ReviewerAppMetadata,
   type TokenCacheEntry,
 } from "./github-app-auth.js";

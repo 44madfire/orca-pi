@@ -49,7 +49,7 @@ describe("github integration: worker PR -> reviewer review/check -> human-ready"
         return { ok: true, status: 200, json: async () => ({ total_count: 1, repositories: [{ id: 1, full_name: "octo/hello-world" }] }), text: async () => "{}" };
       }
       if (/\/repos\/[^/]+\/[^/]+\/pulls\/7$/.test(url) && init.method === "GET") {
-        return { ok: true, status: 200, json: async () => ({ user: { login: prAuthor } }), text: async () => "{}" };
+        return { ok: true, status: 200, json: async () => ({ user: { login: prAuthor }, head: { sha } }), text: async () => "{}" };
       }
       if (url.includes("/pulls/7/reviews?") && init.method === "GET") {
         // Real listing shape with response states.
@@ -155,7 +155,7 @@ describe("github integration: worker PR -> reviewer review/check -> human-ready"
         return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
       }
       if (/\/repos\/[^/]+\/[^/]+\/pulls\/1$/.test(url)) {
-        return { ok: true, status: 200, json: async () => ({ user: { login: "human-user[bot]" } }), text: async () => "{}" };
+        return { ok: true, status: 200, json: async () => ({ user: { login: "human-user[bot]" }, head: { sha: "bbbbbbbb11111111111111111111111111111111" } }), text: async () => "{}" };
       }
       if (init.method === "POST") posts.push(url);
       throw new Error(`must not POST: ${init.method} ${url}`);

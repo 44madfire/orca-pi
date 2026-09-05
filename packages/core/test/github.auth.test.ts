@@ -114,9 +114,16 @@ describe("github-app-auth: installation-token refresh/expiry", () => {
   });
 
   it("fetchPullRequestAuthor returns user.login for distinct-actor comparison", async () => {
-    const fetchFn: GithubFetchFn = async () => ({ ok: true, status: 200, json: async () => ({ user: { login: "human-user" } }), text: async () => "{}" });
+    const fetchFn: GithubFetchFn = async () => ({ ok: true, status: 200, json: async () => ({ user: { login: "human-user" }, head: { sha: "abc1234" } }), text: async () => "{}" });
     const author = await fetchPullRequestAuthor({ owner: "o", repo: "r", pullNumber: 1 }, { fetchFn, token: REVIEWER_TOKEN });
     expect(author).toBe("human-user");
+  });
+
+  it("fetchPullRequestMeta returns author + head SHA for head-aware targeting", async () => {
+    const { fetchPullRequestMeta } = await import("../src/github/github-app-auth.js");
+    const fetchFn: GithubFetchFn = async () => ({ ok: true, status: 200, json: async () => ({ user: { login: "human-user" }, head: { sha: "deadbeef" } }), text: async () => "{}" });
+    const meta = await fetchPullRequestMeta({ owner: "o", repo: "r", pullNumber: 1 }, { fetchFn, token: REVIEWER_TOKEN });
+    expect(meta).toEqual({ authorLogin: "human-user", headSha: "deadbeef" });
   });
 
   it("resolveReviewerAppMetadata requires verified login + installation id (fail closed)", async () => {
@@ -152,6 +159,7 @@ describe("github-app-auth: installation-token refresh/expiry", () => {
 
   it("verifyReviewerForReview enforces IAT class + distinct author (never GET /user)", async () => {
     const reviewerEnv = { ORCA_PI_GITHUB_REVIEWER_TOKEN: REVIEWER_TOKEN, ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]", ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123" };
+    const HEAD = "feedfacefeedfacefeedfacefeedfacefeedface";
     const mkFetch = (prAuthor: string, installationStatus = 200): GithubFetchFn =>
       (async (url: string) => {
         if (url.includes("/installation/repositories")) {
@@ -159,11 +167,11 @@ describe("github-app-auth: installation-token refresh/expiry", () => {
           return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
         }
         if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
-        return { ok: true, status: 200, json: async () => ({ user: { login: prAuthor } }), text: async () => "{}" };
+        return { ok: true, status: 200, json: async () => ({ user: { login: prAuthor }, head: { sha: HEAD } }), text: async () => "{}" };
       }) as GithubFetchFn;
-    // Happy path: IAT + configured Bot distinct from author.
+    // Happy path: IAT + configured Bot distinct from author (head SHA captured).
     const ok = await verifyReviewerForReview("reviewer", { owner: "o", repo: "r", pullNumber: 1 }, { fetchFn: mkFetch("human-user"), env: reviewerEnv, cache: createInstallationTokenCache() });
-    expect(ok).toEqual({ reviewerLogin: "orca-pi-reviewer[bot]", prAuthorLogin: "human-user", installationId: "123" });
+    expect(ok).toEqual({ reviewerLogin: "orca-pi-reviewer[bot]", prAuthorLogin: "human-user", installationId: "123", headSha: HEAD });
     // Same login → same-actor rejection before any POST.
     const sameEnv = { ...reviewerEnv, ORCA_PI_GITHUB_REVIEWER_LOGIN: "human-user[bot]" };
     // Note: configured login must still look like a bot; use a bot login equal to author to trigger distinctness.

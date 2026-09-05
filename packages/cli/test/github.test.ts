@@ -42,7 +42,7 @@ function mockGithubFetch(options?: {
       return ok({ total_count: 1, repositories: [{ id: 1, full_name: "o/r" }] }, 200);
     }
     if (/\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url) && init.method === "GET") {
-      return ok({ user: { login: options?.prAuthor ?? "human-user" } }, 200);
+      return ok({ user: { login: options?.prAuthor ?? "human-user" }, head: { sha: "feedfacefeedfacefeedfacefeedfacefeedface" } }, 200);
     }
     if (url.includes("/reviews?") && init.method === "GET") {
       return ok(options?.existingReviews ?? [], 200);

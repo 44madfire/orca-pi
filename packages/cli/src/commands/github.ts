@@ -12,6 +12,11 @@
  *   orca-pi github review --identity <name> --pr <url|number|owner/repo#n>
  *     --verdict <approve|request-changes|comment> --body <text|@file>
  *     [--repo <owner/repo>] [--commit <sha>] [--task <id>] [--issue <JEF-...>] [--json]
+ *
+ * Reviews are head-aware: an omitted --commit pins to the PR's current
+ * head.sha (captured in preflight, matching GitHub's default) and is always
+ * sent as commit_id; retries dedupe only on exact commit equality, so new
+ * pushes always get a fresh review.
  *   orca-pi github check start --identity <name> --repo <owner/repo> --sha <sha>
  *     [--summary <text>] [--task <id>] [--issue <JEF-...>] [--json]
  *   orca-pi github check complete --identity <name> --repo <owner/repo> --sha <sha>

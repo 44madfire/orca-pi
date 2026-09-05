@@ -247,10 +247,16 @@ export async function listPullReviews(
  * Compares against GitHub response `state` spelling (`APPROVED` /
  * `CHANGES_REQUESTED` / `COMMENTED` via `reviewEventToState`), not the
  * request `event` spelling — otherwise real retries never match.
+ *
+ * Commit comparison is strict and head-aware: `match.commitId` is required
+ * (callers pass `explicit --commit ?? current PR head.sha`), and an
+ * existing review dedupes only on exact `review.commitId` equality. Reviews
+ * with a missing/different commit never dedupe, so pushing new commits can
+ * never reuse an older head's review (unsafe for APPROVE especially).
  */
 export function findDuplicateReview(
   reviews: readonly ExistingPullReview[],
-  match: { reviewerLogin: string; event: ReviewEvent; body: string; commitId?: string },
+  match: { reviewerLogin: string; event: ReviewEvent; body: string; commitId: string },
 ): ExistingPullReview | undefined {
   const wantBody = match.body.trim();
   const wantState = reviewEventToState(match.event);
@@ -258,7 +264,7 @@ export function findDuplicateReview(
     if (review.userLogin?.toLowerCase() !== match.reviewerLogin.toLowerCase()) return false;
     if ((review.state ?? "").toUpperCase() !== wantState) return false;
     if ((review.body ?? "").trim() !== wantBody) return false;
-    if (match.commitId !== undefined && review.commitId !== undefined && review.commitId !== match.commitId) return false;
+    if (review.commitId === undefined || review.commitId !== match.commitId) return false;
     return true;
   });
   if (candidates.length === 0) return undefined;
@@ -275,9 +281,12 @@ export function findDuplicateReview(
  * `--identity worker` and human PATs in the reviewer slot never reach POST.
  * Tokens never enter logs.
  *
- * Retry semantics: retries with identical `(reviewer, event, body, commit)`
- * return the existing review instead of POSTing a duplicate (best-effort
- * list-then-dedupe; genuinely new findings still create a new review).
+ * Head-aware review targeting: `effectiveCommitId = explicit --commit ??
+ * current PR head.sha` (captured in the same preflight GET, matching GitHub's
+ * default of the latest head when `commit_id` is omitted) is always sent as
+ * `commit_id`, and dedupe requires exact commit equality — so a retry after
+ * new pushes POSTs a fresh review instead of reusing an older head's review.
+ * When neither is known (PR omits `head.sha`), no dedupe is attempted.
  *
  * `fetchFn` is injectable for tests; `env`/`cache` thread through to
  * credential resolution. Throws `GithubAuthError` for 401/403/404
@@ -305,21 +314,28 @@ export async function submitGithubReview(
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
   const endpoint = `/repos/${input.owner}/${input.repo}/pulls/${input.pullNumber}/reviews`;
+  // Head-aware targeting: explicit --commit wins, else the current PR head
+  // captured in preflight (GitHub defaults omitted commit_id to latest head).
+  const effectiveCommitId = input.commitId ?? preflight.headSha;
   const payload = buildReviewPayload({
     verdict: input.verdict,
     body: input.body,
-    ...(input.commitId ? { commitId: input.commitId } : {}),
+    ...(effectiveCommitId ? { commitId: effectiveCommitId } : {}),
     ...(input.provenance ? { provenance: input.provenance } : {}),
   });
-  // Idempotent retry: identical retry returns the existing review.
-  try {
-    const existing = await listPullReviews(identity, { owner: input.owner, repo: input.repo, pullNumber: input.pullNumber }, { fetchFn, env, cache, apiBase });
-    const duplicate = findDuplicateReview(existing, { reviewerLogin: preflight.reviewerLogin, event: payload.event, body: payload.body, ...(payload.commit_id ? { commitId: payload.commit_id } : {}) });
-    if (duplicate) {
-      return { id: duplicate.id, deduped: true };
+  // Idempotent retry: identical (reviewer, event, body, commit) returns the
+  // existing review. Skipped when no commit is known — never dedupe across
+  // unknown commits.
+  if (effectiveCommitId) {
+    try {
+      const existing = await listPullReviews(identity, { owner: input.owner, repo: input.repo, pullNumber: input.pullNumber }, { fetchFn, env, cache, apiBase });
+      const duplicate = findDuplicateReview(existing, { reviewerLogin: preflight.reviewerLogin, event: payload.event, body: payload.body, commitId: effectiveCommitId });
+      if (duplicate) {
+        return { id: duplicate.id, deduped: true };
+      }
+    } catch {
+      // Listing is best-effort idempotency — fall through to POST.
     }
-  } catch {
-    // Listing is best-effort idempotency — fall through to POST.
   }
 
   let response;

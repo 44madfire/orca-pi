@@ -299,6 +299,7 @@ export {
   type CheckStatus,
   type ExistingCheckRun,
   type ExistingPullReview,
+  type PullRequestMeta,
   type ReviewerAppMetadata,
   type GithubFetchFn,
   type GithubHttpResponse,

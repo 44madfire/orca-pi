@@ -39,8 +39,12 @@ function jsonResponse(data: unknown, status = 200) {
  * Never mocks GET /user for the reviewer flow (unsupported for IATs — the
  * mock throws if called, proving the contract).
  */
+const HEAD_SHA = "feedfacefeedfacefeedfacefeedfacefeedface";
+const OLD_SHA = "aaaaaaaa00000000000000000000000000000000";
+
 function mockReviewFetch(options?: {
   prAuthor?: string;
+  headSha?: string | null;
   existingReviews?: unknown[];
   onPost?: (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => void;
   failInstallationStatus?: number;
@@ -48,6 +52,7 @@ function mockReviewFetch(options?: {
   env?: Record<string, string | undefined>;
 }): GithubFetchFn {
   const prAuthor = options?.prAuthor ?? PR_AUTHOR;
+  const headSha = options?.headSha === undefined ? HEAD_SHA : options.headSha;
   return vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
     if (url === "https://api.github.com/user" && init.method === "GET") {
       throw new Error("GET /user must never be called for installation tokens (use /installation/repositories + trusted metadata)");
@@ -62,7 +67,7 @@ function mockReviewFetch(options?: {
       if (options?.failPrStatus) {
         return { ok: false, status: options.failPrStatus, json: async () => ({}), text: async () => "denied" };
       }
-      return jsonResponse({ user: { login: prAuthor } }, 200);
+      return jsonResponse({ user: { login: prAuthor }, ...(headSha ? { head: { sha: headSha } } : {}) }, 200);
     }
     if (url.includes("/reviews?") && init.method === "GET") {
       return jsonResponse(options?.existingReviews ?? [], 200);
@@ -151,11 +156,14 @@ describe("review: payloads for COMMENT / REQUEST_CHANGES / APPROVE", () => {
 });
 
 describe("review: submit via reviewer App identity (production preflight)", () => {
-  it("POSTs to /reviews with Bearer auth after proving distinct App actor", async () => {
+  it("POSTs to /reviews with Bearer auth + pinned head commit after proving distinct App actor", async () => {
     let postedEvent = "";
+    let postedCommit: unknown;
     const fetchFn = mockReviewFetch({
       onPost: (_url, init) => {
-        postedEvent = (JSON.parse(init.body as string) as { event: string }).event;
+        const payload = JSON.parse(init.body as string) as { event: string; commit_id?: string };
+        postedEvent = payload.event;
+        postedCommit = payload.commit_id;
       },
     });
     // Assert the preflight Authorization header on every call.
@@ -170,6 +178,8 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     );
     expect(result.id).toBe(9001);
     expect(postedEvent).toBe("REQUEST_CHANGES");
+    // Omitted --commit pins to the current PR head captured in preflight.
+    expect(postedCommit).toBe(HEAD_SHA);
     // Preflight GETs + list + POST all ran.
     expect(fetchFn).toHaveBeenCalled();
     const postCalls = (fetchFn as ReturnType<typeof vi.fn>).mock.calls.filter(([, init]) => (init as { method: string }).method === "POST");
@@ -271,11 +281,12 @@ describe("review: submit via reviewer App identity (production preflight)", () =
   });
 
   it("retry with identical inputs dedupes instead of POSTing a duplicate review", async () => {
-    // Real GitHub response shape: state CHANGES_REQUESTED (not REQUEST_CHANGES).
+    // Real GitHub response shape: state CHANGES_REQUESTED (not REQUEST_CHANGES),
+    // committed against the same head SHA the preflight reports.
     const formattedBody = "Blocking finding.\n\n---\n🤖 orca-pi agent-review (profile: reviewer) · human remains merge authority";
     let posts = 0;
     const fetchFn = mockReviewFetch({
-      existingReviews: [{ id: 555, user: { login: REVIEWER_BOT }, state: "CHANGES_REQUESTED", body: formattedBody, commit_id: null }],
+      existingReviews: [{ id: 555, user: { login: REVIEWER_BOT }, state: "CHANGES_REQUESTED", body: formattedBody, commit_id: HEAD_SHA }],
       onPost: () => {
         posts += 1;
       },
@@ -290,20 +301,105 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     expect(posts).toBe(0);
   });
 
+  it("head-aware dedupe (1): same reviewer/event/body + same head SHA => dedupes", async () => {
+    const formattedBody = "Looks good.\n\n---\n🤖 orca-pi agent-review (profile: reviewer) · human remains merge authority";
+    let posts = 0;
+    const fetchFn = mockReviewFetch({
+      headSha: HEAD_SHA,
+      existingReviews: [{ id: 777, user: { login: REVIEWER_BOT }, state: "APPROVED", body: formattedBody, commit_id: HEAD_SHA }],
+      onPost: () => {
+        posts += 1;
+      },
+    });
+    const result = await submitGithubReview(
+      "reviewer",
+      { owner: "o", repo: "r", pullNumber: 1, verdict: "approve", body: "Looks good.", provenance: { profile: "reviewer" } },
+      { fetchFn, env: ENV, cache: createInstallationTokenCache() },
+    );
+    expect(result).toMatchObject({ id: 777, deduped: true });
+    expect(posts).toBe(0);
+  });
+
+  it("head-aware dedupe (2): older review commit + changed PR head => POSTs a new review", async () => {
+    const formattedBody = "Looks good.\n\n---\n🤖 orca-pi agent-review (profile: reviewer) · human remains merge authority";
+    let posts = 0;
+    let postedCommit: unknown;
+    const fetchFn = mockReviewFetch({
+      headSha: HEAD_SHA,
+      existingReviews: [{ id: 776, user: { login: REVIEWER_BOT }, state: "APPROVED", body: formattedBody, commit_id: OLD_SHA }],
+      onPost: (_url, init) => {
+        posts += 1;
+        postedCommit = (JSON.parse(init.body as string) as { commit_id?: string }).commit_id;
+      },
+    });
+    const result = await submitGithubReview(
+      "reviewer",
+      { owner: "o", repo: "r", pullNumber: 1, verdict: "approve", body: "Looks good.", provenance: { profile: "reviewer" } },
+      { fetchFn, env: ENV, cache: createInstallationTokenCache() },
+    );
+    expect(result.id).toBe(9001);
+    expect(result.deduped).toBeUndefined();
+    expect(posts).toBe(1);
+    expect(postedCommit).toBe(HEAD_SHA);
+  });
+
+  it("head-aware dedupe (3): explicit --commit dedupes only that exact commit", async () => {
+    const formattedBody = "Note.\n\n---\n🤖 orca-pi agent-review (profile: reviewer) · human remains merge authority";
+    const explicit = "bbbbbbbb11111111111111111111111111111111";
+    // Existing review targets a different commit → must POST pinned to --commit.
+    let postedCommit: unknown;
+    const fetchFnMiss = mockReviewFetch({
+      headSha: HEAD_SHA,
+      existingReviews: [{ id: 700, user: { login: REVIEWER_BOT }, state: "COMMENTED", body: formattedBody, commit_id: OLD_SHA }],
+      onPost: (_url, init) => {
+        postedCommit = (JSON.parse(init.body as string) as { commit_id?: string }).commit_id;
+      },
+    });
+    const missed = await submitGithubReview(
+      "reviewer",
+      { owner: "o", repo: "r", pullNumber: 1, verdict: "comment", body: "Note.", commitId: explicit, provenance: { profile: "reviewer" } },
+      { fetchFn: fetchFnMiss, env: ENV, cache: createInstallationTokenCache() },
+    );
+    expect(missed.id).toBe(9001);
+    expect(missed.deduped).toBeUndefined();
+    expect(postedCommit).toBe(explicit);
+    // Existing review targets the same explicit commit → dedupes.
+    let posts = 0;
+    const fetchFnHit = mockReviewFetch({
+      headSha: HEAD_SHA,
+      existingReviews: [{ id: 701, user: { login: REVIEWER_BOT }, state: "COMMENTED", body: formattedBody, commit_id: explicit }],
+      onPost: () => {
+        posts += 1;
+      },
+    });
+    const hit = await submitGithubReview(
+      "reviewer",
+      { owner: "o", repo: "r", pullNumber: 1, verdict: "comment", body: "Note.", commitId: explicit, provenance: { profile: "reviewer" } },
+      { fetchFn: fetchFnHit, env: ENV, cache: createInstallationTokenCache() },
+    );
+    expect(hit).toMatchObject({ id: 701, deduped: true });
+    expect(posts).toBe(0);
+  });
+
   it("findDuplicateReview matches response states, ignores others (Blocking 2)", () => {
     // Real GitHub listing shapes: APPROVED / CHANGES_REQUESTED / COMMENTED.
     const reviews = [
-      { id: 1, userLogin: REVIEWER_BOT, state: "APPROVED", body: "ok" },
-      { id: 2, userLogin: REVIEWER_BOT, state: "CHANGES_REQUESTED", body: "blocking" },
-      { id: 3, userLogin: "someone-else", state: "CHANGES_REQUESTED", body: "blocking" },
-      { id: 4, userLogin: REVIEWER_BOT, state: "PENDING", body: "blocking" },
-      { id: 5, userLogin: REVIEWER_BOT, state: "DISMISSED", body: "blocking" },
+      { id: 1, userLogin: REVIEWER_BOT, state: "APPROVED", body: "ok", commitId: HEAD_SHA },
+      { id: 2, userLogin: REVIEWER_BOT, state: "CHANGES_REQUESTED", body: "blocking", commitId: HEAD_SHA },
+      { id: 3, userLogin: "someone-else", state: "CHANGES_REQUESTED", body: "blocking", commitId: HEAD_SHA },
+      { id: 4, userLogin: REVIEWER_BOT, state: "PENDING", body: "blocking", commitId: HEAD_SHA },
+      { id: 5, userLogin: REVIEWER_BOT, state: "DISMISSED", body: "blocking", commitId: HEAD_SHA },
+      { id: 6, userLogin: REVIEWER_BOT, state: "CHANGES_REQUESTED", body: "blocking", commitId: OLD_SHA },
     ];
-    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking" })?.id).toBe(2);
-    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "APPROVE", body: "different" })).toBeUndefined();
+    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking", commitId: HEAD_SHA })?.id).toBe(2);
+    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "APPROVE", body: "different", commitId: HEAD_SHA })).toBeUndefined();
     // Request-event spellings from old mocks must NOT match response states.
-    expect(findDuplicateReview([{ id: 9, userLogin: REVIEWER_BOT, state: "REQUEST_CHANGES", body: "blocking" }], { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking" })).toBeUndefined();
-    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "COMMENT", body: "blocking" })).toBeUndefined();
+    expect(findDuplicateReview([{ id: 9, userLogin: REVIEWER_BOT, state: "REQUEST_CHANGES", body: "blocking", commitId: HEAD_SHA }], { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking", commitId: HEAD_SHA })).toBeUndefined();
+    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "COMMENT", body: "blocking", commitId: HEAD_SHA })).toBeUndefined();
+    // Head-aware: same body/state but older commit never dedupes.
+    expect(findDuplicateReview(reviews, { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking", commitId: "ffffffff00000000000000000000000000000000" })).toBeUndefined();
+    // Missing commit on the existing review never dedupes.
+    expect(findDuplicateReview([{ id: 10, userLogin: REVIEWER_BOT, state: "CHANGES_REQUESTED", body: "blocking" }], { reviewerLogin: REVIEWER_BOT, event: "REQUEST_CHANGES", body: "blocking", commitId: HEAD_SHA })).toBeUndefined();
   });
 
   it("listPullReviews parses the API shape (real states)", async () => {

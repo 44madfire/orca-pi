@@ -433,11 +433,18 @@ export async function fetchAuthenticatedActor(
   return { login: data.login.trim(), ...(typeof data.type === "string" ? { type: data.type } : {}) };
 }
 
-/** Fetch the PR author login (`GET /repos/{o}/{r}/pulls/{n}` → `user.login`). */
-export async function fetchPullRequestAuthor(
+/** PR metadata needed for safe review writes (`user.login` + `head.sha`). */
+export interface PullRequestMeta {
+  authorLogin: string;
+  /** Current head SHA (`head.sha`); absent only when GitHub omits it. */
+  headSha?: string;
+}
+
+/** Fetch PR author + current head SHA (`GET /repos/{o}/{r}/pulls/{n}`). */
+export async function fetchPullRequestMeta(
   input: { owner: string; repo: string; pullNumber: number },
   options?: { fetchFn?: FetchFn; token?: string; identity?: string; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
-): Promise<string> {
+): Promise<PullRequestMeta> {
   const identity = options?.identity ?? "reviewer";
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
@@ -453,12 +460,21 @@ export async function fetchPullRequestAuthor(
     const text = await response.text().catch(() => "");
     throw new GithubApiError(endpoint, response.status, `Could not load PR author for ${input.owner}/${input.repo}#${input.pullNumber} (${response.status}): ${redactSecretsFromText(text.slice(0, 1000), [token as string]) || "no response body"}.`);
   }
-  const data = (await response.json()) as { user?: { login?: unknown } };
+  const data = (await response.json()) as { user?: { login?: unknown }; head?: { sha?: unknown } };
   const login = data.user?.login;
   if (typeof login !== "string" || !login.trim()) {
     throw new GithubApiError(endpoint, response.status, `PR ${input.owner}/${input.repo}#${input.pullNumber} returned no author login — cannot prove reviewer is distinct from the PR author.`);
   }
-  return login.trim();
+  const headSha = typeof data.head?.sha === "string" && data.head.sha.trim() ? data.head.sha.trim() : undefined;
+  return { authorLogin: login.trim(), ...(headSha ? { headSha } : {}) };
+}
+
+/** Fetch the PR author login (thin wrapper over `fetchPullRequestMeta`). */
+export async function fetchPullRequestAuthor(
+  input: { owner: string; repo: string; pullNumber: number },
+  options?: { fetchFn?: FetchFn; token?: string; identity?: string; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+): Promise<string> {
+  return (await fetchPullRequestMeta(input, options)).authorLogin;
 }
 
 /**
@@ -481,7 +497,7 @@ export async function verifyReviewerForReview(
   identity: string,
   pr: { owner: string; repo: string; pullNumber: number },
   options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
-): Promise<{ reviewerLogin: string; prAuthorLogin: string; installationId: string }> {
+): Promise<{ reviewerLogin: string; prAuthorLogin: string; installationId: string; headSha?: string }> {
   assertReviewerIdentityForWrites(identity);
   const env = options?.env ?? process.env;
   const metadata = resolveReviewerAppMetadata(env);
@@ -489,9 +505,9 @@ export async function verifyReviewerForReview(
     throw new GithubAuthError(identity, "unauthorized-installation", `Configured reviewer login "${metadata.login}" (${REVIEWER_LOGIN_ENV_VAR}) does not look like a GitHub App bot (expected a "[bot]" suffix, e.g. "orca-pi-reviewer[bot]"). Refusing to review — a human login must never occupy the reviewer slot (same-account PATs are not distinct identities). Fix the App configuration outside LLM context and retry.`);
   }
   await proveInstallationTokenClass(identity, options);
-  const prAuthorLogin = await fetchPullRequestAuthor(pr, { ...(options ?? {}), identity });
-  assertDistinctGithubActors({ workerLogin: prAuthorLogin, reviewerLogin: metadata.login });
-  return { reviewerLogin: metadata.login, prAuthorLogin, installationId: metadata.installationId };
+  const meta = await fetchPullRequestMeta(pr, { ...(options ?? {}), identity });
+  assertDistinctGithubActors({ workerLogin: meta.authorLogin, reviewerLogin: metadata.login });
+  return { reviewerLogin: metadata.login, prAuthorLogin: meta.authorLogin, installationId: metadata.installationId, ...(meta.headSha ? { headSha: meta.headSha } : {}) };
 }
 
 /**
