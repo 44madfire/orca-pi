@@ -490,6 +490,14 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
                 "utf8",
               ),
             );
+          } else if (msg.kind === "close") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "closed", opId: msg.opId, exit: { code: 0, signal: null } }),
+                "utf8",
+              ),
+            );
           }
         }
       }) as never;
@@ -516,6 +524,80 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     // Post-exit dispatch is definitely unavailable (rejected), not ambiguous
     // `unknown`, and must not implicitly respawn.
     const outcome = await host.dispatch({ sessionId: "ses_1", text: "after crash" });
+    expect(outcome.status).toBe("rejected");
+    expect(outcome.reason).toMatch(/bridge-unavailable/);
+    expect(spawns).toBe(1);
+    // Explicit restart respawns and serves again.
+    expect((await host.restart()).available).toBe(true);
+    expect(spawns).toBe(2);
+    const reacquired = await host.acquire();
+    expect(reacquired.sessionId).toBe("ses_1");
+    await host.dispose();
+  });
+
+  it("process error without exit finalizes fail-closed until explicit restart", async () => {
+    const procs: ReturnType<typeof createFakeProc>[] = [];
+    let spawns = 0;
+    const spawnFn = (() => {
+      spawns += 1;
+      const proc = createFakeProc();
+      procs.push(proc);
+      proc.stdin.write = ((s: string) => {
+        for (const line of s.split("\n")) {
+          if (line.trim() === "") continue;
+          const msg = JSON.parse(line) as { opId: string; kind: string };
+          if (msg.kind === "hello") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "hello_ok", opId: msg.opId, provider: { id: "erratic", version: "0", protocol: 1 }, capabilities: { textStreaming: true, thinking: false, tools: false, images: false, extensionDialogs: false, history: false, options: false, cancel: false, resume: false } }),
+                "utf8",
+              ),
+            );
+          } else if (msg.kind === "acquire") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "acquired", opId: msg.opId, sessionId: "ses_1", resumed: false, metadata: { sessionId: "ses_1", workspaceRoot: "/tmp/ws", messageCount: 0, isStreaming: false, createdAt: new Date().toISOString() } }),
+                "utf8",
+              ),
+            );
+          } else if (msg.kind === "close") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "closed", opId: msg.opId, exit: { code: 0, signal: null } }),
+                "utf8",
+              ),
+            );
+          }
+        }
+      }) as never;
+      return proc;
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "erratic-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 1000,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    const lifecycle: string[] = [];
+    host.onLifecycle((e) => lifecycle.push(e.kind));
+    expect((await host.probeSupport()).available).toBe(true);
+    expect(spawns).toBe(1);
+    // Terminal process error with NO subsequent exit (Node does not guarantee
+    // exit after error): must still finalize like an exit.
+    procs[0]?.emit("error", new Error("EPIPE: broken pipe"));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(host.support.available).toBe(false);
+    expect(host.support.reason).toMatch(/process-error/);
+    expect(host.isReady).toBe(false);
+    expect(lifecycle).toContain("provider-error");
+    const outcome = await host.dispatch({ sessionId: "ses_1", text: "after error" });
     expect(outcome.status).toBe("rejected");
     expect(outcome.reason).toMatch(/bridge-unavailable/);
     expect(spawns).toBe(1);

@@ -142,7 +142,7 @@ only opIds, kinds, and codes.
 | Missing binary / spawn error | `probeSupport() → {available:false}` | Ordinary Pi TUI, untouched |
 | Hello timeout / `hello_error` / version mismatch | `available:false`, `reason` kept, helper torn down (no resident process) | Pi TUI + one-line notice |
 | `dispatch` while unavailable/disposed/never-started | `{status:rejected, reason: bridge-unavailable…}` (explicit `ensureStarted`/`restart` may still start fresh) | Fall back to TUI send |
-| `dispatch` after a previously healthy provider exited | `{status:rejected, reason: bridge-unavailable: provider-exited}` — no implicit respawn; explicit `restart()` respawns | Fall back to TUI; offer explicit reconnect |
+| `dispatch` after a previously healthy provider exited *or* errored (even with no `exit` after `error`) | `{status:rejected, reason: bridge-unavailable…}` — no implicit respawn; explicit `restart()` respawns | Fall back to TUI; offer explicit reconnect |
 | Provider `dispatch_ack{rejected}` | `{status:rejected}` | Surface `reason`, keep TUI available |
 | Dispatch timeout / malformed ack / exit racing an in-flight send | `{status:unknown}` | "Check history before retrying — never auto-resend" |
 | Malformed provider line | Ignored; waiter deadline → `unknown` | No crash, no journal corruption |
@@ -165,12 +165,18 @@ EOF/SIGTERM/SIGKILL still resolves within ~3 graces):
   clear, listener/session clear. Idempotent and joins Orca teardown — no
   leaked helper processes or `data`/`exit` listeners.
 - Provider exits 0 on stdin EOF; `exiting{code,signal,reason}` precedes
-  abnormal exits. Exit finalizes host state (`provider`/`capabilities`/
-  sessions cleared, `support.available:false`); post-exit `dispatch` rejects
-  as `bridge-unavailable` until explicit `restart()`. In-flight sends racing
-  exit resolve `unknown`. Explicit restart = new OS process + fresh `hello`
-  + `acquire`; sessions do not survive restarts (mock proves this; Pi
-  resume is SNC1.7).
+  abnormal exits. Exit *or terminal process `error`* finalizes host state
+  (`provider`/`capabilities`/sessions cleared, `support.available:false`;
+  `error` without a later `exit` is treated the same since Node does not
+  guarantee `exit` after `error`). Post-exit/error `dispatch` rejects as
+  `bridge-unavailable` until explicit `restart()`. In-flight sends racing
+  exit/error resolve `unknown`. Explicit restart = new OS process + fresh
+  `hello` + `acquire`; sessions do not survive restarts (mock proves this;
+  Pi resume is SNC1.7).
+- `dispose()` attempts the bridge `close` handshake whenever the child is
+  healthy (even mid-teardown), then falls back to bounded EOF/kill; a dead
+  or failed child skips the handshake and goes straight to bounded process
+  teardown.
 - Failed hello/version negotiation tears down the helper (bounded force
   path) so falling back to Pi TUI never leaves a resident process.
 

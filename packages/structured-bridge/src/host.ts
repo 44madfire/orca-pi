@@ -163,9 +163,10 @@ export class BridgeHost {
 
   get support(): BridgeSupport {
     // Exited always wins: a dead provider is never reported ready, even if
-    // identity/capabilities are still cached for diagnostics.
+    // identity/capabilities are still cached for diagnostics. Prefer the
+    // process-error detail when an `error` raced hello (both set).
     if (this.exited) {
-      const reason = this.helloError ?? this.spawnError ?? `provider-exited`;
+      const reason = this.spawnError ?? this.helloError ?? `provider-exited`;
       return { available: false, reason: sanitizeReason(reason) };
     }
     if (this.provider && this.capabilities) {
@@ -350,6 +351,19 @@ export class BridgeHost {
     this.detachReader = attachBridgeReader(proc.stdout as unknown as BridgeReadable, (line) => this.onLine(line));
     proc.on("error", (error: Error) => {
       this.spawnError = `process-error: ${error.message}`;
+      // Terminal fail-closed finalization (same as exit): Node documents that
+      // `exit` may never fire after `error`, so the exit handler cannot be
+      // relied on to repair state. Invalidate provider/session ownership now;
+      // if `exit` later fires on the old proc, that handler idempotently
+      // refreshes `exited` with the real code/signal. Post-error dispatch
+      // rejects bridge-unavailable until explicit restart (see dispatch()).
+      if (!this.exited) this.exited = { code: null, signal: null };
+      this.provider = null;
+      this.capabilities = null;
+      this.sessions.clear();
+      this.detachReader?.();
+      this.detachReader = null;
+      this.proc = null;
       this.failAllPending(new BridgeUnavailableError(sanitizeReason(this.spawnError), "BRIDGE_PROCESS_ERROR"));
       this.emitLifecycle({ kind: "provider-error", message: sanitizeReason(this.spawnError) });
     });
@@ -551,7 +565,10 @@ export class BridgeHost {
   async close(mode: "graceful" | "force" = "graceful"): Promise<{ code: number | null; signal: string | null }> {
     const proc = this.proc;
     if (!proc) return this.exited ? { ...this.exited } : { code: null, signal: null };
-    if (mode === "graceful" && this.isReady) {
+    // Handshake when the child is healthy, even mid-dispose (`isReady` is
+    // false once `disposed` is set, but dispose still promises the bridge
+    // `close` handshake before falling back to EOF/kill).
+    if (mode === "graceful" && this.provider && !this.exited) {
       try {
         const opId = createOpId("cls");
         await this.sendAndWait(
