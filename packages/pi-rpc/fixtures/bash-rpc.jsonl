@@ -1,0 +1,8 @@
+{"v":1,"dir":"c2s","payload":{"id":"u1","type":"bash","command":"echo hello-pi-rpc"}}
+{"v":1,"dir":"s2c","payload":{"type":"bash_execution_update","id":"u1","delta":"hello-pi-rpc\n"}}
+{"v":1,"dir":"s2c","payload":{"id":"u1","type":"response","command":"bash","success":true,"data":{"output":"hello-pi-rpc\n","exitCode":0,"cancelled":false,"truncated":false}}}
+{"v":1,"dir":"c2s","payload":{"id":"u2","type":"bash","command":"node -p \"'A' + String.fromCharCode(8232) + 'B' + String.fromCharCode(8233) + 'C'\""}}
+{"v":1,"dir":"s2c","payload":{"type":"bash_execution_update","id":"u2","delta":"A B C\n"}}
+{"v":1,"dir":"s2c","payload":{"id":"u2","type":"response","command":"bash","success":true,"data":{"output":"A B C\n","exitCode":0,"cancelled":false,"truncated":false}}}
+{"v":1,"dir":"c2s","payload":{"id":"u3","type":"get_messages"}}
+{"v":1,"dir":"s2c","payload":{"id":"u3","type":"response","command":"get_messages","success":true,"data":{"messages":[{"role":"bashExecution","command":"echo hello-pi-rpc","output":"hello-pi-rpc\n","exitCode":0,"cancelled":false,"truncated":false,"timestamp":"<TIMESTAMP_MS>"}]}}}

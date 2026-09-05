@@ -1,0 +1,18 @@
+{"v":1,"dir":"c2s","payload":{"id":"e1","type":"get_commands"}}
+{"v":1,"dir":"s2c","payload":{"id":"e1","type":"response","command":"get_commands","success":true,"data":{"commands":[{"name":"rpc-ask","description":"Trigger select dialog","source":"extension","sourceInfo":{"path":"<TMP>/rpc-dialog-ext.mjs","source":"cli","scope":"temporary","origin":"top-level"}},{"name":"rpc-confirm","description":"Trigger confirm","source":"extension","sourceInfo":{"path":"<TMP>/rpc-dialog-ext.mjs","source":"cli","scope":"temporary","origin":"top-level"}}]}}}
+{"v":1,"dir":"c2s","payload":{"id":"e2","type":"prompt","message":"/rpc-ask"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"select","title":"Pick a fruit","options":["Apple","Banana"]}}
+{"v":1,"dir":"c2s","payload":{"type":"extension_ui_response","id":"<EXT_UI_ID>","value":"Apple"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"notify","message":"Chose: Apple","notifyType":"info"}}
+{"v":1,"dir":"s2c","payload":{"id":"e2","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"e3","type":"prompt","message":"/rpc-confirm"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"confirm","title":"Proceed?","message":"Are you sure?"}}
+{"v":1,"dir":"c2s","payload":{"type":"extension_ui_response","id":"<EXT_UI_ID>","confirmed":true}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"notify","message":"Confirmed: true","notifyType":"info"}}
+{"v":1,"dir":"s2c","payload":{"id":"e3","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"setTitle","title":"pi - snc1.1"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"setStatus","statusKey":"rpc-demo","statusText":"Turn 1 running..."}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"setWidget","widgetKey":"rpc-demo","widgetLines":["--- RPC Extension UI Demo ---","Loaded and ready."],"widgetPlacement":"aboveEditor"}}
+{"v":1,"dir":"s2c","payload":{"type":"extension_ui_request","id":"<EXT_UI_ID>","method":"set_editor_text","text":"prefilled text for the user"}}
+{"v":1,"dir":"c2s","payload":{"id":"e4","type":"get_entries"}}
+{"v":1,"dir":"s2c","payload":{"id":"e4","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"model_change","id":"<ENTRY_ID>","parentId":null,"timestamp":"<TIMESTAMP_ISO>","provider":"opencode-go","modelId":"glm-5.3-flash"},{"type":"thinking_level_change","id":"<ENTRY_ID>","parentId":"<PARENT_ID>","timestamp":"<TIMESTAMP_ISO>","thinkingLevel":"low"}],"leafId":"<LEAF_ID>"}}}

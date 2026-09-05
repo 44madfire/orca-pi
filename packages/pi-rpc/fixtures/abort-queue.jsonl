@@ -1,0 +1,25 @@
+{"v":1,"dir":"c2s","payload":{"id":"ab1","type":"prompt","message":"Write a 500-word essay about the history of JSON Lines. Do not use tools."}}
+{"v":1,"dir":"s2c","payload":{"id":"ab1","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"s2c","payload":{"type":"agent_start"}}
+{"v":1,"dir":"s2c","payload":{"type":"turn_start"}}
+{"v":1,"dir":"s2c","payload":{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-completions","provider":"opencode-go","model":"glm-5.3-flash","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":"<TIMESTAMP_MS>"}}}
+{"v":1,"dir":"c2s","payload":{"id":"ab2","type":"abort"}}
+{"v":1,"dir":"s2c","payload":{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Write","thinkingSignature":"reasoning_content"}],"api":"openai-completions","provider":"opencode-go","model":"glm-5.3-flash","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"aborted","timestamp":"<TIMESTAMP_MS>","responseId":"<RESPONSE_ID>","errorMessage":"Request was aborted"}}}
+{"v":1,"dir":"s2c","payload":{"type":"turn_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Write","thinkingSignature":"reasoning_content"}],"api":"openai-completions","provider":"opencode-go","model":"glm-5.3-flash","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"aborted","timestamp":"<TIMESTAMP_MS>","responseId":"<RESPONSE_ID>","errorMessage":"Request was aborted"},"toolResults":[]}}
+{"v":1,"dir":"s2c","payload":{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"Write a 500-word essay."}],"timestamp":"<TIMESTAMP_MS>"},{"role":"assistant","content":[{"type":"thinking","thinking":"Write","thinkingSignature":"reasoning_content"}],"api":"openai-completions","provider":"opencode-go","model":"glm-5.3-flash","stopReason":"aborted","timestamp":"<TIMESTAMP_MS>","responseId":"<RESPONSE_ID>","errorMessage":"Request was aborted"}],"willRetry":false}}
+{"v":1,"dir":"s2c","payload":{"type":"agent_settled"}}
+{"v":1,"dir":"s2c","payload":{"id":"ab2","type":"response","command":"abort","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"ab3","type":"steer","message":"idle steer"}}
+{"v":1,"dir":"s2c","payload":{"type":"queue_update","steering":["idle steer"],"followUp":[]}}
+{"v":1,"dir":"s2c","payload":{"id":"ab3","type":"response","command":"steer","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"ab4","type":"follow_up","message":"idle followup"}}
+{"v":1,"dir":"s2c","payload":{"type":"queue_update","steering":["idle steer"],"followUp":["idle followup"]}}
+{"v":1,"dir":"s2c","payload":{"id":"ab4","type":"response","command":"follow_up","success":true}}
+{"v":1,"dir":"c2s","payload":{"id":"ab5","type":"clear_queue"}}
+{"v":1,"dir":"s2c","payload":{"type":"queue_update","steering":[],"followUp":[]}}
+{"v":1,"dir":"s2c","payload":{"id":"ab5","type":"response","command":"clear_queue","success":true,"data":{"steering":["idle steer"],"followUp":["idle followup"]}}}
+{"v":1,"dir":"c2s","payload":{"id":"ab6","type":"prompt","message":"Queued via steer behavior","streamingBehavior":"steer"}}
+{"v":1,"dir":"s2c","payload":{"id":"ab6","type":"response","command":"prompt","success":true}}
+{"v":1,"dir":"s2c","payload":{"type":"queue_update","steering":[],"followUp":[]}}
+{"v":1,"dir":"s2c","payload":{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"Queued via steer behavior"}],"timestamp":"<TIMESTAMP_MS>"}}}
+{"v":1,"dir":"s2c","payload":{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"Queued via steer behavior"}],"timestamp":"<TIMESTAMP_MS>"}}}

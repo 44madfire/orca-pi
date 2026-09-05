@@ -1,0 +1,25 @@
+{"v":1,"dir":"c2s","payload":{"id":"r1","type":"get_state"}}
+{"v":1,"dir":"s2c","payload":{"id":"r1","type":"response","command":"get_state","success":true,"data":{"model":{"id":"glm-5.3-flash","provider":"opencode-go","reasoning":true},"thinkingLevel":"low","isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","sessionFile":"<SESSION_FILE>","sessionId":"<SESSION_ID>","autoCompactionEnabled":true,"messageCount":4,"pendingMessageCount":0}}}
+{"v":1,"dir":"c2s","payload":{"id":"r2","type":"get_entries"}}
+{"v":1,"dir":"s2c","payload":{"id":"r2","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"model_change","id":"<ENTRY_ID>","parentId":null,"timestamp":"<TIMESTAMP_ISO>","provider":"opencode-go","modelId":"glm-5.3-flash"},{"type":"message","id":"<ENTRY_ID>","parentId":"<PARENT_ID>","timestamp":"<TIMESTAMP_ISO>","message":{"role":"user","content":[{"type":"text","text":"Say IDLE-OK"}],"timestamp":"<TIMESTAMP_MS>"}}],"leafId":"<LEAF_ID>"}}}
+{"v":1,"dir":"sys","payload":{"event":"restart-process-for-resume"}}
+{"v":1,"dir":"c2s","payload":{"id":"r3","type":"switch_session","sessionPath":"<SESSION_FILE>"}}
+{"v":1,"dir":"s2c","payload":{"id":"r3","type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}}
+{"v":1,"dir":"c2s","payload":{"id":"r4","type":"get_entries"}}
+{"v":1,"dir":"s2c","payload":{"id":"r4","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"model_change","id":"<ENTRY_ID>","parentId":null,"timestamp":"<TIMESTAMP_ISO>","provider":"opencode-go","modelId":"glm-5.3-flash"},{"type":"message","id":"<ENTRY_ID>","parentId":"<PARENT_ID>","timestamp":"<TIMESTAMP_ISO>","message":{"role":"user","content":[{"type":"text","text":"Say IDLE-OK"}],"timestamp":"<TIMESTAMP_MS>"}}],"leafId":"<LEAF_ID>"}}}
+{"v":1,"dir":"c2s","payload":{"id":"r5","type":"get_last_assistant_text"}}
+{"v":1,"dir":"s2c","payload":{"id":"r5","type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"IDLE-OK"}}}
+{"v":1,"dir":"c2s","payload":{"id":"r6","type":"get_fork_messages"}}
+{"v":1,"dir":"s2c","payload":{"id":"r6","type":"response","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"<ENTRY_ID>","text":"Say FIRST."},{"entryId":"<ENTRY_ID>","text":"Say SECOND."}]}}}
+{"v":1,"dir":"c2s","payload":{"id":"r7","type":"fork","entryId":"<ENTRY_ID>"}}
+{"v":1,"dir":"s2c","payload":{"id":"r7","type":"response","command":"fork","success":true,"data":{"text":"Say FIRST.","cancelled":false}}}
+{"v":1,"dir":"c2s","payload":{"id":"r8","type":"get_entries"}}
+{"v":1,"dir":"s2c","payload":{"id":"r8","type":"response","command":"get_entries","success":true,"data":{"entries":[{"type":"model_change","id":"<ENTRY_ID>","parentId":"<PARENT_ID>","timestamp":"<TIMESTAMP_ISO>","provider":"opencode-go","modelId":"glm-5.3-flash"},{"type":"thinking_level_change","id":"<ENTRY_ID>","parentId":"<PARENT_ID>","timestamp":"<TIMESTAMP_ISO>","thinkingLevel":"low"}],"leafId":"<LEAF_ID>"}}}
+{"v":1,"dir":"c2s","payload":{"id":"r9","type":"get_tree"}}
+{"v":1,"dir":"s2c","payload":{"id":"r9","type":"response","command":"get_tree","success":true,"data":{"tree":[{"entry":{"type":"model_change","id":"<ENTRY_ID>","parentId":"<PARENT_ID>","timestamp":"<TIMESTAMP_ISO>","provider":"opencode-go","modelId":"glm-5.3-flash"},"children":[{"entry":{"type":"thinking_level_change","id":"<ENTRY_ID>","parentId":"<PARENT_ID>","timestamp":"<TIMESTAMP_ISO>","thinkingLevel":"low"},"children":[]}]}],"leafId":"<LEAF_ID>"}}}
+{"v":1,"dir":"c2s","payload":{"id":"r10","type":"clone"}}
+{"v":1,"dir":"s2c","payload":{"id":"r10","type":"response","command":"clone","success":false,"error":"This session has not been saved yet. Wait for the first assistant response before cloning or forking it."}}
+{"v":1,"dir":"c2s","payload":{"id":"r11","type":"new_session"}}
+{"v":1,"dir":"s2c","payload":{"id":"r11","type":"response","command":"new_session","success":true,"data":{"cancelled":false}}}
+{"v":1,"dir":"c2s","payload":{"id":"r12","type":"get_state"}}
+{"v":1,"dir":"s2c","payload":{"id":"r12","type":"response","command":"get_state","success":true,"data":{"model":{"id":"glm-5.3-flash","provider":"opencode-go"},"thinkingLevel":"low","isStreaming":false,"isCompacting":false,"sessionFile":"<SESSION_FILE>","sessionId":"<SESSION_ID>","autoCompactionEnabled":true,"messageCount":0,"pendingMessageCount":0}}}
