@@ -18,42 +18,48 @@ import { serializeJsonLine } from "../src/jsonl.js";
 interface FakeProc {
   spawnFn: ReturnType<typeof vi.fn>;
   proc: EventEmitter & {
-    stdin: { write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> };
+    stdin: EventEmitter & { write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> };
     stdout: EventEmitter & { destroy?: () => void };
     stderr: EventEmitter & { destroy?: () => void };
     kill: ReturnType<typeof vi.fn>;
     exitCode: number | null;
     signalCode: string | null | undefined;
   };
+  stdin: EventEmitter;
   stdout: EventEmitter;
   stderr: EventEmitter;
   written: string[];
   emitStdout: (text: string | Buffer) => void;
   emitStderr: (text: string) => void;
   emitExit: (code: number | null, signal: string | null) => void;
+  emitStdinError: (error: Error) => void;
+  emitChildError: (error: Error) => void;
 }
 
 function createFakeProc(): FakeProc {
   const stdout = new EventEmitter() as EventEmitter & { destroy?: () => void };
   const stderr = new EventEmitter() as EventEmitter & { destroy?: () => void };
+  const stdinEmitter = new EventEmitter();
   const written: string[] = [];
-  const stdin = {
-    write: vi.fn((s: string) => {
-      written.push(typeof s === "string" ? s : (s as Buffer).toString("utf8"));
-      return true;
-    }),
-    end: vi.fn(() => {
-      // Simulate Pi's clean EOF → exit 0 on the next tick (like real Pi).
-      setTimeout(() => {
-        const p = proc as unknown as EventEmitter & { exitCode: number | null };
-        if (p.exitCode === null) {
-          p.exitCode = 0;
-          proc.emit("exit", 0, null);
-        }
-      }, 0);
-      return undefined;
-    }),
+  const stdin = stdinEmitter as EventEmitter & {
+    write: ReturnType<typeof vi.fn>;
+    end: ReturnType<typeof vi.fn>;
   };
+  stdin.write = vi.fn((s: string) => {
+    written.push(typeof s === "string" ? s : (s as Buffer).toString("utf8"));
+    return true;
+  }) as unknown as ReturnType<typeof vi.fn>;
+  stdin.end = vi.fn(() => {
+    // Simulate Pi's clean EOF → exit 0 on the next tick (like real Pi).
+    setTimeout(() => {
+      const p = proc as unknown as EventEmitter & { exitCode: number | null };
+      if (p.exitCode === null) {
+        p.exitCode = 0;
+        proc.emit("exit", 0, null);
+      }
+    }, 0);
+    return undefined;
+  }) as unknown as ReturnType<typeof vi.fn>;
   stdout.destroy = vi.fn();
   stderr.destroy = vi.fn();
   const proc = new EventEmitter() as FakeProc["proc"];
@@ -76,6 +82,7 @@ function createFakeProc(): FakeProc {
   return {
     spawnFn,
     proc,
+    stdin: stdinEmitter,
     stdout,
     stderr,
     written,
@@ -88,6 +95,12 @@ function createFakeProc(): FakeProc {
     emitExit: (code: number | null, signal: string | null) => {
       (proc as unknown as { exitCode: number | null }).exitCode = code;
       proc.emit("exit", code, signal);
+    },
+    emitStdinError: (error: Error) => {
+      stdinEmitter.emit("error", error);
+    },
+    emitChildError: (error: Error) => {
+      proc.emit("error", error);
     },
   };
 }
@@ -603,5 +616,65 @@ describe("PiRpcConnection abort sequencing", () => {
     fake.emitStdout(serializeJsonLine({ id: abortId, type: "response", command: "abort", success: true }));
     await expect(done).resolves.toBeUndefined();
     await conn.close(200);
+  });
+});
+
+describe("PiRpcConnection async stream/child failures", () => {
+  it("async stdin error rejects in-flight as ambiguous transport-closed with full cleanup", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({ spawnFn: fake.spawnFn, startupProbe: false });
+    await conn.start();
+    const exits: unknown[] = [];
+    conn.onExit((r) => exits.push(r));
+    // Secret-bearing prompt in flight: the failure must stay secret-safe.
+    const pending = conn.request(
+      { type: "prompt", message: "secret sk-proj-abcdefghijklmnop123456" },
+      { timeoutMs: 5000 },
+    );
+    fake.emitStdinError(new Error("write EPIPE"));
+    const error = await pending.then(
+      () => null,
+      (e) => e as PiRpcError,
+    );
+    expect(error?.code).toBe("transport-closed");
+    expect(error?.ambiguous).toBe(true);
+    expect(String(error?.message)).toContain("stdin");
+    expect(String(error?.message)).not.toContain("sk-proj");
+    expect(exits).toHaveLength(1);
+    // Terminal path: no leaked children/listeners, fail-fast afterwards.
+    expect(conn.isClosed).toBe(true);
+    expect(conn.pendingCount).toBe(0);
+    expect(fake.proc.listenerCount("exit")).toBe(0);
+    expect(fake.stdout.listenerCount("data")).toBe(0);
+    expect(fake.stdin.listenerCount("error")).toBe(0);
+    await expect(conn.request({ type: "get_state" })).rejects.toMatchObject({ code: "transport-closed" });
+    const result = await conn.close(200);
+    expect(result.exitCode).toBeNull();
+  });
+
+  it("child error with no subsequent exit still terminates the transport", async () => {
+    const fake = createFakeProc();
+    const conn = new PiRpcConnection({ spawnFn: fake.spawnFn, startupProbe: false });
+    await conn.start();
+    const pending = conn.request({ id: "k1", type: "get_state" }, { timeoutMs: 5000 });
+    const settled = conn.waitForSettled(5000);
+    // Node documents `exit` may never follow `error`: do not emit exit.
+    fake.emitChildError(new Error("spawn EACCES"));
+    const error = await pending.then(
+      () => null,
+      (e) => e as PiRpcError,
+    );
+    expect(error?.code).toBe("transport-closed");
+    expect(error?.ambiguous).toBe(true);
+    await expect(settled).rejects.toMatchObject({ code: "transport-closed" });
+    expect(conn.isClosed).toBe(true);
+    expect(conn.pendingCount).toBe(0);
+    expect(fake.proc.listenerCount("exit")).toBe(0);
+    expect(fake.proc.listenerCount("error")).toBe(0);
+    // Late `exit`, if the OS ever delivers one, is a no-op (no double fire).
+    const exits: unknown[] = [];
+    conn.onExit((r) => exits.push(r));
+    fake.emitExit(1, null);
+    expect(exits).toHaveLength(0);
   });
 });

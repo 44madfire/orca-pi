@@ -21,6 +21,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { JsonlFramer, serializeJsonLine } from "./jsonl.js";
 import {
+  boundTail,
   PiRpcError,
   STDERR_TAIL_MAX_CHARS,
   redactLinePreview,
@@ -166,6 +167,8 @@ export class PiRpcConnection {
   private started = false;
   private closed = false;
   private closing = false;
+  /** True while the OS-spawn phase of start() owns child exit/error. */
+  private startingPhase1 = false;
   private exitInfo: PiRpcCloseResult | null = null;
   private malformedCount = 0;
   private unmatchedCount = 0;
@@ -266,6 +269,16 @@ export class PiRpcConnection {
     // fake processes in tests that emit neither), bound by the outer
     // startup timeout. Phase 1 alone cannot prove Pi is speaking RPC
     // (spawn fires before invalid args/config fail), so phase 2 probes.
+    // Steady-state exit/error handlers defer to this phase while
+    // `startingPhase1` is set; stdio errors still finalize immediately and
+    // are reclassified below via the post-phase-1 closed check.
+    type OnceCapable = { once(event: string, listener: (...args: never[]) => void): unknown; off?(event: string, listener: (...args: never[]) => void): unknown; removeListener?(event: string, listener: (...args: never[]) => void): unknown };
+    const procOnce = proc as unknown as OnceCapable;
+    let onSpawn: (...args: never[]) => void = () => undefined;
+    let onPhaseError: (...args: never[]) => void = () => undefined;
+    let onEarlyExit: (...args: never[]) => void = () => undefined;
+    this.startingPhase1 = true;
+    try {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const done = (fn: () => void): void => {
@@ -275,8 +288,8 @@ export class PiRpcConnection {
         clearTimeout(outer);
         fn();
       };
-      const onSpawn = (): void => done(resolve);
-      const onError = (error: Error): void =>
+      onSpawn = (): void => done(resolve);
+      onPhaseError = (error: unknown): void =>
         done(() => {
           this.detachAndKill();
           const msg = (error as NodeJS.ErrnoException).code === "ENOENT"
@@ -284,7 +297,7 @@ export class PiRpcConnection {
             : `failed to spawn ${command}: ${(error as Error).message}`;
           reject(new PiRpcError({ code: "spawn-failed", ambiguous: false }, msg));
         });
-      const onEarlyExit = (code: number | null, signal: string | null): void =>
+      onEarlyExit = (code: unknown, signal: unknown): void =>
         done(() => {
           this.detachAndKill();
           reject(
@@ -292,8 +305,8 @@ export class PiRpcConnection {
               {
                 code: "startup-failed",
                 ambiguous: false,
-                exitCode: code,
-                signal,
+                exitCode: code as number | null,
+                signal: signal as string | null,
                 stderrTail: this.stderrTail,
               },
               `pi exited during startup (code=${String(code)} signal=${String(signal)})` +
@@ -322,14 +335,45 @@ export class PiRpcConnection {
       );
       // `once` keeps startup listeners out of the steady-state set; the
       // persistent exit/error handlers are attached in `attach()`.
-      type OnceCapable = { once(event: string, listener: (...args: never[]) => void): unknown };
-      (proc as unknown as OnceCapable).once?.("spawn", onSpawn as (...args: never[]) => void);
-      (proc as unknown as OnceCapable).once?.("error", onError as (...args: never[]) => void);
-      (proc as unknown as OnceCapable).once?.("exit", onEarlyExit as (...args: never[]) => void);
+      procOnce.once?.("spawn", onSpawn);
+      procOnce.once?.("error", onPhaseError);
+      procOnce.once?.("exit", onEarlyExit);
       // If the process already failed synchronously (fake `error` emitted
       // before `once` attached), the persistent handler in `attach()` will
       // have recorded it — re-check on the next tick via grace resolution.
     });
+    } finally {
+      this.startingPhase1 = false;
+      // Phase-1 `once` listeners that never fired (e.g. `spawn` on fakes)
+      // must not linger into steady state.
+      try {
+        if (typeof procOnce.off === "function") {
+          procOnce.off("spawn", onSpawn);
+          procOnce.off("error", onPhaseError);
+          procOnce.off("exit", onEarlyExit);
+        } else if (typeof procOnce.removeListener === "function") {
+          procOnce.removeListener("spawn", onSpawn);
+          procOnce.removeListener("error", onPhaseError);
+          procOnce.removeListener("exit", onEarlyExit);
+        }
+      } catch {
+        // Cleanup must not throw.
+      }
+    }
+    // A stdio failure during phase 1 finalizes the transport immediately
+    // (phase 1 only watches spawn/error/exit); reclassify for startup.
+    if (this.closed) {
+      throw new PiRpcError(
+        {
+          code: "startup-failed",
+          ambiguous: false,
+          exitCode: this.exitInfo?.exitCode,
+          signal: this.exitInfo?.signal,
+          stderrTail: this.stderrTail,
+        },
+        `pi transport failed during startup` + (this.stderrTail ? `: ${this.stderrTail}` : ""),
+      );
+    }
 
     // Phase 2 — RPC readiness probe (unless explicitly disabled for
     // framing-only unit tests). A bounded internal `get_state` round-trip
@@ -414,21 +458,15 @@ export class PiRpcConnection {
   }
 
   private attach(proc: ChildProcess): void {
-    const stdout = proc.stdout as unknown as {
-      on(event: string, listener: (...args: never[]) => void): unknown;
-      off?(event: string, listener: (...args: never[]) => void): unknown;
-      removeListener?(event: string, listener: (...args: never[]) => void): unknown;
-    } | null;
-    const stderr = proc.stderr as unknown as {
-      on(event: string, listener: (...args: never[]) => void): unknown;
-      off?(event: string, listener: (...args: never[]) => void): unknown;
-      removeListener?(event: string, listener: (...args: never[]) => void): unknown;
-    } | null;
-    const procEvents = proc as unknown as {
+    type Eventable = {
       on(event: string, listener: (...args: never[]) => void): unknown;
       off?(event: string, listener: (...args: never[]) => void): unknown;
       removeListener?(event: string, listener: (...args: never[]) => void): unknown;
     };
+    const stdin = proc.stdin as unknown as Eventable | null;
+    const stdout = proc.stdout as unknown as Eventable | null;
+    const stderr = proc.stderr as unknown as Eventable | null;
+    const procEvents = proc as unknown as Eventable;
 
     const off = (
       target: {
@@ -461,10 +499,27 @@ export class PiRpcConnection {
         this.stderrRaw = this.stderrRaw.slice(-this.stderrMaxBytes);
       }
     };
-    const onError = (): void => {
-      // Steady-state spawn errors after startup surface as exits; the
-      // startup path handles pre-start errors. No-op here to avoid double
-      // rejection (exit follows error in Node).
+    // Async stream failures (e.g. EPIPE after Pi closes stdin) surface via
+    // `error` events, never as synchronous `write()` throws. Without these
+    // listeners they become uncaught exceptions; with them they become
+    // secret-safe ambiguous transport failures (see
+    // `terminateOnTransportError`). Guards inside ignore teardown races.
+    const onStdinError = (error: unknown): void => {
+      this.terminateOnTransportError("stdin", error);
+    };
+    const onStdoutError = (error: unknown): void => {
+      this.terminateOnTransportError("stdout", error);
+    };
+    const onStderrError = (error: unknown): void => {
+      this.terminateOnTransportError("stderr", error);
+    };
+    const onChildError = (error: unknown): void => {
+      // Phase-1 startup owns child errors via its `once` listener (which
+      // classifies them as `spawn-failed`); steady state must not double
+      // handle. Node documents that `exit` may or may not follow `error`,
+      // so steady state treats it as terminal without waiting for `exit`.
+      if (this.startingPhase1) return;
+      this.terminateOnTransportError("child", error);
     };
     const onExit = (code: number | null, signal: string | null): void => {
       this.handleExit(code, signal);
@@ -473,14 +528,111 @@ export class PiRpcConnection {
     stdout?.on("data", onStdoutData as (...args: never[]) => void);
     stdout?.on("end", onStdoutEnd as (...args: never[]) => void);
     stderr?.on("data", onStderrData as (...args: never[]) => void);
-    procEvents.on("error", onError as (...args: never[]) => void);
+    // `?.` capability checks: minimal fake stdins may be write-only
+    // `{write, end}` objects without an emitter; sync throws in request
+    // paths still classify failures for those.
+    try {
+      stdin?.on?.("error", onStdinError as (...args: never[]) => void);
+    } catch {
+      // Ignore.
+    }
+    try {
+      stdout?.on?.("error", onStdoutError as (...args: never[]) => void);
+    } catch {
+      // Ignore.
+    }
+    try {
+      stderr?.on?.("error", onStderrError as (...args: never[]) => void);
+    } catch {
+      // Ignore.
+    }
+    procEvents.on("error", onChildError as (...args: never[]) => void);
     procEvents.on("exit", onExit as (...args: never[]) => void);
 
     this.detachFns.push(() => off(stdout, "data", onStdoutData as (...args: never[]) => void));
     this.detachFns.push(() => off(stdout, "end", onStdoutEnd as (...args: never[]) => void));
     this.detachFns.push(() => off(stderr, "data", onStderrData as (...args: never[]) => void));
-    this.detachFns.push(() => off(procEvents, "error", onError as (...args: never[]) => void));
+    this.detachFns.push(() => off(stdin, "error", onStdinError as (...args: never[]) => void));
+    this.detachFns.push(() => off(stdout, "error", onStdoutError as (...args: never[]) => void));
+    this.detachFns.push(() => off(stderr, "error", onStderrError as (...args: never[]) => void));
+    this.detachFns.push(() => off(procEvents, "error", onChildError as (...args: never[]) => void));
     this.detachFns.push(() => off(procEvents, "exit", onExit as (...args: never[]) => void));
+  }
+
+  /**
+   * Terminal transport failure without a process exit (async stdin/stdout/
+   * stderr `error`, or a child `error` with no subsequent `exit`). Rejects
+   * every in-flight request as ambiguous `transport-closed` (the write may
+   * or may not have reached Pi), rejects settle waiters, notifies exit
+   * listeners with synthesized facts, and funnels through the same
+   * ownership release as unexpected exits — without depending on a later
+   * `exit` that Node does not guarantee. Subsequent `exit`, if any, is a
+   * no-op via the `closed` guard. Errors carry only the stream name + OS
+   * message (never command payloads or prompt contents).
+   */
+  private terminateOnTransportError(source: "stdin" | "stdout" | "stderr" | "child", error: unknown): void {
+    if (this.closed || this.closing) return;
+    const osMessage = boundTail(error instanceof Error ? error.message : String(error), 300);
+    const tail = this.stderrTail;
+    const exitInfo: PiRpcCloseResult = { exitCode: null, signal: null, forced: false };
+    this.exitInfo = exitInfo;
+    const pendings = [...this.pending.entries()];
+    this.pending.clear();
+    for (const [id, entry] of pendings) {
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.reject(
+        new PiRpcError(
+          {
+            code: "transport-closed",
+            command: entry.command,
+            requestId: id,
+            ambiguous: true,
+            stderrTail: tail,
+          },
+          `pi transport ${source} failed before answering ${entry.command} (id=${id}): ${osMessage}` +
+            (tail ? `: ${tail}` : ""),
+        ),
+      );
+    }
+    const waiters = this.settledWaiters.splice(0);
+    for (const w of waiters) {
+      clearTimeout(w.timer);
+      w.reject(
+        new PiRpcError(
+          { code: "transport-closed", command: "waitForSettled", ambiguous: false },
+          `pi transport ${source} failed before agent_settled: ${osMessage}`,
+        ),
+      );
+    }
+    for (const h of [...this.exitHandlers]) {
+      try {
+        h(exitInfo);
+      } catch {
+        // Ignore.
+      }
+    }
+    this.closed = true;
+    const proc = this.proc;
+    this.detachAll();
+    // Best-effort kill so a still-alive child cannot leak after its stdio
+    // broke; harmless when the process is already gone.
+    try {
+      proc?.kill("SIGKILL");
+    } catch {
+      // Already dead.
+    }
+    try {
+      proc?.stdout?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    try {
+      proc?.stderr?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    this.proc = null;
+    this.removeAllListeners();
   }
 
   private detachAll(): void {

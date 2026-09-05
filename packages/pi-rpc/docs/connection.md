@@ -81,14 +81,20 @@ await conn.close(); // EOF → exit 0, then SIGTERM → SIGKILL with cleanup
   `sk-…`, `eyJ…`, `rt.…`, user paths → `[REDACTED]`) and tail-truncated.
   Errors carry only command name + id + redacted tail — never prompt text,
   image bytes, or credentials.
-- **Close / unexpected exit**: graceful stdin EOF, then SIGTERM → SIGKILL
-  after `graceMs` (default 2s per stage, bounded even when Pi ignores
-  signals). Remaining in-flight requests reject as ambiguous
+- **Close / unexpected exit / stream errors**: graceful stdin EOF, then
+  SIGTERM → SIGKILL after `graceMs` (default 2s per stage, bounded even when
+  Pi ignores signals). Remaining in-flight requests reject as ambiguous
   `transport-closed`. Unexpected deaths reject in-flight as ambiguous
   `process-exited` and funnel through the same finalization (stdio destroyed,
   process ref cleared, subscriptions released); `close()` afterwards returns
-  the cached exit info. All stdout/stderr/process listeners are removed,
-  stdio destroyed, subscriptions cleared. Idempotent; safe idle or active.
+  the cached exit info. Async `stdin`/`stdout`/`stderr` stream failures
+  (e.g. EPIPE, which surfaces via `error` events rather than synchronous
+  `write()` throws) and child `error` events are likewise terminal without
+  waiting for a later `exit` that Node does not guarantee: in-flight work
+  rejects as ambiguous `transport-closed` (secret-safe, command name + id
+  only) with the same ownership release. All stream/process listeners are
+  removed, stdio destroyed, subscriptions cleared. Idempotent; safe idle or
+  active.
 - **Abort sequencing**: because the `abort` response can arrive *after*
   `agent_settled`, `await abort(); await waitForSettled()` waits for the
   *next* settle and can time out. Register the waiter first, or use
