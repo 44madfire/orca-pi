@@ -202,8 +202,10 @@ source of truth for completion/status.
   Launch role is authoritative: `githubIdentity` from the resolved profile controls the
   effective actor (`--profile` or spawn-injected `ORCA_PI_GITHUB_IDENTITY` inherits;
   explicit `--identity` must match the profile, no escalation). Worker git/GH writes run
-  as the worker App via a scoped broker (per-process `exec` env / per-repo `setup-git`
-  `--local` helper, never `--global`). See `docs/GITHUB_IDENTITIES.md`.
+  as the worker App via a scoped broker (per-process `exec` `GH_TOKEN` with Worker-App
+  preflight / worktree-scoped `setup-git` empty-reset + helper, never `--global`;
+  `gh` needs `exec`, `setup-git` covers `git` only). Repository verification uses
+  App JWT on the JWT-only installation endpoint. See `docs/GITHUB_IDENTITIES.md`.
   - `orca-pi github auth status [--identity <name>] [--profile <name>] [--json]` — credential presence
     (source label + expiry, never values).
   - `orca-pi github review [--identity reviewer] [--profile <name>] --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]`
@@ -212,7 +214,7 @@ source of truth for completion/status.
   - `orca-pi github setup --identity <name> [--repo <owner/repo>]` — idempotent non-secret App bootstrap steps (Apps require UI/admin; no secrets committed).
   - `orca-pi github mint --identity <name>` — out-of-LLM installation-token mint/refresh (private key from `..._PRIVATE_KEY_PATH`, WSL/Windows aware; prints metadata only).
   - `orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>` — scoped broker (`GH_TOKEN` only for the child; reviewer `git push` refused).
-  - `orca-pi github setup-git --identity worker [--path <repo-path>]` — pins repo-local credential helper (`--local`, never `--global`).
+  - `orca-pi github setup-git --identity worker [--path <repo-path>]` — worktree empty-reset + helper (`--worktree`, never `--global`; `git` only, `gh` needs `exec`).
   - Profiles reference logical identities (`githubIdentity: worker|reviewer`), never secrets;
     tokens resolve at runtime via `ORCA_PI_GITHUB_<IDENTITY>_TOKEN` (+ optional `..._EXPIRES_AT`) or App mint
     (`..._APP_ID` + `..._PRIVATE_KEY_PATH` + `..._INSTALLATION_ID` + `..._LOGIN`).

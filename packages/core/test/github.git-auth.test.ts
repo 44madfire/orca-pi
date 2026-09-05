@@ -71,8 +71,8 @@ describe("git-auth: credential helper protocol", () => {
   });
 });
 
-describe("git-auth: repo-local setup never touches global", () => {
-  it("builds git -C <path> config --local argv", () => {
+describe("git-auth: worktree override never touches global", () => {
+  it("builds git -C <path> config --worktree argv (default)", () => {
     const { executable, args } = gitConfigArgsForSetup({
       repoPath: "/wt/worker",
       helperCommand: "orca-pi github git-credential --identity worker",
@@ -82,7 +82,7 @@ describe("git-auth: repo-local setup never touches global", () => {
       "-C",
       "/wt/worker",
       "config",
-      "--local",
+      "--worktree",
       "credential.helper",
       "orca-pi github git-credential --identity worker",
     ]);
@@ -99,7 +99,7 @@ describe("git-auth: repo-local setup never touches global", () => {
     );
   });
 
-  it("setupRepoGitAuth invokes only --local via the runner", async () => {
+  it("setupRepoGitAuth installs empty-reset + helper via worktree scope", async () => {
     const seen: string[][] = [];
     const receipt = await setupRepoGitAuth(
       {
@@ -111,8 +111,13 @@ describe("git-auth: repo-local setup never touches global", () => {
       { repoPath: "/wt/worker" },
     );
     expect(receipt.helperCommand).toContain("git-credential --identity worker");
-    expect(seen[0]).toContain("--local");
-    expect(seen[0]).not.toContain("--global");
+    expect(receipt.scope).toBe("--worktree");
+    expect(seen.length).toBe(2);
+    expect(seen[0]).toContain("--worktree");
+    expect(seen[0]).toContain("--replace-all");
+    expect(seen[1]).toContain("--worktree");
+    expect(seen[1]).toContain("--add");
+    expect(seen.flat().join(" ")).not.toContain("--global");
   });
 
   it("assertRepoLocalHelperConfigured requires a .git/config origin", () => {

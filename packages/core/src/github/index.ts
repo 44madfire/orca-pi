@@ -44,6 +44,13 @@ export {
   tokenEnvVarForIdentity,
 } from "./identity.js";
 export {
+  EXPIRY_SKEW_MS,
+  createInstallationTokenCache,
+  defaultTokenCache,
+  type InstallationTokenCache,
+  type TokenCacheEntry,
+} from "./token-cache.js";
+export {
   REVIEWER_INSTALLATION_ID_ENV_VAR,
   REVIEWER_LOGIN_ENV_VAR,
   WORKER_INSTALLATION_ID_ENV_VAR,
@@ -51,8 +58,6 @@ export {
   assertReviewerIdentityForWrites,
   assertWorkerIdentityForWrites,
   authHeaderForCredential,
-  createInstallationTokenCache,
-  defaultTokenCache,
   describeCredentialStatus,
   fetchAuthenticatedActor,
   fetchPullRequestAuthor,
@@ -64,12 +69,15 @@ export {
   verifyReviewerForReview,
   verifyWorkerForWrites,
   type AuthenticatedGithubActor,
-  type InstallationTokenCache,
   type PullRequestMeta,
   type ReviewerAppMetadata,
-  type TokenCacheEntry,
   type WorkerAppMetadata,
 } from "./github-app-auth.js";
+export {
+  describeProductionCredentialStatus,
+  resolveProductionCredential,
+  type ProductionCredentialOptions,
+} from "./production-credential.js";
 export {
   EFFECTIVE_IDENTITY_ENV_VAR,
   EFFECTIVE_PROFILE_ENV_VAR,
@@ -100,17 +108,22 @@ export {
 export {
   assertIdentityMayRunCommand,
   assertRepoLocalHelperConfigured,
+  assertWorktreeHelperConfigured,
   buildScopedEnvForIdentity,
   defaultHelperCommand,
+  extractGitSubcommand,
   gitConfigArgsForSetup,
+  gitConfigCommandsForSetup,
   handleGitCredentialRequest,
   isContentsWriteGitCommand,
+  isWorkerMutationCommand,
   parseGitCredentialInput,
   redactGitCredentialOutput,
   setupRepoGitAuth,
 } from "./git-auth.js";
 export {
   doctorGithubIdentities,
+  fetchRepoInstallationWithJwt,
   formatDoctorReport as formatGithubDoctorReport,
   type GithubDoctorReport,
   type IdentityDoctorEntry,

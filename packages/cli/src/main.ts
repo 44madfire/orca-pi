@@ -68,6 +68,8 @@ export interface CliDeps {
   orcaExecutable?: string;
   /** Injectable worker-mapping file store (tests); defaults to node:fs. */
   mappingFs?: import("@orca-pi/core").MappingFs;
+  /** Injectable GitHub App credential store (tests); defaults to node:fs via fallback. */
+  providerFs?: import("@orca-pi/core").CredentialProviderFs;
 }
 
 export interface CliResult {
@@ -249,6 +251,7 @@ export async function run(
       ...(deps.env !== undefined ? { env: deps.env } : {}),
       ...(deps.fs !== undefined ? { fs: deps.fs } : {}),
       ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}),
+      ...(deps.providerFs !== undefined ? { providerFs: deps.providerFs } : {}),
       projectRoot: defaultProjectRoot(deps),
       ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
       ...(deps.osHomedir !== undefined ? { osHomedir: deps.osHomedir } : {}),

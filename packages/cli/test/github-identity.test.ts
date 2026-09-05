@@ -67,7 +67,12 @@ describe("github auth status inherits profile identity (no --identity repeat)", 
 
 describe("github doctor/setup (non-secret diagnostics)", () => {
   it("doctor reports distinctness without secret values", async () => {
-    const { deps, out } = makeDeps({ env: { ...WORKER_ENV, ...REVIEWER_ENV, GITHUB_ACTOR: "44madfire" } });
+    const iatFetch: GithubFetchFn = vi.fn(async (url: string) => {
+      const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
+      if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      throw new Error(`unexpected ${url}`);
+    });
+    const { deps, out } = makeDeps({ env: { ...WORKER_ENV, ...REVIEWER_ENV, GITHUB_ACTOR: "44madfire" }, fetchFn: iatFetch });
     const result = await runGithubCommand(["doctor", "--json"], deps);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(out.join("")) as { ok: boolean; distinctDetail: string };
@@ -123,9 +128,15 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
   });
 
   it("exec scopes env to the child and blocks reviewer push", async () => {
+    const iatFetch: GithubFetchFn = vi.fn(async (url: string) => {
+      const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
+      if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      throw new Error(`unexpected ${url}`);
+    });
     const seen: { command: string[]; env: Record<string, string> }[] = [];
     const { deps } = makeDeps({
       env: { ...WORKER_ENV },
+      fetchFn: iatFetch,
       execSpawn: async (command, options) => {
         seen.push({ command, env: options.env });
         return 0;
@@ -147,9 +158,15 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
   });
 
   it("exec inherits spawn env without --identity repeat", async () => {
+    const iatFetch2: GithubFetchFn = vi.fn(async (url: string) => {
+      const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
+      if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      throw new Error(`unexpected ${url}`);
+    });
     const seen: string[][] = [];
     const { deps } = makeDeps({
       env: { ...WORKER_ENV, ORCA_PI_GITHUB_IDENTITY: "worker" },
+      fetchFn: iatFetch2,
       execSpawn: async (command) => {
         seen.push(command);
         return 0;
@@ -161,8 +178,14 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
   });
 
   it("git-credential get pipes username/password (never logs framing)", async () => {
+    const iatFetch3: GithubFetchFn = vi.fn(async (url: string) => {
+      const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
+      if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      throw new Error(`unexpected ${url}`);
+    });
     const { deps, out } = makeDeps({
       env: { ...WORKER_ENV },
+      fetchFn: iatFetch3,
       stdinText: async () => "protocol=https\nhost=github.com\n",
     });
     const result = await runGithubCommand(["git-credential", "--identity", "worker", "get"], deps);
@@ -184,8 +207,12 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
     });
     const ok = await runGithubCommand(["setup-git", "--identity", "worker", "--path", "/wt/worker"], deps);
     expect(ok.exitCode).toBe(0);
-    expect(out.join("")).toContain("--local");
-    expect(seen[0]).toContain("--local");
+    expect(out.join("")).toContain("--worktree");
+    expect(seen.length).toBe(2);
+    expect(seen[0]).toContain("--worktree");
+    expect(seen[0]).toContain("--replace-all");
+    expect(seen[1]).toContain("--worktree");
+    expect(seen[1]).toContain("--add");
     expect(seen[0]).not.toContain("--global");
 
     const { deps: rdeps, err } = makeDeps({

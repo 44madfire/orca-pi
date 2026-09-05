@@ -105,13 +105,24 @@ orca-pi github auth status --identity reviewer
 orca-pi github identity doctor --repo 44madfire/orca-pi --ambient 44madfire
 ```
 
-`ensureInstallationToken` order: in-memory cache → fresh
-`ORCA_PI_GITHUB_<IDENT>_TOKEN` → disk cache
+One centralized production resolver (`resolveProductionCredential`:
+in-memory cache → fresh `ORCA_PI_GITHUB_<IDENT>_TOKEN` → disk cache
 (`<config-dir>/github-tokens/<identity>.json`, mode 0600) → App private-key
-mint. Expiry is recorded and refreshed before expiration (5-minute skew).
-Existing reviewer fail-closed installation-token verification
-(`GET /installation/repositories` + trusted App login + distinct-from-author)
-remains intact; worker writes use the parallel worker preflight.
+mint) backs every consumer — `review`/`check` preflights + writes,
+`auth status`/`doctor` (read-only display uses the same chain without
+minting), `exec`, and `git-credential`. Mint once, then later invocations
+with App config but no `*_TOKEN` env still resolve via the disk cache.
+Expiry is recorded and refreshed before expiration (5-minute skew).
+Reviewer fail-closed verification (`GET /installation/repositories` with the
+IAT + trusted App login + distinct-from-author) remains intact; every worker
+remote mutation (`exec` `git push` / `gh pr create/...`, helper-backed `git
+push`) additionally requires Worker-App preflight (`GET
+/installation/repositories` with the worker IAT + `[bot]` metadata) before
+any child is spawned or password emitted — human PATs fail closed and never
+reach write APIs. Repository installation/permission verification uses
+`GET /repos/{owner}/{repo}/installation` with a locally-built App JWT
+(JWT-only per GitHub docs; IATs do not work there) and fails closed when
+`--repo` verification could not run.
 
 A reproducible helper wraps the same flow:
 
@@ -132,15 +143,24 @@ orca-pi github exec --identity worker -- git push origin HEAD
 orca-pi github exec --identity worker -- gh pr create --title "…" --body "…"
 orca-pi github exec --identity worker -- gh pr edit <n> --add-label "…"
 
-# Repo-local git helper (per worktree, never --global/--system):
+# Worktree-scoped git helper override (never --global/--system):
 orca-pi github setup-git --identity worker --path /path/to/worker-checkout
-# Then normal ergonomics work inside that checkout:
+# Then plain git works inside that worktree (gh still needs exec, below):
 git push origin HEAD
-gh pr create --title "…" --body "…"
+# NOTE: plain `gh` is NOT authenticated by setup-git; use exec below:
+# orca-pi github exec --identity worker -- gh pr create --title "…" --body "…"
 ```
 
-`setup-git` runs `git -C <path> config --local credential.helper
-"orca-pi github git-credential --identity worker"` — `--local` only.
+`setup-git` installs a deterministic override in worktree scope
+(`git -C <path> config --worktree --replace-all credential.helper ""`
+then `--add` the worker helper; `--local` fallback on old git) — never
+`--global`/`--system`. The empty reset makes git ignore inherited/global
+helpers (e.g. Git Credential Manager with ambient 44madfire) so the worker
+helper wins deterministically. Worktree scope keeps linked worktrees
+isolated (plain `--local` is shared). `setup-git` authenticates `git` only:
+`gh` ignores git credential helpers, so plain `gh pr create` does NOT work
+after `setup-git` — use `orca-pi github exec --identity worker -- gh ...`
+(scoped `GH_TOKEN` for the child, with Worker-App preflight).
 `git-credential get` mints via the out-of-LLM provider and pipes
 `username=x-access-token / password=<token>` to git (never logged);
 `store`/`erase` are no-ops (tokens are short-lived). `exec --identity

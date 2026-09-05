@@ -36,8 +36,8 @@ import {
   type GithubFetchFn,
   type ResolvedGithubCredential,
 } from "./types.js";
-import type { InstallationTokenCache } from "./github-app-auth.js";
-import { defaultTokenCache } from "./github-app-auth.js";
+import type { InstallationTokenCache } from "./token-cache.js";
+import { defaultTokenCache } from "./token-cache.js";
 
 /** Refresh ahead of expiry so workers never use a token at the edge. */
 export const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;

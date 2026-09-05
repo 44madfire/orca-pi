@@ -38,21 +38,23 @@
 import {
   AGENT_REVIEW_CHECK_NAME,
   completeAgentReviewCheck,
-  describeCredentialStatus,
+  describeProductionCredentialStatus,
   doctorGithubIdentities,
   ensureInstallationToken,
   formatGithubDoctorReport,
   GITHUB_IDENTITY_PATTERN,
+  isWorkerMutationCommand,
   MAX_GITHUB_IDENTITY_LENGTH,
   operatorSetupStepsForIdentity,
   parsePullRequestRef,
   parseReviewVerdict,
-  resolveGithubCredential,
   resolveIdentityWithEnvFallback,
+  resolveProductionCredential,
   sanitizeErrorForDisplay,
   startAgentReviewCheck,
   submitGithubReview,
   validateSetupForIdentity,
+  verifyWorkerForWrites,
   verdictToCheckConclusion,
   assertIdentityMayRunCommand,
   assertWorkerIdentityForWrites,
@@ -121,9 +123,11 @@ supports IATs unlike GET /user) for the trusted configured App login and
 distinctness from the PR author before any POST, so same-account PATs and
 worker identity never reach the write APIs. Check start is idempotent
 (reuses the deterministic run for the SHA); review retries with identical
-inputs dedupe via response-state matching. Worker pushes/PRs run as the
-worker App (Contents: write) via scoped exec/setup-git (per-process/repo,
-never --global). The reviewer App holds Contents: read only; human (44madfire,
+inputs dedupe via response-state matching. Worker pushes run as the
+worker App (Contents: write) via scoped exec (per-process GH_TOKEN) and worktree-scoped
+git helper override (empty credential.helper reset + worker helper, never --global).
+Plain gh is NOT authenticated by setup-git (gh ignores git helpers) -- use
+orca-pi github exec --identity worker -- gh pr create ... for gh writes. The reviewer App holds Contents: read only; human (44madfire,
 including ChatGPT-assisted review) merges. worker bot != reviewer bot != 44madfire.
 `;
 
@@ -312,7 +316,14 @@ async function runAuthStatus(args: readonly string[], deps: GithubCommandDeps): 
   }
   const env = deps.env ?? process.env;
   const cache = deps.cache ?? createInstallationTokenCache();
-  const status = describeCredentialStatus(resolvedIdentity, env, cache);
+  const prodFs = providerFsForDeps(deps) ?? (await nodeProviderFs().catch(() => undefined));
+  const status = await describeProductionCredentialStatus(resolvedIdentity, {
+    env,
+    cache,
+    ...(prodFs ? { providerFs: prodFs } : {}),
+    ...(deps.homedir ? { homedir: deps.homedir } : {}),
+    ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
+  });
   if (asJson) {
     deps.stdout(`${JSON.stringify({ ...status, check: AGENT_REVIEW_CHECK_NAME }, null, 2)}\n`);
   } else if (status.configured) {
@@ -392,6 +403,7 @@ async function runReview(args: readonly string[], deps: GithubCommandDeps): Prom
     const body = await resolveBody(bodyRaw, deps.fs);
     if (!body.trim()) throw new Error(`Review body must not be empty — provide findings with file/line evidence.`);
     const env = deps.env ?? process.env;
+    const prodFs = providerFsForDeps(deps) ?? (await nodeProviderFs().catch(() => undefined));
     const result = await submitGithubReview(
       resolvedIdentity,
       {
@@ -408,6 +420,9 @@ async function runReview(args: readonly string[], deps: GithubCommandDeps): Prom
         env,
         ...(deps.cache ? { cache: deps.cache } : {}),
         ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+        ...(prodFs ? { providerFs: prodFs } : {}),
+        ...(deps.homedir ? { homedir: deps.homedir } : {}),
+        ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
       },
     );
     const conclusion = verdictToCheckConclusion(verdict);
@@ -502,11 +517,15 @@ async function runCheck(args: readonly string[], deps: GithubCommandDeps): Promi
     const headSha = sha.trim();
     const provenance = (task || issue) ? { ...(task ? { taskId: task } : {}), ...(issue ? { linearIssueId: issue } : {}), profile: resolvedIdentity } : undefined;
     const env = deps.env ?? process.env;
+    const prodFs = providerFsForDeps(deps) ?? (await nodeProviderFs().catch(() => undefined));
     const baseOpts = {
       ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
       env,
       ...(deps.cache ? { cache: deps.cache } : {}),
       ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+      ...(prodFs ? { providerFs: prodFs } : {}),
+      ...(deps.homedir ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
     };
     if (action === "start") {
       const result = await startAgentReviewCheck(
@@ -586,6 +605,7 @@ async function runDoctor(args: readonly string[], deps: GithubCommandDeps): Prom
     if (repoRaw) repo = parseRepo(repoRaw);
     const env = deps.env ?? process.env;
     const cache = deps.cache ?? createInstallationTokenCache();
+    const prodFs = providerFsForDeps(deps) ?? (await nodeProviderFs().catch(() => undefined));
     const report = await doctorGithubIdentities({
       env,
       cache,
@@ -593,6 +613,9 @@ async function runDoctor(args: readonly string[], deps: GithubCommandDeps): Prom
       ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
       ...(repo ? { repo } : {}),
       ...(ambient?.trim() ? { ambientLogin: ambient.trim() } : {}),
+      ...(prodFs ? { providerFs: prodFs } : {}),
+      ...(deps.homedir ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
     });
     if (asJson) {
       deps.stdout(`${JSON.stringify(report, null, 2)}\n`);
@@ -758,32 +781,33 @@ async function runExec(args: readonly string[], deps: GithubCommandDeps): Promis
     assertIdentityMayRunCommand(resolved, command);
     const env = deps.env ?? process.env;
     const cache = deps.cache ?? createInstallationTokenCache();
-    let token: string;
-    const providerFs = providerFsForDeps(deps);
-    if (providerFs) {
-      const credential = await ensureInstallationToken(resolved, {
-        env,
-        cache,
-        fs: providerFs,
-        ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
-        ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
-      });
-      token = credential.token;
-    } else {
-      try {
-        token = resolveGithubCredential(resolved, env, cache).token;
-      } catch {
-        const fs = await nodeProviderFs();
-        const credential = await ensureInstallationToken(resolved, {
-          env,
-          cache,
-          fs,
-          ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
-          ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
-        });
-        token = credential.token;
-      }
+    const prodFs = providerFsForDeps(deps) ?? (await nodeProviderFs().catch(() => undefined));
+    const prodOpts = {
+      env,
+      cache,
+      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+      ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+      ...(prodFs ? { providerFs: prodFs } : {}),
+      ...(deps.homedir ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
+    };
+    // Blocker 2: worker remote mutations require Worker-App/IAT preflight
+    // BEFORE any child is spawned � a human PAT in the worker slot fails
+    // here (401/403 via GET /installation/repositories) and never reaches
+    // git/gh. Non-mutating reads (e.g. `git status`) skip the network proof.
+    if (resolved === "worker" && isWorkerMutationCommand(command)) {
+      await verifyWorkerForWrites(resolved, prodOpts);
     }
+    const credential = await resolveProductionCredential(resolved, {
+      env,
+      cache,
+      ...(prodFs ? { providerFs: prodFs } : {}),
+      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+      ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+      ...(deps.homedir ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
+    });
+    const token = credential.token;
     const overlay = buildScopedEnvForIdentity(resolved, token);
     if (deps.execSpawn) {
       const code = await deps.execSpawn(command, { env: overlay });
@@ -847,19 +871,30 @@ async function runGitCredential(args: readonly string[], deps: GithubCommandDeps
     const input = parseGitCredentialInput(inputText);
     const env = deps.env ?? process.env;
     const cache = deps.cache ?? createInstallationTokenCache();
-    const providerFs = providerFsForDeps(deps);
+    const prodFs = providerFsForDeps(deps) ?? (await nodeProviderFs().catch(() => undefined));
+    const prodOpts = {
+      env,
+      cache,
+      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+      ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+      ...(prodFs ? { providerFs: prodFs } : {}),
+      ...(deps.homedir ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
+    };
     const resolveToken = async (): Promise<{ token: string }> => {
-      if (providerFs) {
-        const credential = await ensureInstallationToken(resolved, {
-          env,
-          cache,
-          fs: providerFs,
-          ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
-          ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
-        });
-        return { token: credential.token };
+      if (resolved === "worker" && action === "get") {
+        await verifyWorkerForWrites(resolved, prodOpts);
       }
-      return { token: resolveGithubCredential(resolved, env, cache).token };
+      const credential = await resolveProductionCredential(resolved, {
+        env,
+        cache,
+        ...(prodFs ? { providerFs: prodFs } : {}),
+        ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+        ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+        ...(deps.homedir ? { homedir: deps.homedir } : {}),
+        ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
+      });
+      return { token: credential.token };
     };
     const result = await handleGitCredentialRequest(resolved, action, input, resolveToken);
     // stdout is piped to git — never add framing/logs here.
@@ -910,9 +945,9 @@ async function runSetupGit(args: readonly string[], deps: GithubCommandDeps): Pr
     if (!runner) throw new Error(`setup-git requires a process runner (unavailable in this host).`);
     const receipt = await setupRepoGitAuth(runner, { repoPath: path });
     if (asJson) {
-      deps.stdout(`${JSON.stringify({ ok: true, identity: resolved, repoPath: receipt.repoPath, helper: receipt.helperCommand, scope: "--local" }, null, 2)}\n`);
+      deps.stdout(`${JSON.stringify({ ok: true, identity: resolved, repoPath: receipt.repoPath, helper: receipt.helperCommand, scope: receipt.scope, ghNote: "setup-git authenticates git only; gh needs: orca-pi github exec --identity worker -- gh ..." }, null, 2)}\n`);
     } else {
-      deps.stdout(`ok github setup-git — worker helper pinned repo-local in ${receipt.repoPath} (scope --local, never --global)\n`);
+      deps.stdout(`ok github setup-git — worker helper override in ${receipt.repoPath} (scope ${receipt.scope}: empty reset + worker helper, never --global; git only)\n`);
     }
     return { exitCode: 0 };
   } catch (error) {
