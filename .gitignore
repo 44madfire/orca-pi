@@ -11,3 +11,8 @@ Thumbs.db
 npm-debug.log*
 .env
 .env.local
+# OP1.12: never commit GitHub App private keys, installation tokens, or webhook secrets.
+*.pem
+*.key
+.pi/github-tokens/
+**/github-tokens/*.json

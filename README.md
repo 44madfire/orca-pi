@@ -99,6 +99,10 @@ node packages/cli/dist/main.js profile path
 node packages/cli/dist/main.js status --json
 node scripts/check-skill-size.mjs
 node packages/cli/dist/main.js github auth status --identity reviewer
+node packages/cli/dist/main.js github auth status --profile worker
+node packages/cli/dist/main.js github identity doctor --repo 44madfire/orca-pi
+node packages/cli/dist/main.js github setup --identity worker --repo 44madfire/orca-pi
+node scripts/setup-github-apps.mjs --repo 44madfire/orca-pi
 node packages/cli/dist/main.js github review --identity reviewer --pr https://github.com/octo/hello-world/pull/123 --verdict request-changes --body @/tmp/review.md
 node packages/cli/dist/main.js github check start --identity reviewer --repo octo/hello-world --sha <head-sha>
 node packages/cli/dist/main.js github check complete --identity reviewer --repo octo/hello-world --sha <head-sha> --verdict approve --summary "No blocking findings."
@@ -151,13 +155,17 @@ orca-pi doctor
   user/global and project locations (script-friendly with `--project`/`--user`).
   Never parses file contents, so it stays usable when config is malformed
   (recovery UX; content diagnostics belong to `validate`).
-- `orca-pi spawn <profile> (--task <spec>|--task-id <id>) [--worktree <policy>] [--json]`
+- `orca-pi spawn <profile> (--task <spec>|--task-id <id>) [--worktree <policy>] [--identity <name>] [--json]`
   resolves the role profile pre-launch (unknown profiles fail before any Orca
   effects) then launches an Orca-supervised Pi worker via JEF-8's adapter.
   Returns one frozen receipt (`taskId`, `dispatchId`, `terminalHandle`,
-  worktree, Pi argv). `--worktree` is `current` (default), `new-child` /
+  worktree, Pi argv, `githubIdentity`). `--worktree` is `current` (default), `new-child` /
   `new-top-level` (require `--name`), or an existing selector (`active`,
-  `id:…`, `name:…`, `path:…`). Exit `1` on profile/Orca failures.
+  `id:…`, `name:…`, `path:…`). `--identity` is diagnostics/admin only and must
+  match the profile's `githubIdentity` (cross-role overrides fail closed). The
+  terminal command is prefixed per-process with `ORCA_PI_GITHUB_IDENTITY` +
+  `ORCA_PI_PROFILE` so agents inherit without repeating `--identity` and without
+  touching global git/GH config. Exit `1` on profile/Orca failures.
 - `orca-pi status [--worker <dispatch|terminal>|--task <id>] [--json]`
   inspects Orca Task/Dispatch state (never terminal-text inference). Bare
   `status` sweeps workers (plus tasks when a Run is bound). Exit `0` with a
@@ -178,23 +186,36 @@ orca-pi doctor
 Compact orchestration keeps only minimal handle mappings
 (`<projectRoot>/.pi/orca-pi-workers.json`, best-effort); Orca remains the
 source of truth for completion/status.
-- GitHub agent identities + automated review checks (OP1.9 / JEF-15):
-  `worker` creates/updates PRs while the dedicated Reviewer GitHub App submits
+- GitHub agent identities + automated review checks (OP1.9 / JEF-15 + OP1.12 worker/reviewer Apps):
+  Worker App (`orca-pi-worker[bot]`, Contents: write) creates/updates PRs while the
+  dedicated Reviewer GitHub App (`orca-pi-reviewer[bot]`, Contents: read) submits
   formal `COMMENT`/`REQUEST_CHANGES`/`APPROVE` reviews and publishes the deterministic
   `orca-pi/agent-review` check (`in_progress` → `success`/`failure`) for branch
-  protection/rulesets. Human remains merge authority (no auto-merge). Review/check
-  writes fail closed: `--identity reviewer` only, installation-token proof
-  (`GET /installation/repositories`, IAT-supported unlike `GET /user`) for the
-  trusted configured App login + distinct-from-PR-author guard before any POST
-  (same-account PATs never write); `check start` reuses the deterministic run
-  (idempotent), review retries dedupe via response-state matching.
-  - `orca-pi github auth status --identity reviewer [--json]` — credential presence
+  protection/rulesets. Human (`44madfire`, including ChatGPT-assisted review) remains
+  merge authority (no auto-merge). `worker bot != reviewer bot != 44madfire`, so worker PRs
+  are approvable by both reviewer bot and human. Review/check writes fail closed:
+  reviewer-only with installation-token proof (`GET /installation/repositories`,
+  IAT-supported unlike `GET /user`) for the trusted configured App login +
+  distinct-from-PR-author guard before any POST (same-account PATs never write);
+  worker pushes/PRs fail closed via the parallel worker App preflight; `check start`
+  reuses the deterministic run (idempotent), review retries dedupe via response-state matching.
+  Launch role is authoritative: `githubIdentity` from the resolved profile controls the
+  effective actor (`--profile` or spawn-injected `ORCA_PI_GITHUB_IDENTITY` inherits;
+  explicit `--identity` must match the profile, no escalation). Worker git/GH writes run
+  as the worker App via a scoped broker (per-process `exec` env / per-repo `setup-git`
+  `--local` helper, never `--global`). See `docs/GITHUB_IDENTITIES.md`.
+  - `orca-pi github auth status [--identity <name>] [--profile <name>] [--json]` — credential presence
     (source label + expiry, never values).
-  - `orca-pi github review --identity reviewer --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]`
-  - `orca-pi github check start --identity reviewer --repo <owner/repo> --sha <sha> [--json]`
-  - `orca-pi github check complete --identity reviewer --repo <owner/repo> --sha <sha> --verdict <v> --summary <text> [--check-run-id <n>] [--json]` (idempotent: reuses the deterministic run for the SHA).
+  - `orca-pi github review [--identity reviewer] [--profile <name>] --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]`
+  - `orca-pi github check start|complete [--identity reviewer] [--profile <name>] --repo <owner/repo> --sha <sha> ...` (idempotent: reuses the deterministic run for the SHA).
+  - `orca-pi github doctor [--repo <owner/repo>] [--ambient <login>] [--json]` / `orca-pi github identity doctor` — non-secret diagnostics (App login/ids, perms, expiry, distinctness).
+  - `orca-pi github setup --identity <name> [--repo <owner/repo>]` — idempotent non-secret App bootstrap steps (Apps require UI/admin; no secrets committed).
+  - `orca-pi github mint --identity <name>` — out-of-LLM installation-token mint/refresh (private key from `..._PRIVATE_KEY_PATH`, WSL/Windows aware; prints metadata only).
+  - `orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>` — scoped broker (`GH_TOKEN` only for the child; reviewer `git push` refused).
+  - `orca-pi github setup-git --identity worker [--path <repo-path>]` — pins repo-local credential helper (`--local`, never `--global`).
   - Profiles reference logical identities (`githubIdentity: worker|reviewer`), never secrets;
-    tokens resolve at runtime via `ORCA_PI_GITHUB_<IDENTITY>_TOKEN` (+ optional `..._EXPIRES_AT`).
+    tokens resolve at runtime via `ORCA_PI_GITHUB_<IDENTITY>_TOKEN` (+ optional `..._EXPIRES_AT`) or App mint
+    (`..._APP_ID` + `..._PRIVATE_KEY_PATH` + `..._INSTALLATION_ID` + `..._LOGIN`).
     Reviewer holds Contents: read only — `githubIdentity: reviewer` with `edit`/`write` tools fails validation.
 
 ## Orca plugin

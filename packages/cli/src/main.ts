@@ -85,14 +85,20 @@ Usage:
   orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]
   orca-pi profile validate [<name>] [--json]
   orca-pi profile path [--project|--user] [--json]
-  orca-pi spawn <profile> (--task <spec> | --task-id <id>) [--worktree <policy>] [--json]
+  orca-pi spawn <profile> (--task <spec> | --task-id <id>) [--worktree <policy>] [--identity <name>] [--json]
   orca-pi status [--worker <handle>|--task <id>] [--json]
   orca-pi send --worker <handle> --message <text> [--json]
   orca-pi wait (--worker <handle>|--task <id>) [--timeout <duration>] [--json]
   orca-pi stop --worker <handle> [--json]
-  orca-pi github auth status --identity <name> [--json]
-  orca-pi github review --identity reviewer --pr <url|number> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]
-  orca-pi github check start|complete --identity reviewer --repo <owner/repo> --sha <sha> ...
+  orca-pi github auth status [--identity <name>] [--profile <name>] [--json]
+  orca-pi github review [--identity reviewer] [--profile <name>] --pr <url|number> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]
+  orca-pi github check start|complete [--identity reviewer] [--profile <name>] --repo <owner/repo> --sha <sha> ...
+  orca-pi github doctor [--repo <owner/repo>] [--ambient <login>] [--json]
+  orca-pi github identity doctor [--repo <owner/repo>] [--json]
+  orca-pi github setup --identity <name> [--repo <owner/repo>] [--json]
+  orca-pi github mint --identity <name> [--json]
+  orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>
+  orca-pi github setup-git --identity worker [--path <repo-path>] [--json]
 
 Commands:
   doctor        Verify \`orca\` and \`pi\` are on PATH and report versions (read-only).
@@ -243,6 +249,12 @@ export async function run(
       ...(deps.env !== undefined ? { env: deps.env } : {}),
       ...(deps.fs !== undefined ? { fs: deps.fs } : {}),
       ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}),
+      projectRoot: defaultProjectRoot(deps),
+      ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir !== undefined ? { osHomedir: deps.osHomedir } : {}),
+      ...(deps.userConfigPathOverride !== undefined ? { userConfigPathOverride: deps.userConfigPathOverride } : {}),
+      ...(deps.projectConfigPathOverride !== undefined ? { projectConfigPathOverride: deps.projectConfigPathOverride } : {}),
+      runner: deps.runner,
     });
   }
   if (command === "profile" || command === "profiles") {

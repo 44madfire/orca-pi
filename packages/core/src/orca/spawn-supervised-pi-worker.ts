@@ -59,6 +59,8 @@ import {
   type BuildPiLaunchOptions,
   type PiLaunchResult,
 } from "../pi/build-pi-launch.js";
+import { prefixTerminalCommandWithIdentity, resolveEffectiveGithubIdentity } from "../github/effective-identity.js";
+import { GithubAuthError } from "../github/types.js";
 import type { ResolvedPiProfile } from "../profile/types.js";
 import {
   DEFAULT_READINESS_TIMEOUT_MS,
@@ -128,6 +130,12 @@ export interface SpawnSupervisedPiWorkerOptions {
   readonly preserveTerminalOnFailure?: boolean;
   /** Cooperative cancellation. Checked before each stage; cleanup stays idempotent. */
   readonly signal?: AbortSignal;
+  /**
+   * Explicit GitHub identity override (diagnostics/admin only, OP1.12).
+   * Must match `profile.githubIdentity` when the profile fixes one —
+   * cross-role overrides are refused (no privilege escalation).
+   */
+  readonly githubIdentityOverride?: string;
 }
 
 function isTaskIdSelection(
@@ -217,6 +225,7 @@ export async function spawnSupervisedPiWorker(
     readinessTimeoutMs = DEFAULT_READINESS_TIMEOUT_MS,
     preserveTerminalOnFailure = false,
     signal,
+    githubIdentityOverride,
   } = options;
   const worktreePolicy: WorktreePolicy = options.worktree ?? { kind: "current" };
 
@@ -267,6 +276,26 @@ export async function spawnSupervisedPiWorker(
       message: `Invalid worktree policy: new-worktree name must be non-empty.`,
       diagnostics: "worktree-create: name is empty.",
       cleanup: { terminalClosed: false, createdNewWorktree: false },
+    });
+  }
+
+  // OP1.12: launch role is authoritative for GitHub actor selection.
+  // An explicit override must match the profile (no privilege escalation).
+  let effectiveGithubIdentity: string | undefined;
+  try {
+    effectiveGithubIdentity =
+      resolveEffectiveGithubIdentity(profile, {
+        ...(githubIdentityOverride !== undefined ? { explicitIdentity: githubIdentityOverride } : {}),
+      }) ?? undefined;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new SupervisedWorkerError({
+      stage: "launch-build",
+      code: "invalid-github-identity",
+      message: `Invalid GitHub identity override for Pi profile "${profile.name}": ${message}`,
+      diagnostics: `launch-build: ${message}`,
+      cleanup: { terminalClosed: false, createdNewWorktree: false },
+      cause: error instanceof GithubAuthError ? error : undefined,
     });
   }
 
@@ -504,7 +533,13 @@ export async function spawnSupervisedPiWorker(
   // 5. Create the Orca terminal running Pi. Task text is never embedded:
   // the command carries only the rebuilt OP1.3 Pi argv; supervised
   // attachment delivers the task + preamble authoritatively.
-  const terminalCommand = formatPiCommandForTerminal(launch.spec);
+  // OP1.12: prefix per-terminal identity env (ORCA_PI_GITHUB_IDENTITY +
+  // ORCA_PI_PROFILE) so agents inherit without repeating --identity and
+  // without touching global git/GH config. Logical names only, no secrets.
+  const terminalCommand = prefixTerminalCommandWithIdentity(formatPiCommandForTerminal(launch.spec), {
+    ...(effectiveGithubIdentity ? { githubIdentity: effectiveGithubIdentity } : {}),
+    profileName: profile.name,
+  });
   const launchSummary = summarizePiSpecForDiagnostics(launch.spec);
   let terminalHandle: string;
   try {
@@ -686,6 +721,7 @@ export async function spawnSupervisedPiWorker(
       createdNew: createdNewWorktree,
     }),
     profileName: profile.name,
+    ...(effectiveGithubIdentity ? { githubIdentity: effectiveGithubIdentity } : {}),
     ...(profile.model !== undefined ? { piModel: profile.model } : {}),
     piCommand: launch.spec.command,
     piArgs: Object.freeze([...launch.spec.args]) as readonly string[],

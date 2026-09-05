@@ -1,5 +1,5 @@
 /**
- * `orca-pi github` commands (OP1.9 / JEF-15).
+ * `orca-pi github` commands (OP1.9 / JEF-15 + OP1.12 identity propagation).
  *
  * Structured helpers over distinct GitHub automation identities — never
  * exposes raw credentials to Pi. All GitHub actions run behind a logical
@@ -7,9 +7,14 @@
  * via env / helper (see `@orca-pi/core` github module) and are never
  * logged.
  *
+ * OP1.12: the launch role is authoritative. `--profile <name>` and the
+ * spawn-injected `ORCA_PI_GITHUB_IDENTITY` env let agents inherit without
+ * repeating `--identity`; explicit `--identity` overrides must match the
+ * profile (no privilege escalation).
+ *
  * Commands:
- *   orca-pi github auth status --identity <name> [--json]
- *   orca-pi github review --identity <name> --pr <url|number|owner/repo#n>
+ *   orca-pi github auth status [--identity <name>] [--profile <name>] [--json]
+ *   orca-pi github review [--identity <name>] [--profile <name>] --pr <url|number|owner/repo#n>
  *     --verdict <approve|request-changes|comment> --body <text|@file>
  *     [--repo <owner/repo>] [--commit <sha>] [--task <id>] [--issue <JEF-...>] [--json]
  *
@@ -17,40 +22,70 @@
  * head.sha (captured in preflight, matching GitHub's default) and is always
  * sent as commit_id; retries dedupe only on exact commit equality, so new
  * pushes always get a fresh review.
- *   orca-pi github check start --identity <name> --repo <owner/repo> --sha <sha>
- *     [--summary <text>] [--task <id>] [--issue <JEF-...>] [--json]
- *   orca-pi github check complete --identity <name> --repo <owner/repo> --sha <sha>
- *     --verdict <approve|request-changes|comment> --summary <text>
- *     [--check-run-id <n>] [--task <id>] [--issue <JEF-...>] [--json]
+ *   orca-pi github check start|complete [--identity <name>] [--profile <name>] --repo <owner/repo> --sha <sha> ...
+ *   orca-pi github doctor [--repo <owner/repo>] [--ambient <login>] [--json]
+ *   orca-pi github identity doctor [--repo <owner/repo>] [--ambient <login>] [--json]
+ *   orca-pi github setup --identity <name> [--repo <owner/repo>] [--json]
+ *   orca-pi github mint --identity <name> [--json]
+ *   orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>
+ *   orca-pi github git-credential --identity <name> <get|store|erase>
+ *   orca-pi github setup-git --identity worker [--path <repo-path>] [--json]
  *
  * Human remains the final merge authority — no auto-merge command exists.
+ * ChatGPT/human acts as 44madfire, distinct from both bots.
  */
 
 import {
   AGENT_REVIEW_CHECK_NAME,
   completeAgentReviewCheck,
   describeCredentialStatus,
+  doctorGithubIdentities,
+  ensureInstallationToken,
+  formatGithubDoctorReport,
   GITHUB_IDENTITY_PATTERN,
   MAX_GITHUB_IDENTITY_LENGTH,
+  operatorSetupStepsForIdentity,
   parsePullRequestRef,
   parseReviewVerdict,
+  resolveGithubCredential,
+  resolveIdentityWithEnvFallback,
   sanitizeErrorForDisplay,
   startAgentReviewCheck,
   submitGithubReview,
+  validateSetupForIdentity,
   verdictToCheckConclusion,
+  assertIdentityMayRunCommand,
+  assertWorkerIdentityForWrites,
+  buildScopedEnvForIdentity,
+  handleGitCredentialRequest,
+  parseGitCredentialInput,
+  setupRepoGitAuth,
+  tokenCacheFileForIdentity,
+  type CredentialProviderFs,
   type GithubFetchFn,
   type InstallationTokenCache,
 } from "@orca-pi/core";
 import { createInstallationTokenCache } from "@orca-pi/core";
+import { loadMergedProfiles } from "@orca-pi/core";
+import { resolveProfile } from "@orca-pi/core";
 
 export interface GithubCommandDeps {
   stdout: (text: string) => void;
   stderr: (text: string) => void;
   env?: NodeJS.ProcessEnv;
-  fs?: Pick<typeof import("node:fs/promises"), "readFile">;
+  fs?: Pick<typeof import("node:fs/promises"), "readFile"> & Partial<Pick<typeof import("node:fs/promises"), "writeFile" | "mkdir" | "stat">>;
   fetchFn?: GithubFetchFn;
   cache?: InstallationTokenCache;
   apiBase?: string;
+  projectRoot?: string;
+  homedir?: string;
+  osHomedir?: () => string;
+  userConfigPathOverride?: string;
+  projectConfigPathOverride?: string;
+  runner?: import("@orca-pi/core").ProcessRunner;
+  providerFs?: CredentialProviderFs;
+  stdinText?: () => Promise<string>;
+  execSpawn?: (command: string[], options: { env: Record<string, string> }) => Promise<number>;
 }
 
 export interface GithubCommandResult {
@@ -60,23 +95,36 @@ export interface GithubCommandResult {
 const GITHUB_USAGE = `orca-pi github — distinct GitHub automation identities and review checks
 
 Usage:
-  orca-pi github auth status --identity <name> [--json]
-  orca-pi github review --identity reviewer --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--commit <sha>] [--task <id>] [--issue <id>] [--json]
-  orca-pi github check start --identity reviewer --repo <owner/repo> --sha <sha> [--summary <text>] [--task <id>] [--issue <id>] [--json]
-  orca-pi github check complete --identity reviewer --repo <owner/repo> --sha <sha> --verdict <approve|request-changes|comment> --summary <text> [--check-run-id <n>] [--task <id>] [--issue <id>] [--json]
+  orca-pi github auth status [--identity <name>] [--profile <name>] [--json]
+  orca-pi github review [--identity <name>] [--profile <name>] --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--commit <sha>] [--task <id>] [--issue <id>] [--json]
+  orca-pi github check start|complete [--identity <name>] [--profile <name>] --repo <owner/repo> --sha <sha> ...
+  orca-pi github doctor [--repo <owner/repo>] [--ambient <login>] [--json]
+  orca-pi github identity doctor [--repo <owner/repo>] [--ambient <login>] [--json]
+  orca-pi github setup --identity <name> [--repo <owner/repo>] [--json]
+  orca-pi github mint --identity <name> [--json]
+  orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>
+  orca-pi github git-credential --identity <name> <get|store|erase>
+  orca-pi github setup-git --identity worker [--path <repo-path>] [--json]
 
+Identity inheritance (OP1.12): the launch role is authoritative. Prefer
+--profile <name> or the spawn-injected ORCA_PI_GITHUB_IDENTITY env over
+repeating --identity. Explicit --identity must match the profile's
+githubIdentity (reviewer cannot select worker credentials and vice versa).
 Identities are logical credential slots resolved at runtime via env
-(ORCA_PI_GITHUB_<IDENTITY>_TOKEN plus verified ORCA_PI_GITHUB_REVIEWER_LOGIN /
-ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID for the reviewer App, all outside LLM
-context). Tokens never appear in output.
-Formal reviews and the orca-pi/agent-review check must use --identity reviewer:
-the CLI proves installation-token class (GET /installation/repositories, which
+(ORCA_PI_GITHUB_<IDENTITY>_TOKEN plus verified ORCA_PI_GITHUB_<IDENTITY>_LOGIN /
+ORCA_PI_GITHUB_<IDENTITY>_INSTALLATION_ID for App identities, all outside LLM
+context) or via App private-key mint (ORCA_PI_GITHUB_<IDENTITY>_APP_ID +
+..._PRIVATE_KEY_PATH + ..._INSTALLATION_ID). Tokens never appear in output.
+Formal reviews and the orca-pi/agent-review check must use the reviewer
+identity: the CLI proves installation-token class (GET /installation/repositories, which
 supports IATs unlike GET /user) for the trusted configured App login and
 distinctness from the PR author before any POST, so same-account PATs and
---identity worker never reach the write APIs. Check start is idempotent
+worker identity never reach the write APIs. Check start is idempotent
 (reuses the deterministic run for the SHA); review retries with identical
-inputs dedupe via response-state matching. The reviewer App holds Contents:
-read only; human merges.
+inputs dedupe via response-state matching. Worker pushes/PRs run as the
+worker App (Contents: write) via scoped exec/setup-git (per-process/repo,
+never --global). The reviewer App holds Contents: read only; human (44madfire,
+including ChatGPT-assisted review) merges. worker bot != reviewer bot != 44madfire.
 `;
 
 function isHelpFlag(arg: string): boolean {
@@ -139,14 +187,102 @@ async function resolveBody(
   }
 }
 
+function defaultProjectRoot(deps: GithubCommandDeps): string {
+  if (deps.projectRoot && deps.projectRoot.length > 0) return deps.projectRoot;
+  try {
+    return process.cwd();
+  } catch {
+    return ".";
+  }
+}
+
+/**
+ * Resolve the effective identity for a github subcommand (OP1.12).
+ * Precedence: explicit --identity > --profile githubIdentity >
+ * ORCA_PI_GITHUB_IDENTITY env. Cross-role overrides fail closed.
+ */
+async function resolveCommandIdentity(
+  options: { explicitIdentity?: string; profileName?: string },
+  deps: GithubCommandDeps,
+): Promise<string> {
+  const env = deps.env ?? process.env;
+  const explicit = options.explicitIdentity?.trim() || undefined;
+  const profileName = options.profileName?.trim() || undefined;
+  if (profileName) {
+    const merged = await loadMergedProfiles({
+      projectRoot: defaultProjectRoot(deps),
+      ...(deps.userConfigPathOverride !== undefined ? { userConfigPath: deps.userConfigPathOverride } : {}),
+      ...(deps.projectConfigPathOverride !== undefined ? { projectConfigPath: deps.projectConfigPathOverride } : {}),
+      ...(deps.env !== undefined ? { env: deps.env } : {}),
+      ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir !== undefined ? { osHomedir: deps.osHomedir } : {}),
+      ...(deps.fs?.readFile ? { fs: { readFile: deps.fs.readFile } } : {}),
+    });
+    const profile = resolveProfile(profileName, merged);
+    const effective = resolveIdentityWithEnvFallback(profile, {
+      ...(explicit ? { explicitIdentity: explicit } : {}),
+      env,
+    });
+    if (!effective) {
+      throw new Error(
+        `Pi profile "${profileName}" sets no githubIdentity and no --identity/ORCA_PI_GITHUB_IDENTITY fallback was provided. Pass --identity <name> (worker|reviewer) or launch a role profile (worker, reviewer).`,
+      );
+    }
+    return effective;
+  }
+  if (explicit) {
+    const validated = validateIdentity(explicit);
+    // Still honor env agreement: a mismatched spawn env fails closed.
+    const effective = resolveIdentityWithEnvFallback(
+      { name: "(cli)", githubIdentity: undefined },
+      { explicitIdentity: validated, env },
+    );
+    // When no profile is involved the helper returns the explicit value
+    // unless env disagrees (then it throws). Fall back to validated.
+    return effective ?? validated;
+  }
+  // No flags: inherit spawn env (worker-terminal case).
+  const effective = resolveIdentityWithEnvFallback(
+    { name: "(cli)", githubIdentity: undefined },
+    { env },
+  );
+  if (!effective) {
+    throw new Error(`Missing --identity <name>: pass --identity <name> or --profile <name> (e.g. --identity reviewer, --profile reviewer). Spawned workers inherit ORCA_PI_GITHUB_IDENTITY automatically.`);
+  }
+  return effective;
+}
+
+function providerFsForDeps(deps: GithubCommandDeps): CredentialProviderFs | undefined {
+  if (deps.providerFs) return deps.providerFs;
+  const fs = deps.fs;
+  if (fs?.readFile && (fs as Partial<CredentialProviderFs>).writeFile && (fs as Partial<CredentialProviderFs>).mkdir) {
+    return fs as CredentialProviderFs;
+  }
+  return undefined;
+}
+
+async function nodeProviderFs(): Promise<CredentialProviderFs> {
+  const fs = await import("node:fs/promises");
+  return {
+    readFile: (path: string, encoding: "utf8") => fs.readFile(path, encoding),
+    writeFile: (path: string, data: string, options?: { mode?: number }) => fs.writeFile(path, data, options as never) as Promise<void>,
+    mkdir: (path: string, options?: { recursive?: boolean; mode?: number }) => fs.mkdir(path, options as never) as Promise<void>,
+  };
+}
+
 async function runAuthStatus(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
   let identity: string | undefined;
+  let profileName: string | undefined;
   let asJson = false;
   for (let i = 0; i < args.length;) {
     const arg = args[i] as string;
     if (arg === "--identity") {
       const taken = takeValue(args, i, "--identity");
       identity = taken.value;
+      i += taken.consumed;
+    } else if (arg === "--profile") {
+      const taken = takeValue(args, i, "--profile");
+      profileName = taken.value;
       i += taken.consumed;
     } else if (arg === "--json") {
       asJson = true;
@@ -156,20 +292,23 @@ async function runAuthStatus(args: readonly string[], deps: GithubCommandDeps): 
       return { exitCode: 0 };
     } else if (arg.startsWith("--")) {
       deps.stderr(`error: unknown github auth status option: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github auth status --identity <name> [--json]\n`);
+      deps.stderr(`usage: orca-pi github auth status [--identity <name>] [--profile <name>] [--json]\n`);
       return { exitCode: 2 };
     } else {
       deps.stderr(`error: unexpected argument: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github auth status --identity <name> [--json]\n`);
+      deps.stderr(`usage: orca-pi github auth status [--identity <name>] [--profile <name>] [--json]\n`);
       return { exitCode: 2 };
     }
   }
   let resolvedIdentity: string;
   try {
-    resolvedIdentity = validateIdentity(identity);
+    resolvedIdentity = await resolveCommandIdentity({ ...(identity ? { explicitIdentity: identity } : {}), ...(profileName ? { profileName } : {}) }, deps);
   } catch (error) {
     deps.stderr(`error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return { exitCode: 2 };
+    const message = error instanceof Error ? error.message : String(error);
+    const isUsage = message.includes("Missing --identity") || message.includes("Invalid --identity");
+    if ((error as { name?: string }).name?.startsWith("Github")) return { exitCode: 1 };
+    return { exitCode: isUsage ? 2 : 1 };
   }
   const env = deps.env ?? process.env;
   const cache = deps.cache ?? createInstallationTokenCache();
@@ -189,6 +328,7 @@ async function runAuthStatus(args: readonly string[], deps: GithubCommandDeps): 
 
 async function runReview(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
   let identity: string | undefined;
+  let profileName: string | undefined;
   let pr: string | undefined;
   let repo: string | undefined;
   let verdictRaw: string | undefined;
@@ -201,6 +341,9 @@ async function runReview(args: readonly string[], deps: GithubCommandDeps): Prom
     const arg = args[i] as string;
     if (arg === "--identity") {
       identity = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--profile") {
+      profileName = takeValue(args, i, arg).value;
       i += 2;
     } else if (arg === "--pr") {
       pr = takeValue(args, i, arg).value;
@@ -231,16 +374,16 @@ async function runReview(args: readonly string[], deps: GithubCommandDeps): Prom
       return { exitCode: 0 };
     } else if (arg.startsWith("--")) {
       deps.stderr(`error: unknown github review option: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github review --identity <name> --pr <ref> --verdict <v> --body <text|@file> [--repo <o/r>] [--json]\n`);
+      deps.stderr(`usage: orca-pi github review [--identity <name>] [--profile <name>] --pr <ref> --verdict <v> --body <text|@file> [--repo <o/r>] [--json]\n`);
       return { exitCode: 2 };
     } else {
       deps.stderr(`error: unexpected argument: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github review --identity <name> --pr <ref> --verdict <v> --body <text|@file> [--repo <o/r>] [--json]\n`);
+      deps.stderr(`usage: orca-pi github review [--identity <name>] [--profile <name>] --pr <ref> --verdict <v> --body <text|@file> [--repo <o/r>] [--json]\n`);
       return { exitCode: 2 };
     }
   }
   try {
-    const resolvedIdentity = validateIdentity(identity);
+    const resolvedIdentity = await resolveCommandIdentity({ ...(identity ? { explicitIdentity: identity } : {}), ...(profileName ? { profileName } : {}) }, deps);
     if (!pr) throw new Error(`Missing --pr <url|number|owner/repo#n> (e.g. --pr https://github.com/octo/hello-world/pull/123).`);
     if (!verdictRaw) throw new Error(`Missing --verdict <approve|request-changes|comment>.`);
     if (bodyRaw === undefined) throw new Error(`Missing --body <text|@file> (inline text or @<file>).`);
@@ -292,10 +435,11 @@ async function runCheck(args: readonly string[], deps: GithubCommandDeps): Promi
   }
   if (action !== "start" && action !== "complete") {
     deps.stderr(`error: unknown github check action: ${action} (expected "start" or "complete")\n`);
-    deps.stderr(`usage: orca-pi github check start|complete --identity <name> --repo <owner/repo> --sha <sha> ...\n`);
+    deps.stderr(`usage: orca-pi github check start|complete [--identity <name>] [--profile <name>] --repo <owner/repo> --sha <sha> ...\n`);
     return { exitCode: 2 };
   }
   let identity: string | undefined;
+  let profileName: string | undefined;
   let repo: string | undefined;
   let sha: string | undefined;
   let verdictRaw: string | undefined;
@@ -308,6 +452,9 @@ async function runCheck(args: readonly string[], deps: GithubCommandDeps): Promi
     const arg = rest[i] as string;
     if (arg === "--identity") {
       identity = takeValue(rest, i, arg).value;
+      i += 2;
+    } else if (arg === "--profile") {
+      profileName = takeValue(rest, i, arg).value;
       i += 2;
     } else if (arg === "--repo") {
       repo = takeValue(rest, i, arg).value;
@@ -338,16 +485,16 @@ async function runCheck(args: readonly string[], deps: GithubCommandDeps): Promi
       return { exitCode: 0 };
     } else if (arg.startsWith("--")) {
       deps.stderr(`error: unknown github check ${action} option: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github check ${action} --identity <name> --repo <owner/repo> --sha <sha> ...\n`);
+      deps.stderr(`usage: orca-pi github check ${action} [--identity <name>] [--profile <name>] --repo <owner/repo> --sha <sha> ...\n`);
       return { exitCode: 2 };
     } else {
       deps.stderr(`error: unexpected argument: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github check ${action} --identity <name> --repo <owner/repo> --sha <sha> ...\n`);
+      deps.stderr(`usage: orca-pi github check ${action} [--identity <name>] [--profile <name>] --repo <owner/repo> --sha <sha> ...\n`);
       return { exitCode: 2 };
     }
   }
   try {
-    const resolvedIdentity = validateIdentity(identity);
+    const resolvedIdentity = await resolveCommandIdentity({ ...(identity ? { explicitIdentity: identity } : {}), ...(profileName ? { profileName } : {}) }, deps);
     if (!repo) throw new Error(`Missing --repo <owner/repo> (e.g. --repo octo/hello-world).`);
     const { owner, repo: repoName } = parseRepo(repo);
     if (!sha || !sha.trim()) throw new Error(`Missing --sha <commit-sha>.`);
@@ -406,6 +553,377 @@ async function runCheck(args: readonly string[], deps: GithubCommandDeps): Promi
   }
 }
 
+async function runDoctor(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
+  let repoRaw: string | undefined;
+  let ambient: string | undefined;
+  let asJson = false;
+  for (let i = 0; i < args.length;) {
+    const arg = args[i] as string;
+    if (arg === "--repo") {
+      repoRaw = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--ambient") {
+      ambient = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--json") {
+      asJson = true;
+      i += 1;
+    } else if (isHelpFlag(arg)) {
+      deps.stdout(`${GITHUB_USAGE}`);
+      return { exitCode: 0 };
+    } else if (arg.startsWith("--")) {
+      deps.stderr(`error: unknown github doctor option: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github doctor [--repo <owner/repo>] [--ambient <login>] [--json]\n`);
+      return { exitCode: 2 };
+    } else {
+      deps.stderr(`error: unexpected argument: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github doctor [--repo <owner/repo>] [--ambient <login>] [--json]\n`);
+      return { exitCode: 2 };
+    }
+  }
+  try {
+    let repo: { owner: string; repo: string } | undefined;
+    if (repoRaw) repo = parseRepo(repoRaw);
+    const env = deps.env ?? process.env;
+    const cache = deps.cache ?? createInstallationTokenCache();
+    const report = await doctorGithubIdentities({
+      env,
+      cache,
+      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+      ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+      ...(repo ? { repo } : {}),
+      ...(ambient?.trim() ? { ambientLogin: ambient.trim() } : {}),
+    });
+    if (asJson) {
+      deps.stdout(`${JSON.stringify(report, null, 2)}\n`);
+    } else {
+      deps.stdout(`${formatGithubDoctorReport(report)}\n`);
+    }
+    return { exitCode: report.ok ? 0 : 1 };
+  } catch (error) {
+    const env = deps.env ?? process.env;
+    deps.stderr(`error: ${sanitizeErrorForDisplay(error, env)}\n`);
+    return { exitCode: 1 };
+  }
+}
+
+async function runSetup(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
+  let identity: string | undefined;
+  let repoRaw: string | undefined;
+  let asJson = false;
+  for (let i = 0; i < args.length;) {
+    const arg = args[i] as string;
+    if (arg === "--identity") {
+      identity = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--repo") {
+      repoRaw = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--json") {
+      asJson = true;
+      i += 1;
+    } else if (isHelpFlag(arg)) {
+      deps.stdout(`${GITHUB_USAGE}`);
+      return { exitCode: 0 };
+    } else if (arg.startsWith("--")) {
+      deps.stderr(`error: unknown github setup option: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github setup --identity <name> [--repo <owner/repo>] [--json]\n`);
+      return { exitCode: 2 };
+    } else {
+      deps.stderr(`error: unexpected argument: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github setup --identity <name> [--repo <owner/repo>] [--json]\n`);
+      return { exitCode: 2 };
+    }
+  }
+  try {
+    const resolved = validateIdentity(identity);
+    const env = deps.env ?? process.env;
+    const validation = validateSetupForIdentity(resolved, env);
+    const steps = operatorSetupStepsForIdentity(resolved, { ...(repoRaw?.trim() ? { repo: repoRaw.trim() } : {}) });
+    if (asJson) {
+      deps.stdout(`${JSON.stringify({ ok: validation.ok, identity: resolved, missing: validation.missing, guidance: validation.guidance, steps }, null, 2)}\n`);
+    } else {
+      deps.stdout(`github setup — identity "${resolved}": ${validation.guidance}\n`);
+      for (const step of steps) deps.stdout(`${step}\n`);
+    }
+    return { exitCode: validation.ok ? 0 : 1 };
+  } catch (error) {
+    const env = deps.env ?? process.env;
+    deps.stderr(`error: ${sanitizeErrorForDisplay(error, env)}\n`);
+    return { exitCode: 2 };
+  }
+}
+
+async function runMint(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
+  let identity: string | undefined;
+  let asJson = false;
+  for (let i = 0; i < args.length;) {
+    const arg = args[i] as string;
+    if (arg === "--identity") {
+      identity = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--json") {
+      asJson = true;
+      i += 1;
+    } else if (isHelpFlag(arg)) {
+      deps.stdout(`${GITHUB_USAGE}`);
+      return { exitCode: 0 };
+    } else if (arg.startsWith("--")) {
+      deps.stderr(`error: unknown github mint option: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github mint --identity <name> [--json]\n`);
+      return { exitCode: 2 };
+    } else {
+      deps.stderr(`error: unexpected argument: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github mint --identity <name> [--json]\n`);
+      return { exitCode: 2 };
+    }
+  }
+  try {
+    const resolved = validateIdentity(identity);
+    const env = deps.env ?? process.env;
+    const cache = deps.cache ?? createInstallationTokenCache();
+    const fs = providerFsForDeps(deps) ?? (await nodeProviderFs());
+    const credential = await ensureInstallationToken(resolved, {
+      env,
+      cache,
+      fs,
+      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+      ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+      ...(deps.homedir ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
+    });
+    const cachePath = tokenCacheFileForIdentity(resolved, {
+      env,
+      ...(deps.homedir ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
+    });
+    // Never print the token value — only non-secret metadata.
+    if (asJson) {
+      deps.stdout(
+        `${JSON.stringify({ ok: true, identity: resolved, sourceLabel: credential.sourceLabel, ...(credential.expiresAt ? { expiresAt: credential.expiresAt.toISOString() } : {}), ...(credential.installationId ? { installationId: credential.installationId } : {}), cachePath }, null, 2)}\n`,
+      );
+    } else {
+      deps.stdout(
+        `ok github mint — "${resolved}" via ${credential.sourceLabel}${credential.expiresAt ? ` (expires ${credential.expiresAt.toISOString()})` : ""} — cached at ${cachePath} (token value never printed)\n`,
+      );
+    }
+    return { exitCode: 0 };
+  } catch (error) {
+    const env = deps.env ?? process.env;
+    deps.stderr(`error: ${sanitizeErrorForDisplay(error, env)}\n`);
+    return { exitCode: 1 };
+  }
+}
+
+async function runExec(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
+  let identity: string | undefined;
+  let profileName: string | undefined;
+  const command: string[] = [];
+  let seenSep = false;
+  for (let i = 0; i < args.length;) {
+    const arg = args[i] as string;
+    if (!seenSep && arg === "--") {
+      seenSep = true;
+      i += 1;
+      continue;
+    }
+    if (!seenSep && arg === "--identity") {
+      identity = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (!seenSep && arg === "--profile") {
+      profileName = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (!seenSep && (arg === "--json" || isHelpFlag(arg))) {
+      if (isHelpFlag(arg)) {
+        deps.stdout(`${GITHUB_USAGE}`);
+        return { exitCode: 0 };
+      }
+      deps.stderr(`error: unknown github exec option: ${arg}\n`);
+      return { exitCode: 2 };
+    } else if (!seenSep && arg.startsWith("--")) {
+      deps.stderr(`error: unknown github exec option: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>\n`);
+      return { exitCode: 2 };
+    } else {
+      command.push(arg);
+      i += 1;
+    }
+  }
+  if (command.length === 0) {
+    deps.stderr(`error: github exec requires -- <command...> (e.g. orca-pi github exec --identity worker -- git push origin HEAD)\n`);
+    return { exitCode: 2 };
+  }
+  try {
+    const resolved = await resolveCommandIdentity({ ...(identity ? { explicitIdentity: identity } : {}), ...(profileName ? { profileName } : {}) }, deps);
+    assertIdentityMayRunCommand(resolved, command);
+    const env = deps.env ?? process.env;
+    const cache = deps.cache ?? createInstallationTokenCache();
+    let token: string;
+    const providerFs = providerFsForDeps(deps);
+    if (providerFs) {
+      const credential = await ensureInstallationToken(resolved, {
+        env,
+        cache,
+        fs: providerFs,
+        ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+        ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+      });
+      token = credential.token;
+    } else {
+      try {
+        token = resolveGithubCredential(resolved, env, cache).token;
+      } catch {
+        const fs = await nodeProviderFs();
+        const credential = await ensureInstallationToken(resolved, {
+          env,
+          cache,
+          fs,
+          ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+          ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+        });
+        token = credential.token;
+      }
+    }
+    const overlay = buildScopedEnvForIdentity(resolved, token);
+    if (deps.execSpawn) {
+      const code = await deps.execSpawn(command, { env: overlay });
+      return { exitCode: code };
+    }
+    // Production: inherit stdio, scope env to the child only.
+    const { spawn } = await import("node:child_process");
+    const [exe, ...restArgs] = command as [string, ...string[]];
+    const code: number = await new Promise((resolve) => {
+      const child = spawn(exe, restArgs, {
+        stdio: "inherit",
+        env: { ...process.env, ...overlay },
+        windowsHide: true,
+      });
+      child.on("error", () => resolve(1));
+      child.on("close", (c) => resolve(c ?? 1));
+    });
+    return { exitCode: code };
+  } catch (error) {
+    const env = deps.env ?? process.env;
+    deps.stderr(`error: ${sanitizeErrorForDisplay(error, env)}\n`);
+    return { exitCode: 1 };
+  }
+}
+
+async function readStdinText(deps: GithubCommandDeps): Promise<string> {
+  if (deps.stdinText) return await deps.stdinText();
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function runGitCredential(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
+  let identity: string | undefined;
+  let action: string | undefined;
+  for (let i = 0; i < args.length;) {
+    const arg = args[i] as string;
+    if (arg === "--identity") {
+      identity = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (isHelpFlag(arg)) {
+      deps.stdout(`${GITHUB_USAGE}`);
+      return { exitCode: 0 };
+    } else if (arg.startsWith("--")) {
+      deps.stderr(`error: unknown github git-credential option: ${arg}\n`);
+      return { exitCode: 2 };
+    } else if (!action) {
+      action = arg;
+      i += 1;
+    } else {
+      deps.stderr(`error: unexpected argument: ${arg}\n`);
+      return { exitCode: 2 };
+    }
+  }
+  try {
+    const resolved = validateIdentity(identity);
+    if (action !== "get" && action !== "store" && action !== "erase") {
+      throw new Error(`Missing action: usage orca-pi github git-credential --identity <name> <get|store|erase> (invoked by git, not manually).`);
+    }
+    const inputText = action === "get" ? await readStdinText(deps) : "";
+    const input = parseGitCredentialInput(inputText);
+    const env = deps.env ?? process.env;
+    const cache = deps.cache ?? createInstallationTokenCache();
+    const providerFs = providerFsForDeps(deps);
+    const resolveToken = async (): Promise<{ token: string }> => {
+      if (providerFs) {
+        const credential = await ensureInstallationToken(resolved, {
+          env,
+          cache,
+          fs: providerFs,
+          ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+          ...(deps.apiBase ? { apiBase: deps.apiBase } : {}),
+        });
+        return { token: credential.token };
+      }
+      return { token: resolveGithubCredential(resolved, env, cache).token };
+    };
+    const result = await handleGitCredentialRequest(resolved, action, input, resolveToken);
+    // stdout is piped to git — never add framing/logs here.
+    if (result.stdout) deps.stdout(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);
+    return { exitCode: result.exitCode };
+  } catch (error) {
+    const env = deps.env ?? process.env;
+    deps.stderr(`error: ${sanitizeErrorForDisplay(error, env)}\n`);
+    return { exitCode: 1 };
+  }
+}
+
+async function runSetupGit(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
+  let identity: string | undefined;
+  let repoPath: string | undefined;
+  let asJson = false;
+  for (let i = 0; i < args.length;) {
+    const arg = args[i] as string;
+    if (arg === "--identity") {
+      identity = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--path") {
+      repoPath = takeValue(args, i, arg).value;
+      i += 2;
+    } else if (arg === "--json") {
+      asJson = true;
+      i += 1;
+    } else if (isHelpFlag(arg)) {
+      deps.stdout(`${GITHUB_USAGE}`);
+      return { exitCode: 0 };
+    } else if (arg.startsWith("--")) {
+      deps.stderr(`error: unknown github setup-git option: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github setup-git --identity worker [--path <repo-path>] [--json]\n`);
+      return { exitCode: 2 };
+    } else {
+      deps.stderr(`error: unexpected argument: ${arg}\n`);
+      deps.stderr(`usage: orca-pi github setup-git --identity worker [--path <repo-path>] [--json]\n`);
+      return { exitCode: 2 };
+    }
+  }
+  try {
+    const resolved = validateIdentity(identity);
+    // Reviewer must never configure push credentials (Contents: read only).
+    assertWorkerIdentityForWrites(resolved);
+    const path = (repoPath ?? defaultProjectRoot(deps)).trim();
+    if (!path) throw new Error(`Missing --path <repo-path> (e.g. --path /wt/worker-checkout).`);
+    const runner = deps.runner;
+    if (!runner) throw new Error(`setup-git requires a process runner (unavailable in this host).`);
+    const receipt = await setupRepoGitAuth(runner, { repoPath: path });
+    if (asJson) {
+      deps.stdout(`${JSON.stringify({ ok: true, identity: resolved, repoPath: receipt.repoPath, helper: receipt.helperCommand, scope: "--local" }, null, 2)}\n`);
+    } else {
+      deps.stdout(`ok github setup-git — worker helper pinned repo-local in ${receipt.repoPath} (scope --local, never --global)\n`);
+    }
+    return { exitCode: 0 };
+  } catch (error) {
+    const env = deps.env ?? process.env;
+    deps.stderr(`error: ${sanitizeErrorForDisplay(error, env)}\n`);
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("Missing --") || message.includes("Invalid --") || message.includes("Refusing git config scope")) return { exitCode: 2 };
+    return { exitCode: 1 };
+  }
+}
+
 /** Route `github` subcommands. `argv` is everything after the `github` word. */
 export async function runGithubCommand(
   argv: readonly string[],
@@ -420,11 +938,31 @@ export async function runGithubCommand(
     const [action, ...authRest] = rest;
     if (action === "status") return await runAuthStatus(authRest, deps);
     deps.stderr(`error: unknown github auth action: ${action ?? "(none)"} (expected "status")\n`);
-    deps.stderr(`usage: orca-pi github auth status --identity <name> [--json]\n`);
+    deps.stderr(`usage: orca-pi github auth status [--identity <name>] [--profile <name>] [--json]\n`);
     return { exitCode: 2 };
   }
   if (subcommand === "review") return await runReview(rest, deps);
   if (subcommand === "check") return await runCheck(rest, deps);
+  if (subcommand === "doctor") return await runDoctor(rest, deps);
+  if (subcommand === "identity") {
+    const [action, ...identityRest] = rest;
+    if (action === "doctor") return await runDoctor(identityRest, deps);
+    deps.stderr(`error: unknown github identity action: ${action ?? "(none)"} (expected "doctor")\n`);
+    deps.stderr(`usage: orca-pi github identity doctor [--repo <owner/repo>] [--json]\n`);
+    return { exitCode: 2 };
+  }
+  if (subcommand === "setup") {
+    // `setup-git` is a distinct subcommand; `setup` alone is App bootstrap.
+    if (rest[0] === "-git" || (rest[0] as string) === "git") {
+      deps.stderr(`error: unknown github subcommand: ${subcommand} ${rest[0] ?? ""} (did you mean "setup-git"?)\n`);
+      return { exitCode: 2 };
+    }
+    return await runSetup(rest, deps);
+  }
+  if (subcommand === "setup-git") return await runSetupGit(rest, deps);
+  if (subcommand === "mint") return await runMint(rest, deps);
+  if (subcommand === "exec") return await runExec(rest, deps);
+  if (subcommand === "git-credential") return await runGitCredential(rest, deps);
   deps.stderr(`error: unknown github subcommand: ${subcommand}\n`);
   deps.stderr(`${GITHUB_USAGE}`);
   return { exitCode: 2 };
