@@ -36,5 +36,6 @@ profiles:
     discoverSkills: false
     discoverExtensions: false
     session: ephemeral
+    githubIdentity: worker
     displayName: Worker
     description: Bounded implementation with scoped edits and focused validation.

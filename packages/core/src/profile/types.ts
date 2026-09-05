@@ -80,6 +80,16 @@ export interface PiProfileInput {
   discoverExtensions?: boolean;
   /** Session policy. Defaults to `"ephemeral"` (never resumes). */
   session?: SessionMode;
+  /**
+   * Logical GitHub automation identity (OP1.9 / JEF-15).
+   *
+   * Names a credential slot (`"worker"`, `"reviewer"`, or a custom
+   * identity) resolved at launch/runtime through a secret provider or
+   * helper process — never a secret itself. Keeps GitHub actor selection
+   * orthogonal to Pi model/tools/skills. The deterministic Pi launcher
+   * (JEF-7) ignores it; GitHub helpers use it to select tokens.
+   */
+  githubIdentity?: string;
   /** Display-only label. Never affects execution semantics. */
   displayName?: string;
   /** Display-only description. Never affects execution semantics. */
@@ -111,6 +121,7 @@ export interface ValidatedPiProfile {
   discoverSkills?: boolean;
   discoverExtensions?: boolean;
   session?: SessionMode;
+  githubIdentity?: string;
   displayName?: string;
   description?: string;
   /** Which config source last defined this profile (for diagnostics). */
@@ -153,6 +164,7 @@ export interface ResolvedPiProfile {
   readonly discoverSkills: boolean;
   readonly discoverExtensions: boolean;
   readonly session: SessionMode;
+  readonly githubIdentity?: string;
   readonly displayName?: string;
   readonly description?: string;
 }

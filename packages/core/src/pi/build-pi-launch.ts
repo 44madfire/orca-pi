@@ -148,6 +148,20 @@ export async function buildPiLaunch(
     );
   }
 
+  // Defense-in-depth (OP1.9 / JEF-15): reviewer identities never launch
+  // with source-write tools, even if a caller bypasses resolveProfile.
+  // The authoritative guard lives in resolveProfile; this mirrors it so
+  // direct PiProcessSpec construction cannot smuggle edit/write in.
+  if (profile.githubIdentity === "reviewer" && profile.tools !== undefined) {
+    const offending = profile.tools.filter((tool) => tool === "edit" || tool === "write");
+    if (offending.length > 0) {
+      throw new Error(
+        `Pi profile "${profile.name}" uses reviewer githubIdentity but resolves with source-write tools (${offending.map((tool) => `"${tool}"`).join(", ")}). ` +
+          `The reviewer GitHub App holds Contents: read only — remove "edit"/"write" from this profile.`,
+      );
+    }
+  }
+
   const args: string[] = [];
 
   // 1-2. Provider / model (optional).

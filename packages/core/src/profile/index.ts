@@ -24,6 +24,7 @@ export {
   getBuiltinProfilesDocument,
   isBuiltinProfileName,
 } from "./builtins.js";
+export { GITHUB_IDENTITY_PATTERN, MAX_GITHUB_IDENTITY_LENGTH, REVIEWER_FORBIDDEN_TOOLS, REVIEWER_GITHUB_IDENTITY, WORKER_GITHUB_IDENTITY } from "./schema.js";
 export {
   BUILTIN_PROFILE_DEFAULTS,
   BUILTIN_TOOLS,

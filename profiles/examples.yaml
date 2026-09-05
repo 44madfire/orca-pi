@@ -1,4 +1,4 @@
-# Example Pi agent profiles (OP1.2 / JEF-6 + OP1.6 / JEF-10 defaults).
+# Example Pi agent profiles (OP1.2 / JEF-6 + OP1.6 / JEF-10 defaults + OP1.9 / JEF-15 GitHub identities).
 #
 # Fresh installs already expose built-in `scout`, `worker`, and `reviewer`
 # (model-agnostic, see `profiles/scout.yaml`, `worker.yaml`, `reviewer.yaml`
@@ -51,6 +51,7 @@ profiles:
     tools: [read, grep, find, ls, bash, edit, write]
     skills: [.pi/skills/project, .pi/skills/testing]
     contextFiles: true
+    githubIdentity: worker
     displayName: Worker
     description: Coding worker with full tool access.
 
@@ -65,5 +66,6 @@ profiles:
     discoverSkills: false
     discoverExtensions: false
     session: ephemeral
+    githubIdentity: reviewer
     displayName: Reviewer
     description: Independent review with blocking vs non-blocking findings.

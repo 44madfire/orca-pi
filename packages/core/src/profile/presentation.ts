@@ -226,6 +226,7 @@ export interface ProfileDetail {
   discoverSkills: ProfileDetailField<boolean>;
   discoverExtensions: ProfileDetailField<boolean>;
   session: ProfileDetailField<SessionMode>;
+  githubIdentity: ProfileDetailField<string | undefined>;
   displayName: ProfileDetailField<string | undefined>;
   description: ProfileDetailField<string | undefined>;
   extendsChain: readonly string[];
@@ -283,6 +284,7 @@ type ExecutionFieldName =
   | "discoverSkills"
   | "discoverExtensions"
   | "session"
+  | "githubIdentity"
   | "displayName"
   | "description";
 
@@ -511,6 +513,7 @@ export function describeProfile(
     discoverSkills: field(resolved.discoverSkills, "discoverSkills"),
     discoverExtensions: field(resolved.discoverExtensions, "discoverExtensions"),
     session: field(resolved.session, "session"),
+    githubIdentity: field(resolved.githubIdentity, "githubIdentity"),
     displayName: field(resolved.displayName, "displayName"),
     description: field(resolved.description, "description"),
     extendsChain: chain,
@@ -746,6 +749,7 @@ export function formatProfileShow(
   row("discoverSkills", detail.resolved.discoverSkills, detail.discoverSkills.provenance);
   row("discoverExtensions", detail.resolved.discoverExtensions, detail.discoverExtensions.provenance);
   row("session", detail.resolved.session, detail.session.provenance);
+  row("githubIdentity", detail.resolved.githubIdentity, detail.githubIdentity.provenance);
   if (!showPrompt && detail.resolved.systemPrompt !== undefined && detail.resolved.systemPrompt.length > PROMPT_PREVIEW_LIMIT) {
     lines.push("");
     lines.push("Note: inline prompt truncated (redacted display). Re-run with --show-prompt for the full text.");

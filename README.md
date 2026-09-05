@@ -98,6 +98,10 @@ node packages/cli/dist/main.js profile validate
 node packages/cli/dist/main.js profile path
 node packages/cli/dist/main.js status --json
 node scripts/check-skill-size.mjs
+node packages/cli/dist/main.js github auth status --identity reviewer
+node packages/cli/dist/main.js github review --identity reviewer --pr https://github.com/octo/hello-world/pull/123 --verdict request-changes --body @/tmp/review.md
+node packages/cli/dist/main.js github check start --identity reviewer --repo octo/hello-world --sha <head-sha>
+node packages/cli/dist/main.js github check complete --identity reviewer --repo octo/hello-world --sha <head-sha> --verdict approve --summary "No blocking findings."
 ```
 
 Or link it globally for the `orca-pi` name:
@@ -174,6 +178,24 @@ orca-pi doctor
 Compact orchestration keeps only minimal handle mappings
 (`<projectRoot>/.pi/orca-pi-workers.json`, best-effort); Orca remains the
 source of truth for completion/status.
+- GitHub agent identities + automated review checks (OP1.9 / JEF-15):
+  `worker` creates/updates PRs while the dedicated Reviewer GitHub App submits
+  formal `COMMENT`/`REQUEST_CHANGES`/`APPROVE` reviews and publishes the deterministic
+  `orca-pi/agent-review` check (`in_progress` → `success`/`failure`) for branch
+  protection/rulesets. Human remains merge authority (no auto-merge). Review/check
+  writes fail closed: `--identity reviewer` only, installation-token proof
+  (`GET /installation/repositories`, IAT-supported unlike `GET /user`) for the
+  trusted configured App login + distinct-from-PR-author guard before any POST
+  (same-account PATs never write); `check start` reuses the deterministic run
+  (idempotent), review retries dedupe via response-state matching.
+  - `orca-pi github auth status --identity reviewer [--json]` — credential presence
+    (source label + expiry, never values).
+  - `orca-pi github review --identity reviewer --pr <url|number|owner/repo#n> --verdict <approve|request-changes|comment> --body <text|@file> [--repo <owner/repo>] [--json]`
+  - `orca-pi github check start --identity reviewer --repo <owner/repo> --sha <sha> [--json]`
+  - `orca-pi github check complete --identity reviewer --repo <owner/repo> --sha <sha> --verdict <v> --summary <text> [--check-run-id <n>] [--json]` (idempotent: reuses the deterministic run for the SHA).
+  - Profiles reference logical identities (`githubIdentity: worker|reviewer`), never secrets;
+    tokens resolve at runtime via `ORCA_PI_GITHUB_<IDENTITY>_TOKEN` (+ optional `..._EXPIRES_AT`).
+    Reviewer holds Contents: read only — `githubIdentity: reviewer` with `edit`/`write` tools fails validation.
 
 ## Orca plugin
 

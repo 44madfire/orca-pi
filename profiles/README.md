@@ -110,6 +110,7 @@ Profile names matching `^[A-Za-z0-9][A-Za-z0-9_-]*$` are accepted except the res
 | `discoverSkills` | `--no-skills` (when `false`) | Default `false` — ambient discovery is explicit opt-in. |
 | `discoverExtensions` | `--no-extensions` (when `false`) | Default `false`. |
 | `session` | `--no-session` (when `ephemeral`) | `ephemeral` (default, no session file) or `fresh` (new saved session). Profiles can never resume (`--continue`/`--resume`/`--session`/`--fork` require explicit CLI overrides). |
+| `githubIdentity` | — (GitHub helpers only; Pi launcher ignores it) | Logical GitHub automation identity (`worker`, `reviewer`, or custom `^[A-Za-z0-9][A-Za-z0-9_-]*$`). Names a credential slot resolved at launch/runtime via `ORCA_PI_GITHUB_<IDENTITY>_TOKEN` — never a secret. `reviewer` must not list `edit`/`write` tools (Contents: read only). Built-ins: `worker → worker`, `reviewer → reviewer`, `scout` unset. |
 | `displayName`/`description` | — | Display-only; never affects execution semantics (JEF-11 UX). |
 
 Unknown fields are rejected — profiles must never contain secrets/API keys
@@ -139,6 +140,26 @@ Helpers: `getCandidateConfigPaths({ projectRoot })` returns
 in order; `resolveProfile(name, merged, { overrides })` flattens
 inheritance and applies overrides last. `loadMergedProfiles` prepends
 builtins by default (`includeBuiltins: false` only for raw layer tests).
+
+## GitHub agent identities (OP1.9 / JEF-15)
+
+Worker creates/updates PRs (human/machine-user credential); the dedicated
+Reviewer GitHub App submits formal reviews and the deterministic
+`orca-pi/agent-review` check (branch-protection ready). Human merges.
+
+```yaml
+profiles:
+  worker:
+    githubIdentity: worker
+  reviewer:
+    githubIdentity: reviewer
+```
+
+- Reviewer App permissions: Contents: read, Pull requests: write, Checks: write, Metadata: read. Never Contents: write.
+- Tokens resolve at runtime (`ORCA_PI_GITHUB_<IDENTITY>_TOKEN` + optional `..._EXPIRES_AT` ISO-8601, optional verified `ORCA_PI_GITHUB_REVIEWER_LOGIN`); mint/refresh outside LLM context. Never place keys/tokens/secrets in prompts, task text, logs, or Linear.
+- Same-account PATs are not distinct actors — install the reviewer App for a separate actor. Review/check writes fail closed: installation-token proof (`GET /installation/repositories`, IAT-supported) for the trusted configured App login (`ORCA_PI_GITHUB_REVIEWER_LOGIN` + `..._INSTALLATION_ID`) + PR-author distinctness before any POST; `--identity worker` is refused; never `GET /user` (unsupported for IATs), never token-prefix inference.
+- Resolved profiles fail closed too: `githubIdentity: reviewer` with inherited `edit`/`write` (via `extends`) is rejected at resolve/validate/show/inspect/launch time (`invalid-github-identity`).
+- CLI: `orca-pi github auth status --identity reviewer`, `orca-pi github review ...`, `orca-pi github check start|complete ...` (see root `README.md`). `check start` is idempotent (reuses the run for the SHA); identical review retries dedupe. Helpers redact token-like values from output/errors.
 
 ## Security / context rules
 
