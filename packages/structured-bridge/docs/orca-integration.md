@@ -1,5 +1,13 @@
 # Orca Integration (SNC1.3 dev branch)
 
+> Scope note (review feedback on #22): this package is the **bridge
+> protocol/host/provider testbed prerequisite** for #13. It does **not** by
+> itself close #13: the Orca-fork `ExternalStructuredSessionAdapter`, dev
+> flag, journal/Native Chat wiring, and fork-side mock E2E remain as the
+> follow-up that actually creates a *real Orca structured session* (§6).
+> Host-callback assertions in `test/host.test.ts` are explicitly a
+> “Native Chat stand-in” until that fork work lands.
+
 How the future Orca fork wires the generic seam without widening the
 public plugin surface. Until the fork exists, this package carries the
 full seam + mock so `orca-pi` development is unblocked.
@@ -101,7 +109,25 @@ input, restart (dispose + new host) starts empty, and killing the mock
 makes the host report `available:false` / `dispatch{rejected}` so the Pi
 TUI path remains.
 
-## 5. Upstream strategy
+## 5. Remaining fork work to close #13
+
+This PR must stay **part of #13, not `Closes #13`** until the fork lands:
+
+- [ ] Vendor `framing.ts` + `protocol.ts` + `host.ts` into the Orca fork
+  (temporary dev branch) and write the thin
+  `ExternalStructuredSessionAdapter` against the fork's **current**
+  `StructuredAgentSessionAdapter` contract (delegate to `BridgeHost`,
+  translate `session_event` → journal appends + Native Chat renders, keep
+  Orca ownership of journal/lease/fencing/outbox/rendering/sync).
+- [ ] Add the explicit dev-only flag + `ORCA_PI_BRIDGE_COMMAND` path
+  (no plugin-manifest widening), fail-closed fallback to the Pi TUI path.
+- [ ] Prove with a mock provider creating a **real Orca structured session**
+  streaming a fake response into the **normal Native Chat UI**, restartable
+  independently of Orca, with teardown joined to Orca teardown.
+- [ ] Open the upstream PR(s) to `stablyai/orca` (small provider-neutral
+  seam) or carry the temporary dev branch.
+
+## 6. Upstream strategy
 
 Keep the Orca PR minimal and provider-neutral: three vendored files +
 the adapter wrapper + dev-flag config + teardown wiring + mock E2E test.

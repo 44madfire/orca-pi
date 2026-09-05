@@ -16,8 +16,9 @@
  *   (including bridge-unavailable), and `unknown` on timeout / exit /
  *   malformed ack. Unknown prompts are never auto-resent.
  *
- * Teardown: `dispose()` joins Orca teardown — graceful `close`, bounded
- * wait, then SIGTERM/SIGKILL, listener detach, timer clear. Idempotent.
+ * Teardown: `dispose()` joins Orca teardown — bounded EOF grace → SIGTERM
+ * grace → SIGKILL grace → synthetic finalization (never hangs), plus
+ * listener detach and timer clear. Idempotent.
  *
  * Secret hygiene: the host never sends `env`/credentials over the bridge
  * and never includes prompt text in errors. Stderr is bounded + redacted.
@@ -73,7 +74,10 @@ export interface BridgeHostOptions {
   spawnFn?: SpawnFn;
   helloTimeoutMs?: number;
   requestTimeoutMs?: number;
+  /** EOF grace for graceful shutdown (default 2000ms). Also bounds SIGTERM/SIGKILL stages unless killGraceMs overrides. */
   closeGraceMs?: number;
+  /** Grace per kill stage (SIGTERM wait, then SIGKILL wait). Defaults to closeGraceMs. Every stage is bounded; teardown never hangs. */
+  killGraceMs?: number;
   maxStderrBytes?: number;
   hostVersion?: string;
 }
@@ -158,10 +162,16 @@ export class BridgeHost {
   }
 
   get support(): BridgeSupport {
+    // Exited always wins: a dead provider is never reported ready, even if
+    // identity/capabilities are still cached for diagnostics.
+    if (this.exited) {
+      const reason = this.helloError ?? this.spawnError ?? `provider-exited`;
+      return { available: false, reason: sanitizeReason(reason) };
+    }
     if (this.provider && this.capabilities) {
       return { available: true, reason: "bridge-ready", provider: this.provider, capabilities: this.capabilities };
     }
-    const reason = this.helloError ?? this.spawnError ?? (this.exited ? "provider-exited" : "bridge-not-started");
+    const reason = this.helloError ?? this.spawnError ?? "bridge-not-started";
     return { available: false, reason: sanitizeReason(reason) };
   }
 
@@ -211,7 +221,17 @@ export class BridgeHost {
   /** Ensure the provider is spawned + hello-negotiated. Throws fail-closed errors. */
   async ensureStarted(): Promise<BridgeSupport> {
     if (this.disposed) throw new BridgeUnavailableError("bridge host is disposed", "BRIDGE_DISPOSED");
-    if (this.provider && this.capabilities) {
+    // A dead child never reports ready. Calling ensureStarted/probeSupport/
+    // restart is the explicit restart path: drop the dead child and reset
+    // exit diagnostics so the next hello starts fresh. dispatch()
+    // deliberately bypasses this after exit (fail-closed, no auto-respawn).
+    if (this.exited) {
+      await this.abandonChildBestEffort();
+      this.exited = null;
+      this.helloError = null;
+      this.spawnError = null;
+    }
+    if (this.provider && this.capabilities && !this.exited) {
       return { available: true, reason: "bridge-ready", provider: this.provider, capabilities: this.capabilities };
     }
     if (!this.starting) this.starting = this.startAndHello();
@@ -220,6 +240,20 @@ export class BridgeHost {
     } finally {
       this.starting = null;
     }
+  }
+
+  /**
+   * Explicit restart: bounded teardown of any current child (healthy, dead,
+   * or failed), then fresh hello negotiation. Use after exit/failure instead
+   * of relying on implicit respawn (dispatch never auto-respawns after death).
+   */
+  async restart(): Promise<BridgeSupport> {
+    if (this.disposed) throw new BridgeUnavailableError("bridge host is disposed", "BRIDGE_DISPOSED");
+    await this.abandonChildBestEffort();
+    this.exited = null;
+    this.helloError = null;
+    this.spawnError = null;
+    return this.ensureStarted();
   }
 
   private async startAndHello(): Promise<BridgeSupport> {
@@ -239,18 +273,24 @@ export class BridgeHost {
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       this.helloError = `hello-failed: ${reason}`;
+      // Failed negotiation must not leave a resident helper when the caller
+      // falls back to Pi TUI and never touches the bridge again.
+      await this.abandonChildBestEffort();
       throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_HELLO_FAILED");
     }
     if (ack.kind === "hello_error") {
       this.helloError = `provider-refused: ${ack.error.code}`;
+      await this.abandonChildBestEffort();
       throw new BridgeUnavailableError(sanitizeReason(`provider-refused: ${ack.error.code}`), ack.error.code);
     }
     if (ack.kind !== "hello_ok") {
       this.helloError = `unexpected-hello-reply: ${ack.kind}`;
+      await this.abandonChildBestEffort();
       throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_HELLO_UNEXPECTED");
     }
     if (ack.provider.protocol !== BRIDGE_PROTOCOL_VERSION) {
       this.helloError = `incompatible-protocol: provider=${ack.provider.protocol} host=${BRIDGE_PROTOCOL_VERSION}`;
+      await this.abandonChildBestEffort();
       throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_INCOMPATIBLE");
     }
     this.provider = ack.provider;
@@ -258,7 +298,34 @@ export class BridgeHost {
     return { available: true, reason: "bridge-ready", provider: this.provider, capabilities: this.capabilities };
   }
 
+  /**
+   * Best-effort bounded teardown of a failed/dead child without clearing the
+   * diagnostic reason (helloError/spawnError/exited). Leaves the host ready
+   * for an explicit restart: proc nulled, reader detached, provider cleared.
+   * Never throws and never hangs (bounded SIGTERM/SIGKILL + synthetic finish).
+   */
+  private async abandonChildBestEffort(): Promise<void> {
+    const proc = this.proc;
+    if (proc) {
+      try {
+        await this.shutdownProcessInner(proc, "force");
+      } catch {
+        // Best-effort: never let cleanup throw.
+      }
+    }
+    this.detachReader?.();
+    this.detachReader = null;
+    this.proc = null;
+    this.provider = null;
+    this.capabilities = null;
+    this.sessions.clear();
+    // Do not clear helloError/spawnError/exited here: support.reason needs them.
+    // ensureStarted/restart reset them before a fresh spawn (see below).
+  }
+
   private spawnProvider(): void {
+    // A finalized dead child (see exit handler) leaves proc nulled so the
+    // next explicit start spawns fresh. A live proc is reused.
     if (this.proc) return;
     const spawnFn: SpawnFn = this.options.spawnFn ?? ((spawn as unknown) as SpawnFn);
     const env = this.options.env ? { ...process.env, ...this.options.env } : { ...process.env };
@@ -288,6 +355,16 @@ export class BridgeHost {
     });
     proc.on("exit", (code: number | null, signal: string | null) => {
       this.exited = { code, signal };
+      // Finalize so support/ensureStarted never report stale ready and the
+      // next explicit start spawns fresh. In-flight dispatches resolve
+      // `unknown` (ambiguous ownership); post-exit dispatches reject as
+      // bridge-unavailable without auto-respawn (see dispatch()).
+      this.provider = null;
+      this.capabilities = null;
+      this.sessions.clear();
+      this.detachReader?.();
+      this.detachReader = null;
+      this.proc = null;
       this.failAllPending(new BridgeUnavailableError(`provider-exited code=${code} signal=${signal}`, "BRIDGE_EXITED"));
       this.emitLifecycle({ kind: "provider-exit", message: `provider exited code=${code} signal=${signal}`, code, signal });
     });
@@ -341,12 +418,24 @@ export class BridgeHost {
     queue?: "reject" | "steer" | "followUp";
   }): Promise<DispatchOutcome> {
     if (this.disposed) return { status: "rejected", opId: createOpId("dsp"), reason: "bridge-disposed" };
+    // Fail-closed after death: a previously healthy provider that has exited
+    // is definitely unavailable. Do NOT auto-respawn here (that would turn a
+    // definite rejection into an ambiguous `unknown` against a fresh provider
+    // with no such session). Explicit restart() / ensureStarted() respawns.
+    if (this.exited) {
+      return { status: "rejected", opId: createOpId("dsp"), reason: sanitizeReason(`bridge-unavailable: provider-exited`) };
+    }
     if (!this.isReady) {
       try {
         await this.ensureStarted();
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         return { status: "rejected", opId: createOpId("dsp"), reason: sanitizeReason(`bridge-unavailable: ${reason}`) };
+      }
+      // ensureStarted may have raced with an exit (respawn still pending or
+      // child died during hello): re-check before writing to a dead process.
+      if (this.exited || !this.isReady) {
+        return { status: "rejected", opId: createOpId("dsp"), reason: sanitizeReason(`bridge-unavailable: provider-exited`) };
       }
     }
     const opId = createOpId("dsp");
@@ -454,10 +543,14 @@ export class BridgeHost {
 
   // -- teardown (joins Orca teardown) -----------------------------------------
 
-  /** Graceful (`close` + bounded wait) or forceful provider shutdown. */
+  /**
+   * Graceful (`close` + EOF→SIGTERM→SIGKILL, each bounded) or forceful
+   * (SIGKILL, bounded) provider shutdown. Never hangs: every stage has a
+   * hard deadline and ends with synthetic finalization.
+   */
   async close(mode: "graceful" | "force" = "graceful"): Promise<{ code: number | null; signal: string | null }> {
     const proc = this.proc;
-    if (!proc) return { code: null, signal: null };
+    if (!proc) return this.exited ? { ...this.exited } : { code: null, signal: null };
     if (mode === "graceful" && this.isReady) {
       try {
         const opId = createOpId("cls");
@@ -626,6 +719,68 @@ export class BridgeHost {
     }
   }
 
+  private killGraceMs(): number {
+    return this.options.killGraceMs ?? this.options.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
+  }
+
+  /** Wait for one explicit proc's exit with a hard deadline; always resolves. */
+  private waitForProcExit(proc: ChildProcess, timeoutMs: number): Promise<{ code: number | null; signal: string | null } | "timeout"> {
+    // Fast path: already observed via the host exit handler or exitCode.
+    if (this.exited) return Promise.resolve({ ...this.exited });
+    if ((proc.exitCode as number | null | undefined) != null || (proc as unknown as { signalCode?: string | null }).signalCode != null) {
+      return Promise.resolve({ code: proc.exitCode, signal: (proc as unknown as { signalCode?: string | null }).signalCode ?? null });
+    }
+    return new Promise((resolve) => {
+      const onExit = (code: number | null, signal: string | null): void => {
+        clearTimeout(timer);
+        resolve({ code, signal });
+      };
+      const timer = setTimeout(() => {
+        proc.off("exit", onExit);
+        resolve("timeout");
+      }, timeoutMs);
+      proc.once("exit", onExit);
+    });
+  }
+
+  /**
+   * Bounded shutdown of one explicit child: EOF grace → SIGTERM grace →
+   * SIGKILL grace → synthetic `{code:null,signal:null}`. Never hangs, even
+   * if the helper ignores stdin EOF, SIGTERM, and SIGKILL (regression: fake
+   * that swallows all three still resolves within ~3 graces).
+   */
+  private async shutdownProcessInner(proc: ChildProcess, mode: "graceful" | "force"): Promise<{ code: number | null; signal: string | null }> {
+    const eofGrace = this.options.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
+    const killGrace = this.killGraceMs();
+    if (mode === "graceful") {
+      try {
+        (proc.stdin as unknown as { end(): void }).end();
+      } catch {
+        // Already closed.
+      }
+      const eof = await this.waitForProcExit(proc, eofGrace);
+      if (eof !== "timeout") return eof;
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // Already exited.
+      }
+      const termed = await this.waitForProcExit(proc, killGrace);
+      if (termed !== "timeout") return termed;
+    }
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // Already exited.
+    }
+    const killed = await this.waitForProcExit(proc, killGrace);
+    if (killed !== "timeout") return killed;
+    // Synthetic finalization: the helper ignored even SIGKILL (only possible
+    // for swallowed-signal fakes; real SIGKILL cannot be ignored). Resolve
+    // teardown instead of hanging Orca; caller nulls/detaches regardless.
+    return { code: null, signal: null };
+  }
+
   private async shutdownProcess(mode: "graceful" | "force"): Promise<{ code: number | null; signal: string | null }> {
     const proc = this.proc;
     if (!proc) return { code: null, signal: null };
@@ -637,27 +792,6 @@ export class BridgeHost {
     if ((proc.exitCode as number | null | undefined) != null || (proc as unknown as { signalCode?: string | null }).signalCode != null) {
       return { code: proc.exitCode, signal: (proc as unknown as { signalCode?: string | null }).signalCode ?? null };
     }
-    const graceMs = this.options.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
-    const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
-      proc.on("exit", (code: number | null, signal: string | null) => resolve({ code, signal }));
-    });
-    if (mode === "graceful") {
-      try {
-        (proc.stdin as unknown as { end(): void }).end();
-      } catch {
-        // Already closed.
-      }
-      const winner = await Promise.race([
-        exit,
-        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), graceMs)),
-      ]);
-      if (winner !== "timeout") return winner;
-    }
-    try {
-      proc.kill(mode === "force" ? "SIGKILL" : "SIGTERM");
-    } catch {
-      // Already exited.
-    }
-    return exit;
+    return this.shutdownProcessInner(proc, mode);
   }
 }

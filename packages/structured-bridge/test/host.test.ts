@@ -405,6 +405,170 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     await host.dispose();
   });
 
+  it("teardown is bounded when the helper ignores EOF, SIGTERM, and SIGKILL", async () => {
+    const proc = createFakeProc();
+    // Swallow everything: EOF never exits, signals never exit.
+    proc.stdin.end = (() => {
+      proc.stdinEnded = true;
+    }) as never;
+    proc.kill = (vi.fn((signal?: string) => {
+      proc.killedWith.push(signal);
+      // Intentionally never emits exit: simulates a hung helper.
+    }) as never);
+    proc.stdin.write = ((s: string) => {
+      for (const line of s.split("\n")) {
+        if (line.trim() === "") continue;
+        const msg = JSON.parse(line) as { opId: string; kind: string };
+        if (msg.kind === "hello") {
+          proc.stdout.emit(
+            "data",
+            Buffer.from(
+              serializeBridgeLine({ v: 1, kind: "hello_ok", opId: msg.opId, provider: { id: "hung", version: "0", protocol: 1 }, capabilities: { textStreaming: true, thinking: false, tools: false, images: false, extensionDialogs: false, history: false, options: false, cancel: false, resume: false } }),
+              "utf8",
+            ),
+          );
+        }
+      }
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "hung-helper",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn: (() => proc) as never,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 500,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    expect((await host.probeSupport()).available).toBe(true);
+    // Graceful must still resolve (~EOF+TERM+KILL graces) and attempt both signals.
+    const closed = await host.close("graceful");
+    expect(closed).toEqual({ code: null, signal: null });
+    expect(proc.killedWith).toContain("SIGTERM");
+    expect(proc.killedWith).toContain("SIGKILL");
+    // Force is likewise bounded (single SIGKILL grace + synthetic finish).
+    const forced = await host.close("force");
+    expect(forced).toEqual({ code: null, signal: null });
+    // Dispose joins teardown without hanging and clears waiters.
+    await host.dispose();
+    expect(host.pendingCount).toBe(0);
+    expect(host.isReady).toBe(false);
+  });
+
+  it("provider exit finalizes support fail-closed until explicit restart", async () => {
+    const procs: ReturnType<typeof createFakeProc>[] = [];
+    let spawns = 0;
+    const spawnFn = (() => {
+      spawns += 1;
+      const proc = createFakeProc();
+      procs.push(proc);
+      proc.stdin.write = ((s: string) => {
+        for (const line of s.split("\n")) {
+          if (line.trim() === "") continue;
+          const msg = JSON.parse(line) as { opId: string; kind: string; sessionId?: string; message?: { text?: string } };
+          if (msg.kind === "hello") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "hello_ok", opId: msg.opId, provider: { id: "flappy", version: "0", protocol: 1 }, capabilities: { textStreaming: true, thinking: false, tools: false, images: false, extensionDialogs: false, history: false, options: false, cancel: false, resume: false } }),
+                "utf8",
+              ),
+            );
+          } else if (msg.kind === "acquire") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "acquired", opId: msg.opId, sessionId: "ses_1", resumed: false, metadata: { sessionId: "ses_1", workspaceRoot: "/tmp/ws", messageCount: 0, isStreaming: false, createdAt: new Date().toISOString() } }),
+                "utf8",
+              ),
+            );
+          } else if (msg.kind === "dispatch") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId ?? "ses_1", status: "accepted" }),
+                "utf8",
+              ),
+            );
+          }
+        }
+      }) as never;
+      return proc;
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "flappy-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 1000,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    expect((await host.probeSupport()).available).toBe(true);
+    expect(spawns).toBe(1);
+    // Crash the previously healthy provider.
+    procs[0]?.emit("exit", 1, null);
+    // Let the exit handler run.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(host.support.available).toBe(false);
+    expect(host.isReady).toBe(false);
+    // Post-exit dispatch is definitely unavailable (rejected), not ambiguous
+    // `unknown`, and must not implicitly respawn.
+    const outcome = await host.dispatch({ sessionId: "ses_1", text: "after crash" });
+    expect(outcome.status).toBe("rejected");
+    expect(outcome.reason).toMatch(/bridge-unavailable/);
+    expect(spawns).toBe(1);
+    // Explicit restart respawns and serves again.
+    expect((await host.restart()).available).toBe(true);
+    expect(spawns).toBe(2);
+    const reacquired = await host.acquire();
+    expect(reacquired.sessionId).toBe("ses_1");
+    await host.dispose();
+  });
+
+  it("failed hello tears down the helper instead of leaving it resident", async () => {
+    const procs: ReturnType<typeof createFakeProc>[] = [];
+    let spawns = 0;
+    const spawnFn = (() => {
+      spawns += 1;
+      const proc = createFakeProc();
+      procs.push(proc);
+      proc.stdin.write = ((s: string) => {
+        for (const line of s.split("\n")) {
+          if (line.trim() === "") continue;
+          const msg = JSON.parse(line) as { opId: string; kind: string };
+          if (msg.kind === "hello") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(serializeBridgeLine({ v: 1, kind: "hello_error", opId: msg.opId, error: { code: "INCOMPATIBLE_PROTOCOL", message: "need v2" } }), "utf8"),
+            );
+          }
+        }
+      }) as never;
+      return proc;
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "incompatible-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 1000,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    expect((await host.probeSupport()).available).toBe(false);
+    expect(spawns).toBe(1);
+    // Failed negotiation must have torn down the child (bounded SIGKILL path).
+    expect(procs[0]?.killedWith).toContain("SIGKILL");
+    // A later explicit probe retries fresh instead of reusing the dead child.
+    expect((await host.probeSupport()).available).toBe(false);
+    expect(spawns).toBe(2);
+    expect(procs[1]?.killedWith).toContain("SIGKILL");
+    await host.dispose();
+  });
+
   it("drives a real external OS process and restarts it independently", async () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const cli = path.resolve(here, "../dist/mock-provider-cli.js");

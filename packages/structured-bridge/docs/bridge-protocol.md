@@ -140,10 +140,11 @@ only opIds, kinds, and codes.
 | Situation | Host behavior | Orca UX |
 |---|---|---|
 | Missing binary / spawn error | `probeSupport() → {available:false}` | Ordinary Pi TUI, untouched |
-| Hello timeout / `hello_error` / version mismatch | `available:false`, `reason` kept | Pi TUI + one-line notice |
-| `dispatch` while unavailable/disposed | `{status:rejected, reason: bridge-unavailable…}` | Fall back to TUI send |
+| Hello timeout / `hello_error` / version mismatch | `available:false`, `reason` kept, helper torn down (no resident process) | Pi TUI + one-line notice |
+| `dispatch` while unavailable/disposed/never-started | `{status:rejected, reason: bridge-unavailable…}` (explicit `ensureStarted`/`restart` may still start fresh) | Fall back to TUI send |
+| `dispatch` after a previously healthy provider exited | `{status:rejected, reason: bridge-unavailable: provider-exited}` — no implicit respawn; explicit `restart()` respawns | Fall back to TUI; offer explicit reconnect |
 | Provider `dispatch_ack{rejected}` | `{status:rejected}` | Surface `reason`, keep TUI available |
-| Dispatch timeout / exit / malformed ack | `{status:unknown}` | "Check history before retrying — never auto-resend" |
+| Dispatch timeout / malformed ack / exit racing an in-flight send | `{status:unknown}` | "Check history before retrying — never auto-resend" |
 | Malformed provider line | Ignored; waiter deadline → `unknown` | No crash, no journal corruption |
 | `cancel`/`history`/`options` transport failure | Throw `BridgeUnavailableError` (not silent) | Toast + TUI fallback |
 
@@ -152,14 +153,26 @@ only opIds, kinds, and codes.
 
 ## 8. Lifecycle / teardown
 
-- `close{graceful}`: host sends `close`, waits ≤3s for `closed`, EOFs
-  stdin, waits `closeGraceMs` (default 2s), then SIGTERM.
-- `close{force}` / `dispose()`: SIGKILL path, reader detach, timer clear,
-  listener clear. `dispose()` is idempotent and joins Orca teardown —
-  no leaked helper processes or `data`/`exit` listeners.
+Every stage is bounded; teardown never hangs (regression: fake ignoring
+EOF/SIGTERM/SIGKILL still resolves within ~3 graces):
+
+- `close{graceful}`: host sends `close` (≤3s for `closed`), EOFs stdin and
+  waits `closeGraceMs` (default 2s), then SIGTERM and waits `killGraceMs`
+  (default: `closeGraceMs`), then SIGKILL and waits `killGraceMs`, then
+  synthetic `{code:null,signal:null}` finalization.
+- `close{force}`: skips `close`/EOF, SIGKILL + `killGraceMs` wait +
+  synthetic finish. `dispose()`: graceful then force, reader detach, timer
+  clear, listener/session clear. Idempotent and joins Orca teardown — no
+  leaked helper processes or `data`/`exit` listeners.
 - Provider exits 0 on stdin EOF; `exiting{code,signal,reason}` precedes
-  abnormal exits. Restart = new OS process + fresh `hello` + `acquire`;
-  sessions do not survive restarts (mock proves this; Pi resume is SNC1.7).
+  abnormal exits. Exit finalizes host state (`provider`/`capabilities`/
+  sessions cleared, `support.available:false`); post-exit `dispatch` rejects
+  as `bridge-unavailable` until explicit `restart()`. In-flight sends racing
+  exit resolve `unknown`. Explicit restart = new OS process + fresh `hello`
+  + `acquire`; sessions do not survive restarts (mock proves this; Pi
+  resume is SNC1.7).
+- Failed hello/version negotiation tears down the helper (bounded force
+  path) so falling back to Pi TUI never leaves a resident process.
 
 ## 9. Mock test hooks (deterministic, documented)
 
