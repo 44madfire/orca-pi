@@ -11,23 +11,33 @@ import { BRIDGE_PROTOCOL_VERSION } from "../src/protocol.js";
 /** Minimal ChildProcess stand-in for BridgeHost tests. */
 function createFakeProc() {
   const proc = new EventEmitter() as EventEmitter & {
-    stdin: { write: (s: string) => void; end: () => void };
-    stdout: EventEmitter;
-    stderr: EventEmitter;
+    stdin: EventEmitter & { write: (s: string) => void; end: () => void };
+    stdout: EventEmitter & { destroy: () => void; destroyed: boolean };
+    stderr: EventEmitter & { destroy: () => void; destroyed: boolean };
     kill: (signal?: string) => void;
     killedWith: (string | undefined)[];
     stdinEnded: boolean;
   };
-  proc.stdout = new EventEmitter();
-  proc.stderr = new EventEmitter();
+  const stdout = new EventEmitter() as EventEmitter & { destroy: () => void; destroyed: boolean };
+  stdout.destroyed = false;
+  stdout.destroy = vi.fn(() => {
+    stdout.destroyed = true;
+  }) as never;
+  const stderr = new EventEmitter() as EventEmitter & { destroy: () => void; destroyed: boolean };
+  stderr.destroyed = false;
+  stderr.destroy = vi.fn(() => {
+    stderr.destroyed = true;
+  }) as never;
+  const stdin = new EventEmitter() as EventEmitter & { write: (s: string) => void; end: () => void };
+  proc.stdout = stdout;
+  proc.stderr = stderr;
   proc.killedWith = [];
   proc.stdinEnded = false;
-  proc.stdin = {
-    write: () => undefined,
-    end: () => {
-      proc.stdinEnded = true;
-    },
+  stdin.write = () => undefined;
+  stdin.end = () => {
+    proc.stdinEnded = true;
   };
+  proc.stdin = stdin;
   proc.kill = vi.fn((signal?: string) => {
     proc.killedWith.push(signal);
     queueMicrotask(() => proc.emit("exit", null, signal ?? "SIGTERM"));
@@ -590,13 +600,17 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     expect((await host.probeSupport()).available).toBe(true);
     expect(spawns).toBe(1);
     // Terminal process error with NO subsequent exit (Node does not guarantee
-    // exit after error): must still finalize like an exit.
+    // exit after error): must still finalize like an exit — and actually tear
+    // the errored child down (kill + destroy) before any replacement spawns.
     procs[0]?.emit("error", new Error("EPIPE: broken pipe"));
     await new Promise((r) => setTimeout(r, 10));
     expect(host.support.available).toBe(false);
     expect(host.support.reason).toMatch(/process-error/);
     expect(host.isReady).toBe(false);
     expect(lifecycle).toContain("provider-error");
+    expect(procs[0]?.killedWith).toContain("SIGKILL");
+    expect(procs[0]?.stdout.destroyed).toBe(true);
+    expect(procs[0]?.stderr.destroyed).toBe(true);
     const outcome = await host.dispatch({ sessionId: "ses_1", text: "after error" });
     expect(outcome.status).toBe("rejected");
     expect(outcome.reason).toMatch(/bridge-unavailable/);
@@ -606,6 +620,68 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     expect(spawns).toBe(2);
     const reacquired = await host.acquire();
     expect(reacquired.sessionId).toBe("ses_1");
+    await host.dispose();
+  });
+
+  it("async stdin EPIPE becomes shaped fail-closed failure (no crash, restartable)", async () => {
+    const procs: ReturnType<typeof createFakeProc>[] = [];
+    let spawns = 0;
+    const spawnFn = (() => {
+      spawns += 1;
+      const proc = createFakeProc();
+      procs.push(proc);
+      proc.stdin.write = ((s: string) => {
+        for (const line of s.split("\n")) {
+          if (line.trim() === "") continue;
+          const msg = JSON.parse(line) as { opId: string; kind: string };
+          if (msg.kind === "hello") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "hello_ok", opId: msg.opId, provider: { id: "epipe", version: "0", protocol: 1 }, capabilities: { textStreaming: true, thinking: false, tools: false, images: false, extensionDialogs: false, history: false, options: false, cancel: false, resume: false } }),
+                "utf8",
+              ),
+            );
+          } else if (msg.kind === "close") {
+            proc.stdout.emit(
+              "data",
+              Buffer.from(
+                serializeBridgeLine({ v: 1, kind: "closed", opId: msg.opId, exit: { code: 0, signal: null } }),
+                "utf8",
+              ),
+            );
+          }
+        }
+      }) as never;
+      return proc;
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "epipe-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 1000,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    const lifecycle: string[] = [];
+    host.onLifecycle((e) => lifecycle.push(e.kind));
+    expect((await host.probeSupport()).available).toBe(true);
+    // Async stdin stream failure (never a sync write throw): must not crash
+    // or throw unhandled — it funnels to the terminal finalizer instead.
+    procs[0]?.stdin.emit("error", new Error("EPIPE: write EPIPE"));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(host.support.available).toBe(false);
+    expect(host.support.reason).toMatch(/transport-stdin-error/);
+    expect(lifecycle).toContain("provider-error");
+    expect(procs[0]?.killedWith).toContain("SIGKILL");
+    const outcome = await host.dispatch({ sessionId: "ses_1", text: "after epipe" });
+    expect(outcome.status).toBe("rejected");
+    expect(outcome.reason).toMatch(/bridge-unavailable/);
+    expect(spawns).toBe(1);
+    expect((await host.restart()).available).toBe(true);
+    expect(spawns).toBe(2);
     await host.dispose();
   });
 

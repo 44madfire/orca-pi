@@ -165,14 +165,17 @@ EOF/SIGTERM/SIGKILL still resolves within ~3 graces):
   clear, listener/session clear. Idempotent and joins Orca teardown — no
   leaked helper processes or `data`/`exit` listeners.
 - Provider exits 0 on stdin EOF; `exiting{code,signal,reason}` precedes
-  abnormal exits. Exit *or terminal process `error`* finalizes host state
-  (`provider`/`capabilities`/sessions cleared, `support.available:false`;
-  `error` without a later `exit` is treated the same since Node does not
-  guarantee `exit` after `error`). Post-exit/error `dispatch` rejects as
-  `bridge-unavailable` until explicit `restart()`. In-flight sends racing
-  exit/error resolve `unknown`. Explicit restart = new OS process + fresh
-  `hello` + `acquire`; sessions do not survive restarts (mock proves this;
-  Pi resume is SNC1.7).
+  abnormal exits. Exit, terminal child `error`, or async stdin/stdout/stderr
+  stream `error` all funnel through one terminal finalizer: provider/
+  capabilities/sessions invalidated, every listener detached, the failing
+  child SIGKilled + stdio destroyed while still reachable, then ownership
+  cleared (`support.available:false`; `error` without a later `exit` is
+  treated the same since Node does not guarantee `exit` after `error`, and
+  async EPIPE never surfaces as an uncaught stream exception).
+  Post-failure `dispatch` rejects as `bridge-unavailable` until explicit
+  `restart()`. In-flight sends racing the failure resolve `unknown`.
+  Explicit restart = new OS process + fresh `hello` + `acquire`; sessions do
+  not survive restarts (mock proves this; Pi resume is SNC1.7).
 - `dispose()` attempts the bridge `close` handshake whenever the child is
   healthy (even mid-teardown), then falls back to bounded EOF/kill; a dead
   or failed child skips the handshake and goes straight to bounded process

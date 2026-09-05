@@ -131,6 +131,7 @@ function sanitizeReason(message: string): string {
 export class BridgeHost {
   private proc: ChildProcess | null = null;
   private detachReader: (() => void) | null = null;
+  private detachFns: (() => void)[] = [];
   private readonly pending = new Map<string, PendingEntry>();
   private readonly sessionListeners = new Set<(envelope: SessionEventEnvelope) => void>();
   private readonly lifecycleListeners = new Set<(envelope: LifecycleEnvelope) => void>();
@@ -314,8 +315,7 @@ export class BridgeHost {
         // Best-effort: never let cleanup throw.
       }
     }
-    this.detachReader?.();
-    this.detachReader = null;
+    this.detachAll();
     this.proc = null;
     this.provider = null;
     this.capabilities = null;
@@ -343,45 +343,171 @@ export class BridgeHost {
       throw new BridgeUnavailableError(sanitizeReason(this.spawnError), "BRIDGE_SPAWN_FAILED");
     }
     this.proc = proc;
-    proc.stderr?.on("data", (chunk: Buffer | string) => {
+    const stdout = proc.stdout as unknown as (NodeJS.ReadableStream & { on(event: string, listener: (...args: never[]) => void): unknown; off(event: string, listener: (...args: never[]) => void): unknown; destroy?: () => void }) | null;
+    const stderr = proc.stderr as unknown as (NodeJS.ReadableStream & { on(event: string, listener: (...args: never[]) => void): unknown; off(event: string, listener: (...args: never[]) => void): unknown; destroy?: () => void }) | null;
+    const stdin = proc.stdin as unknown as ({ on?(event: string, listener: (...args: never[]) => void): unknown; off?(event: string, listener: (...args: never[]) => void): unknown } | null);
+    const onStderrData = (chunk: Buffer | string): void => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       this.stderr += text;
       if (this.stderr.length > this.maxStderr * 2) this.stderr = this.stderr.slice(-this.maxStderr);
+    };
+    stderr?.on("data", onStderrData as (...args: never[]) => void);
+    this.detachFns.push(() => {
+      try {
+        stderr?.off("data", onStderrData as (...args: never[]) => void);
+      } catch {
+        // Cleanup must not throw.
+      }
     });
     this.detachReader = attachBridgeReader(proc.stdout as unknown as BridgeReadable, (line) => this.onLine(line));
-    proc.on("error", (error: Error) => {
-      this.spawnError = `process-error: ${error.message}`;
-      // Terminal fail-closed finalization (same as exit): Node documents that
-      // `exit` may never fire after `error`, so the exit handler cannot be
-      // relied on to repair state. Invalidate provider/session ownership now;
-      // if `exit` later fires on the old proc, that handler idempotently
-      // refreshes `exited` with the real code/signal. Post-error dispatch
-      // rejects bridge-unavailable until explicit restart (see dispatch()).
-      if (!this.exited) this.exited = { code: null, signal: null };
-      this.provider = null;
-      this.capabilities = null;
-      this.sessions.clear();
-      this.detachReader?.();
-      this.detachReader = null;
-      this.proc = null;
-      this.failAllPending(new BridgeUnavailableError(sanitizeReason(this.spawnError), "BRIDGE_PROCESS_ERROR"));
-      this.emitLifecycle({ kind: "provider-error", message: sanitizeReason(this.spawnError) });
+    const detachStdoutReader = this.detachReader;
+    this.detachFns.push(() => {
+      try {
+        detachStdoutReader();
+      } catch {
+        // Cleanup must not throw.
+      }
     });
-    proc.on("exit", (code: number | null, signal: string | null) => {
-      this.exited = { code, signal };
-      // Finalize so support/ensureStarted never report stale ready and the
-      // next explicit start spawns fresh. In-flight dispatches resolve
-      // `unknown` (ambiguous ownership); post-exit dispatches reject as
-      // bridge-unavailable without auto-respawn (see dispatch()).
-      this.provider = null;
-      this.capabilities = null;
-      this.sessions.clear();
+    // Async stream failures (e.g. EPIPE after the helper closes stdin)
+    // surface via `error` events, never as synchronous write() throws.
+    // Without these listeners they become uncaught exceptions; with them
+    // they become shaped fail-closed bridge failures (same finalizer as a
+    // child error). Guards inside ignore teardown races; minimal fake
+    // stdins may be write-only `{write,end}` without an emitter.
+    const onStdinError = (error: unknown): void => {
+      this.terminateOnTransportError("stdin", error);
+    };
+    const onStdoutError = (error: unknown): void => {
+      this.terminateOnTransportError("stdout", error);
+    };
+    const onStderrError = (error: unknown): void => {
+      this.terminateOnTransportError("stderr", error);
+    };
+    const onChildError = (error: unknown): void => {
+      this.terminateOnTransportError("child", error);
+    };
+    const onChildExit = (code: number | null, signal: string | null): void => {
+      this.handleChildExit(code, signal);
+    };
+    try {
+      stdin?.on?.("error", onStdinError as (...args: never[]) => void);
+    } catch {
+      // Ignore (write-only fake stdin).
+    }
+    try {
+      stdout?.on?.("error", onStdoutError as (...args: never[]) => void);
+    } catch {
+      // Ignore.
+    }
+    try {
+      stderr?.on?.("error", onStderrError as (...args: never[]) => void);
+    } catch {
+      // Ignore.
+    }
+    proc.on("error", onChildError);
+    proc.on("exit", onChildExit);
+    const off = (emitter: { off?(event: string, listener: (...args: never[]) => void): unknown } | null | undefined, event: string, listener: (...args: never[]) => void): void => {
+      try {
+        emitter?.off?.(event, listener);
+      } catch {
+        // Cleanup must not throw.
+      }
+    };
+    this.detachFns.push(() => off(stdin, "error", onStdinError as (...args: never[]) => void));
+    this.detachFns.push(() => off(stdout as unknown as { off?(event: string, listener: (...args: never[]) => void): unknown } | null, "error", onStdoutError as (...args: never[]) => void));
+    this.detachFns.push(() => off(stderr as unknown as { off?(event: string, listener: (...args: never[]) => void): unknown } | null, "error", onStderrError as (...args: never[]) => void));
+    this.detachFns.push(() => off(proc as unknown as { off?(event: string, listener: (...args: never[]) => void): unknown }, "error", onChildError as (...args: never[]) => void));
+    this.detachFns.push(() => off(proc as unknown as { off?(event: string, listener: (...args: never[]) => void): unknown }, "exit", onChildExit as (...args: never[]) => void));
+  }
+
+  /** Detach every listener attached in spawnProvider (reader, data, stdio/child errors, exit). Never throws. */
+  private detachAll(): void {
+    const fns = this.detachFns.splice(0);
+    for (const fn of fns) {
+      try {
+        fn();
+      } catch {
+        // Cleanup must not throw.
+      }
+    }
+    try {
       this.detachReader?.();
-      this.detachReader = null;
-      this.proc = null;
-      this.failAllPending(new BridgeUnavailableError(`provider-exited code=${code} signal=${signal}`, "BRIDGE_EXITED"));
-      this.emitLifecycle({ kind: "provider-exit", message: `provider exited code=${code} signal=${signal}`, code, signal });
-    });
+    } catch {
+      // Ignore.
+    }
+    this.detachReader = null;
+  }
+
+  /**
+   * Terminal transport failure without a guaranteed process exit (async
+   * stdin/stdout/stderr `error`, or child `error` with no subsequent
+   * `exit`). Invalidates provider/session ownership, detaches every
+   * listener, best-effort SIGKills + destroys stdio while the failing proc
+   * is still reachable, then clears it — so an `error`-without-`exit` child
+   * can never orphan a live helper while the host spawns a replacement.
+   * In-flight dispatches resolve `unknown` (the write may or may not have
+   * landed); post-failure dispatch rejects `bridge-unavailable` until
+   * explicit restart/probe. Idempotent: a later `exit` on the detached old
+   * proc is a no-op (listener removed). Diagnostics carry only the stream
+   * name + OS message (never prompt text or env).
+   */
+  private terminateOnTransportError(source: "stdin" | "stdout" | "stderr" | "child", error: unknown): void {
+    const proc = this.proc;
+    if (!proc && this.exited) return;
+    const osMessage = sanitizeReason(error instanceof Error ? error.message : String(error));
+    this.spawnError = source === "child" ? `process-error: ${osMessage}` : `transport-${source}-error: ${osMessage}`;
+    if (!this.exited) this.exited = { code: null, signal: null };
+    this.provider = null;
+    this.capabilities = null;
+    this.sessions.clear();
+    this.detachAll();
+    // Keep the failing proc reachable just long enough to kill/destroy it.
+    try {
+      proc?.kill("SIGKILL");
+    } catch {
+      // Already dead.
+    }
+    try {
+      (proc?.stdout as unknown as { destroy?: () => void })?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    try {
+      (proc?.stderr as unknown as { destroy?: () => void })?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    this.proc = null;
+    this.failAllPending(new BridgeUnavailableError(sanitizeReason(this.spawnError), "BRIDGE_PROCESS_ERROR"));
+    this.emitLifecycle({ kind: "provider-error", message: sanitizeReason(this.spawnError) });
+  }
+
+  /** Normal child exit path (no prior terminal error). Later errors on the detached proc are no-ops. */
+  private handleChildExit(code: number | null, signal: string | null): void {
+    if (!this.proc && this.exited) return;
+    this.exited = { code, signal };
+    // Finalize so support/ensureStarted never report stale ready and the
+    // next explicit start spawns fresh. In-flight dispatches resolve
+    // `unknown` (ambiguous ownership); post-exit dispatches reject as
+    // bridge-unavailable without auto-respawn (see dispatch()).
+    this.provider = null;
+    this.capabilities = null;
+    this.sessions.clear();
+    const proc = this.proc;
+    this.detachAll();
+    try {
+      (proc?.stdout as unknown as { destroy?: () => void })?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    try {
+      (proc?.stderr as unknown as { destroy?: () => void })?.destroy?.();
+    } catch {
+      // Ignore.
+    }
+    this.proc = null;
+    this.failAllPending(new BridgeUnavailableError(`provider-exited code=${code} signal=${signal}`, "BRIDGE_EXITED"));
+    this.emitLifecycle({ kind: "provider-exit", message: `provider exited code=${code} signal=${signal}`, code, signal });
   }
 
   // -- session operations ----------------------------------------------------
@@ -600,8 +726,7 @@ export class BridgeHost {
     } catch {
       // Ignore — process already gone.
     }
-    this.detachReader?.();
-    this.detachReader = null;
+    this.detachAll();
     for (const [, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.reject(new BridgeUnavailableError("bridge host disposed", "BRIDGE_DISPOSED"));
