@@ -227,6 +227,84 @@ describe("waitCompact success/timeout/failed", () => {
     expect(receipt.outcome).toBe("failed");
   });
 
+  it("worker-only succeeded with no Task status maps to completed (run_required fallback)", async () => {
+    const runRequired = () => {
+      throw new OrcaCommandError({
+        code: "run_required",
+        message: "No Run is bound",
+        executable: "orca",
+        args: [],
+        diagnostics: "run_required",
+      });
+    };
+    const orca = makeFakeOrca({
+      async showWorker(dispatchId: string) {
+        return {
+          dispatchId,
+          taskId: "task_1",
+          dispatchStatus: "completed",
+          workerState: "succeeded",
+          terminalHandle: "term_1",
+          raw: {},
+        };
+      },
+      async listTasks() {
+        return runRequired();
+      },
+    });
+    const receipt = await waitCompact({
+      orca,
+      worker: "dispatch_1",
+      timeoutMs: 5_000,
+      pollIntervalMs: 1,
+      sleep: async () => undefined,
+      now: (() => {
+        let now = 0;
+        return () => (now += 10);
+      })(),
+    });
+    expect(receipt.outcome).toBe("completed");
+    expect(receipt.workerState).toBe("succeeded");
+    expect(receipt.timedOut).toBe(false);
+  });
+
+  it("worker-only failed with no Task status maps to failed (run_required fallback)", async () => {
+    const orca = makeFakeOrca({
+      async showWorker(dispatchId: string) {
+        return {
+          dispatchId,
+          taskId: "task_1",
+          dispatchStatus: "failed",
+          workerState: "failed",
+          terminalHandle: "term_1",
+          raw: {},
+        };
+      },
+      async listTasks(): Promise<{ entries: { taskId: string; status?: string }[]; raw: unknown }> {
+        throw new OrcaCommandError({
+          code: "run_required",
+          message: "No Run is bound",
+          executable: "orca",
+          args: [],
+          diagnostics: "run_required",
+        });
+      },
+    });
+    const receipt = await waitCompact({
+      orca,
+      worker: "dispatch_1",
+      timeoutMs: 5_000,
+      pollIntervalMs: 1,
+      sleep: async () => undefined,
+      now: (() => {
+        let now = 0;
+        return () => (now += 10);
+      })(),
+    });
+    expect(receipt.outcome).toBe("failed");
+    expect(receipt.workerState).toBe("failed");
+  });
+
   it("returns timeout when the deadline passes while running", async () => {
     const orca = makeFakeOrca();
     let now = 0;

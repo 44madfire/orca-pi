@@ -666,7 +666,15 @@ export async function waitCompact(options: WaitOperationOptions): Promise<Compac
       state.workerState !== undefined &&
       isSettledWorkerState(state.workerState);
     if (settledByTask || settledByWorker) {
-      const succeeded = state.taskStatus !== undefined && isSuccessfulTaskStatus(state.taskStatus);
+      // Precedence: authoritative Task status wins when present; otherwise
+      // map the settled worker lifecycle state (Orca maps accepted
+      // worker_done outcome=succeeded to worker state succeeded).
+      const succeeded =
+        state.taskStatus !== undefined
+          ? isSuccessfulTaskStatus(state.taskStatus)
+          : state.workerState !== undefined
+            ? state.workerState.toLowerCase() === "succeeded"
+            : false;
       const outcome = succeeded ? ("completed" as const) : ("failed" as const);
       const elapsedMs = now() - startedAt;
       const summary =
