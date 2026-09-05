@@ -1,6 +1,6 @@
 # `packages/pi-rpc` fixtures (SNC1.1)
 
-Real Pi 0.84.4 `--mode rpc` request/response/event sequences, normalized for
+Real Pi 0.85.1 `--mode rpc` request/response/event sequences, normalized for
 deterministic tests. See `docs/pi-rpc-contract.md` for the authoritative
 contract and `../../fixtures/README.md` (this file) for capture details.
 
@@ -22,20 +22,33 @@ Every `*.jsonl` line is one envelope:
 
 ## Normalization
 
-Volatile values are replaced with stable placeholders (see
-`src/normalize.ts`):
+Volatile values are replaced with stable numbered aliases (see
+`src/normalize.ts` — one `createRecordNormalizer()` per trace, aliases
+assigned in first-seen order). Identity is preserved: the same raw id always
+maps to the same alias, so `parentId` chains, `since` cursors, `leafId`, and
+`toolCallId` correlations stay verifiable:
 
-`<SESSION_ID>` `<ENTRY_ID>` `<PARENT_ID>` `<LEAF_ID>` `<CALL_ID>`
-`<EXT_UI_ID>` `<RESPONSE_ID>` `<TIMESTAMP_MS>` `<TIMESTAMP_ISO>`
-`<SESSION_FILE>` `<HOME>` `<TMP>` `<CWD>` `<IMAGE_DATA>`
-
-- Entry ids (`8-hex`) → `<ENTRY_ID>`; `call_*` → `call_<ENTRY_ID>`.
-- UUIDs → `<SESSION_ID>`; extension UI uuids → `<EXT_UI_ID>`.
-- ISO timestamps → `<TIMESTAMP_ISO>`; epoch-ms → `<TIMESTAMP_MS>`.
+- Session UUIDs → `<SESSION_1>`, `<SESSION_2>`, …
+- Entry ids (`8-hex`) → `<ENTRY_1>`, `<ENTRY_2>`, … — shared by `parentId`,
+  `entryId`, `leafId`, `since`, and fork cursors, so `parentId` of entry N
+  equals the id of entry N-1 and `leafId` names the current node.
+- Tool calls (`call_*`, `toolCallId`) → `<CALL_1>`, `<CALL_2>`, …
+- Extension UI request ids → `<EXT_UI_1>`, `<EXT_UI_2>`, … — a request and
+  its matching `extension_ui_response` share the number.
+- Provider `responseId` → `<RESPONSE_1>`, …
+- ISO timestamp strings → `<TIMESTAMP_ISO>`. Numeric epoch-ms message
+  timestamps stay raw live values: replacing a JSON number with a string
+  placeholder would break protocol shape, and the values carry no identity
+  or secret (ordering within a trace is preserved by record order).
 - Absolute paths → `<SESSION_FILE>` / `<HOME>` / `<TMP>`.
 - Base64 image bytes → `<IMAGE_DATA>` (mimeType + shape kept).
 - Usage/cost numbers are preserved as representative real values.
 - `U+2028`/`U+2029` payloads are literal characters (LF-only proof).
+
+Each fixture is internally coherent as one real RPC sequence: `get_tree` is
+the same session view as `get_entries`, `leafId` names the last entry,
+`get_fork_messages` lists that session's user turns, and message counts
+match the entries shown.
 
 ## Secret hygiene
 

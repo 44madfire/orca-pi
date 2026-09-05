@@ -1,6 +1,6 @@
 # Pi RPC Contract (SNC1.1 — authoritative)
 
-Validated against **real Pi `0.84.4`** in `--mode rpc` (not OMP/mocks).
+Validated against **real Pi `0.85.1`** in `--mode rpc` (not OMP/mocks).
 Fixtures: `packages/pi-rpc/fixtures/*.jsonl` (normalized, secret-free,
 LF-only). Spike client: `packages/pi-rpc/src/spike-client.ts` (strict
 LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.
@@ -12,7 +12,7 @@ LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.
 
 ## 1. Baseline
 
-- Binary: `pi --version` → `0.84.4` (`fixtures/baseline.json`).
+- Binary: `pi --version` → `0.85.1` (`fixtures/baseline.json`).
 - Hosts probed: `win32`, Node `v25.3.0`, Orca app `1.4.197` present but not
   required for RPC.
 - Framing: **strict JSONL, LF (`\n`) only**. Clients split stdout on `\n`
@@ -33,6 +33,20 @@ LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.
   `orca-titlebar-spinner.ts`) inject `extension_ui_request setTitle` spinner
   events into every turn. Isolated-dir runs prove the base protocol without
   them; production clients must ignore unknown fire-and-forget UI requests.
+- Provenance: every fixture is captured live by `spike/capture.mjs` through
+  the strict spike client (one process per fixture, so each file is internally
+  coherent). `--offline-only` captures the no-LLM fixtures; `--full` adds the
+  LLM turns (short constrained prompts on `opencode-go/glm-5.3-flash`);
+  `--only <name>` recaptures a single fixture. Each scenario normalizes with
+  a fresh `createRecordNormalizer()`, so aliases are per-file first-seen.
+- Normalization: `<SESSION_1>` (session UUIDs); `<ENTRY_1…>` (entry ids,
+  shared by `parentId`/`entryId`/`leafId`/`since`/fork cursors so chains stay
+  checkable); `<CALL_1…>` (tool calls); `<EXT_UI_1…>` (extension UI request
+  ids — a request and its response share the number); `<RESPONSE_1…>`
+  (provider response ids). ISO timestamps → `<TIMESTAMP_ISO>`; numeric
+  epoch-ms message timestamps stay raw (a string placeholder would break JSON
+  number shape). Paths → `<SESSION_FILE>`/`<HOME>`/`<TMP>`; image bytes →
+  `<IMAGE_DATA>`.
 
 ## 2. Protocol shape
 
@@ -45,7 +59,7 @@ LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.
   extension-UI. No `id` except `bash_execution_update.id` (correlates the
   originating `bash` command id).
 - **Extension UI responses** (`c2s`): `{"type":"extension_ui_response",
-  "id":"<EXT_UI_ID>", "value"|"confirmed"|"cancelled":...}`.
+  "id":"<EXT_UI_1>", "value"|"confirmed"|"cancelled":...}`.
 - `success:true` on `prompt` means *accepted/queued/handled*, not completed.
   Completion is `agent_end` + `agent_settled`. Failures after acceptance flow
   through the message stream, not a second `response`.
@@ -75,9 +89,9 @@ LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.
 | `state-tree.jsonl` | `get_state` with `sessionFile`+`sessionName`; `get_entries` full chain + `leafId`; `since` cursor returns strictly-after entries + current `leafId`; `get_tree` `{entry,children} + leafId` (single root when well-formed); `get_fork_messages` lists forkable user turns; `get_last_assistant_text`; `get_session_stats` (tokens/cost/contextUsage; `contextUsage` omitted when no model/window). |
 | `models-thinking.jsonl` | `get_available_models` (full `Model` objects), `set_model` success emits `thinking_level_changed` then response with new `Model`, invalid `set_model` → `Model not found`; `get_available_thinking_levels` per-model (e.g. `["low","high","max"]` on `glm-5.3-flash`); `set_thinking_level` emits `thinking_level_changed` + response; `cycle_thinking_level` returns `{level}`; **lenient**: bogus level succeeds and falls back to `minimal` + `thinking_level_changed(minimal)` (no error — bridge must validate levels itself). Queue/auto commands (`set_steering/follow_up_mode`, `set_auto_compaction/retry`, `abort/abort_bash/abort_retry` idle) all `success:true`. |
 | `images.jsonl` | `prompt` with `images:[{type:image,data:<base64>,mimeType:image/png}]` accepted; `user` message preserves `{type:text}+{type:image,data,mimeType}`; model with `input:[text,image]` replies normally (`ONE-PIXEL` on 1px PNG); `get_entries` preserves image blocks. Models without image input (e.g. `deepseek-v4-flash`) must be guarded client-side. |
-| `extension-ui.jsonl` | Dialog: `prompt /rpc-ask` → `extension_ui_request{select,title,options}` → client `extension_ui_response{value}` → `notify` fire-and-forget → `prompt` response `success:true` (request precedes response). `confirm` mirrors with `{confirmed}`. Fire-and-forget (`notify/setStatus/setWidget/setTitle/set_editor_text`) never expect a response — clients may display or ignore. Extension commands execute immediately even during streaming and leave no session entries (`get_entries` still only bootstrap entries). `get_commands` lists `{name,description,source,sourceInfo}`. |
+| `extension-ui.jsonl` | Dialogs, one per extension command: `select` → `{value}` (request precedes its `prompt` response), `confirm` → `{confirmed}`, `input{title,placeholder}` → `{value}`, `editor{title,prefill}` → `{value}`, plus `cancelled:true` → extension sees `undefined` (proven via `notify`). `notify` fire-and-forget follows each dialog. `setTitle`/`setStatus`/`setWidget`/`set_editor_text` observed as fire-and-forget — never expect a response. Extension commands execute immediately even during streaming and leave no session entries (`get_entries` still only bootstrap entries). `get_commands` lists `{name,description,source,sourceInfo}`. |
 | `resume-branch.jsonl` | `get_state.sessionFile/sessionId`; kill + new process + `switch_session{sessionPath}` → `cancelled:false` restores identical `entries/leafId`; `get_last_assistant_text` resumes at active leaf. `fork{entryId}` → `{text,cancelled:false}`, resets to a **new session** (new `sessionId`/`sessionFile`, `messageCount:0`, entries = fresh bootstrap chain parented under the old chain; old branch abandoned). `get_tree` after fork shows only the new chain + new `leafId`. `clone` on an unsaved (no assistant response) session → `success:false "This session has not been saved yet..."`. `new_session` → `cancelled:false` + fresh bootstrap. `set_session_name` → `session_info_changed` event + `get_state.sessionName`. |
-| `malformed-exit.jsonl` | Raw `not-json` → `{command:parse,success:false}`; JSON-string body → `{success:false, error:"Unknown command: undefined"}`; unknown object type echoes `command`; `set_model` invalid, `fork` bad id (`"Invalid entry ID for forking"`), `get_entries since` missing (`"Entry not found: missing"`); `prompt`-while-streaming without behavior → `success:false "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."` (rejected turn leaves no `get_fork_messages` entry); `switch_session` to a nonexistent path **succeeds** (`cancelled:false`) and re-points `sessionFile` at that path with a fresh bootstrap (must be treated as *new empty session*, not an error); `compact` on tiny session emits `compaction_start(manual)` → `compaction_end{aborted:false,willRetry:false,errorMessage}` + response `success:false "Nothing to compact (session too small)"`; `export_html` with no conversation → `success:false "Nothing to export yet..."`; stdin EOF → clean exit `0`; SIGTERM fallback documented. |
+| `malformed-exit.jsonl` | Raw `not-json` → `{command:parse,success:false}`; unknown object type echoes `command`; `set_model` invalid, `fork` bad id (`"Invalid entry ID for forking"`), `get_entries since` missing (`"Entry not found: missing"`); `prompt`-while-streaming without behavior → `success:false "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."` (rejected turn leaves no `get_fork_messages` entry); `switch_session` to a nonexistent path **succeeds** (`cancelled:false`) and re-points `sessionFile` at that path with a fresh bootstrap (must be treated as *new empty session*, not an error); `compact` on tiny session emits `compaction_start(manual)` → `compaction_end{aborted:false,willRetry:false,errorMessage}` + response `success:false "Nothing to compact (session too small)"`; `export_html` with no conversation → `success:false "Nothing to export yet..."`; stdin EOF → clean exit `0`; SIGTERM fallback documented. |
 
 ## 4. Session tree / current-leaf / resume semantics
 
@@ -114,7 +128,7 @@ LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.
 | Model discovery/switch (`get_available_models`/`set_model`/`cycle_model`) | **Proven** (`models-thinking`; invalid fails closed). |
 | Thinking discovery/switch (levels/`set`/`cycle`) | **Proven** with leniency note (bogus → `minimal`, no error). |
 | Images (`prompt.images`, `ImageContent`) | **Proven** 1px PNG round-trip (`images`); guard models without `image` input. |
-| Extension dialogs (`select`/`confirm`/`input`/`editor` + `extension_ui_response`) | **Proven** for `select`/`confirm`+`notify` (`extension-ui`); `input`/`editor` share the same `value`/`cancelled` shape per `rpc.md` but were not live-exercised — treat as **supported-by-protocol, single-sample**. |
+| Extension dialogs (`select`/`confirm`/`input`/`editor` + `extension_ui_response`) | **Proven** all four live (`extension-ui`): `select{title,options}` → `{value}`, `confirm{title,message}` → `{confirmed}`, `input{title,placeholder}` → `{value}`, `editor{title,prefill}` → `{value}`; `cancelled:true` → `undefined`. Each dialog precedes its `prompt` response. |
 | Extension fire-and-forget (`notify`/`setStatus`/`setWidget`/`setTitle`/`set_editor_text`) | **Proven observed** (spinner `setTitle` + demo `notify`/`setStatus`/`setWidget`); safe to ignore. |
 | Unsupported/degraded UI (`custom`, `setWorking*`, `setFooter/Header`, `getEditorText=""`, `getToolsExpanded=false`, `getAllThemes=[]`, `setTheme→{success:false}`) | **Marked per docs, not live-exercised** — bridge must not depend on them. |
 | Resume at active leaf (`switch_session`, `--session`) | **Proven** (`resume-branch`). |
@@ -123,7 +137,7 @@ LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.
 | Retry (`set_auto_retry`, `abort_retry`, `auto_retry_*`) | Commands proven (`success:true`); retry event loop not triggered in fixtures — **supported, events per docs**. |
 | `export_html` | **Proven fail-closed when empty**; HTML export bytes not captured. |
 | Process exit (EOF→0, SIGTERM) | **Proven** (`malformed-exit`). |
-| `get_commands` (extension/prompt/skill) | **Proven** (extension entries + user skills observed in full runs). |
+| `get_commands` (extension/prompt/skill) | **Proven** (isolated capture lists the loaded temp extensions; user skills/prompt templates appear in full-config runs). |
 | `cycle_model` | Per-docs (`{model,thinkingLevel,isScoped}|null`); live cycle not captured — **supported, shape-per-docs**. Single-model hosts return `null` data. |
 
 ## 6. Rejected / malformed operations (fail-closed)

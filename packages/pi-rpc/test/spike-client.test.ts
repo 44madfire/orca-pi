@@ -26,7 +26,8 @@ function fakeSpawn(outputs: string[]) {
     emitLines: (lines: string[] = outputs) => {
       for (const line of lines) stdout.emit("data", Buffer.from(line + "\n", "utf8"));
     },
-    emitRaw: (chunk: string) => stdout.emit("data", Buffer.from(chunk, "utf8")),
+    emitRaw: (chunk: string | Buffer) =>
+      stdout.emit("data", typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk),
   };
 }
 
@@ -55,10 +56,12 @@ describe("SpikeClient (strict LF-only probe)", () => {
     const client = new SpikeClient({ spawnFn: fake.spawnFn });
     await client.start();
     const payload = JSON.stringify({ type: "bash_execution_update", id: "u1", delta: "A\u2028B\u2029C\n" });
-    // Deliver the record split across two chunks inside the multibyte run.
+    // Deliver the record split after byte 1 of the 3-byte U+2028 sequence.
     const bytes = Buffer.from(payload + "\n", "utf8");
-    fake.emitRaw(bytes.subarray(0, 25).toString("utf8"));
-    fake.emitRaw(bytes.subarray(25).toString("utf8"));
+    const lsStart = bytes.indexOf(Buffer.from("\u2028", "utf8")[0] as number);
+    expect(lsStart).toBeGreaterThan(0);
+    fake.emitRaw(bytes.subarray(0, lsStart + 1));
+    fake.emitRaw(bytes.subarray(lsStart + 1));
     const s2c = client.records.filter((r) => r.dir === "s2c");
     expect(s2c).toHaveLength(1);
     expect(s2c[0]?.payload).toMatchObject({ type: "bash_execution_update", id: "u1" });

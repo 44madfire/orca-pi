@@ -21,18 +21,21 @@ describe("strict LF-only JSONL framing (SNC1.1)", () => {
   });
 
   it("keeps U+2028/U+2029 intact when chunks split mid-record", () => {
-    const framer = new JsonlFramer();
+    // U+2028 is 3 bytes in UTF-8 (E2 80 A8). Cut after byte 1 of that
+    // sequence so the first chunk ends with an incomplete character.
     const line = JSON.stringify({ delta: "A\u2028B\u2029C" });
     const bytes = Buffer.from(`${line}\n`, "utf8");
-    const mid = bytes.indexOf(Buffer.from([0xe2, 0x80])[0] as unknown as number);
-    void mid;
-    // Split the byte stream at an arbitrary point inside the multibyte run.
-    const cut = 20;
-    const first = framer.push(bytes.subarray(0, cut));
-    expect(first).toEqual([]);
-    const second = framer.push(bytes.subarray(cut));
-    expect(second).toHaveLength(1);
-    expect(JSON.parse(second[0] as string)).toEqual({ delta: "A\u2028B\u2029C" });
+    const lsByte = Buffer.from("\u2028", "utf8")[0] as number;
+    const lsStart = bytes.indexOf(lsByte);
+    expect(lsStart).toBeGreaterThan(0);
+    for (const cut of [lsStart + 1, lsStart + 2]) {
+      const framer = new JsonlFramer();
+      expect(framer.push(bytes.subarray(0, cut))).toEqual([]);
+      const rest = framer.push(bytes.subarray(cut));
+      expect(rest).toHaveLength(1);
+      expect(JSON.parse(rest[0] as string)).toEqual({ delta: "A\u2028B\u2029C" });
+      expect(rest[0]).not.toContain("\uFFFD");
+    }
   });
 
   it("tolerates CRLF input by stripping one trailing CR", () => {

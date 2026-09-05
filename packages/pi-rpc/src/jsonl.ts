@@ -15,6 +15,8 @@
  * (see `fixtures/bash-rpc.jsonl` and `docs/pi-rpc-contract.md`).
  */
 
+import { StringDecoder } from "node:string_decoder";
+
 /** Serialize one strict JSONL record (LF-terminated, no CRLF). */
 export function serializeJsonLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
@@ -45,22 +47,20 @@ export function splitJsonLines(buffer: string): { lines: string[]; rest: string 
 /**
  * Stateful LF-only feeder for streaming `stdout` bytes.
  *
- * Handles UTF-8 chunk splits via `StringDecoder`, CRLF tolerance, and
- * U+2028/U+2029 preservation. Call `push()` with each data chunk and
- * `finish()` on stream end to flush a final unterminated line (if any).
+ * Byte-safe: Buffer/Uint8Array chunks are decoded through a streaming
+ * `StringDecoder`, so a multibyte UTF-8 sequence (e.g. the 3-byte U+2028
+ * `E2 80 A8`) split across data events never becomes U+FFFD. String chunks
+ * are appended directly. Split on `\n` only; strip one trailing `\r`.
+ * Call `push()` per data event and `finish()` on stream end to flush a
+ * final unterminated line (if any).
  */
 export class JsonlFramer {
+  private readonly decoder = new StringDecoder("utf8");
   private text = "";
 
   /** Feed a raw chunk; returns newly completed lines (CRLF-stripped). */
   push(chunk: string | Uint8Array | Buffer): string[] {
-    // Buffer/Uint8Array chunks are UTF-8 JSONL bytes. Decoding each chunk
-    // with toString("utf8") is safe here because callers feed whole data
-    // events and we only split on ASCII LF; split multibyte sequences
-    // across events are handled by the streaming reader path
-    // (`attachJsonlReader`, which uses StringDecoder). For byte-exact
-    // streaming, prefer `attachJsonlReader` on the live socket.
-    this.text += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    this.text += typeof chunk === "string" ? chunk : this.decoder.write(Buffer.from(chunk));
     const { lines, rest } = splitJsonLines(this.text);
     this.text = rest;
     return lines;
@@ -68,6 +68,7 @@ export class JsonlFramer {
 
   /** Flush any trailing unterminated line (CRLF-stripped). */
   finish(): string[] {
+    this.text += this.decoder.end();
     if (this.text.length === 0) return [];
     let line = this.text;
     this.text = "";
@@ -89,9 +90,6 @@ export function attachJsonlReader(
   },
   onLine: (line: string) => void,
 ): () => void {
-  // StringDecoder avoids splitting multibyte UTF-8 across data events.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { StringDecoder } = require("node:string_decoder") as typeof import("node:string_decoder");
   const decoder = new StringDecoder("utf8");
   let buffer = "";
   const onData = (chunk: unknown): void => {

@@ -6,42 +6,47 @@ Minimal strict LF-only client + live capture against a real Pi binary.
 
 - `../src/spike-client.ts` — the spike client (strict JSONL, id correlation).
 - `../src/jsonl.ts` — LF-only framing (no `readline`).
-- `capture.mjs` — regenerates `../fixtures/*.jsonl` + `baseline.json` from a
-  real `pi --mode rpc` binary (offline probes + cheap online LLM turns).
+- `capture.mjs` — captures `../fixtures/*.jsonl` + `baseline.json` live from
+  a real `pi --mode rpc` binary through the spike client (one process per
+  fixture, so each file is internally coherent). Each scenario normalizes
+  with a fresh `createRecordNormalizer()` (identity-preserving numbered
+  aliases) and writes LF-only JSONL.
 - This README — procedure and cost controls.
 
 ## Prerequisites
 
-- `pi` on PATH (validated: `0.84.4`).
-- Provider auth in `PI_CODING_AGENT_DIR` (or `~/.pi/agent` for manual runs).
-- Network for LLM turns; `--offline` probes need no network.
+- `pi` on PATH (validated: `0.85.1`; falls back to the local npm bundle).
+- Provider auth in `~/.pi/agent` (copied into an isolated temp
+  `PI_CODING_AGENT_DIR` per run) for `--full`.
+- Network for LLM turns and the model catalog; `--offline-only` needs none
+  of the LLM turns (catalog reads still prefer network).
 
 ## Regenerate fixtures (isolated, cheap)
 
 ```sh
-# From repo root:
+# From repo root (build first so capture uses fresh ../dist):
+npm run build
 node packages/pi-rpc/spike/capture.mjs --offline-only
-node packages/pi-rpc/spike/capture.mjs --full  # includes ~8 short LLM turns (glm-5.3-flash, low thinking)
+node packages/pi-rpc/spike/capture.mjs --full  # ~10 short LLM turns (glm-5.3-flash)
+node packages/pi-rpc/spike/capture.mjs --full --only abort-queue  # one fixture
 ```
 
-`capture.mjs` always uses an isolated temp `PI_CODING_AGENT_DIR` (auth copied,
-settings minimal) so global `~/.pi/agent/settings.json` is never mutated by
-`set_steering_mode` / `set_auto_compaction` probes. It prints per-scenario
-record counts and rewrites fixtures already normalized
-(`<SESSION_ID>`, `<ENTRY_ID>`, `<TIMESTAMP_*>`, `<SESSION_FILE>`, …).
+`--offline-only` captures `startup-idle`, `bash-rpc`, `models-thinking`,
+`malformed-exit`, and `baseline.json` — no LLM calls. `--full` additionally
+captures `text-streaming`, `thinking`, `tool-execution`, `abort-queue`,
+`state-tree`, `images`, `extension-ui` (temp extension exercising
+select/confirm/input/editor/cancel, auto-answered), and `resume-branch`
+(session dir + switch/fork/clone/new). Every run uses an isolated temp
+`PI_CODING_AGENT_DIR` (auth copied, settings minimal) so global
+`~/.pi/agent/settings.json` is never mutated by `set_steering_mode` /
+`set_auto_compaction` probes. Each fixture print shows record counts.
 
-Cost control for `--full`: two text turns, one thinking turn, two tool turns,
-one image turn, one abort turn, one queue turn — all on
+Cost control for `--full`: short constrained prompts on
 `opencode-go/glm-5.3-flash` with `low` thinking except the thinking probe
-(`high`). Each prompt constrains output length explicitly.
+(`high`); the abort turn is capped (~100 words) and aborts on the first
+streamed delta.
 
 ## Manual one-off probe
-
-```sh
-node -e "import('./packages/pi-rpc/dist/spike-client.js')"
-```
-
-Prefer `SpikeClient` from `@orca-pi/pi-rpc` in Node scripts:
 
 ```js
 import { SpikeClient } from "@orca-pi/pi-rpc";

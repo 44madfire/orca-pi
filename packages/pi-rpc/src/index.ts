@@ -22,6 +22,7 @@ export {
 export {
   assertLfOnlyJsonl,
   assertSecretFreeLine,
+  createRecordNormalizer,
   normalizeRecord,
   PLACEHOLDERS,
 } from "./normalize.js";

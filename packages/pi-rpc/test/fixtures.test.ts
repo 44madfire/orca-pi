@@ -60,12 +60,15 @@ describe("pi-rpc fixtures (real-Pi, normalized, secret-free)", () => {
 
   it("contains no volatile raw ids/timestamps/paths or secrets", () => {
     const uuid = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+    const rawWinUserPath = /[A-Za-z]:\\Users\\[A-Za-z0-9._-]+\\/;
     for (const name of EXPECTED_FIXTURES) {
       const text = readFixture(name);
       expect(text, `${name} raw UUID`).not.toMatch(uuid);
-      expect(text, `${name} raw user path`).not.toContain("C:\\Users\\jeffr\\");
+      expect(text, `${name} raw user path`).not.toMatch(rawWinUserPath);
       expect(text, `${name} bearer`).not.toMatch(/bearer\s+[A-Za-z0-9\-._~+/=]{16,}/i);
       expect(text, `${name} api key`).not.toMatch(/sk-(?:proj-)?[A-Za-z0-9\-_]{16,}/);
+      // Legacy collapsed placeholders must not appear; aliases are numbered.
+      expect(text, `${name} legacy placeholder`).not.toMatch(/<(SESSION_ID|ENTRY_ID|PARENT_ID|LEAF_ID|CALL_ID|EXT_UI_ID|RESPONSE_ID)>/);
     }
   });
 
@@ -80,6 +83,66 @@ describe("pi-rpc fixtures (real-Pi, normalized, secret-free)", () => {
     expect(deltas.some((d) => (d.payload.delta ?? "").includes("\u2028"))).toBe(true);
   });
 
+  it("keeps state-tree internally coherent as one session trace", () => {
+    const envs = envelopes("state-tree.jsonl");
+    const byId = (id: string) =>
+      envs.find((e) => e.dir === "s2c" && (e.payload as Record<string, unknown>)["id"] === id)?.payload as Record<string, unknown>;
+    const entries = (byId("st3")?.["data"] as { entries: Array<{ id: string; parentId: string | null }>; leafId: string })["entries"];
+    const leafId = (byId("st3")?.["data"] as { leafId: string })["leafId"];
+    // Parent chain links and leafId names the last entry.
+    expect(entries[0]?.parentId).toBeNull();
+    for (let i = 1; i < entries.length; i++) {
+      expect(entries[i]?.parentId).toBe(entries[i - 1]?.id);
+    }
+    expect(leafId).toBe(entries[entries.length - 1]?.id);
+    // get_tree shows the same chain with the same leaf.
+    const tree = byId("st5")?.["data"] as { tree: Array<{ entry: { id: string }; children: unknown[] }>; leafId: string };
+    expect(tree.leafId).toBe(leafId);
+    // get_fork_messages lists this session's user turn; message counts match.
+    const forks = byId("st6")?.["data"] as { messages: Array<{ entryId: string; text: string }> };
+    const userEntry = entries.find((e) => (e as unknown as { type: string }).type === "message" && JSON.stringify(e).includes('"role":"user"'));
+    expect(forks.messages.map((m) => m.entryId)).toContain(userEntry?.id);
+    const state = byId("st2")?.["data"] as { messageCount: number };
+    expect(state.messageCount).toBe(2);
+  });
+
+  it("keeps resume-branch coherent across switch/fork", () => {
+    const envs = envelopes("resume-branch.jsonl");
+    const byId = (id: string) =>
+      envs.find((e) => e.dir === "s2c" && (e.payload as Record<string, unknown>)["id"] === id)?.payload as Record<string, unknown>;
+    const before = JSON.stringify((byId("r2")?.["data"] as { entries: unknown })["entries"]);
+    const after = JSON.stringify((byId("r4")?.["data"] as { entries: unknown })["entries"]);
+    // switch_session resume returns the identical entry tree.
+    expect(after).toBe(before);
+    // fork resets to a fresh bootstrap session with a new session id.
+    const forked = (byId("r8")?.["data"] as { entries: Array<{ type: string }> })["entries"];
+    expect(forked.every((e) => e.type === "model_change" || e.type === "thinking_level_change")).toBe(true);
+    const preState = (byId("r1")?.["data"] as { sessionId: string })["sessionId"];
+    const postState = (byId("r10")?.["data"] as { sessionId: string })["sessionId"];
+    expect(postState).not.toBe(preState);
+  });
+
+  it("preserves tool-call and extension-UI correlations", () => {
+    const toolText = readFixture("tool-execution.jsonl");
+    // Distinct calls keep distinct aliases; every frame of a call matches.
+    expect(toolText).toContain("<CALL_1>");
+    expect(toolText).toContain("<CALL_2>");
+    const ext = envelopes("extension-ui.jsonl");
+    const requests = ext.filter((e) => (e.payload as Record<string, unknown>)["type"] === "extension_ui_request");
+    const responses = ext.filter((e) => (e.payload as Record<string, unknown>)["type"] === "extension_ui_response");
+    expect(requests.length).toBeGreaterThan(0);
+    for (const res of responses) {
+      const id = (res.payload as Record<string, unknown>)["id"];
+      expect(requests.some((q) => (q.payload as Record<string, unknown>)["id"] === id)).toBe(true);
+    }
+    // All four dialog methods plus cancellation are proven live.
+    const methods = requests.map((r) => (r.payload as Record<string, unknown>)["method"]);
+    for (const m of ["select", "confirm", "input", "editor"]) {
+      expect(methods).toContain(m);
+    }
+    expect(ext.some((e) => JSON.stringify(e.payload).includes('"cancelled":true'))).toBe(true);
+  });
+
   it("locks core protocol invariants across fixtures", () => {
     // prompt accept precedes agent_settled in text-streaming.
     const textFlow = envelopes("text-streaming.jsonl").map((e) => e.payload["type"] ?? e.payload["command"]);
@@ -90,13 +153,6 @@ describe("pi-rpc fixtures (real-Pi, normalized, secret-free)", () => {
     expect(abortText).toContain('"errorMessage":"Request was aborted"');
     // queue updates carry both queues.
     expect(abortText).toContain('"queue_update"');
-    // leafId present in state-tree + resume-branch.
-    expect(readFixture("state-tree.jsonl")).toContain('"leafId":"<LEAF_ID>"');
-    expect(readFixture("resume-branch.jsonl")).toContain('"leafId":"<LEAF_ID>"');
-    // extension UI request/response id correlation shape.
-    const ext = readFixture("extension-ui.jsonl");
-    expect(ext).toContain('"method":"select"');
-    expect(ext).toContain('"type":"extension_ui_response"');
     // malformed ops fail closed with success:false + error.
     const malformed = readFixture("malformed-exit.jsonl");
     expect(malformed).toContain('"command":"parse","success":false');
