@@ -1,12 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
 import {
+  ALLOWED_HOSTS_ENV_VAR,
+  allowedHostsFromEnv,
   assertWorktreeHelperConfigured,
+  buildWorkerExecEnv,
+  credentialHostKey,
+  defaultSshGuardCommand,
   extractGitSubcommand,
   gitConfigCommandsForSetup,
   isContentsWriteGitCommand,
+  isHostAllowed,
   isWorkerMutationCommand,
   assertIdentityMayRunCommand,
+  normalizeCredentialHost,
   setupRepoGitAuth,
 } from "../src/github/git-auth.js";
 import { fetchRepoInstallationWithJwt, doctorGithubIdentities } from "../src/github/doctor.js";
@@ -121,7 +128,7 @@ describe("blocker 1: mint once, separate invocations reuse disk cache (no *_TOKE
     expect(okReview.id).toBe(9);
 
     // git-credential get via disk (no env token) returns the minted password.
-    const got = await handleGitCredentialRequest("reviewer", "get", { host: "github.com" }, async () => {
+    const got = await handleGitCredentialRequest("reviewer", "get", { protocol: "https", host: "github.com" }, async () => {
       const { resolveProductionCredential } = await import("../src/github/production-credential.js");
       const c = await resolveProductionCredential("reviewer", { env: reviewerEnv, cache: createInstallationTokenCache(), providerFs: fs2, fetchFn: mintFetch, homedir: "/home/u" });
       return { token: c.token };
@@ -199,14 +206,12 @@ describe("blocker 3: JWT-only vs IAT auth classes", () => {
 });
 
 describe("blocker 4: deterministic worktree override beats ambient helper", () => {
-  it("setup emits empty reset + worker add in worktree scope", () => {
+  it("setup emits empty resets + host worker add in worktree scope", () => {
     const cmds = gitConfigCommandsForSetup({ repoPath: "/wt/w", helperCommand: "orca-pi github git-credential --identity worker" });
-    expect(cmds.length).toBe(2);
-    expect(cmds[0]?.args).toContain("--worktree");
-    expect(cmds[0]?.args).toContain("--replace-all");
-    expect(cmds[0]?.args.slice(-1)[0]).toBe("");
-    expect(cmds[1]?.args).toContain("--add");
-    expect(cmds[1]?.args.slice(-1)[0]).toContain("git-credential");
+    expect(cmds.length).toBe(3);
+    expect(cmds[0]?.args).toEqual(["-C", "/wt/w", "config", "--worktree", "--replace-all", "credential.helper", ""]);
+    expect(cmds[1]?.args).toEqual(["-C", "/wt/w", "config", "--worktree", "--replace-all", "credential.https://github.com.helper", ""]);
+    expect(cmds[2]?.args).toEqual(["-C", "/wt/w", "config", "--worktree", "--add", "credential.https://github.com.helper", "orca-pi github git-credential --identity worker"]);
   });
 
   it("ambient helper ahead without reset is rejected; with reset it passes", () => {
@@ -221,19 +226,34 @@ describe("blocker 4: deterministic worktree override beats ambient helper", () =
     expect(() => assertWorktreeHelperConfigured(withReset, { repoPath: "/wt/w" })).not.toThrow();
   });
 
-  it("setupRepoGitAuth runs reset + add, never global", async () => {
+  it("setupRepoGitAuth runs resets + host add, never global", async () => {
     const seen: string[][] = [];
+    const workerHelper = "orca-pi github git-credential --identity worker";
     const receipt = await setupRepoGitAuth(
       {
         async run(exe: string, args: readonly string[]) {
           seen.push([exe, ...args]);
+          if (args.includes("--git-dir")) return { stdout: ".git\n", stderr: "", exitCode: 0 };
+          if (args.includes("--git-common-dir")) return { stdout: ".git\n", stderr: "", exitCode: 0 };
+          if (args.includes("--show-origin")) {
+            return {
+              stdout:
+                "file:/wt/w/.git/config.worktree\t\n" +
+                `file:/wt/w/.git/config.worktree\t${workerHelper}\n`,
+              stderr: "",
+              stderr: "",
+              exitCode: 0,
+            };
+          }
           return { stdout: "", stderr: "", exitCode: 0 };
         },
       },
       { repoPath: "/wt/w" },
     );
     expect(receipt.scope).toBe("--worktree");
-    expect(seen.length).toBe(2);
+    expect(receipt.hostKey).toBe("credential.https://github.com.helper");
+    const writes = seen.filter((a) => a.includes("config") && !a.includes("rev-parse") && !a.includes("--show-origin"));
+    expect(writes.length).toBe(3);
     expect(seen.flat().join(" ")).not.toContain("--global");
   });
 });
@@ -270,3 +290,173 @@ describe("hardening: git global-option bypass + identity-aware diagnostics", () 
     expect(worker404.message).not.toMatch(/Reviewer GitHub App/);
   });
 });
+
+describe("blocker 3: credential helper host allowlisting (no leak to foreign hosts)", () => {
+  it("refuses non-https, foreign, and missing hosts without resolving a token", async () => {
+    let resolved = false;
+    const resolveToken = async () => {
+      resolved = true;
+      return { token: "ghs_must-never-leak-12345678" };
+    };
+    for (const input of [
+      { protocol: "https", host: "example.invalid" },
+      { protocol: "http", host: "github.com" },
+      { protocol: "", host: "github.com" },
+      { protocol: "https", host: "" },
+      {},
+    ]) {
+      resolved = false;
+      const out = await handleGitCredentialRequest("worker", "get", input, resolveToken);
+      expect(out.stdout).toBe("");
+      expect(out.exitCode).toBe(0);
+      expect(resolved).toBe(false);
+    }
+  });
+
+  it("allows github.com (case-insensitive) and enterprise hosts via env", async () => {
+    const resolveToken = async () => ({ token: "ghs_ok-12345678" });
+    const ok = await handleGitCredentialRequest(
+      "worker",
+      "get",
+      { protocol: "https", host: "GitHub.com" },
+      resolveToken,
+    );
+    expect(ok.stdout).toContain("ghs_ok-12345678");
+    const refused = await handleGitCredentialRequest(
+      "worker",
+      "get",
+      { protocol: "https", host: "ghe.example.com" },
+      resolveToken,
+    );
+    expect(refused.stdout).toBe("");
+    const allowed = await handleGitCredentialRequest(
+      "worker",
+      "get",
+      { protocol: "https", host: "ghe.example.com" },
+      resolveToken,
+      { allowedHosts: ["github.com", "ghe.example.com"] },
+    );
+    expect(allowed.stdout).toContain("ghs_ok-12345678");
+    expect(normalizeCredentialHost("https://GitHub.com/foo")).toBe("github.com");
+    expect(isHostAllowed("github.com", ["github.com"])).toBe(true);
+    expect(isHostAllowed("example.invalid", ["github.com"])).toBe(false);
+    expect(allowedHostsFromEnv({ [ALLOWED_HOSTS_ENV_VAR]: "ghe.example.com, GitHub.com" })).toEqual([
+      "github.com",
+      "ghe.example.com",
+    ]);
+    expect(credentialHostKey()).toBe("credential.https://github.com.helper");
+    expect(credentialHostKey("ghe.example.com")).toBe("credential.https://ghe.example.com.helper");
+  });
+});
+
+describe("blocker 2 (hardening): worker exec env is deterministically scoped", () => {
+  it("buildWorkerExecEnv carries tokens, host override, and SSH guard", () => {
+    const env = buildWorkerExecEnv("ghs_worker-12345678");
+    expect(env.GH_TOKEN).toBe("ghs_worker-12345678");
+    expect(env.GITHUB_TOKEN).toBe("ghs_worker-12345678");
+    expect(env.ORCA_PI_GITHUB_IDENTITY).toBe("worker");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("");
+    expect(env.GIT_CONFIG_KEY_1).toBe("credential.https://github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_1).toBe("");
+    expect(env.GIT_CONFIG_KEY_2).toBe("credential.https://github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_2).toContain("git-credential --identity worker");
+    expect(env.GIT_SSH_COMMAND).toBe(defaultSshGuardCommand());
+    expect(JSON.stringify(env)).not.toContain("ghp_");
+  });
+
+  it("mutation classifier handles --method=POST equals form", () => {
+    expect(isWorkerMutationCommand(["gh", "api", "--method=POST", "repos/o/r/pulls"])).toBe(true);
+    expect(isWorkerMutationCommand(["gh", "api", "--method=GET", "repos/o/r/pulls"])).toBe(false);
+  });
+});
+
+describe("blocker 4: cache bound to configured installation id", () => {
+  function appEnvFor(installationId: string): Record<string, string> {
+    return {
+      ORCA_PI_GITHUB_WORKER_APP_ID: "1001",
+      ORCA_PI_GITHUB_WORKER_PRIVATE_KEY_PATH: "/keys/worker.pem",
+      ORCA_PI_GITHUB_WORKER_INSTALLATION_ID: installationId,
+      ORCA_PI_GITHUB_WORKER_LOGIN: "orca-pi-worker[bot]",
+      HOME: "/home/u",
+    };
+  }
+
+  it("stale memory/disk entries for installation 111 are discarded after config moves to 222", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const pem = privateKey.export({ type: "pkcs1", format: "pem" }) as string;
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const mintFetch: GithubFetchFn = vi.fn(async (url: string) => {
+      if (url.includes("/access_tokens")) {
+        return { ok: true, status: 201, json: async () => ({ token: "ghs_fresh-222-12345678", expires_at: future }), text: async () => "{}" };
+      }
+      throw new Error("unexpected " + url);
+    });
+    const cache = createInstallationTokenCache();
+    const staleExpires = new Date(Date.now() + 60 * 60 * 1000);
+    cache.set("worker", { token: "ghs_stale-111-12345678", expiresAt: staleExpires, installationId: "111" });
+    const diskPath = "/home/u/.pi/agent/github-tokens/worker.json";
+    const fsWithStaleDisk = memFs({
+      "/keys/worker.pem": pem,
+      [diskPath]: JSON.stringify({ token: "ghs_stale-disk-111", expiresAt: future, installationId: "111" }),
+    });
+    const credential = await ensureInstallationToken("worker", {
+      env: appEnvFor("222"),
+      fs: fsWithStaleDisk,
+      fetchFn: mintFetch,
+      cache,
+      homedir: "/home/u",
+    });
+    expect(credential.token).toBe("ghs_fresh-222-12345678");
+    expect(credential.token).not.toContain("stale");
+    expect(credential.installationId).toBe("222");
+    expect(mintFetch).toHaveBeenCalled();
+  });
+
+  it("expired env tokens fall through to disk/App refresh instead of throwing", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const pem = privateKey.export({ type: "pkcs1", format: "pem" }) as string;
+    const past = new Date(Date.now() - 60 * 1000).toISOString();
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const fs = memFs({ "/keys/worker.pem": pem });
+    const mintFetch: GithubFetchFn = async (url: string) => {
+      if (url.includes("/access_tokens")) {
+        return { ok: true, status: 201, json: async () => ({ token: "ghs_refreshed-12345678", expires_at: future }), text: async () => "{}" };
+      }
+      throw new Error("unexpected " + url);
+    };
+    const credential = await ensureInstallationToken("worker", {
+      env: {
+        ORCA_PI_GITHUB_WORKER_TOKEN: "ghs_expired-env-12345678",
+        ORCA_PI_GITHUB_WORKER_EXPIRES_AT: past,
+        ORCA_PI_GITHUB_WORKER_APP_ID: "1001",
+        ORCA_PI_GITHUB_WORKER_PRIVATE_KEY_PATH: "/keys/worker.pem",
+        ORCA_PI_GITHUB_WORKER_INSTALLATION_ID: "111",
+        HOME: "/home/u",
+      },
+      fs,
+      fetchFn: mintFetch,
+      cache: createInstallationTokenCache(),
+      homedir: "/home/u",
+    });
+    expect(credential.token).toBe("ghs_refreshed-12345678");
+  });
+
+  it("expired env tokens still fail closed when refresh is impossible", async () => {
+    const past = new Date(Date.now() - 60 * 1000).toISOString();
+    await expect(
+      ensureInstallationToken("worker", {
+        env: {
+          ORCA_PI_GITHUB_WORKER_TOKEN: "ghs_expired-env-12345678",
+          ORCA_PI_GITHUB_WORKER_EXPIRES_AT: past,
+        },
+        fs: memFs({}),
+        cache: createInstallationTokenCache(),
+      }),
+    ).rejects.toMatchObject({ name: "GithubAuthError", code: "expired-token" });
+  });
+});
+
+

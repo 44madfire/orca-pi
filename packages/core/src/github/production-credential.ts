@@ -119,18 +119,32 @@ export async function describeProductionCredentialStatus(
 }> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
+  const slotOf = (id: string): string =>
+    `ORCA_PI_GITHUB_${id.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_TOKEN`;
+  const installationVarOf = (id: string): string =>
+    `ORCA_PI_GITHUB_${id.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_INSTALLATION_ID`;
+  const configuredInstallationId = env[installationVarOf(identity)]?.trim() || undefined;
+  // Fail-closed binding helper shared with ensure(): stale entries bound to
+  // a different installation never count as configured.
+  const isStaleBinding = (entryInstallationId?: string): boolean => {
+    if (!configuredInstallationId) return false;
+    return !entryInstallationId || entryInstallationId.trim() !== configuredInstallationId;
+  };
   // 1. Warmed memory / fresh env via the sync path (no I/O).
   try {
     const credential = resolveGithubCredential(identity, env, cache);
-    return {
-      identity,
-      configured: true,
-      sourceLabel: credential.sourceLabel,
-      ...(credential.expiresAt ? { expiresAt: credential.expiresAt.toISOString(), expired: false } : {}),
-    };
+    if (!isStaleBinding(credential.installationId)) {
+      return {
+        identity,
+        configured: true,
+        sourceLabel: credential.sourceLabel,
+        ...(credential.expiresAt ? { expiresAt: credential.expiresAt.toISOString(), expired: false } : {}),
+      };
+    }
+    cache.clear(identity);
   } catch (error) {
     if (error instanceof GithubAuthError && error.code === "expired-token") {
-      return { identity, configured: false, sourceLabel: `ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_TOKEN`, expired: true };
+      return { identity, configured: false, sourceLabel: slotOf(identity), expired: true };
     }
     // Fall through to disk below (missing-credential).
   }
@@ -140,7 +154,7 @@ export async function describeProductionCredentialStatus(
     try {
       providerFs = await nodeProviderFs();
     } catch {
-      return { identity, configured: false, sourceLabel: `ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_TOKEN` };
+      return { identity, configured: false, sourceLabel: slotOf(identity) };
     }
   }
   try {
@@ -154,16 +168,25 @@ export async function describeProductionCredentialStatus(
     });
     const text = await providerFs.readFile(path, "utf8").catch(() => undefined);
     if (!text) {
-      return { identity, configured: false, sourceLabel: `ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_TOKEN` };
+      return { identity, configured: false, sourceLabel: slotOf(identity) };
     }
     const parsed = JSON.parse(text) as { token?: unknown; expiresAt?: unknown; installationId?: unknown };
     if (typeof parsed.token !== "string" || !parsed.token.trim()) {
-      return { identity, configured: false, sourceLabel: `ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_TOKEN` };
+      return { identity, configured: false, sourceLabel: slotOf(identity) };
+    }
+    // Fail-closed installation binding (blocker 4): a disk entry for a
+    // different installation never counts as configured.
+    const diskInstallationId =
+      typeof parsed.installationId === "string" && parsed.installationId.trim()
+        ? parsed.installationId.trim()
+        : undefined;
+    if (isStaleBinding(diskInstallationId)) {
+      return { identity, configured: false, sourceLabel: slotOf(identity) };
     }
     if (typeof parsed.expiresAt === "string" && parsed.expiresAt.trim()) {
       const time = Date.parse(parsed.expiresAt);
       if (Number.isNaN(time)) {
-        return { identity, configured: false, sourceLabel: `ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_TOKEN` };
+        return { identity, configured: false, sourceLabel: slotOf(identity) };
       }
       const skew = 5 * 60 * 1000;
       if (time <= (options?.nowMs ?? Date.now()) + skew) {
@@ -184,6 +207,6 @@ export async function describeProductionCredentialStatus(
     cache.set(identity, { token: parsed.token.trim() });
     return { identity, configured: true, sourceLabel: `${path} (cache-file)` };
   } catch {
-    return { identity, configured: false, sourceLabel: `ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_TOKEN` };
+    return { identity, configured: false, sourceLabel: slotOf(identity) };
   }
 }

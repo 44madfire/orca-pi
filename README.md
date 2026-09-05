@@ -213,8 +213,9 @@ source of truth for completion/status.
   - `orca-pi github doctor [--repo <owner/repo>] [--ambient <login>] [--json]` / `orca-pi github identity doctor` — non-secret diagnostics (App login/ids, perms, expiry, distinctness).
   - `orca-pi github setup --identity <name> [--repo <owner/repo>]` — idempotent non-secret App bootstrap steps (Apps require UI/admin; no secrets committed).
   - `orca-pi github mint --identity <name>` — out-of-LLM installation-token mint/refresh (private key from `..._PRIVATE_KEY_PATH`, WSL/Windows aware; prints metadata only).
-  - `orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>` — scoped broker (`GH_TOKEN` only for the child; reviewer `git push` refused).
-  - `orca-pi github setup-git --identity worker [--path <repo-path>]` — worktree empty-reset + helper (`--worktree`, never `--global`; `git` only, `gh` needs `exec`).
+  - `orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>` — scoped broker (every worker exec preflights the Worker App; process `GIT_CONFIG_*` host override + `GIT_SSH_COMMAND` guard; reviewer `git push` refused).
+  - `orca-pi github setup-git --identity worker [--path <repo-path>] [--host <host>]` — worktree empty-resets + host helper (`--worktree` with `extensions.worktreeConfig` auto-enable, never `--global`; `git` only, `gh` needs `exec`).
+  - `orca-pi github ssh-guard` — internal SSH fail-closed guard (exit 128; worker pushes require HTTPS).
   - Profiles reference logical identities (`githubIdentity: worker|reviewer`), never secrets;
     tokens resolve at runtime via `ORCA_PI_GITHUB_<IDENTITY>_TOKEN` (+ optional `..._EXPIRES_AT`) or App mint
     (`..._APP_ID` + `..._PRIVATE_KEY_PATH` + `..._INSTALLATION_ID` + `..._LOGIN`).

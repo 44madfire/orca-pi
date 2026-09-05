@@ -112,7 +112,12 @@ mint) backs every consumer — `review`/`check` preflights + writes,
 `auth status`/`doctor` (read-only display uses the same chain without
 minting), `exec`, and `git-credential`. Mint once, then later invocations
 with App config but no `*_TOKEN` env still resolve via the disk cache.
-Expiry is recorded and refreshed before expiration (5-minute skew).
+Expired env tokens fall through to disk/App refresh (instead of throwing);
+when refresh is impossible the original expired-token error is rethrown.
+Expiry uses a unified 5-minute refresh skew everywhere. Cached entries are
+bound to `ORCA_PI_GITHUB_<IDENT>_INSTALLATION_ID`: a token cached for
+installation 111 is discarded (never reused) after config moves to 222, and
+minting resumes from the current App config (fail closed).
 Reviewer fail-closed verification (`GET /installation/repositories` with the
 IAT + trusted App login + distinct-from-author) remains intact; every worker
 remote mutation (`exec` `git push` / `gh pr create/...`, helper-backed `git
@@ -152,15 +157,31 @@ git push origin HEAD
 ```
 
 `setup-git` installs a deterministic override in worktree scope
-(`git -C <path> config --worktree --replace-all credential.helper ""`
-then `--add` the worker helper; `--local` fallback on old git) — never
-`--global`/`--system`. The empty reset makes git ignore inherited/global
-helpers (e.g. Git Credential Manager with ambient 44madfire) so the worker
-helper wins deterministically. Worktree scope keeps linked worktrees
-isolated (plain `--local` is shared). `setup-git` authenticates `git` only:
-`gh` ignores git credential helpers, so plain `gh pr create` does NOT work
-after `setup-git` — use `orca-pi github exec --identity worker -- gh ...`
-(scoped `GH_TOKEN` for the child, with Worker-App preflight).
+(`git -C <path> config --worktree --replace-all credential.helper ""`,
+`--replace-all credential.https://github.com.helper ""`, then
+`--add credential.https://github.com.helper "<worker helper>"`; `--local`
+fallback only for single worktrees on old git — never silently for linked
+worktrees, never `--global`/`--system`). In linked worktrees it first enables
+`extensions.worktreeConfig` in the common repo config (idempotent,
+repo-scoped) because modern git refuses `--worktree` writes otherwise; old
+git + linked worktree fails closed (upgrade git). After writing, setup reads
+back the host-scoped helpers and verifies the worker entry (fail closed).
+The empty resets make git ignore inherited/global helpers (e.g. Git
+Credential Manager with ambient 44madfire) so the worker helper wins
+deterministically. Host scoping means non-GitHub hosts never receive the
+worker token. Worktree scope keeps linked worktrees isolated (plain
+`--local` is shared). `setup-git` authenticates `git` only: `gh` ignores git
+credential helpers, so plain `gh pr create` does NOT work after `setup-git`
+— use `orca-pi github exec --identity worker -- gh ...`. Every worker `exec`
+runs Worker-App preflight first (any executable can consume `GH_TOKEN`, so
+classification allowlists are fail-open) and injects a process-scoped Git
+override (`GIT_CONFIG_*` empty resets + host worker helper) plus a
+`GIT_SSH_COMMAND` guard (`orca-pi github ssh-guard`, exit 128), so `git
+push` via exec uses the verified worker token even with ambient helpers
+configured, and SSH remotes fail closed (use HTTPS). The credential helper
+itself validates `protocol=https` + allowlisted host (default `github.com`,
+plus `ORCA_PI_GITHUB_ALLOWED_HOSTS` for enterprise) before emitting any
+password — foreign hosts get empty success with no mint and no token text.
 `git-credential get` mints via the out-of-LLM provider and pipes
 `username=x-access-token / password=<token>` to git (never logged);
 `store`/`erase` are no-ops (tokens are short-lived). `exec --identity

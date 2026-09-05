@@ -17,7 +17,9 @@
  *   (e.g. `orca-pi-worker[bot]`), used for distinct-actor checks.
  * - `ORCA_PI_GITHUB_<IDENT>_TOKEN` (+ `..._EXPIRES_AT`) — direct token
  *   slot (existing OP1.9 contract); the provider prefers a fresh env token
- *   when present and only mints when it is missing/expired.
+ *   when present, refreshes via disk/App mint when it is expired (expired
+ *   env errors are rethrown only when refresh is impossible), and only mints
+ *   when no fresh token exists anywhere.
  *
  * Short-lived installation tokens are additionally cached on disk
  * (`<config-dir>/github-tokens/<identity>.json`, mode 0600) so repeated
@@ -41,8 +43,8 @@ import { defaultTokenCache } from "./token-cache.js";
 
 /** Refresh ahead of expiry so workers never use a token at the edge. */
 export const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
-/** Clock skew tolerance for env-supplied expiry evaluation. */
-const ENV_EXPIRY_SKEW_MS = 60_000;
+/** Skew for env-supplied expiry evaluation (unified with refresh skew). */
+const ENV_EXPIRY_SKEW_MS = TOKEN_REFRESH_SKEW_MS;
 
 export interface CredentialProviderFs {
   readFile(path: string, encoding: "utf8"): Promise<string>;
@@ -635,26 +637,51 @@ export async function ensureInstallationToken(
   const cache = options?.cache ?? defaultTokenCache;
   const nowMs = options?.nowMs ?? Date.now();
 
-  // 1. In-memory cache (honors refresh skew).
+  const configuredInstallationId = env[installationIdEnvVarForIdentity(identity)]?.trim() || undefined;
+  // Fail-closed binding helper: cached/disk installation ids must match the
+  // currently configured installation (blocker 4). Stale entries are
+  // discarded so a token minted for installation 111 is never reused after
+  // config moves to 222. Entries without an id are also discarded when a
+  // configured id exists (they predate binding); when no id is configured
+  // there is nothing to bind against (downstream metadata preflight still
+  // requires it for writes).
+  const installationMismatch = (entryInstallationId?: string): string | undefined => {
+    if (!configuredInstallationId) return undefined;
+    if (!entryInstallationId || entryInstallationId.trim() !== configuredInstallationId) {
+      return entryInstallationId?.trim() || "(none)";
+    }
+    return undefined;
+  };
+
+  // 1. In-memory cache (honors refresh skew + installation binding).
   const cached = cache.get(identity);
   if (cached) {
     // `createInstallationTokenCache` uses its own 60s skew; re-check the
     // stricter refresh skew here so long-lived processes refresh early.
     if (!cached.expiresAt || cached.expiresAt.getTime() > nowMs + TOKEN_REFRESH_SKEW_MS) {
-      return {
-        identity,
-        sourceLabel: `${tokenEnvVarForIdentity(identity)} (cached)`,
-        token: cached.token,
-        ...(cached.expiresAt ? { expiresAt: cached.expiresAt } : {}),
-        ...(cached.installationId ? { installationId: cached.installationId } : {}),
-      };
+      const staleId = installationMismatch(cached.installationId);
+      if (staleId === undefined) {
+        return {
+          identity,
+          sourceLabel: `${tokenEnvVarForIdentity(identity)} (cached)`,
+          token: cached.token,
+          ...(cached.expiresAt ? { expiresAt: cached.expiresAt } : {}),
+          ...(cached.installationId ? { installationId: cached.installationId } : {}),
+        };
+      }
+      // Bound to a different installation — discard and continue to
+      // disk/mint from the current App config (fail closed, never reuse).
     }
     cache.clear(identity);
   }
 
-  // 2. Direct env token (existing OP1.9 contract) when fresh.
+  // 2. Direct env token (existing OP1.9 contract) when fresh. Expired env
+  // tokens fall through to disk/mint refresh (instead of throwing) so the
+  // documented refresh path holds; when refresh is impossible the original
+  // expired-token error is rethrown below (fail closed, actionable).
   const tokenVar = tokenEnvVarForIdentity(identity);
   const envToken = env[tokenVar]?.trim();
+  let expiredEnvError: GithubAuthError | undefined;
   if (envToken) {
     const expiresAt = parseEnvExpiry(env[expiryEnvVarForIdentity(identity)], identity);
     if (!expiresAt || expiresAt.getTime() > nowMs + ENV_EXPIRY_SKEW_MS) {
@@ -675,7 +702,7 @@ export async function ensureInstallationToken(
         ...(installationId ? { installationId } : {}),
       };
     }
-    throw new GithubAuthError(
+    expiredEnvError = new GithubAuthError(
       identity,
       "expired-token",
       `GitHub credential for identity "${identity}" is expired (from ${tokenVar}). ` +
@@ -694,24 +721,32 @@ export async function ensureInstallationToken(
       skewMs: TOKEN_REFRESH_SKEW_MS,
     });
     if (disk) {
-      const expiresAt = disk.entry.expiresAt ? new Date(disk.entry.expiresAt) : undefined;
-      cache.set(identity, {
-        token: disk.entry.token,
-        ...(expiresAt ? { expiresAt } : {}),
-        ...(disk.entry.installationId ? { installationId: disk.entry.installationId } : {}),
-      });
-      return {
-        identity,
-        sourceLabel: `${disk.path} (cache-file)`,
-        token: disk.entry.token,
-        ...(expiresAt ? { expiresAt } : {}),
-        ...(disk.entry.installationId ? { installationId: disk.entry.installationId } : {}),
-      };
+      const staleDiskId = installationMismatch(disk.entry.installationId);
+      if (staleDiskId === undefined) {
+        const expiresAt = disk.entry.expiresAt ? new Date(disk.entry.expiresAt) : undefined;
+        cache.set(identity, {
+          token: disk.entry.token,
+          ...(expiresAt ? { expiresAt } : {}),
+          ...(disk.entry.installationId ? { installationId: disk.entry.installationId } : {}),
+        });
+        return {
+          identity,
+          sourceLabel: `${disk.path} (cache-file)`,
+          token: disk.entry.token,
+          ...(expiresAt ? { expiresAt } : {}),
+          ...(disk.entry.installationId ? { installationId: disk.entry.installationId } : {}),
+        };
+      }
+      // Stale installation binding — ignore the disk entry and continue to
+      // mint from the current App config (fail closed, never reuse).
     }
   }
 
   // 4. Mint via App private key (out-of-LLM).
   const app = resolveAppIdentityConfig(identity, env);
+  if (expiredEnvError && (!app.appId || !app.privateKeyPath || !app.installationId)) {
+    throw expiredEnvError;
+  }
   if (!app.appId || !app.privateKeyPath || !app.installationId) {
     const missing: string[] = [];
     if (!app.appId) missing.push(app.appIdVar);
@@ -726,6 +761,7 @@ export async function ensureInstallationToken(
     );
   }
   if (!options?.fs) {
+    if (expiredEnvError) throw expiredEnvError;
     throw new GithubAuthError(
       identity,
       "helper-failed",

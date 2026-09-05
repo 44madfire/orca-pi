@@ -194,13 +194,25 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
     expect(out.join("")).toContain("ghs_worker-12345678");
   });
 
-  it("setup-git pins --local and refuses reviewer", async () => {
+  it("setup-git pins worktree host override and refuses reviewer", async () => {
     const seen: string[][] = [];
+    const workerHelper = "orca-pi github git-credential --identity worker";
     const { deps, out } = makeDeps({
       env: {},
       runner: {
         async run(exe: string, args: readonly string[]) {
           seen.push([exe, ...args]);
+          if (args.includes("--git-dir")) return { stdout: ".git\n", stderr: "", exitCode: 0 };
+          if (args.includes("--git-common-dir")) return { stdout: ".git\n", stderr: "", exitCode: 0 };
+          if (args.includes("--show-origin")) {
+            return {
+              stdout:
+                "file:/wt/worker/.git/config.worktree\t\n" +
+                `file:/wt/worker/.git/config.worktree\t${workerHelper}\n`,
+              stderr: "",
+              exitCode: 0,
+            };
+          }
           return { stdout: "", stderr: "", exitCode: 0 };
         },
       },
@@ -208,12 +220,12 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
     const ok = await runGithubCommand(["setup-git", "--identity", "worker", "--path", "/wt/worker"], deps);
     expect(ok.exitCode).toBe(0);
     expect(out.join("")).toContain("--worktree");
-    expect(seen.length).toBe(2);
-    expect(seen[0]).toContain("--worktree");
-    expect(seen[0]).toContain("--replace-all");
-    expect(seen[1]).toContain("--worktree");
-    expect(seen[1]).toContain("--add");
-    expect(seen[0]).not.toContain("--global");
+    const writes = seen.filter((a) => a.includes("config") && !a.includes("rev-parse") && !a.includes("--show-origin"));
+    expect(writes.length).toBe(3);
+    expect(writes[0]).toContain("--replace-all");
+    expect(writes[2]).toContain("--add");
+    expect(writes[2].join(" ")).toContain("credential.https://github.com.helper");
+    expect(seen.flat().join(" ")).not.toContain("--global");
 
     const { deps: rdeps, err } = makeDeps({
       env: {},

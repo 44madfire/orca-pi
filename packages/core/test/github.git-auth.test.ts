@@ -54,7 +54,7 @@ describe("git-auth: credential helper protocol", () => {
   });
 
   it("get returns username/password; store/erase are no-ops", async () => {
-    const get = await handleGitCredentialRequest("worker", "get", { host: "github.com" }, async () => ({
+    const get = await handleGitCredentialRequest("worker", "get", { protocol: "https", host: "github.com" }, async () => ({
       token: "ghs_helper-12345678",
     }));
     expect(get.exitCode).toBe(0);
@@ -99,12 +99,24 @@ describe("git-auth: worktree override never touches global", () => {
     );
   });
 
-  it("setupRepoGitAuth installs empty-reset + helper via worktree scope", async () => {
+  it("setupRepoGitAuth installs empty resets + host helper via worktree scope", async () => {
     const seen: string[][] = [];
+    const workerHelper = "orca-pi github git-credential --identity worker";
     const receipt = await setupRepoGitAuth(
       {
         async run(exe: string, args: readonly string[]) {
           seen.push([exe, ...args]);
+          if (args.includes("--git-dir")) return { stdout: ".git\n", stderr: "", exitCode: 0 };
+          if (args.includes("--git-common-dir")) return { stdout: ".git\n", stderr: "", exitCode: 0 };
+          if (args.includes("--show-origin")) {
+            return {
+              stdout:
+                "file:/wt/worker/.git/config.worktree\t\n" +
+                `file:/wt/worker/.git/config.worktree\t${workerHelper}\n`,
+              stderr: "",
+              exitCode: 0,
+            };
+          }
           return { stdout: "", stderr: "", exitCode: 0 };
         },
       },
@@ -112,11 +124,12 @@ describe("git-auth: worktree override never touches global", () => {
     );
     expect(receipt.helperCommand).toContain("git-credential --identity worker");
     expect(receipt.scope).toBe("--worktree");
-    expect(seen.length).toBe(2);
-    expect(seen[0]).toContain("--worktree");
-    expect(seen[0]).toContain("--replace-all");
-    expect(seen[1]).toContain("--worktree");
-    expect(seen[1]).toContain("--add");
+    expect(receipt.hostKey).toBe("credential.https://github.com.helper");
+    const configWrites = seen.filter((a) => a.includes("config") && !a.includes("rev-parse") && !a.includes("--show-origin"));
+    expect(configWrites.length).toBe(3);
+    expect(configWrites[0]).toContain("--replace-all");
+    expect(configWrites[1]).toContain("--replace-all");
+    expect(configWrites[2]).toContain("--add");
     expect(seen.flat().join(" ")).not.toContain("--global");
   });
 

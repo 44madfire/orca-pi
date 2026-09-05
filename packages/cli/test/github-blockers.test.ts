@@ -176,3 +176,71 @@ describe("blocker 2: PAT in worker slot never spawns child / never reaches write
     expect(err.join("")).not.toContain("ghp_human-pat-12345678");
   });
 });
+
+describe("worker exec is deterministically scoped (process override + SSH guard)", () => {
+  const iatFetch: GithubFetchFn = vi.fn(async (url: string) => {
+    if (url.includes("/installation/repositories")) {
+      return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+    }
+    throw new Error("unexpected " + url);
+  });
+  const workerEnv = {
+    ORCA_PI_GITHUB_WORKER_TOKEN: "ghs_worker-12345678",
+    ORCA_PI_GITHUB_WORKER_LOGIN: "orca-pi-worker[bot]",
+    ORCA_PI_GITHUB_WORKER_INSTALLATION_ID: "111",
+  };
+
+  it("every worker exec preflights (even non-mutations) and injects git override + ssh guard", async () => {
+    const seen: { command: string[]; env: Record<string, string> }[] = [];
+    const { deps } = makeDeps({
+      env: { ...workerEnv },
+      fetchFn: iatFetch,
+      execSpawn: async (command, options) => {
+        seen.push({ command, env: options.env });
+        return 0;
+      },
+    });
+    const r = await runGithubCommand(["exec", "--identity", "worker", "--", "git", "status"], deps);
+    expect(r.exitCode).toBe(0);
+    expect(iatFetch).toHaveBeenCalled();
+    const overlay = seen[0]?.env ?? {};
+    expect(overlay.GH_TOKEN).toBe("ghs_worker-12345678");
+    expect(overlay.GIT_CONFIG_COUNT).toBe("3");
+    expect(overlay.GIT_CONFIG_KEY_2).toBe("credential.https://github.com.helper");
+    expect(overlay.GIT_CONFIG_VALUE_2).toContain("git-credential --identity worker");
+    expect(overlay.GIT_SSH_COMMAND).toContain("ssh-guard");
+  });
+
+  it("arbitrary executables still preflight (classifier cannot be bypassed)", async () => {
+    let spawned = false;
+    const patFetch: GithubFetchFn = async (url: string) => {
+      if (url.includes("/installation/repositories")) {
+        return { ok: false, status: 403, json: async () => ({}), text: async () => "forbidden" };
+      }
+      throw new Error("must not reach: " + url);
+    };
+    const { deps } = makeDeps({
+      env: {
+        ORCA_PI_GITHUB_WORKER_TOKEN: "ghp_human-pat-12345678",
+        ORCA_PI_GITHUB_WORKER_LOGIN: "orca-pi-worker[bot]",
+        ORCA_PI_GITHUB_WORKER_INSTALLATION_ID: "111",
+      },
+      fetchFn: patFetch,
+      execSpawn: async () => {
+        spawned = true;
+        return 0;
+      },
+    });
+    const r = await runGithubCommand(["exec", "--identity", "worker", "--", "python", "-c", "print(1)"], deps);
+    expect(r.exitCode).toBe(1);
+    expect(spawned).toBe(false);
+  });
+
+  it("ssh-guard fails closed with exit 128 and no secrets", async () => {
+    const { deps, err } = makeDeps({ env: {} });
+    const r = await runGithubCommand(["ssh-guard", "git@github.com", "git-upload-pack"], deps);
+    expect(r.exitCode).toBe(128);
+    expect(err.join("")).toMatch(/SSH remotes are not supported/i);
+    expect(err.join("")).not.toMatch(/ghs_|ghp_/);
+  });
+});

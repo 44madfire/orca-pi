@@ -14,12 +14,19 @@
  *   provider. `get` prints `username`/`password` to stdout (piped to git,
  *   never logged); `store`/`erase` are no-ops (tokens are short-lived).
  * - `gitConfigCommandsForSetup` builds the deterministic override sequence
- *   (`credential.helper ""` reset + worker helper `--add`) in `--worktree`
- *   scope (fallback `--local` on old git). The empty reset is Git's
- *   documented way to ignore inherited/global helpers (e.g. Git Credential
- *   Manager holding ambient `44madfire`), so the worker helper wins without
- *   mutating global config. `--worktree` keeps linked worktrees isolated
+ *   (generic `credential.helper ""` reset + host-scoped
+ *   `credential.https://<host>.helper ""` reset + host-scoped worker helper
+ *   `--add`) in `--worktree` scope (fallback `--local` only for single
+ *   worktrees on old git — never silently for linked worktrees). Resets are
+ *   Git's documented way to ignore inherited/global helpers (e.g. Git
+ *   Credential Manager holding ambient `44madfire`), so the worker helper
+ *   wins without mutating global config. `--worktree` (with
+ *   `extensions.worktreeConfig` auto-enabled) keeps linked worktrees isolated
  *   (plain `--local` is shared across linked worktrees).
+ * - `buildWorkerExecEnv` builds the process-scoped child env for worker
+ *   `exec` (GH_TOKEN + GIT_CONFIG_* host override + GIT_SSH_COMMAND guard),
+ *   so `git push` via exec deterministically uses the verified worker token
+ *   even with ambient helpers configured, and SSH remotes fail closed.
  * - `assertIdentityMayRunCommand` blocks reviewer Contents-write
  *   (`git push ...` with global `-C`/`-c` forms); reviewers describe
  *   follow-ups, they never push. `isWorkerMutationCommand` identifies
@@ -128,7 +135,7 @@ export function isContentsWriteGitCommand(argv: readonly string[]): boolean {
  * - `gh pr create|edit|merge|close|reopen|ready|lock|unlock`
  * - `gh issue create|edit|close|reopen|lock|unlock|transfer|pin|unpin`
  * - `gh release create|edit|delete|upload`
- * - `gh api` with mutating `--method` (POST/PUT/PATCH/DELETE) or
+ * - `gh api` with mutating `--method`/`--method=` (POST/PUT/PATCH/DELETE) or
  *   `/repos/.../pulls|issues|check-runs|contents` POST-ish paths
  * - `gh auth` subcommands are NOT mutations (excluded)
  */
@@ -147,8 +154,8 @@ export function isWorkerMutationCommand(argv: readonly string[]): boolean {
   }
   if (group === "api") {
     const joined = rest.join(" ").toLowerCase();
-    // Explicit mutating method wins.
-    const methodMatch = /--method\s+(\w+)/.exec(joined) ?? /-x\s*(\w+)/.exec(joined);
+    // Explicit mutating method wins (space and equals forms).
+    const methodMatch = /--method[\s=]+(\w+)/.exec(joined) ?? /-x\s*(\w+)/.exec(joined);
     if (methodMatch) {
       const method = (methodMatch[1] as string).toUpperCase();
       if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) return true;
@@ -181,6 +188,65 @@ export function assertIdentityMayRunCommand(
   }
 }
 
+/** Default GitHub host allowlist for the credential helper (enterprise via ORCA_PI_GITHUB_ALLOWED_HOSTS). */
+export const DEFAULT_CREDENTIAL_HOSTS: readonly string[] = ["github.com"] as const;
+
+/** Env var carrying extra allowed credential hosts (comma-separated, e.g. GHE). */
+export const ALLOWED_HOSTS_ENV_VAR = "ORCA_PI_GITHUB_ALLOWED_HOSTS";
+
+/** Exit code for the SSH guard (git fatal convention). */
+export const SSH_GUARD_EXIT_CODE = 128;
+
+/** Message printed by the SSH guard (no secrets). */
+export const SSH_GUARD_MESSAGE =
+  "error: SSH remotes are not supported for worker Git operations (worker identity requires HTTPS with the Worker App credential helper). " +
+  "Use an HTTPS remote (https://github.com/...) and retry via: orca-pi github exec --identity worker -- git push ...";
+
+/** Default SSH guard command (relies on orca-pi on PATH, like the credential helper). */
+export function defaultSshGuardCommand(executable = "orca-pi"): string {
+  return `${executable} github ssh-guard`;
+}
+
+/** Normalize a credential host for comparison (lowercase, strip scheme/path/port). */
+export function normalizeCredentialHost(raw: string): string {
+  let host = raw.trim().toLowerCase();
+  const schemeIdx = host.indexOf("://");
+  if (schemeIdx >= 0) host = host.slice(schemeIdx + 3);
+  const slashIdx = host.indexOf("/");
+  if (slashIdx >= 0) host = host.slice(0, slashIdx);
+  const colonIdx = host.indexOf(":");
+  if (colonIdx >= 0) host = host.slice(0, colonIdx);
+  return host.replace(/\.+$/, "");
+}
+
+/** Allowlist from env (default github.com plus ORCA_PI_GITHUB_ALLOWED_HOSTS). */
+export function allowedHostsFromEnv(
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): string[] {
+  const hosts = ["github.com"];
+  const raw = env?.[ALLOWED_HOSTS_ENV_VAR];
+  if (typeof raw === "string" && raw.trim()) {
+    for (const part of raw.split(",")) {
+      const normalized = normalizeCredentialHost(part);
+      if (normalized && !hosts.includes(normalized)) hosts.push(normalized);
+    }
+  }
+  return hosts;
+}
+
+/** True when the credential request host is allowed to receive the token. */
+export function isHostAllowed(host: string, allowedHosts?: readonly string[]): boolean {
+  const normalized = normalizeCredentialHost(host);
+  if (!normalized) return false;
+  return (allowedHosts ?? DEFAULT_CREDENTIAL_HOSTS).includes(normalized);
+}
+
+/** Config key for host-scoped credential helpers (e.g. credential.https://github.com.helper). */
+export function credentialHostKey(host = "github.com"): string {
+  const normalized = normalizeCredentialHost(host) || "github.com";
+  return "credential.https://" + normalized + ".helper";
+}
+
 /** Parse `git credential` helper input (`key=value` lines) into a map. */
 export function parseGitCredentialInput(text: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -197,8 +263,9 @@ export function parseGitCredentialInput(text: string): Record<string, string> {
 }
 
 /**
- * Handle one `git credential <action>` request. `get` resolves the
- * credential via `resolveToken` and returns the helper stdout
+ * Handle one `git credential <action>` request. `get` validates the request
+ * host (protocol=https + allowlisted host, default github.com) BEFORE
+ * resolving any token, then returns the helper stdout
  * (`username=x-access-token\npassword=<token>\n`); `store`/`erase` return
  * empty success (short-lived tokens are never stored by git).
  */
@@ -207,10 +274,16 @@ export async function handleGitCredentialRequest(
   action: "get" | "store" | "erase",
   input: Record<string, string>,
   resolveToken: () => Promise<{ token: string }>,
+  options?: { allowedHosts?: readonly string[] },
 ): Promise<{ stdout: string; exitCode: number }> {
-  void input;
   if (action === "store" || action === "erase") return { stdout: "", exitCode: 0 };
-  // `get`: mint/refresh outside LLM context, then hand to git via stdout.
+  const protocol = (input.protocol ?? "").trim().toLowerCase();
+  const host = (input.host ?? "").trim();
+  if (protocol !== "https" || !isHostAllowed(host, options?.allowedHosts)) {
+    return { stdout: "", exitCode: 0 };
+  }
+  // `get` for an allowed host: mint/refresh outside LLM context, then hand
+  // to git via stdout.
   const { token } = await resolveToken();
   if (!token || !token.trim()) {
     throw new GithubAuthError(
@@ -261,17 +334,18 @@ export function gitConfigArgsForSetup(options: {
 }
 
 /**
- * Deterministic override sequence (blocker 4): empty reset followed by the
- * worker helper `--add`, both in worktree scope. Git tries multiple
- * `credential.helper` values in order; without the empty reset a
+ * Deterministic override sequence: generic empty reset + host-scoped empty
+ * reset + host-scoped worker helper `--add`, all in worktree scope. Git tries
+ * multiple `credential.helper` values in order; without the resets a
  * global/system Git Credential Manager helper holding ambient `44madfire`
- * can answer before the worker helper. The empty value is Git's documented
- * reset — inherited helpers are ignored after it.
+ * can answer before the worker helper. Host scoping means non-GitHub hosts
+ * never receive the worker token (fail closed, no leak).
  */
 export function gitConfigCommandsForSetup(options: {
   repoPath: string;
   helperCommand: string;
   scope?: "--worktree" | "--local";
+  githubHost?: string;
 }): { executable: string; args: string[] }[] {
   const scope = options.scope ?? "--worktree";
   if (scope !== "--worktree" && scope !== "--local") {
@@ -282,10 +356,44 @@ export function gitConfigCommandsForSetup(options: {
   const repoPath = options.repoPath.trim();
   if (!repoPath) throw new Error(`setup-git requires a non-empty --path <repo-path>.`);
   if (!options.helperCommand.trim()) throw new Error(`setup-git requires a helper command.`);
+  const hostKey = credentialHostKey(options.githubHost ?? "github.com");
   return [
     { executable: "git", args: ["-C", repoPath, "config", scope, "--replace-all", "credential.helper", ""] },
-    { executable: "git", args: ["-C", repoPath, "config", scope, "--add", "credential.helper", options.helperCommand] },
+    { executable: "git", args: ["-C", repoPath, "config", scope, "--replace-all", hostKey, ""] },
+    { executable: "git", args: ["-C", repoPath, "config", scope, "--add", hostKey, options.helperCommand] },
   ];
+}
+
+/**
+ * Process-scoped child env for worker `exec` (blocker 2, second half).
+ *
+ * In addition to GH_TOKEN/GITHUB_TOKEN this installs a Git credential
+ * override for the child only (generic empty reset + host-scoped empty
+ * reset + host-scoped worker helper via GIT_CONFIG_COUNT/KEY/VALUE) so
+ * `git push` via exec deterministically uses the verified worker token even
+ * when ambient helpers (GCM with human credential) are configured — without
+ * touching any repo/global config. Non-GitHub hosts get no helper (fail
+ * closed, no leak). SSH remotes fail closed via GIT_SSH_COMMAND guard.
+ */
+export function buildWorkerExecEnv(
+  token: string,
+  options?: { helperCommand?: string; githubHost?: string; sshGuardCommand?: string },
+): Record<string, string> {
+  const base = buildScopedEnvForIdentity("worker", token);
+  const helperCommand = options?.helperCommand ?? defaultHelperCommand();
+  const hostKey = credentialHostKey(options?.githubHost ?? "github.com");
+  const sshGuard = options?.sshGuardCommand ?? defaultSshGuardCommand();
+  return {
+    ...base,
+    GIT_CONFIG_COUNT: "3",
+    GIT_CONFIG_KEY_0: "credential.helper",
+    GIT_CONFIG_VALUE_0: "",
+    GIT_CONFIG_KEY_1: hostKey,
+    GIT_CONFIG_VALUE_1: "",
+    GIT_CONFIG_KEY_2: hostKey,
+    GIT_CONFIG_VALUE_2: helperCommand,
+    GIT_SSH_COMMAND: sshGuard,
+  };
 }
 
 /** Default helper command embedded in worktree git config. */
@@ -294,52 +402,167 @@ export function defaultHelperCommand(executable = "orca-pi"): string {
 }
 
 /**
+ * True when `repoPath` is inside a linked worktree (git-dir differs from
+ * git-common-dir, typically `<common>/.git/worktrees/<name>`). Best-effort:
+ * unparseable output is treated as NOT linked (preserves mocked-runner
+ * behavior); real git always reports parseable paths. Throws when the path
+ * is not a git checkout.
+ */
+export async function isLinkedWorktree(
+  runner: ProcessRunner,
+  repoPath: string,
+): Promise<boolean> {
+  let gitDirOut: string;
+  let commonDirOut: string;
+  try {
+    const gitDirRes = await runner.run("git", ["-C", repoPath, "rev-parse", "--git-dir"]);
+    const commonRes = await runner.run("git", ["-C", repoPath, "rev-parse", "--git-common-dir"]);
+    if (gitDirRes.exitCode !== 0 || commonRes.exitCode !== 0) {
+      throw new Error(
+        `setup-git failed: ${JSON.stringify(repoPath)} is not a git checkout ` +
+          `(${(gitDirRes.stderr || gitDirRes.stdout || commonRes.stderr || commonRes.stdout).trim().slice(0, 200) || "rev-parse failed"}).`,
+      );
+    }
+    gitDirOut = gitDirRes.stdout;
+    commonDirOut = commonRes.stdout;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("setup-git failed")) throw error;
+    throw new Error(
+      `setup-git failed: could not inspect git worktree in ${JSON.stringify(repoPath)} (${error instanceof Error ? error.message : String(error)}). Is this a git checkout?`,
+    );
+  }
+  const norm = (s: string): string => s.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const gitDir = norm(gitDirOut);
+  const commonDir = norm(commonDirOut);
+  if (!gitDir || !commonDir) return false;
+  if (gitDir.includes("/worktrees/")) return true;
+  return gitDir !== commonDir;
+}
+
+/**
  * Run worktree-scoped `git config` override via an injectable runner.
- * Tries `--worktree` first (isolated per linked worktree), falls back to
- * `--local` on old git without worktree scope. Never touches
- * global/system config. Returns the helper command recorded.
+ *
+ * Linked worktrees: safely enables `extensions.worktreeConfig` in the
+ * common repo config first (idempotent, repo-scoped, never global), then
+ * writes the host-scoped reset+helper sequence with `--worktree`. Never
+ * falls back to `--local` for linked worktrees (`--local` is shared across
+ * linked worktrees and would violate per-worker isolation).
+ * Single worktrees: writes with `--worktree`, falling back to `--local`
+ * only on old git without worktree scope (equivalent when unlinked).
+ * Old git + linked worktree fails closed (upgrade git).
+ * After writing, reads back the host-scoped helpers and verifies the
+ * worker entry is present (fail closed).
+ * Never touches global/system config. Returns the helper command recorded.
  */
 export async function setupRepoGitAuth(
   runner: ProcessRunner,
-  options: { repoPath: string; helperCommand?: string; executable?: string },
-): Promise<{ repoPath: string; helperCommand: string; scope: "--worktree" | "--local" }> {
+  options: { repoPath: string; helperCommand?: string; executable?: string; githubHost?: string },
+): Promise<{ repoPath: string; helperCommand: string; scope: "--worktree" | "--local"; hostKey: string }> {
   const helperCommand = options.helperCommand ?? defaultHelperCommand(options.executable ?? "orca-pi");
-  const attempts: ("--worktree" | "--local")[] = ["--worktree", "--local"];
-  let lastError: unknown;
-  for (const scope of attempts) {
-    const commands = gitConfigCommandsForSetup({ repoPath: options.repoPath, helperCommand, scope });
+  const hostKey = credentialHostKey(options.githubHost ?? "github.com");
+  const repoPath = options.repoPath;
+  if (!repoPath.trim()) throw new Error(`setup-git requires a non-empty --path <repo-path>.`);
+  if (!helperCommand.trim()) throw new Error(`setup-git requires a helper command.`);
+  const linked = await isLinkedWorktree(runner, repoPath);
+
+  async function runConfig(args: readonly string[]): Promise<void> {
+    let result;
     try {
-      for (const { executable, args } of commands) {
-        const result = await runner.run(executable, args);
-        if (result.exitCode !== 0) {
-          const detail = `${result.stderr || result.stdout}`.trim().slice(0, 500);
-          // Old git without --worktree reports "unknown option"; fall back.
-          if (scope === "--worktree" && /unknown option|unknown switch/i.test(detail)) {
-            throw new Error(`worktree-scope-unsupported: ${detail}`);
-          }
-          throw new Error(
-            `setup-git failed: git config ${scope} exited ${result.exitCode}${detail ? ` — ${redactSecretsFromText(detail, [])}` : ""}. Is ${JSON.stringify(options.repoPath)} a git checkout?`,
-          );
-        }
-      }
-      return { repoPath: options.repoPath, helperCommand, scope };
+      result = await runner.run("git", args);
     } catch (error) {
-      lastError = error;
-      if (error instanceof Error && error.message.startsWith("worktree-scope-unsupported")) {
-        continue;
+      throw new Error(
+        `setup-git failed: could not run git ${args.slice(0, 4).join(" ")} in ${JSON.stringify(repoPath)} (${error instanceof Error ? error.message : String(error)}). Is this a git checkout?`,
+      );
+    }
+    if (result.exitCode !== 0) {
+      const detail = `${result.stderr || result.stdout}`.trim().slice(0, 500);
+      if (/cannot be used with multiple working trees|worktreeconfig/i.test(detail)) {
+        throw new Error(`worktree-config-disabled: ${detail}`);
       }
-      // Runner-level failure (e.g. not a git repo): do not silently fall back.
-      if (scope === "--worktree" && error instanceof Error && /unknown option/i.test(error.message)) continue;
-      throw error instanceof Error && error.message.startsWith("setup-git failed")
-        ? error
-        : new Error(
-            `setup-git failed: could not run git config ${scope} in ${JSON.stringify(options.repoPath)} (${error instanceof Error ? error.message : String(error)}). Is this a git checkout?`,
-          );
+      if (/unknown option|unknown switch/i.test(detail)) {
+        throw new Error(`worktree-scope-unsupported: ${detail}`);
+      }
+      throw new Error(
+        `setup-git failed: git ${args.slice(2, 4).join(" ")} exited ${result.exitCode}${detail ? ` — ${redactSecretsFromText(detail, [])}` : ""}. Is ${JSON.stringify(repoPath)} a git checkout?`,
+      );
     }
   }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`setup-git failed in ${JSON.stringify(options.repoPath)}.`);
+
+  async function writeWorktreeSequence(): Promise<void> {
+    const commands = gitConfigCommandsForSetup({ repoPath, helperCommand, scope: "--worktree", githubHost: options.githubHost });
+    for (const { args } of commands) {
+      await runConfig(args);
+    }
+  }
+
+  async function enableWorktreeConfigExtension(): Promise<void> {
+    await runConfig(["-C", repoPath, "config", "extensions.worktreeConfig", "true"]);
+  }
+
+  async function verifyHostHelper(): Promise<void> {
+    let result;
+    try {
+      result = await runner.run("git", ["-C", repoPath, "config", "--show-origin", "--get-all", hostKey]);
+    } catch (error) {
+      throw new Error(
+        `setup-git verification failed in ${JSON.stringify(repoPath)} (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `setup-git verification failed: ${hostKey} not readable in ${JSON.stringify(repoPath)} (exit ${result.exitCode}).`,
+      );
+    }
+    try {
+      assertWorktreeHelperConfigured(result.stdout, { repoPath, helperCommand });
+    } catch (error) {
+      throw new Error(
+        `setup-git verification failed: worker helper not deterministically configured in ${JSON.stringify(repoPath)} (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    }
+  }
+
+  if (linked) {
+    try {
+      await writeWorktreeSequence();
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("worktree-config-disabled")) {
+        await enableWorktreeConfigExtension();
+        await writeWorktreeSequence();
+      } else if (error instanceof Error && error.message.startsWith("worktree-scope-unsupported")) {
+        throw new Error(
+          `setup-git failed: linked worktree at ${JSON.stringify(repoPath)} requires git with --worktree scope (old git detected). ` +
+            `Upgrade git instead of sharing --local config across linked worktrees (per-worker isolation).`,
+        );
+      } else {
+        throw error;
+      }
+    }
+    await verifyHostHelper();
+    return { repoPath, helperCommand, scope: "--worktree", hostKey };
+  }
+
+  try {
+    await writeWorktreeSequence();
+    await verifyHostHelper();
+    return { repoPath, helperCommand, scope: "--worktree", hostKey };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("worktree-config-disabled")) {
+      await enableWorktreeConfigExtension();
+      await writeWorktreeSequence();
+      await verifyHostHelper();
+      return { repoPath, helperCommand, scope: "--worktree", hostKey };
+    }
+    if (error instanceof Error && error.message.startsWith("worktree-scope-unsupported")) {
+      const commands = gitConfigCommandsForSetup({ repoPath, helperCommand, scope: "--local", githubHost: options.githubHost });
+      for (const { args } of commands) {
+        await runConfig(args);
+      }
+      await verifyHostHelper();
+      return { repoPath, helperCommand, scope: "--local", hostKey };
+    }
+    throw error;
+  }
 }
 
 /**
@@ -380,7 +603,13 @@ export function assertWorktreeHelperConfigured(
   options?: { repoPath?: string; helperCommand?: string },
 ): void {
   const expectedHelper = options?.helperCommand ?? "orca-pi github git-credential --identity worker";
-  const lines = showOriginAllOutput.split("\n").map((line) => line.trim()).filter(Boolean);
+  // Split first, trim parts second: trimming the whole line first would strip
+  // the trailing tab of empty-reset entries (`file:<path>\t`), destroying
+  // the separator that marks them as resets.
+  const lines = showOriginAllOutput
+    .split("\n")
+    .map((line) => line.replace(/\r$/, ""))
+    .filter((line) => line.trim().length > 0);
   if (lines.length === 0) {
     throw new Error(
       `No git credential.helper is configured${options?.repoPath ? ` for ${JSON.stringify(options.repoPath)}` : ""} — run \`orca-pi github setup-git --identity worker --path <repo-path>\` (worktree-scoped empty reset + worker helper, never --global) and retry.`,

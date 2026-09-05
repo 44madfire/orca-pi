@@ -29,7 +29,8 @@
  *   orca-pi github mint --identity <name> [--json]
  *   orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>
  *   orca-pi github git-credential --identity <name> <get|store|erase>
- *   orca-pi github setup-git --identity worker [--path <repo-path>] [--json]
+ *   orca-pi github setup-git --identity worker [--path <repo-path>] [--host <host>] [--json]
+ *   orca-pi github ssh-guard (internal GIT_SSH_COMMAND fail-closed guard; exit 128)
  *
  * Human remains the final merge authority — no auto-merge command exists.
  * ChatGPT/human acts as 44madfire, distinct from both bots.
@@ -43,7 +44,6 @@ import {
   ensureInstallationToken,
   formatGithubDoctorReport,
   GITHUB_IDENTITY_PATTERN,
-  isWorkerMutationCommand,
   MAX_GITHUB_IDENTITY_LENGTH,
   operatorSetupStepsForIdentity,
   parsePullRequestRef,
@@ -56,9 +56,13 @@ import {
   validateSetupForIdentity,
   verifyWorkerForWrites,
   verdictToCheckConclusion,
+  SSH_GUARD_EXIT_CODE,
+  SSH_GUARD_MESSAGE,
+  allowedHostsFromEnv,
   assertIdentityMayRunCommand,
   assertWorkerIdentityForWrites,
   buildScopedEnvForIdentity,
+  buildWorkerExecEnv,
   handleGitCredentialRequest,
   parseGitCredentialInput,
   setupRepoGitAuth,
@@ -106,7 +110,8 @@ Usage:
   orca-pi github mint --identity <name> [--json]
   orca-pi github exec [--identity <name>] [--profile <name>] -- <command...>
   orca-pi github git-credential --identity <name> <get|store|erase>
-  orca-pi github setup-git --identity worker [--path <repo-path>] [--json]
+  orca-pi github setup-git --identity worker [--path <repo-path>] [--host <host>] [--json]
+  orca-pi github ssh-guard (internal GIT_SSH_COMMAND fail-closed guard; exit 128)
 
 Identity inheritance (OP1.12): the launch role is authoritative. Prefer
 --profile <name> or the spawn-injected ORCA_PI_GITHUB_IDENTITY env over
@@ -791,11 +796,12 @@ async function runExec(args: readonly string[], deps: GithubCommandDeps): Promis
       ...(deps.homedir ? { homedir: deps.homedir } : {}),
       ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
     };
-    // Blocker 2: worker remote mutations require Worker-App/IAT preflight
-    // BEFORE any child is spawned � a human PAT in the worker slot fails
-    // here (401/403 via GET /installation/repositories) and never reaches
-    // git/gh. Non-mutating reads (e.g. `git status`) skip the network proof.
-    if (resolved === "worker" && isWorkerMutationCommand(command)) {
+    // Every worker exec is credential-bearing (arbitrary executables can
+    // consume GH_TOKEN), so Worker-App/IAT preflight runs before EVERY worker
+    // child -- not just classified mutations. A human PAT in the worker slot
+    // fails here (401/403 via GET /installation/repositories) and never
+    // reaches the child.
+    if (resolved === "worker") {
       await verifyWorkerForWrites(resolved, prodOpts);
     }
     const credential = await resolveProductionCredential(resolved, {
@@ -808,7 +814,15 @@ async function runExec(args: readonly string[], deps: GithubCommandDeps): Promis
       ...(deps.osHomedir ? { osHomedir: deps.osHomedir } : {}),
     });
     const token = credential.token;
-    const overlay = buildScopedEnvForIdentity(resolved, token);
+    // Worker children get the process-scoped Git override (generic + host
+    // resets + host-scoped worker helper) plus the SSH guard, so `git push`
+    // deterministically uses the verified worker token even with ambient
+    // helpers configured, and SSH remotes fail closed. Other identities keep
+    // the token-only overlay.
+    const overlay =
+      resolved === "worker"
+        ? buildWorkerExecEnv(token)
+        : buildScopedEnvForIdentity(resolved, token);
     if (deps.execSpawn) {
       const code = await deps.execSpawn(command, { env: overlay });
       return { exitCode: code };
@@ -896,7 +910,8 @@ async function runGitCredential(args: readonly string[], deps: GithubCommandDeps
       });
       return { token: credential.token };
     };
-    const result = await handleGitCredentialRequest(resolved, action, input, resolveToken);
+    const allowedHosts = allowedHostsFromEnv(env);
+    const result = await handleGitCredentialRequest(resolved, action, input, resolveToken, { allowedHosts });
     // stdout is piped to git — never add framing/logs here.
     if (result.stdout) deps.stdout(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);
     return { exitCode: result.exitCode };
@@ -910,6 +925,7 @@ async function runGitCredential(args: readonly string[], deps: GithubCommandDeps
 async function runSetupGit(args: readonly string[], deps: GithubCommandDeps): Promise<GithubCommandResult> {
   let identity: string | undefined;
   let repoPath: string | undefined;
+  let githubHost: string | undefined;
   let asJson = false;
   for (let i = 0; i < args.length;) {
     const arg = args[i] as string;
@@ -919,6 +935,9 @@ async function runSetupGit(args: readonly string[], deps: GithubCommandDeps): Pr
     } else if (arg === "--path") {
       repoPath = takeValue(args, i, arg).value;
       i += 2;
+    } else if (arg === "--host") {
+      githubHost = takeValue(args, i, arg).value;
+      i += 2;
     } else if (arg === "--json") {
       asJson = true;
       i += 1;
@@ -927,11 +946,11 @@ async function runSetupGit(args: readonly string[], deps: GithubCommandDeps): Pr
       return { exitCode: 0 };
     } else if (arg.startsWith("--")) {
       deps.stderr(`error: unknown github setup-git option: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github setup-git --identity worker [--path <repo-path>] [--json]\n`);
+      deps.stderr(`usage: orca-pi github setup-git --identity worker [--path <repo-path>] [--host <host>] [--json]\n`);
       return { exitCode: 2 };
     } else {
       deps.stderr(`error: unexpected argument: ${arg}\n`);
-      deps.stderr(`usage: orca-pi github setup-git --identity worker [--path <repo-path>] [--json]\n`);
+      deps.stderr(`usage: orca-pi github setup-git --identity worker [--path <repo-path>] [--host <host>] [--json]\n`);
       return { exitCode: 2 };
     }
   }
@@ -943,11 +962,14 @@ async function runSetupGit(args: readonly string[], deps: GithubCommandDeps): Pr
     if (!path) throw new Error(`Missing --path <repo-path> (e.g. --path /wt/worker-checkout).`);
     const runner = deps.runner;
     if (!runner) throw new Error(`setup-git requires a process runner (unavailable in this host).`);
-    const receipt = await setupRepoGitAuth(runner, { repoPath: path });
+    const receipt = await setupRepoGitAuth(runner, {
+      repoPath: path,
+      ...(githubHost?.trim() ? { githubHost: githubHost.trim() } : {}),
+    });
     if (asJson) {
-      deps.stdout(`${JSON.stringify({ ok: true, identity: resolved, repoPath: receipt.repoPath, helper: receipt.helperCommand, scope: receipt.scope, ghNote: "setup-git authenticates git only; gh needs: orca-pi github exec --identity worker -- gh ..." }, null, 2)}\n`);
+      deps.stdout(`${JSON.stringify({ ok: true, identity: resolved, repoPath: receipt.repoPath, helper: receipt.helperCommand, scope: receipt.scope, hostKey: receipt.hostKey, ghNote: "setup-git authenticates git only; gh needs: orca-pi github exec --identity worker -- gh ..." }, null, 2)}\n`);
     } else {
-      deps.stdout(`ok github setup-git — worker helper override in ${receipt.repoPath} (scope ${receipt.scope}: empty reset + worker helper, never --global; git only)\n`);
+      deps.stdout(`ok github setup-git — worker helper override in ${receipt.repoPath} (scope ${receipt.scope}: empty resets + ${receipt.hostKey} worker helper, never --global; git only)\n`);
     }
     return { exitCode: 0 };
   } catch (error) {
@@ -998,6 +1020,11 @@ export async function runGithubCommand(
   if (subcommand === "mint") return await runMint(rest, deps);
   if (subcommand === "exec") return await runExec(rest, deps);
   if (subcommand === "git-credential") return await runGitCredential(rest, deps);
+  if (subcommand === "ssh-guard") {
+    deps.stderr(`${SSH_GUARD_MESSAGE}
+`);
+    return { exitCode: SSH_GUARD_EXIT_CODE };
+  }
   deps.stderr(`error: unknown github subcommand: ${subcommand}\n`);
   deps.stderr(`${GITHUB_USAGE}`);
   return { exitCode: 2 };
