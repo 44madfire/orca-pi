@@ -210,28 +210,28 @@ describe("blocker 3: JWT-only vs IAT auth classes", () => {
 
 describe("blocker 4: deterministic worktree override beats ambient helper", () => {
   it("setup emits empty resets + host worker add in worktree scope", () => {
-    const cmds = gitConfigCommandsForSetup({ repoPath: "/wt/w", helperCommand: "orca-pi github git-credential --identity worker" });
+    const cmds = gitConfigCommandsForSetup({ repoPath: "/wt/w", helperCommand: "!orca-pi github git-credential --identity worker" });
     expect(cmds.length).toBe(3);
     expect(cmds[0]?.args).toEqual(["-C", "/wt/w", "config", "--worktree", "--replace-all", "credential.helper", ""]);
     expect(cmds[1]?.args).toEqual(["-C", "/wt/w", "config", "--worktree", "--replace-all", "credential.https://github.com.helper", ""]);
-    expect(cmds[2]?.args).toEqual(["-C", "/wt/w", "config", "--worktree", "--add", "credential.https://github.com.helper", "orca-pi github git-credential --identity worker"]);
+    expect(cmds[2]?.args).toEqual(["-C", "/wt/w", "config", "--worktree", "--add", "credential.https://github.com.helper", "!orca-pi github git-credential --identity worker"]);
   });
 
   it("ambient helper ahead without reset is rejected; with reset it passes", () => {
     const ambientFirst =
       "file:/home/u/.gitconfig\tcredential.helper=manager\n" +
-      "file:/wt/w/.git/config\tcredential.helper=orca-pi github git-credential --identity worker\n";
+      "file:/wt/w/.git/config\tcredential.helper=!orca-pi github git-credential --identity worker\n";
     expect(() => assertWorktreeHelperConfigured(ambientFirst, { repoPath: "/wt/w" })).toThrow(/empty-reset/i);
     const withReset =
       "file:/home/u/.gitconfig\tcredential.helper=manager\n" +
       "file:/wt/w/.git/config.worktree\tcredential.helper=\n" +
-      "file:/wt/w/.git/config.worktree\tcredential.helper=orca-pi github git-credential --identity worker\n";
+      "file:/wt/w/.git/config.worktree\tcredential.helper=!orca-pi github git-credential --identity worker\n";
     expect(() => assertWorktreeHelperConfigured(withReset, { repoPath: "/wt/w" })).not.toThrow();
   });
 
   it("setupRepoGitAuth runs resets + host add, never global", async () => {
     const seen: string[][] = [];
-    const workerHelper = "orca-pi github git-credential --identity worker";
+    const workerHelper = "!orca-pi github git-credential --identity worker";
     const receipt = await setupRepoGitAuth(
       {
         async run(exe: string, args: readonly string[]) {
