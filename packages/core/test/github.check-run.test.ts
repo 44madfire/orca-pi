@@ -34,8 +34,10 @@ function mockChecksFetch(options?: {
   existing?: Array<{ id: number; name?: string; head_sha?: string; status?: string }>;
   createdId?: number;
   failInstallationStatus?: number;
+  actorLogin?: string;
 }): { fetchFn: GithubFetchFn; calls: string[] } {
   const calls: string[] = [];
+  const actorLogin = options?.actorLogin ?? "orca-pi-reviewer[bot]";
   const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
     calls.push(`${init.method} ${url}`);
     if (url === "https://api.github.com/user" && init.method === "GET") {
@@ -46,6 +48,9 @@ function mockChecksFetch(options?: {
         return { ok: false, status: options.failInstallationStatus, json: async () => ({}), text: async () => "denied" };
       }
       return jsonResponse({ total_count: 1, repositories: [{ id: 1, full_name: "o/r" }] }, 200);
+    }
+    if (url.endsWith("/graphql") && init.method === "POST") {
+      return jsonResponse({ data: { viewer: { login: actorLogin } } }, 200);
     }
     if (url.includes("/check-runs?") && init.method === "GET") {
       return jsonResponse({ check_runs: options?.existing ?? [] }, 200);
@@ -150,7 +155,8 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
     );
     expect(started.id).toBe(5001);
     expect(started.deduped).toBeUndefined();
-    expect(calls.filter((c) => c.startsWith("POST")).length).toBe(1);
+    // One check-run create POST (plus the GraphQL actor-binding POST).
+    expect(calls.filter((c) => c.startsWith("POST") && !c.endsWith("/graphql")).length).toBe(1);
   });
 
   it("Blocking 3: repeating start for the same SHA reuses the run (no duplicate POST)", async () => {
@@ -178,8 +184,9 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
     expect(first.id).toBe(5001);
     expect(second.id).toBe(5001);
     expect(second.deduped).toBe(true);
-    // No POST creates at all — both starts PATCHed the existing run.
-    expect(calls.filter((c) => c.startsWith("POST"))).toEqual([]);
+    // No check-run POST creates at all — both starts PATCHed the existing run
+    // (GraphQL actor-binding POSTs still run per preflight).
+    expect(calls.filter((c) => c.startsWith("POST") && !c.endsWith("/graphql"))).toEqual([]);
     expect(calls.filter((c) => c.startsWith("PATCH")).length).toBe(2);
     // PATCH bodies must be update-safe: no create-only head_sha.
     expect(patchBodies.length).toBe(2);
@@ -208,7 +215,8 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
     );
     expect(completed.id).toBe(5001);
     expect(completed.conclusion).toBe("success");
-    expect(calls.filter((c) => c.startsWith("POST")).length).toBe(1);
+    // One check-run create POST across start+complete (plus GraphQL binding POSTs).
+    expect(calls.filter((c) => c.startsWith("POST") && !c.endsWith("/graphql")).length).toBe(1);
   });
 
   it("complete without an id reuses the existing deterministic run via list", async () => {
@@ -267,6 +275,7 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
       seen.push(`${init.method} ${url}`);
       if (url === "https://api.github.com/user") throw new Error("contract violation: GET /user called for IAT flow");
       if (url.includes("/installation/repositories")) return jsonResponse({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return jsonResponse({ data: { viewer: { login: "orca-pi-reviewer[bot]" } } }, 200);
       if (url.includes("/check-runs?")) return jsonResponse({ check_runs: [] }, 200);
       if (url.endsWith("/check-runs")) return jsonResponse({ id: 9001 }, 201);
       throw new Error(`unexpected ${init.method} ${url}`);
@@ -275,6 +284,14 @@ describe("check-run: idempotent retry (Blocking 3)", () => {
     expect(started.id).toBe(9001);
     expect(seen.some((c) => c === "GET https://api.github.com/user")).toBe(false);
     expect(seen.some((c) => c.includes("/installation/repositories"))).toBe(true);
+  });
+
+  it("actor binding: worker IAT in the reviewer slot never reaches check writes", async () => {
+    const { fetchFn, calls } = mockChecksFetch({ actorLogin: "orca-pi-worker[bot]" });
+    await expect(startAgentReviewCheck("reviewer", { owner: "o", repo: "r", headSha: SHA, summary: "x" }, { fetchFn, env: ENV, cache: createInstallationTokenCache() })).rejects.toThrow(/authenticates as "orca-pi-worker\[bot\]"/);
+    // Only the GraphQL binding read ran — no check-run POST/PATCH writes.
+    expect(calls.filter((c) => (c.startsWith("POST") || c.startsWith("PATCH")) && !c.endsWith("/graphql"))).toEqual([]);
+    expect(calls.some((c) => c === "POST https://api.github.com/graphql")).toBe(true);
   });
 
   it("403 during preflight maps to actionable unauthorized-installation error", async () => {

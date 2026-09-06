@@ -119,12 +119,21 @@ bound to `ORCA_PI_GITHUB_<IDENT>_INSTALLATION_ID`: a token cached for
 installation 111 is discarded (never reused) after config moves to 222, and
 minting resumes from the current App config (fail closed).
 Reviewer fail-closed verification (`GET /installation/repositories` with the
-IAT + trusted App login + distinct-from-author) remains intact; every worker
-remote mutation (`exec` `git push` / `gh pr create/...`, helper-backed `git
-push`) additionally requires Worker-App preflight (`GET
-/installation/repositories` with the worker IAT + `[bot]` metadata) before
-any child is spawned or password emitted — human PATs fail closed and never
-reach write APIs. Repository installation/permission verification uses
+IAT + GraphQL `viewer.login` actor binding to the trusted App login +
+distinct-from-author) remains intact; every worker `exec` (any executable can
+consume `GH_TOKEN`, so there is no mutation allowlist) additionally requires
+Worker-App preflight (IAT class + GraphQL actor binding + `[bot]` metadata)
+before any child is spawned, and helper-backed `git push` requires the same
+before any password is emitted — human PATs and swapped App tokens fail
+closed and never reach write APIs.
+
+Trust model for `exec`: the short-lived installation token is intentionally
+injected as `GH_TOKEN`/`GITHUB_TOKEN` into the child process env (after
+preflight + actor binding), so prefer the intended `git`/`gh` surfaces — a
+child that dumps its environment (e.g. `exec -- env`) can expose it in the
+terminal/transcript. This is scoped per child process/session (never ambient,
+never global config); long-lived PATs, App private keys, and webhook secrets
+are never exposed to model context, prompts, logs, or receipts. Repository installation/permission verification uses
 `GET /repos/{owner}/{repo}/installation` with a locally-built App JWT
 (JWT-only per GitHub docs; IATs do not work there) and fails closed when
 `--repo` verification could not run.

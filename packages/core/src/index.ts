@@ -292,6 +292,7 @@ export {
   listPullReviews,
   parsePullRequestRef,
   parseReviewVerdict,
+  proveInstallationActor,
   proveInstallationTokenClass,
   redactSecretsFromText,
   redactTokenLikeValues,

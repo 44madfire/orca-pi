@@ -124,15 +124,22 @@ context) or via App private-key mint (ORCA_PI_GITHUB_<IDENTITY>_APP_ID +
 ..._PRIVATE_KEY_PATH + ..._INSTALLATION_ID). Tokens never appear in output.
 Formal reviews and the orca-pi/agent-review check must use the reviewer
 identity: the CLI proves installation-token class (GET /installation/repositories, which
-supports IATs unlike GET /user) for the trusted configured App login and
-distinctness from the PR author before any POST, so same-account PATs and
-worker identity never reach the write APIs. Check start is idempotent
+supports IATs unlike GET /user), binds the token to the configured App actor
+(GraphQL viewer.login must equal the trusted ..._LOGIN, so swapped App tokens
+fail closed), and proves distinctness from the PR author before any POST, so
+same-account PATs and worker identity never reach the write APIs. Check start is idempotent
 (reuses the deterministic run for the SHA); review retries with identical
 inputs dedupe via response-state matching. Worker pushes run as the
 worker App (Contents: write) via scoped exec (per-process GH_TOKEN) and worktree-scoped
 git helper override (empty credential.helper reset + worker helper, never --global).
 Plain gh is NOT authenticated by setup-git (gh ignores git helpers) -- use
-orca-pi github exec --identity worker -- gh pr create ... for gh writes. The reviewer App holds Contents: read only; human (44madfire,
+orca-pi github exec --identity worker -- gh pr create ... for gh writes. Trust
+model: exec injects the short-lived installation token as GH_TOKEN into the
+child env (after Worker-App preflight + actor binding), so prefer the intended
+git/gh surfaces -- a child that dumps its environment (e.g. exec -- env)
+can expose it in the terminal/transcript. Long-lived tokens, private keys,
+and webhook secrets are never exposed. The reviewer App holds Contents: read
+only; human (44madfire,
 including ChatGPT-assisted review) merges. worker bot != reviewer bot != 44madfire.
 `;
 

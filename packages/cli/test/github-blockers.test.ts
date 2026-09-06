@@ -58,6 +58,7 @@ describe("blocker 1: separate invocations reuse disk cache (mint once, no TOKEN)
     const fetchFn: GithubFetchFn = vi.fn(async (url: string) => {
       if (url.includes("/access_tokens")) return okPayload({ token: "ghs_cli-minted-12345678", expires_at: future }, 201);
       if (url.includes("/installation/repositories")) return okPayload({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return okPayload({ data: { viewer: { login: "orca-pi-reviewer[bot]" } } }, 200);
       if (/\/pulls\/\d+$/.test(url)) return okPayload({ user: { login: "human-user" }, head: { sha: "feedfacefeedfacefeedfacefeedfacefeedface" } }, 200);
       if (url.includes("/reviews?")) return okPayload([], 200);
       if (url.endsWith("/reviews")) return okPayload({ id: 77 }, 200);
@@ -182,6 +183,9 @@ describe("worker exec is deterministically scoped (process override + SSH guard)
     if (url.includes("/installation/repositories")) {
       return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
     }
+    if (url.endsWith("/graphql")) {
+      return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "orca-pi-worker[bot]" } } }), text: async () => "{}" };
+    }
     throw new Error("unexpected " + url);
   });
   const workerEnv = {
@@ -242,5 +246,66 @@ describe("worker exec is deterministically scoped (process override + SSH guard)
     expect(r.exitCode).toBe(128);
     expect(err.join("")).toMatch(/SSH remotes are not supported/i);
     expect(err.join("")).not.toMatch(/ghs_|ghp_/);
+  });
+});
+
+describe("actor binding: swapped App tokens cannot masquerade across slots", () => {
+  const workerEnvWithReviewerToken = {
+    ORCA_PI_GITHUB_WORKER_TOKEN: "ghs_reviewer-iat-12345678",
+    ORCA_PI_GITHUB_WORKER_LOGIN: "orca-pi-worker[bot]",
+    ORCA_PI_GITHUB_WORKER_INSTALLATION_ID: "111",
+  };
+  const reviewerEnvWithWorkerToken = {
+    ORCA_PI_GITHUB_REVIEWER_TOKEN: "ghs_worker-iat-12345678",
+    ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]",
+    ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "222",
+  };
+  const swappedFetchFor = (actualActor: string): GithubFetchFn =>
+    vi.fn(async (url: string) => {
+      if (url.includes("/installation/repositories")) {
+        return okPayload({ repositories: [] }, 200);
+      }
+      if (url.endsWith("/graphql")) {
+        return okPayload({ data: { viewer: { login: actualActor } } }, 200);
+      }
+      throw new Error("must not reach write API: " + url);
+    });
+
+  it("worker exec git push with a reviewer IAT never spawns the child", async () => {
+    let spawned = false;
+    const { deps, err } = makeDeps({
+      env: { ...workerEnvWithReviewerToken },
+      fetchFn: swappedFetchFor("orca-pi-reviewer[bot]"),
+      execSpawn: async () => {
+        spawned = true;
+        return 0;
+      },
+    });
+    const r = await runGithubCommand(["exec", "--identity", "worker", "--", "git", "push", "origin", "HEAD"], deps);
+    expect(r.exitCode).toBe(1);
+    expect(spawned).toBe(false);
+    expect(err.join("")).toMatch(/authenticates as "orca-pi-reviewer\[bot\]"/);
+    expect(err.join("")).not.toContain("ghs_reviewer-iat-12345678");
+  });
+
+  it("reviewer review with a worker IAT never reaches POST", async () => {
+    const posts: string[] = [];
+    const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string }) => {
+      if (url.includes("/installation/repositories")) return okPayload({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return okPayload({ data: { viewer: { login: "orca-pi-worker[bot]" } } }, 200);
+      if (init.method === "POST" || init.method === "PATCH") posts.push(`${init.method} ${url}`);
+      if (/\/pulls\/\d+$/.test(url)) {
+        return okPayload({ user: { login: "human-user" }, head: { sha: "feedfacefeedfacefeedfacefeedfacefeedface" } }, 200);
+      }
+      throw new Error(`must not write: ${init.method} ${url}`);
+    });
+    const { deps, err } = makeDeps({ env: { ...reviewerEnvWithWorkerToken }, fetchFn });
+    const r = await runGithubCommand(
+      ["review", "--identity", "reviewer", "--pr", "o/r#1", "--verdict", "comment", "--body", "hi"],
+      deps,
+    );
+    expect(r.exitCode).toBe(1);
+    expect(posts).toEqual([]);
+    expect(err.join("")).toMatch(/authenticates as "orca-pi-worker\[bot\]"/);
   });
 });

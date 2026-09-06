@@ -61,6 +61,7 @@ export {
   describeCredentialStatus,
   fetchAuthenticatedActor,
   fetchPullRequestAuthor,
+  proveInstallationActor,
   proveInstallationTokenClass,
   resolveGithubCredential,
   resolveReviewerAppMetadata,

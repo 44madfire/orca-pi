@@ -70,6 +70,7 @@ describe("github doctor/setup (non-secret diagnostics)", () => {
     const iatFetch: GithubFetchFn = vi.fn(async (url: string) => {
       const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
       if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return ok({ data: { viewer: { login: "orca-pi-worker[bot]" } } }, 200);
       throw new Error(`unexpected ${url}`);
     });
     const { deps, out } = makeDeps({ env: { ...WORKER_ENV, ...REVIEWER_ENV, GITHUB_ACTOR: "44madfire" }, fetchFn: iatFetch });
@@ -131,6 +132,7 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
     const iatFetch: GithubFetchFn = vi.fn(async (url: string) => {
       const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
       if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return ok({ data: { viewer: { login: "orca-pi-worker[bot]" } } }, 200);
       throw new Error(`unexpected ${url}`);
     });
     const seen: { command: string[]; env: Record<string, string> }[] = [];
@@ -161,6 +163,7 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
     const iatFetch2: GithubFetchFn = vi.fn(async (url: string) => {
       const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
       if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return ok({ data: { viewer: { login: "orca-pi-worker[bot]" } } }, 200);
       throw new Error(`unexpected ${url}`);
     });
     const seen: string[][] = [];
@@ -181,6 +184,7 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
     const iatFetch3: GithubFetchFn = vi.fn(async (url: string) => {
       const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
       if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return ok({ data: { viewer: { login: "orca-pi-worker[bot]" } } }, 200);
       throw new Error(`unexpected ${url}`);
     });
     const { deps, out } = makeDeps({
@@ -246,6 +250,7 @@ describe("github review inherits profile (reviewer bot, no repeat)", () => {
     const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
       const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
       if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      if (url.endsWith("/graphql")) return ok({ data: { viewer: { login: "orca-pi-reviewer[bot]" } } }, 200);
       if (/\/pulls\/\d+$/.test(url)) return ok({ user: { login: "human-user" }, head: { sha: "feedfacefeedfacefeedfacefeedfacefeedface" } }, 200);
       if (url.includes("/reviews?")) return ok([], 200);
       if (url.endsWith("/reviews")) return ok({ id: 7 }, 200);

@@ -160,11 +160,14 @@ describe("github-app-auth: installation-token refresh/expiry", () => {
   it("verifyReviewerForReview enforces IAT class + distinct author (never GET /user)", async () => {
     const reviewerEnv = { ORCA_PI_GITHUB_REVIEWER_TOKEN: REVIEWER_TOKEN, ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]", ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123" };
     const HEAD = "feedfacefeedfacefeedfacefeedfacefeedface";
-    const mkFetch = (prAuthor: string, installationStatus = 200): GithubFetchFn =>
-      (async (url: string) => {
+    const mkFetch = (prAuthor: string, installationStatus = 200, actorLogin = "orca-pi-reviewer[bot]"): GithubFetchFn =>
+      (async (url: string, init: { method: string }) => {
         if (url.includes("/installation/repositories")) {
           if (installationStatus !== 200) return { ok: false, status: installationStatus, json: async () => ({}), text: async () => "denied" };
           return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+        }
+        if (url.endsWith("/graphql") && init.method === "POST") {
+          return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: actorLogin } } }), text: async () => "{}" };
         }
         if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
         return { ok: true, status: 200, json: async () => ({ user: { login: prAuthor }, head: { sha: HEAD } }), text: async () => "{}" };
@@ -172,10 +175,10 @@ describe("github-app-auth: installation-token refresh/expiry", () => {
     // Happy path: IAT + configured Bot distinct from author (head SHA captured).
     const ok = await verifyReviewerForReview("reviewer", { owner: "o", repo: "r", pullNumber: 1 }, { fetchFn: mkFetch("human-user"), env: reviewerEnv, cache: createInstallationTokenCache() });
     expect(ok).toEqual({ reviewerLogin: "orca-pi-reviewer[bot]", prAuthorLogin: "human-user", installationId: "123", headSha: HEAD });
-    // Same login → same-actor rejection before any POST.
+    // Same login → same-actor rejection before any POST (token actor matches config so binding passes).
     const sameEnv = { ...reviewerEnv, ORCA_PI_GITHUB_REVIEWER_LOGIN: "human-user[bot]" };
     // Note: configured login must still look like a bot; use a bot login equal to author to trigger distinctness.
-    await expect(verifyReviewerForReview("reviewer", { owner: "o", repo: "r", pullNumber: 1 }, { fetchFn: mkFetch("human-user[bot]"), env: sameEnv, cache: createInstallationTokenCache() })).rejects.toThrow(/same actor/i);
+    await expect(verifyReviewerForReview("reviewer", { owner: "o", repo: "r", pullNumber: 1 }, { fetchFn: mkFetch("human-user[bot]", 200, "human-user[bot]"), env: sameEnv, cache: createInstallationTokenCache() })).rejects.toThrow(/same actor/i);
     // Non-IAT token (installation endpoint 403) → actionable before PR fetch.
     await expect(verifyReviewerForReview("reviewer", { owner: "o", repo: "r", pullNumber: 1 }, { fetchFn: mkFetch("human-user", 403), env: reviewerEnv, cache: createInstallationTokenCache() })).rejects.toThrow(/installation.token|Reviewer GitHub App/i);
     // Missing metadata → fail closed without network writes.
@@ -187,8 +190,12 @@ describe("github-app-auth: installation-token refresh/expiry", () => {
 
   it("verifyReviewerForChecks enforces IAT identity for check writes", async () => {
     const reviewerEnv = { ORCA_PI_GITHUB_REVIEWER_TOKEN: REVIEWER_TOKEN, ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]", ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123" };
-    const botFetch: GithubFetchFn = async (url) => {
+    const botFetch: GithubFetchFn = async (url, init) => {
       if (url.includes("/installation/repositories")) return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+      if (url.endsWith("/graphql")) {
+        expect(init.method).toBe("POST");
+        return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "orca-pi-reviewer[bot]" } } }), text: async () => "{}" };
+      }
       if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
       throw new Error(`unexpected ${url}`);
     };
@@ -217,5 +224,67 @@ describe("github-app-auth: installation-token refresh/expiry", () => {
 
     const missing = describeCredentialStatus("reviewer", {}, createInstallationTokenCache());
     expect(missing.configured).toBe(false);
+  });
+});
+
+describe("github-app-auth: installation actor binding (GraphQL viewer.login)", () => {
+  const reviewerEnv = {
+    ORCA_PI_GITHUB_REVIEWER_TOKEN: REVIEWER_TOKEN,
+    ORCA_PI_GITHUB_REVIEWER_LOGIN: "orca-pi-reviewer[bot]",
+    ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID: "123",
+  };
+  const graphqlFetch = (actorLogin: string): GithubFetchFn =>
+    (async (url: string, init: { method: string; headers: Record<string, string> }) => {
+      if (url.includes("/installation/repositories")) {
+        return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+      }
+      if (url.endsWith("/graphql")) {
+        expect(init.method).toBe("POST");
+        expect(init.headers.Authorization).toBe(`Bearer ${REVIEWER_TOKEN}`);
+        expect(url.endsWith("/user")).toBe(false);
+        return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: actorLogin } } }), text: async () => "{}" };
+      }
+      throw new Error(`unexpected ${url}`);
+    }) as GithubFetchFn;
+
+  it("proveInstallationActor accepts the configured bot (case-insensitive), never GET /user", async () => {
+    const { proveInstallationActor } = await import("../src/github/github-app-auth.js");
+    await expect(
+      proveInstallationActor("reviewer", { fetchFn: graphqlFetch("ORCA-PI-REVIEWER[bot]"), env: reviewerEnv, cache: createInstallationTokenCache() }),
+    ).resolves.toEqual({ actorLogin: "ORCA-PI-REVIEWER[bot]" });
+  });
+
+  it("proveInstallationActor rejects a swapped App token before any write", async () => {
+    const { proveInstallationActor } = await import("../src/github/github-app-auth.js");
+    const error = await proveInstallationActor(
+      "reviewer",
+      { fetchFn: graphqlFetch("orca-pi-worker[bot]"), env: reviewerEnv, cache: createInstallationTokenCache() },
+    ).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GithubAuthError);
+    expect((error as GithubAuthError).code).toBe("unauthorized-installation");
+    expect(String((error as Error).message)).toMatch(/authenticates as "orca-pi-worker\[bot\]"/);
+    expect(String((error as Error).message)).toMatch(/worker bot != reviewer bot/);
+    expect(String((error as Error).message)).not.toContain(REVIEWER_TOKEN);
+  });
+
+  it("proveInstallationActor fails closed on missing login, GraphQL errors, and absent viewer", async () => {
+    const { proveInstallationActor } = await import("../src/github/github-app-auth.js");
+    await expect(
+      proveInstallationActor("reviewer", { fetchFn: graphqlFetch("x[bot]"), env: { ORCA_PI_GITHUB_REVIEWER_TOKEN: REVIEWER_TOKEN }, cache: createInstallationTokenCache() }),
+    ).rejects.toThrow(/Missing verified reviewer App identit/);
+    const errorsFetch: GithubFetchFn = async (url) => {
+      if (url.includes("/installation/repositories")) return { ok: true, status: 200, json: async () => ({}), text: async () => "{}" };
+      return { ok: true, status: 200, json: async () => ({ errors: [{ message: "FORBIDDEN" }] }), text: async () => "{}" };
+    };
+    await expect(
+      proveInstallationActor("reviewer", { fetchFn: errorsFetch, env: reviewerEnv, cache: createInstallationTokenCache() }),
+    ).rejects.toThrow(/GraphQL errors/i);
+    const noViewerFetch: GithubFetchFn = async (url) => {
+      if (url.includes("/installation/repositories")) return { ok: true, status: 200, json: async () => ({}), text: async () => "{}" };
+      return { ok: true, status: 200, json: async () => ({ data: {} }), text: async () => "{}" };
+    };
+    await expect(
+      proveInstallationActor("reviewer", { fetchFn: noViewerFetch, env: reviewerEnv, cache: createInstallationTokenCache() }),
+    ).rejects.toThrow(/no viewer login/i);
   });
 });

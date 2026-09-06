@@ -69,6 +69,9 @@ describe("blocker 1: mint once, separate invocations reuse disk cache (no *_TOKE
       if (url.includes("/installation/repositories")) {
         return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
       }
+      if (url.endsWith("/graphql")) {
+        return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "orca-pi-reviewer[bot]" } } }), text: async () => "{}" };
+      }
       if (/\/pulls\/\d+$/.test(url)) {
         return { ok: true, status: 200, json: async () => ({ user: { login: "human-user" }, head: { sha: "abc1234abc1234abc1234abc1234abc1234abc12" } }), text: async () => "{}" };
       }

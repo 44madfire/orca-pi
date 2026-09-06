@@ -39,17 +39,44 @@ describe("worker App metadata: fail-closed installation binding", () => {
   });
 });
 
-describe("worker preflight: IAT class + bot shape (never GET /user)", () => {
-  it("happy path proves installation-token class", async () => {
-    const fetchFn: GithubFetchFn = vi.fn(async (url: string) => {
-      expect(url).toContain("/installation/repositories");
-      expect(url.endsWith("/user")).toBe(false);
-      return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+describe("worker preflight: IAT class + bot shape + actor binding (never GET /user)", () => {
+  it("happy path proves installation-token class and actor", async () => {
+    const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string }) => {
+      if (url.includes("/installation/repositories")) {
+        expect(url.endsWith("/user")).toBe(false);
+        return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+      }
+      if (url.endsWith("/graphql") && init.method === "POST") {
+        return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "orca-pi-worker[bot]" } } }), text: async () => "{}" };
+      }
+      throw new Error(`unexpected ${url}`);
     });
     await expect(
       verifyWorkerForWrites("worker", { fetchFn, env: { ...WORKER_ENV }, cache: createInstallationTokenCache() }),
     ).resolves.toEqual({ workerLogin: "orca-pi-worker[bot]", installationId: "654321" });
     expect(fetchFn).toHaveBeenCalled();
+  });
+
+  it("swapped reviewer token in the worker slot is rejected before any write", async () => {
+    const posts: string[] = [];
+    const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string }) => {
+      if (url.includes("/installation/repositories")) {
+        return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+      }
+      if (url.endsWith("/graphql")) {
+        return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "orca-pi-reviewer[bot]" } } }), text: async () => "{}" };
+      }
+      if (init.method === "POST") posts.push(url);
+      throw new Error(`must not reach write API: ${init.method} ${url}`);
+    });
+    const error = await verifyWorkerForWrites(
+      "worker",
+      { fetchFn, env: { ...WORKER_ENV }, cache: createInstallationTokenCache() },
+    ).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(String((error as Error).message)).toMatch(/authenticates as "orca-pi-reviewer\[bot\]"/);
+    expect(posts).toEqual([]);
+    expect(String((error as Error).message)).not.toContain(WORKER_TOKEN);
   });
 
   it("human login in the worker slot is refused", async () => {
