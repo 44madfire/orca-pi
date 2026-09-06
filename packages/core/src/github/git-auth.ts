@@ -396,9 +396,15 @@ export function buildWorkerExecEnv(
   };
 }
 
-/** Default helper command embedded in worktree git config. */
+/** Default helper command embedded in worktree git config.
+ *
+ * Leading `!` is required: without it git treats the first word as a
+ * helper name and looks for a `git-credential-orca-pi` binary (push fails
+ * with "git: 'credential-orca-pi' is not a git command"). With `!` git
+ * runs it as a shell command, appending the operation (`get`/`store`/`erase`).
+ */
 export function defaultHelperCommand(executable = "orca-pi"): string {
-  return `${executable} github git-credential --identity worker`;
+  return `!${executable} github git-credential --identity worker`;
 }
 
 /**
@@ -602,7 +608,7 @@ export function assertWorktreeHelperConfigured(
   showOriginAllOutput: string,
   options?: { repoPath?: string; helperCommand?: string },
 ): void {
-  const expectedHelper = options?.helperCommand ?? "orca-pi github git-credential --identity worker";
+  const expectedHelper = options?.helperCommand ?? "!orca-pi github git-credential --identity worker";
   // Split first, trim parts second: trimming the whole line first would strip
   // the trailing tab of empty-reset entries (`file:<path>\t`), destroying
   // the separator that marks them as resets.

@@ -1,3 +1,8 @@
+---
+name: orca-pi-doctor
+description: Run read-only orca-pi diagnostics (version and doctor) to verify orca and pi CLIs are available. Use for Orca-Pi setup checks.
+---
+
 # orca-pi-doctor
 
 Thin Orca skill placeholder (OP1.1 scaffold). It documents the read-only

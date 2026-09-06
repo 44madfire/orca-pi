@@ -200,7 +200,7 @@ describe("github mint/exec/setup-git broker (scoped, never prints secrets)", () 
 
   it("setup-git pins worktree host override and refuses reviewer", async () => {
     const seen: string[][] = [];
-    const workerHelper = "orca-pi github git-credential --identity worker";
+    const workerHelper = "!orca-pi github git-credential --identity worker";
     const { deps, out } = makeDeps({
       env: {},
       runner: {
