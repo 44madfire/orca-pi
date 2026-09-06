@@ -60,7 +60,7 @@ export interface OrchestrationCommandResult {
 export const ORCHESTRATION_USAGE = `orca-pi orchestration — compact Pi-facing worker lifecycle (Orca owns Tasks/Dispatches)
 
 Usage:
-  orca-pi spawn <profile> (--task <spec> | --task-id <id>) [--task-title <title>] [--parent <task-id>] [--deps <json-array>] [--worktree current|new-child|new-top-level|<selector>] [--name <worktree-name>] [--parent-worktree <selector>] [--base-branch <ref>] [--setup run|skip|inherit] [--from <handle>] [--run <run-id>] [--title <terminal-title>] [--json]
+  orca-pi spawn <profile> (--task <spec> | --task-id <id>) [--task-title <title>] [--parent <task-id>] [--deps <json-array>] [--worktree current|new-child|new-top-level|<selector>] [--name <worktree-name>] [--parent-worktree <selector>] [--base-branch <ref>] [--setup run|skip|inherit] [--from <handle>] [--run <run-id>] [--title <terminal-title>] [--identity <name>] [--json]
   orca-pi status [--worker <dispatch|terminal-handle>|--task <task-id>] [--run <run-id>] [--from <handle>] [--json]
   orca-pi send --worker <dispatch|terminal-handle> --message <text> [--subject <text>] [--from <handle>] [--run <run-id>] [--json]
   orca-pi wait (--worker <dispatch|terminal-handle>|--task <task-id>) [--timeout <duration>] [--run <run-id>] [--from <handle>] [--json]
@@ -98,6 +98,7 @@ function formatSpawnHuman(receipt: {
   worktree: { id: string; selector: string; createdNew: boolean; path?: string };
   piModel?: string;
   runId?: string;
+  githubIdentity?: string;
 }): string {
   const lines = [
     `spawned ${receipt.profileName} worker`,
@@ -107,6 +108,7 @@ function formatSpawnHuman(receipt: {
     `  worktree: ${receipt.worktree.id} (${receipt.worktree.selector}${receipt.worktree.createdNew ? ", created new" : ""})`,
   ];
   if (receipt.piModel) lines.push(`  model: ${receipt.piModel}`);
+  if (receipt.githubIdentity) lines.push(`  github: ${receipt.githubIdentity} (ORCA_PI_GITHUB_IDENTITY, per-terminal; no --identity repeat needed)`);
   if (receipt.runId) lines.push(`  run: ${receipt.runId}`);
   if (receipt.worktree.path) lines.push(`  path: ${receipt.worktree.path}`);
   return lines.join("\n");
@@ -198,6 +200,7 @@ async function runSpawn(args: readonly string[], deps: OrchestrationCommandDeps)
   let fromHandle: string | undefined;
   let runId: string | undefined;
   let title: string | undefined;
+  let identityOverride: string | undefined;
   let asJson = false;
   const unknown: string[] = [];
   const takeValue = (flag: string, index: number): { value?: string; consumed: number } => {
@@ -224,6 +227,7 @@ async function runSpawn(args: readonly string[], deps: OrchestrationCommandDeps)
     else if (arg === "--from") { const t = takeValue(arg, i); if (t.value !== undefined) fromHandle = t.value; i += t.consumed; }
     else if (arg === "--run") { const t = takeValue(arg, i); if (t.value !== undefined) runId = t.value; i += t.consumed; }
     else if (arg === "--title") { const t = takeValue(arg, i); if (t.value !== undefined) title = t.value; i += t.consumed; }
+    else if (arg === "--identity") { const t = takeValue(arg, i); if (t.value !== undefined) identityOverride = t.value; i += t.consumed; }
     else if (isHelpFlag(arg)) { deps.stdout(`${ORCHESTRATION_USAGE}`); return { exitCode: 0 }; }
     else if (arg.startsWith("--")) { unknown.push(arg); i += 1; }
     else if (profile === undefined) { profile = arg; i += 1; }
@@ -291,6 +295,7 @@ async function runSpawn(args: readonly string[], deps: OrchestrationCommandDeps)
     const receipt = await spawnCompactWorker({
       orca: getOrca(deps),
       profileName: profile,
+      ...(identityOverride !== undefined ? { githubIdentityOverride: identityOverride } : {}),
       task,
       worktree: worktreePolicy,
       projectRoot: deps.projectRoot,

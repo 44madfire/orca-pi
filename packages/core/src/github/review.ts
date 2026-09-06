@@ -22,6 +22,38 @@ import {
   verifyReviewerForReview,
   type InstallationTokenCache,
 } from "./github-app-auth.js";
+import type { CredentialProviderFs } from "./credential-provider.js";
+
+async function warmProductionCache(
+  identity: GithubIdentity,
+  options?: {
+    env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+    cache?: InstallationTokenCache;
+    providerFs?: CredentialProviderFs;
+    fetchFn?: GithubFetchFn;
+    apiBase?: string;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
+  },
+): Promise<void> {
+  if (!options?.providerFs) return;
+  try {
+    const { ensureInstallationToken } = await import("./credential-provider.js");
+    await ensureInstallationToken(identity, {
+      ...(options.env !== undefined ? { env: options.env } : {}),
+      ...(options.cache !== undefined ? { cache: options.cache } : {}),
+      fs: options.providerFs,
+      ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
+      ...(options.apiBase ? { apiBase: options.apiBase } : {}),
+      ...(options.homedir ? { homedir: options.homedir } : {}),
+      ...(options.osHomedir ? { osHomedir: options.osHomedir } : {}),
+      ...(options.nowMs !== undefined ? { nowMs: options.nowMs } : {}),
+    });
+  } catch {
+    // Best-effort — authoritative errors surface below.
+  }
+}
 import { redactSecretsFromText } from "./identity.js";
 import {
   GithubApiError,
@@ -198,10 +230,15 @@ export async function listPullReviews(
     env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
     cache?: InstallationTokenCache;
     apiBase?: string;
+    providerFs?: CredentialProviderFs;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
   },
 ): Promise<ExistingPullReview[]> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
+  await warmProductionCache(identity, options);
   const credential = resolveGithubCredential(identity, env, cache);
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
@@ -300,6 +337,10 @@ export async function submitGithubReview(
     env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
     cache?: InstallationTokenCache;
     apiBase?: string;
+    providerFs?: CredentialProviderFs;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
   },
 ): Promise<{ id: number; htmlUrl?: string; submittedAt?: string; deduped?: boolean }> {
   const env = options?.env ?? process.env;
@@ -308,7 +349,7 @@ export async function submitGithubReview(
   const preflight = await verifyReviewerForReview(
     identity,
     { owner: input.owner, repo: input.repo, pullNumber: input.pullNumber },
-    { ...(options?.fetchFn ? { fetchFn: options.fetchFn } : {}), env, cache, ...(options?.apiBase ? { apiBase: options.apiBase } : {}) },
+    { ...(options?.fetchFn ? { fetchFn: options.fetchFn } : {}), env, cache, ...(options?.apiBase ? { apiBase: options.apiBase } : {}), ...(options?.providerFs ? { providerFs: options.providerFs } : {}), ...(options?.homedir ? { homedir: options.homedir } : {}), ...(options?.osHomedir ? { osHomedir: options.osHomedir } : {}), ...(options?.nowMs !== undefined ? { nowMs: options.nowMs } : {}) },
   );
   const credential = resolveGithubCredential(identity, env, cache);
   const fetchFn = options?.fetchFn ?? defaultFetch();
@@ -328,7 +369,7 @@ export async function submitGithubReview(
   // unknown commits.
   if (effectiveCommitId) {
     try {
-      const existing = await listPullReviews(identity, { owner: input.owner, repo: input.repo, pullNumber: input.pullNumber }, { fetchFn, env, cache, apiBase });
+      const existing = await listPullReviews(identity, { owner: input.owner, repo: input.repo, pullNumber: input.pullNumber }, { fetchFn, env, cache, apiBase, ...(options?.providerFs ? { providerFs: options.providerFs } : {}), ...(options?.homedir ? { homedir: options.homedir } : {}), ...(options?.osHomedir ? { osHomedir: options.osHomedir } : {}), ...(options?.nowMs !== undefined ? { nowMs: options.nowMs } : {}) });
       const duplicate = findDuplicateReview(existing, { reviewerLogin: preflight.reviewerLogin, event: payload.event, body: payload.body, commitId: effectiveCommitId });
       if (duplicate) {
         return { id: duplicate.id, deduped: true };

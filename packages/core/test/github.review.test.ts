@@ -50,9 +50,11 @@ function mockReviewFetch(options?: {
   failInstallationStatus?: number;
   failPrStatus?: number;
   env?: Record<string, string | undefined>;
+  actorLogin?: string;
 }): GithubFetchFn {
   const prAuthor = options?.prAuthor ?? PR_AUTHOR;
   const headSha = options?.headSha === undefined ? HEAD_SHA : options.headSha;
+  const actorLogin = options?.actorLogin ?? REVIEWER_BOT;
   return vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
     if (url === "https://api.github.com/user" && init.method === "GET") {
       throw new Error("GET /user must never be called for installation tokens (use /installation/repositories + trusted metadata)");
@@ -62,6 +64,9 @@ function mockReviewFetch(options?: {
         return { ok: false, status: options.failInstallationStatus, json: async () => ({}), text: async () => "denied" };
       }
       return jsonResponse({ total_count: 1, repositories: [{ id: 1, full_name: "octo/hello-world" }] }, 200);
+    }
+    if (url.endsWith("/graphql") && init.method === "POST") {
+      return jsonResponse({ data: { viewer: { login: actorLogin } } }, 200);
     }
     if (/\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url) && init.method === "GET") {
       if (options?.failPrStatus) {
@@ -180,9 +185,12 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     expect(postedEvent).toBe("REQUEST_CHANGES");
     // Omitted --commit pins to the current PR head captured in preflight.
     expect(postedCommit).toBe(HEAD_SHA);
-    // Preflight GETs + list + POST all ran.
+    // Preflight GETs + actor binding + list + POST all ran.
     expect(fetchFn).toHaveBeenCalled();
-    const postCalls = (fetchFn as ReturnType<typeof vi.fn>).mock.calls.filter(([, init]) => (init as { method: string }).method === "POST");
+    const calls = (fetchFn as ReturnType<typeof vi.fn>).mock.calls as Array<[string, { method: string }]>;
+    // Actor binding posts once to GraphQL before the review POST.
+    expect(calls.filter(([url, init]) => init.method === "POST" && url.endsWith("/graphql")).length).toBe(1);
+    const postCalls = calls.filter(([url, init]) => init.method === "POST" && url.endsWith("/reviews"));
     expect(postCalls.length).toBe(1);
   });
 
@@ -199,6 +207,7 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     let posted = 0;
     const fetchFn = mockReviewFetch({
       prAuthor: "human-user[bot]",
+      actorLogin: "human-user[bot]",
       onPost: () => {
         posted += 1;
       },
@@ -248,6 +257,28 @@ describe("review: submit via reviewer App identity (production preflight)", () =
     expect(error).toBeInstanceOf(GithubAuthError);
     expect((error as Error).message).toMatch(/must use the dedicated reviewer GitHub App/i);
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("actor binding: worker IAT in the reviewer slot never reaches POST", async () => {
+    // Both Apps' tokens pass IAT-class proof; only viewer.login distinguishes
+    // them. A swapped worker token would attribute the review to the worker
+    // bot, so preflight must reject before POST.
+    let posted = 0;
+    const fetchFn = mockReviewFetch({
+      prAuthor: "human-user",
+      actorLogin: "orca-pi-worker[bot]",
+      onPost: () => {
+        posted += 1;
+      },
+    });
+    await expect(
+      submitGithubReview(
+        "reviewer",
+        { owner: "o", repo: "r", pullNumber: 1, verdict: "comment", body: "hi" },
+        { fetchFn, env: ENV, cache: createInstallationTokenCache() },
+      ),
+    ).rejects.toThrow(/authenticates as "orca-pi-worker\[bot\]"/);
+    expect(posted).toBe(0);
   });
 
   it("Blocking 1: human login in the reviewer slot is refused before POST", async () => {

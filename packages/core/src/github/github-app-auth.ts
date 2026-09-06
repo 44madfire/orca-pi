@@ -25,6 +25,7 @@ import {
   redactTokenLikeValues,
   tokenEnvVarForIdentity,
 } from "./identity.js";
+import type { CredentialProviderFs } from "./credential-provider.js";
 import {
   GithubApiError,
   GithubAuthError,
@@ -41,63 +42,19 @@ const REVIEWER_TOKEN_ALIASES: readonly string[] = [
 /** Clock skew tolerance when evaluating installation-token expiry. */
 const EXPIRY_SKEW_MS = 60_000;
 
-export interface TokenCacheEntry {
-  token: string;
-  expiresAt?: Date;
-  installationId?: string;
-}
-
-/**
- * Small expiry-aware cache for installation tokens. `get` returns
- * `undefined` for missing OR expired entries (callers then re-resolve from
- * env/helper, which mints fresh tokens outside LLM context). Never logs.
- */
-export function createInstallationTokenCache(options?: {
-  now?: () => number;
-  skewMs?: number;
-}) {
-  const now = options?.now ?? Date.now;
-  const skewMs = options?.skewMs ?? EXPIRY_SKEW_MS;
-  const entries = new Map<string, TokenCacheEntry>();
-
-  function isExpired(entry: TokenCacheEntry): boolean {
-    if (!entry.expiresAt) return false;
-    return entry.expiresAt.getTime() <= now() + skewMs;
-  }
-
-  return {
-    get(identity: GithubIdentity): TokenCacheEntry | undefined {
-      const entry = entries.get(identity);
-      if (!entry) return undefined;
-      if (isExpired(entry)) {
-        entries.delete(identity);
-        return undefined;
-      }
-      return { ...entry };
-    },
-    set(
-      identity: GithubIdentity,
-      entry: TokenCacheEntry,
-    ): void {
-      entries.set(identity, { ...entry });
-    },
-    clear(identity?: GithubIdentity): void {
-      if (identity === undefined) entries.clear();
-      else entries.delete(identity);
-    },
-    /** Test seam: true when a non-expired entry exists. */
-    has(identity: GithubIdentity): boolean {
-      return entries.get(identity) !== undefined && !isExpired(entries.get(identity)!);
-    },
-  };
-}
-
-export type InstallationTokenCache = ReturnType<
-  typeof createInstallationTokenCache
->;
-
-/** Shared default cache (long-lived process use; tests create their own). */
-export const defaultTokenCache = createInstallationTokenCache();
+// Single source of truth lives in token-cache.ts (OP1.12 blocker 1:
+// breaks the github-app-auth ↔ credential-provider static cycle so
+// preflights can warm via the disk-backed provider). Re-exported here
+// for backward compatibility.
+export {
+  EXPIRY_SKEW_MS as TOKEN_CACHE_SKEW_MS,
+  createInstallationTokenCache,
+  defaultTokenCache,
+  type InstallationTokenCache,
+  type TokenCacheEntry,
+} from "./token-cache.js";
+import { defaultTokenCache } from "./token-cache.js";
+import type { InstallationTokenCache } from "./token-cache.js";
 
 function parseExpiry(raw: string | undefined, identity: string): Date | undefined {
   if (raw === undefined) return undefined;
@@ -185,7 +142,9 @@ export function resolveGithubCredential(
   const installationId =
     identity === "reviewer"
       ? env.ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID?.trim() || undefined
-      : undefined;
+      : identity === "worker"
+        ? env.ORCA_PI_GITHUB_WORKER_INSTALLATION_ID?.trim() || undefined
+        : undefined;
 
   const credential: ResolvedGithubCredential = {
     identity,
@@ -249,6 +208,48 @@ export function describeCredentialStatus(
   }
 }
 
+/**
+ * Warm the in-memory cache via the disk-backed production provider when a
+ * filesystem handle is available (OP1.12 blocker 1). Separate CLI
+ * invocations share state via `<config>/github-tokens/<identity>.json`:
+ * `mint` once, then later `review`/`check`/`exec`/`git-credential` with App
+ * config but no `*_TOKEN` env still resolve. Best-effort: when warming
+ * fails (no App config, no disk entry), the caller falls through to the
+ * env-only path which throws the authoritative missing/expired error.
+ */
+async function warmProductionCache(
+  identity: string,
+  options?: {
+    env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+    cache?: InstallationTokenCache;
+    providerFs?: CredentialProviderFs;
+    fetchFn?: FetchFn;
+    apiBase?: string;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
+  },
+): Promise<void> {
+  if (!options?.providerFs) return;
+  try {
+    // Static import is cycle-safe: credential-provider no longer imports
+    // from github-app-auth (cache lives in token-cache.ts).
+    const { ensureInstallationToken } = await import("./credential-provider.js");
+    await ensureInstallationToken(identity, {
+      ...(options.env !== undefined ? { env: options.env } : {}),
+      ...(options.cache !== undefined ? { cache: options.cache } : {}),
+      fs: options.providerFs,
+      ...(options.fetchFn ? { fetchFn: options.fetchFn as never } : {}),
+      ...(options.apiBase ? { apiBase: options.apiBase } : {}),
+      ...(options.homedir ? { homedir: options.homedir } : {}),
+      ...(options.osHomedir ? { osHomedir: options.osHomedir } : {}),
+      ...(options.nowMs !== undefined ? { nowMs: options.nowMs } : {}),
+    });
+  } catch {
+    // Best-effort warming — authoritative errors surface below.
+  }
+}
+
 /** Authorization header for GitHub REST calls (token never logged). */
 export function authHeaderForCredential(
   credential: Pick<ResolvedGithubCredential, "token">,
@@ -269,6 +270,10 @@ export function authHeaderForCredential(
  */
 export const REVIEWER_LOGIN_ENV_VAR = "ORCA_PI_GITHUB_REVIEWER_LOGIN";
 export const REVIEWER_INSTALLATION_ID_ENV_VAR = "ORCA_PI_GITHUB_REVIEWER_INSTALLATION_ID";
+/** Worker App bot login slot (operator-set outside LLM context). */
+export const WORKER_LOGIN_ENV_VAR = "ORCA_PI_GITHUB_WORKER_LOGIN";
+/** Worker App installation id slot (operator-set outside LLM context). */
+export const WORKER_INSTALLATION_ID_ENV_VAR = "ORCA_PI_GITHUB_WORKER_INSTALLATION_ID";
 
 /** Trusted reviewer App/installation identity (from env, outside LLM context). */
 export interface ReviewerAppMetadata {
@@ -315,10 +320,11 @@ export function resolveReviewerAppMetadata(
  */
 export async function proveInstallationTokenClass(
   identity: string,
-  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string; providerFs?: CredentialProviderFs; homedir?: string; osHomedir?: () => string; nowMs?: number },
 ): Promise<void> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
+  await warmProductionCache(identity, options);
   const credential = resolveGithubCredential(identity, env, cache);
   const fetchFn = options?.fetchFn ?? defaultFetchFn();
   const base = apiBaseUrl(options?.apiBase);
@@ -332,7 +338,7 @@ export async function proveInstallationTokenClass(
   if (!response.ok) {
     const authError = toAuthError(identity, response.status, endpoint);
     if (authError) {
-      throw new GithubAuthError(identity, authError.code, `${authError.message} (installation-token proof via ${endpoint} failed — the reviewer slot must hold a GitHub App installation access token, not a human PAT.)`);
+      throw new GithubAuthError(identity, authError.code, `${authError.message} (installation-token proof via ${endpoint} failed — the "${identity}" slot must hold a GitHub App installation access token, not a human PAT.)`);
     }
     const text = await response.text().catch(() => "");
     throw new GithubApiError(endpoint, response.status, `Could not prove installation token class for "${identity}" (${response.status}): ${redactSecretsFromText(text.slice(0, 1000), [credential.token]) || "no response body"}.`);
@@ -343,6 +349,90 @@ export async function proveInstallationTokenClass(
 export interface AuthenticatedGithubActor {
   login: string;
   type?: string;
+}
+
+/**
+ * Prove the resolved installation token authenticates as the configured App
+ * actor (OP1.12 actor binding).
+ *
+ * Queries GraphQL `viewer { login }` with the resolved IAT (GitHub supports
+ * GraphQL with installation access tokens) and compares it
+ * case-insensitively to the trusted configured login
+ * (`ORCA_PI_GITHUB_<IDENT>_LOGIN` from env, outside LLM context).
+ * Rejects on mismatch before any role-sensitive write — e.g. a Reviewer IAT
+ * swapped into the worker slot passes IAT-class proof but authenticates as
+ * `orca-pi-reviewer[bot]`, so PRs would be misattributed to the reviewer
+ * bot and violate `worker bot != reviewer bot != 44madfire`.
+ *
+ * Never calls `GET /user` (unsupported for IATs). Human PATs normally fail
+ * earlier at IAT-class proof; a PAT that somehow reaches here returns its
+ * human login from GraphQL and fails the `[bot]`-shaped comparison anyway.
+ * Token values never enter messages; logins are non-secret App actor names.
+ */
+export async function proveInstallationActor(
+  identity: string,
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string; providerFs?: CredentialProviderFs; homedir?: string; osHomedir?: () => string; nowMs?: number },
+): Promise<{ actorLogin: string }> {
+  const env = options?.env ?? process.env;
+  const cache = options?.cache ?? defaultTokenCache;
+  await warmProductionCache(identity, options);
+  const credential = resolveGithubCredential(identity, env, cache);
+  const trustedLogin =
+    identity === "worker"
+      ? resolveWorkerAppMetadata(env).login
+      : identity === "reviewer"
+        ? resolveReviewerAppMetadata(env).login
+        : env[`ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_LOGIN`]?.trim();
+  if (!trustedLogin) {
+    throw new GithubAuthError(
+      identity,
+      "missing-credential",
+      `Missing verified App login for identity "${identity}" (ORCA_PI_GITHUB_${identity.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_LOGIN). ` +
+        `Export the expected App bot login outside LLM context so the installation-token actor can be bound before any write.`,
+    );
+  }
+  const fetchFn = options?.fetchFn ?? defaultFetchFn();
+  const base = apiBaseUrl(options?.apiBase);
+  const endpoint = "/graphql";
+  let response;
+  try {
+    response = await fetchFn(`${base}${endpoint}`, {
+      method: "POST",
+      headers: baseHeaders(credential.token),
+      body: JSON.stringify({ query: "query { viewer { login } }" }),
+    });
+  } catch (error) {
+    throw new GithubAuthError(identity, "helper-failed", `Could not prove installation actor for "${identity}" (${endpoint}): ${redactSecretsFromText(error instanceof Error ? error.message : String(error), [credential.token])}`);
+  }
+  if (!response.ok) {
+    const authError = toAuthError(identity, response.status, endpoint);
+    if (authError) throw authError;
+    const text = await response.text().catch(() => "");
+    throw new GithubApiError(endpoint, response.status, `Could not prove installation actor for "${identity}" (${response.status}): ${redactSecretsFromText(text.slice(0, 1000), [credential.token]) || "no response body"}.`);
+  }
+  const data = (await response.json()) as { data?: { viewer?: { login?: unknown } }; errors?: unknown };
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new GithubAuthError(
+      identity,
+      "unauthorized-installation",
+      `GitHub rejected the installation-actor query for "${identity}" (GraphQL errors). ` +
+        `The credential may not be a valid installation token for the configured App — mint a fresh token outside LLM context and retry.`,
+    );
+  }
+  const actualLogin = data.data?.viewer?.login;
+  if (typeof actualLogin !== "string" || !actualLogin.trim()) {
+    throw new GithubApiError(endpoint, response.status, `GitHub installation-actor query returned no viewer login for identity "${identity}" — cannot bind the token to the configured App actor. Mint a fresh installation token outside LLM context and retry.`);
+  }
+  if (actualLogin.trim().toLowerCase() !== trustedLogin.trim().toLowerCase()) {
+    throw new GithubAuthError(
+      identity,
+      "unauthorized-installation",
+      `GitHub installation token for identity "${identity}" authenticates as "${actualLogin.trim()}" but the slot is configured for "${trustedLogin.trim()}". ` +
+        `Refusing: swapped App tokens would misattribute PRs/reviews and violate worker bot != reviewer bot != 44madfire. ` +
+        `Export the matching installation token (or fix the configured login) outside LLM context and retry — never paste tokens into prompts or task text.`,
+    );
+  }
+  return { actorLogin: actualLogin.trim() };
 }
 
 function apiBaseUrl(apiBase?: string): string {
@@ -443,11 +533,12 @@ export interface PullRequestMeta {
 /** Fetch PR author + current head SHA (`GET /repos/{o}/{r}/pulls/{n}`). */
 export async function fetchPullRequestMeta(
   input: { owner: string; repo: string; pullNumber: number },
-  options?: { fetchFn?: FetchFn; token?: string; identity?: string; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+  options?: { fetchFn?: FetchFn; token?: string; identity?: string; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string; providerFs?: CredentialProviderFs; homedir?: string; osHomedir?: () => string; nowMs?: number },
 ): Promise<PullRequestMeta> {
   const identity = options?.identity ?? "reviewer";
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
+  await warmProductionCache(identity, options);
   let token = options?.token;
   if (!token) token = resolveGithubCredential(identity, env, cache).token;
   const fetchFn = options?.fetchFn ?? defaultFetchFn();
@@ -472,7 +563,7 @@ export async function fetchPullRequestMeta(
 /** Fetch the PR author login (thin wrapper over `fetchPullRequestMeta`). */
 export async function fetchPullRequestAuthor(
   input: { owner: string; repo: string; pullNumber: number },
-  options?: { fetchFn?: FetchFn; token?: string; identity?: string; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+  options?: { fetchFn?: FetchFn; token?: string; identity?: string; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string; providerFs?: CredentialProviderFs; homedir?: string; osHomedir?: () => string; nowMs?: number },
 ): Promise<string> {
   return (await fetchPullRequestMeta(input, options)).authorLogin;
 }
@@ -490,13 +581,15 @@ export async function fetchPullRequestAuthor(
  *    bot (`[bot]` suffix — config validation, not token inference).
  * 3. Proves IAT class via `GET /installation/repositories` (human PATs fail
  *    here with 401/403).
- * 4. Loads the PR author (`GET` PR, IAT-supported) and enforces
+ * 4. Binds the token to the configured App actor via GraphQL `viewer.login`
+ *    (swapped App tokens fail here before any write).
+ * 5. Loads the PR author (`GET` PR, IAT-supported) and enforces
  *    distinctness against the *configured* reviewer login.
  */
 export async function verifyReviewerForReview(
   identity: string,
   pr: { owner: string; repo: string; pullNumber: number },
-  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string; providerFs?: CredentialProviderFs; homedir?: string; osHomedir?: () => string; nowMs?: number },
 ): Promise<{ reviewerLogin: string; prAuthorLogin: string; installationId: string; headSha?: string }> {
   assertReviewerIdentityForWrites(identity);
   const env = options?.env ?? process.env;
@@ -505,6 +598,7 @@ export async function verifyReviewerForReview(
     throw new GithubAuthError(identity, "unauthorized-installation", `Configured reviewer login "${metadata.login}" (${REVIEWER_LOGIN_ENV_VAR}) does not look like a GitHub App bot (expected a "[bot]" suffix, e.g. "orca-pi-reviewer[bot]"). Refusing to review — a human login must never occupy the reviewer slot (same-account PATs are not distinct identities). Fix the App configuration outside LLM context and retry.`);
   }
   await proveInstallationTokenClass(identity, options);
+  await proveInstallationActor(identity, options);
   const meta = await fetchPullRequestMeta(pr, { ...(options ?? {}), identity });
   assertDistinctGithubActors({ workerLogin: meta.authorLogin, reviewerLogin: metadata.login });
   return { reviewerLogin: metadata.login, prAuthorLogin: meta.authorLogin, installationId: metadata.installationId, ...(meta.headSha ? { headSha: meta.headSha } : {}) };
@@ -518,7 +612,7 @@ export async function verifyReviewerForReview(
  */
 export async function verifyReviewerForChecks(
   identity: string,
-  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string },
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string; providerFs?: CredentialProviderFs; homedir?: string; osHomedir?: () => string; nowMs?: number },
 ): Promise<{ reviewerLogin: string; installationId: string }> {
   assertReviewerIdentityForWrites(identity);
   const env = options?.env ?? process.env;
@@ -527,7 +621,81 @@ export async function verifyReviewerForChecks(
     throw new GithubAuthError(identity, "unauthorized-installation", `Configured reviewer login "${metadata.login}" (${REVIEWER_LOGIN_ENV_VAR}) does not look like a GitHub App bot (expected a "[bot]" suffix). Refusing check write — fix the App configuration outside LLM context and retry.`);
   }
   await proveInstallationTokenClass(identity, options);
+  await proveInstallationActor(identity, options);
   return { reviewerLogin: metadata.login, installationId: metadata.installationId };
+}
+
+/** Trusted worker App/installation identity (from env, outside LLM context). */
+export interface WorkerAppMetadata {
+  login: string;
+  installationId: string;
+}
+
+/**
+ * Resolve trusted worker App metadata (fail closed when unconfigured).
+ *
+ * Both `ORCA_PI_GITHUB_WORKER_LOGIN` (e.g. `"orca-pi-worker[bot]"`) and
+ * `ORCA_PI_GITHUB_WORKER_INSTALLATION_ID` must be set by the operator or
+ * credential helper outside LLM context alongside
+ * `ORCA_PI_GITHUB_WORKER_TOKEN`. Prints var names, never values.
+ */
+export function resolveWorkerAppMetadata(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+): WorkerAppMetadata {
+  const login = env[WORKER_LOGIN_ENV_VAR]?.trim();
+  const installationId = env[WORKER_INSTALLATION_ID_ENV_VAR]?.trim();
+  const missing: string[] = [];
+  if (!login) missing.push(WORKER_LOGIN_ENV_VAR);
+  if (!installationId) missing.push(WORKER_INSTALLATION_ID_ENV_VAR);
+  if (missing.length > 0) {
+    throw new GithubAuthError(
+      "worker",
+      "missing-credential",
+      `Missing verified worker App identity (${missing.join(", ")}). Install the Orca-Pi Worker GitHub App on the repository outside LLM context, then export ${WORKER_LOGIN_ENV_VAR} (App bot login, e.g. "orca-pi-worker[bot]") and ${WORKER_INSTALLATION_ID_ENV_VAR} (numeric installation id) alongside ORCA_PI_GITHUB_WORKER_TOKEN. Never place private keys, installation tokens, PATs, or webhook secrets in prompts, task text, logs, or Linear descriptions.`,
+    );
+  }
+  return { login: login as string, installationId: installationId as string };
+}
+
+/**
+ * Reject non-worker identities for Content-write Git operations (fail closed).
+ *
+ * Authenticated `git push` / PR create-update must run as the dedicated
+ * worker GitHub App (distinct actor from reviewer + human). `--identity
+ * reviewer` (Contents: read) must never push — that is the isolation
+ * failure mode OP1.12 prevents.
+ */
+export function assertWorkerIdentityForWrites(identity: string): void {
+  if (identity !== "worker") {
+    throw new GithubAuthError(
+      identity,
+      "unauthorized-installation",
+      `Refusing Git Content-write as identity "${identity}" — pushes and PR creation must use the dedicated worker GitHub App (distinct actor). ` +
+        `Use --identity worker with ORCA_PI_GITHUB_WORKER_TOKEN (installation token, Contents: write / Pull requests: write). ` +
+        `The reviewer App holds Contents: read only and must never push.`,
+    );
+  }
+}
+
+/**
+ * Worker preflight (fail closed, IAT-compatible): proves an installation
+ * token for the configured Worker App before any push/PR write. Same
+ * IAT-class proof as the reviewer path, with worker permission guidance
+ * (Contents: write / Pull requests: write) instead of reviewer guidance.
+ */
+export async function verifyWorkerForWrites(
+  identity: string,
+  options?: { fetchFn?: FetchFn; env?: NodeJS.ProcessEnv | Record<string, string | undefined>; cache?: InstallationTokenCache; apiBase?: string; providerFs?: CredentialProviderFs; homedir?: string; osHomedir?: () => string; nowMs?: number },
+): Promise<{ workerLogin: string; installationId: string }> {
+  assertWorkerIdentityForWrites(identity);
+  const env = options?.env ?? process.env;
+  const metadata = resolveWorkerAppMetadata(env);
+  if (!metadata.login.toLowerCase().endsWith("[bot]")) {
+    throw new GithubAuthError(identity, "unauthorized-installation", `Configured worker login "${metadata.login}" (${WORKER_LOGIN_ENV_VAR}) does not look like a GitHub App bot (expected a "[bot]" suffix, e.g. "orca-pi-worker[bot]"). Refusing push — a human login must never occupy the worker slot. Fix the App configuration outside LLM context and retry.`);
+  }
+  await proveInstallationTokenClass(identity, options);
+  await proveInstallationActor(identity, options);
+  return { workerLogin: metadata.login, installationId: metadata.installationId };
 }
 
 /**
@@ -540,6 +708,19 @@ export function toAuthError(
   status: number,
   endpoint: string,
 ): GithubAuthError | undefined {
+  const appLabel = identity === "worker" ? "Worker" : identity === "reviewer" ? "Reviewer" : `"${identity}"`;
+  const permHint =
+    identity === "worker"
+      ? "needs Contents: write, Pull requests: write"
+      : identity === "reviewer"
+        ? "needs Pull requests: write, Checks: write, Contents: read (never write)"
+        : "check App permissions/installation";
+  const installHint =
+    identity === "worker"
+      ? `Install/authorize the Worker GitHub App on the repository, then retry.`
+      : identity === "reviewer"
+        ? `Install/authorize the Reviewer GitHub App, then retry. Do not grant Contents: write to the reviewer.`
+        : `Install/authorize the "${identity}" GitHub App on the repository, then retry.`;
   if (status === 401) {
     return new GithubAuthError(
       identity,
@@ -553,8 +734,8 @@ export function toAuthError(
       identity,
       "unauthorized-installation",
       `GitHub denied the "${identity}" credential for ${endpoint} (403). ` +
-        `The Reviewer GitHub App may lack permission (needs Pull requests: write, Checks: write, Contents: read) or is not installed on this repository. ` +
-        `Install/authorize the App, then retry. Do not grant Contents: write to the reviewer.`,
+        `The ${appLabel} GitHub App may lack permission (${permHint}) or is not installed on this repository. ` +
+        `${installHint}`,
     );
   }
   if (status === 404) {
@@ -562,7 +743,7 @@ export function toAuthError(
       identity,
       "unauthorized-installation",
       `GitHub returned 404 for ${endpoint} with the "${identity}" credential. ` +
-        `The App installation may not cover this repository (GitHub hides unauthorized repos as 404). Install the Reviewer GitHub App on the repository and retry.`,
+        `The App installation may not cover this repository (GitHub hides unauthorized repos as 404). Install the ${appLabel} GitHub App on the repository and retry.`,
     );
   }
   return undefined;

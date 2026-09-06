@@ -23,6 +23,38 @@ import {
   verifyReviewerForChecks,
   type InstallationTokenCache,
 } from "./github-app-auth.js";
+import type { CredentialProviderFs } from "./credential-provider.js";
+
+async function warmProductionCache(
+  identity: GithubIdentity,
+  options?: {
+    env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+    cache?: InstallationTokenCache;
+    providerFs?: CredentialProviderFs;
+    fetchFn?: GithubFetchFn;
+    apiBase?: string;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
+  },
+): Promise<void> {
+  if (!options?.providerFs) return;
+  try {
+    const { ensureInstallationToken } = await import("./credential-provider.js");
+    await ensureInstallationToken(identity, {
+      ...(options.env !== undefined ? { env: options.env } : {}),
+      ...(options.cache !== undefined ? { cache: options.cache } : {}),
+      fs: options.providerFs,
+      ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
+      ...(options.apiBase ? { apiBase: options.apiBase } : {}),
+      ...(options.homedir ? { homedir: options.homedir } : {}),
+      ...(options.osHomedir ? { osHomedir: options.osHomedir } : {}),
+      ...(options.nowMs !== undefined ? { nowMs: options.nowMs } : {}),
+    });
+  } catch {
+    // Best-effort — authoritative errors surface below.
+  }
+}
 import { redactSecretsFromText } from "./identity.js";
 import {
   AGENT_REVIEW_CHECK_NAME,
@@ -201,10 +233,15 @@ export async function listCheckRunsForRef(
     env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
     cache?: InstallationTokenCache;
     apiBase?: string;
+    providerFs?: CredentialProviderFs;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
   },
 ): Promise<ExistingCheckRun[]> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
+  await warmProductionCache(identity, options);
   const credential = resolveGithubCredential(identity, env, cache);
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
@@ -252,17 +289,22 @@ export async function startAgentReviewCheck(
     env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
     cache?: InstallationTokenCache;
     apiBase?: string;
+    providerFs?: CredentialProviderFs;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
   },
 ): Promise<{ id: number; htmlUrl?: string; deduped?: boolean }> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
-  await verifyReviewerForChecks(identity, { fetchFn, env, cache, apiBase });
+  const providerOpts = { ...(options?.providerFs ? { providerFs: options.providerFs } : {}), ...(options?.homedir ? { homedir: options.homedir } : {}), ...(options?.osHomedir ? { osHomedir: options.osHomedir } : {}), ...(options?.nowMs !== undefined ? { nowMs: options.nowMs } : {}) };
+  await verifyReviewerForChecks(identity, { fetchFn, env, cache, apiBase, ...providerOpts });
   const credential = resolveGithubCredential(identity, env, cache);
   // Idempotent start: reuse the matching deterministic run when present.
   try {
-    const existing = await listCheckRunsForRef(identity, { owner: input.owner, repo: input.repo, ref: input.headSha }, { fetchFn, env, cache, apiBase });
+    const existing = await listCheckRunsForRef(identity, { owner: input.owner, repo: input.repo, ref: input.headSha }, { fetchFn, env, cache, apiBase, ...providerOpts });
     const match = selectCheckRunForUpdate(existing, input.headSha);
     if (match) {
       const updateEndpoint = `/repos/${input.owner}/${input.repo}/check-runs/${match.id}`;
@@ -315,13 +357,18 @@ export async function completeAgentReviewCheck(
     cache?: InstallationTokenCache;
     apiBase?: string;
     listRuns?: (ref: string) => Promise<ExistingCheckRun[]>;
+    providerFs?: CredentialProviderFs;
+    homedir?: string;
+    osHomedir?: () => string;
+    nowMs?: number;
   },
 ): Promise<{ id: number; conclusion: CheckConclusion; htmlUrl?: string }> {
   const env = options?.env ?? process.env;
   const cache = options?.cache ?? defaultTokenCache;
   const fetchFn = options?.fetchFn ?? defaultFetch();
   const apiBase = (options?.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
-  await verifyReviewerForChecks(identity, { fetchFn, env, cache, apiBase });
+  const providerOpts = { ...(options?.providerFs ? { providerFs: options.providerFs } : {}), ...(options?.homedir ? { homedir: options.homedir } : {}), ...(options?.osHomedir ? { osHomedir: options.osHomedir } : {}), ...(options?.nowMs !== undefined ? { nowMs: options.nowMs } : {}) };
+  await verifyReviewerForChecks(identity, { fetchFn, env, cache, apiBase, ...providerOpts });
   const credential = resolveGithubCredential(identity, env, cache);
   const payload = buildCheckCompletePayload({ verdict: input.verdict, summary: input.summary, text: input.text, provenance: input.provenance });
 
@@ -334,7 +381,7 @@ export async function completeAgentReviewCheck(
   // matching deterministic run instead of creating a duplicate.
   if (checkRunId === undefined && !options?.listRuns) {
     try {
-      const existing = await listCheckRunsForRef(identity, { owner: input.owner, repo: input.repo, ref: input.headSha }, { fetchFn, env, cache, apiBase });
+      const existing = await listCheckRunsForRef(identity, { owner: input.owner, repo: input.repo, ref: input.headSha }, { fetchFn, env, cache, apiBase, ...(options?.providerFs ? { providerFs: options.providerFs } : {}), ...(options?.homedir ? { homedir: options.homedir } : {}), ...(options?.osHomedir ? { osHomedir: options.osHomedir } : {}), ...(options?.nowMs !== undefined ? { nowMs: options.nowMs } : {}) });
       const match = selectCheckRunForUpdate(existing, input.headSha);
       if (match) checkRunId = match.id;
     } catch {
@@ -361,7 +408,7 @@ export async function completeAgentReviewCheck(
 
   // No existing run: create an in_progress run then complete it (two calls,
   // same deterministic name — a later retry will find and update it).
-  const created = await startAgentReviewCheck(identity, { owner: input.owner, repo: input.repo, headSha: input.headSha, summary: input.summary, text: input.text, provenance: input.provenance }, { fetchFn, env, cache, apiBase });
+  const created = await startAgentReviewCheck(identity, { owner: input.owner, repo: input.repo, headSha: input.headSha, summary: input.summary, text: input.text, provenance: input.provenance }, { fetchFn, env, cache, apiBase, ...(options?.providerFs ? { providerFs: options.providerFs } : {}), ...(options?.homedir ? { homedir: options.homedir } : {}), ...(options?.osHomedir ? { osHomedir: options.osHomedir } : {}), ...(options?.nowMs !== undefined ? { nowMs: options.nowMs } : {}) });
   const endpoint = `/repos/${input.owner}/${input.repo}/check-runs/${created.id}`;
   const response = await fetchFn(`${apiBase}${endpoint}`, { method: "PATCH", headers: baseHeaders(credential.token), body: JSON.stringify(payload) });
   if (!response.ok) {

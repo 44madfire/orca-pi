@@ -121,6 +121,7 @@ export async function spawnCompactWorker(
   const receipt = await spawnSupervisedPiWorker({
     orca: options.orca,
     profile,
+    ...(options.githubIdentityOverride !== undefined ? { githubIdentityOverride: options.githubIdentityOverride } : {}),
     task: options.task,
     ...(options.worktree !== undefined ? { worktree: options.worktree } : {}),
     ...(options.runId !== undefined ? { runId: options.runId } : {}),

@@ -48,6 +48,9 @@ describe("github integration: worker PR -> reviewer review/check -> human-ready"
       if (url.includes("/installation/repositories") && init.method === "GET") {
         return { ok: true, status: 200, json: async () => ({ total_count: 1, repositories: [{ id: 1, full_name: "octo/hello-world" }] }), text: async () => "{}" };
       }
+      if (url.endsWith("/graphql") && init.method === "POST") {
+        return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: reviewerBot } } }), text: async () => "{}" };
+      }
       if (/\/repos\/[^/]+\/[^/]+\/pulls\/7$/.test(url) && init.method === "GET") {
         return { ok: true, status: 200, json: async () => ({ user: { login: prAuthor }, head: { sha } }), text: async () => "{}" };
       }
@@ -153,6 +156,9 @@ describe("github integration: worker PR -> reviewer review/check -> human-ready"
       if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
       if (url.includes("/installation/repositories")) {
         return { ok: true, status: 200, json: async () => ({ repositories: [] }), text: async () => "{}" };
+      }
+      if (url.endsWith("/graphql")) {
+        return { ok: true, status: 200, json: async () => ({ data: { viewer: { login: "human-user[bot]" } } }), text: async () => "{}" };
       }
       if (/\/repos\/[^/]+\/[^/]+\/pulls\/1$/.test(url)) {
         return { ok: true, status: 200, json: async () => ({ user: { login: "human-user[bot]" }, head: { sha: "bbbbbbbb11111111111111111111111111111111" } }), text: async () => "{}" };

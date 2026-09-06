@@ -33,13 +33,18 @@ function mockGithubFetch(options?: {
   prAuthor?: string;
   existingReviews?: unknown[];
   existingChecks?: unknown[];
+  actorLogin?: string;
 }): { fetchFn: GithubFetchFn; posts: string[] } {
   const posts: string[] = [];
+  const actorLogin = options?.actorLogin ?? REVIEWER_BOT;
   const fetchFn: GithubFetchFn = vi.fn(async (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => {
     const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
     if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
     if (url.includes("/installation/repositories") && init.method === "GET") {
       return ok({ total_count: 1, repositories: [{ id: 1, full_name: "o/r" }] }, 200);
+    }
+    if (url.endsWith("/graphql") && init.method === "POST") {
+      return ok({ data: { viewer: { login: actorLogin } } }, 200);
     }
     if (/\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url) && init.method === "GET") {
       return ok({ user: { login: options?.prAuthor ?? "human-user" }, head: { sha: "feedfacefeedfacefeedfacefeedfacefeedface" } }, 200);
@@ -205,6 +210,7 @@ describe("orca-pi github check", () => {
       const ok = (data: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data, text: async () => JSON.stringify(data) });
       if (url === "https://api.github.com/user") throw new Error("GET /user must never be called for installation tokens");
       if (url.includes("/installation/repositories")) return ok({ repositories: [] }, 200);
+      if (url.endsWith("/graphql") && init.method === "POST") return ok({ data: { viewer: { login: "orca-pi-reviewer[bot]" } } }, 200);
       if (url.includes("/check-runs?")) return ok({ check_runs: existing }, 200);
       if (url.endsWith("/check-runs") && init.method === "POST") {
         posts.push(url);
