@@ -50,7 +50,9 @@ export interface CliDeps {
   env?: NodeJS.ProcessEnv;
   homedir?: string;
   osHomedir?: () => string;
-  fs?: Pick<typeof import("node:fs/promises"), "readFile" | "stat">;
+  fs?: Pick<typeof import("node:fs/promises"), "readFile" | "stat"> & Partial<
+    Pick<typeof import("node:fs/promises"), "writeFile" | "rename" | "mkdir" | "unlink">
+  >;
   /**
    * JEF-7 seam override. Defaults to the production build+format helper
    * below; tests inject stubs. May be async (prompt-file I/O).
@@ -87,6 +89,13 @@ Usage:
   orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]
   orca-pi profile validate [<name>] [--json]
   orca-pi profile path [--project|--user] [--json]
+  orca-pi profile create <name> --scope <user|project> [--extends <parent>] [--data <json|@file>] [--json]
+  orca-pi profile clone <source> <dest> --scope <user|project> [--json]
+  orca-pi profile set <name> <field> <value> --scope <user|project> [--json]
+  orca-pi profile unset <name> <field> --scope <user|project> [--json]
+  orca-pi profile delete <name> --scope <user|project> [--json]
+  orca-pi profile patch <name> --scope <user|project> (--patch <json|@file> | --data <json|@file>) [--json]
+  orca-pi profile read <name> [--json]
   orca-pi spawn <profile> (--task <spec> | --task-id <id>) [--worktree <policy>] [--identity <name>] [--json]
   orca-pi status [--worker <handle>|--task <id>] [--json]
   orca-pi send --worker <handle> --message <text> [--json]

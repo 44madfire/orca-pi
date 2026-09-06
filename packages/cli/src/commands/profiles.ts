@@ -48,6 +48,15 @@ import {
 } from "@orca-pi/core";
 import { ProfileLoadError, ProfileValidationError } from "@orca-pi/core";
 import { ProfileResolveError } from "@orca-pi/core";
+import {
+  runProfileClone,
+  runProfileCreate,
+  runProfileDelete,
+  runProfilePatch,
+  runProfileRead,
+  runProfileSet,
+  runProfileUnset,
+} from "./profile-mutate.js";
 
 export interface ProfilesCommandDeps {
   stdout: (text: string) => void;
@@ -57,7 +66,9 @@ export interface ProfilesCommandDeps {
   env?: NodeJS.ProcessEnv;
   homedir?: string;
   osHomedir?: () => string;
-  fs?: Pick<typeof import("node:fs/promises"), "readFile" | "stat">;
+  fs?: Pick<typeof import("node:fs/promises"), "readFile" | "stat"> & Partial<
+    Pick<typeof import("node:fs/promises"), "writeFile" | "rename" | "mkdir" | "unlink">
+  >;
   /**
    * JEF-7 seam: async build+format helper (`buildPiLaunch` + `formatPiInspect`).
    * May perform `systemPromptFile` I/O, so it is awaited. When omitted,
@@ -72,7 +83,7 @@ export interface ProfilesCommandResult {
   exitCode: number;
 }
 
-const PROFILES_USAGE = `orca-pi profiles — inspect and validate Pi role profiles
+const PROFILES_USAGE = `orca-pi profiles — inspect, validate, and mutate Pi role profiles
 
 Usage:
   orca-pi profiles list [--json]
@@ -80,12 +91,21 @@ Usage:
   orca-pi profile inspect <name> [--project-root <path>] [--cwd <path>] [--user-config <path>] [--project-config <path>] [--json] [--show-prompt] [--context-summary]
   orca-pi profile validate [<name>] [--json]
   orca-pi profile path [--project|--user] [--json]
+  orca-pi profile create <name> --scope <user|project> [--extends <parent>] [--data <json|@file>] [--expected-hash <hash>] [--json]
+  orca-pi profile clone <source> <dest> --scope <user|project> [--expected-hash <hash>] [--json]
+  orca-pi profile set <name> <field> <value> --scope <user|project> [--expected-hash <hash>] [--json]
+  orca-pi profile unset <name> <field> --scope <user|project> [--expected-hash <hash>] [--json]
+  orca-pi profile delete <name> --scope <user|project> [--expected-hash <hash>] [--json]
+  orca-pi profile patch <name> --scope <user|project> (--patch <json|@file> | --data <json|@file> | --json <json|@file>)
+  orca-pi profile read <name> [--json]
 
 Configuration precedence (low → high): builtins < user/global < project.
 Fresh installs expose built-in scout/worker/reviewer with no config files.
 show/inspect redact large prompt bodies unless --show-prompt is given.
 inspect never builds Pi argv itself — launch preview comes from JEF-7's
 async build+format helper when injected.
+Mutations require explicit --scope; writes are schema-validated, atomic,
+and conflict on stale hashes (see --expected-hash). Built-ins are immutable.
 `;
 
 const PROFILE_INSPECT_USAGE =
@@ -713,6 +733,15 @@ export async function runProfilesCommand(
     return await runShow(rest, deps, { inspect: true });
   if (subcommand === "validate") return await runValidate(rest, deps);
   if (subcommand === "path") return await runPath(rest, deps);
+  if (subcommand === "create") return await runProfileCreate(rest, deps);
+  if (subcommand === "clone") return await runProfileClone(rest, deps);
+  if (subcommand === "set") return await runProfileSet(rest, deps);
+  if (subcommand === "unset") return await runProfileUnset(rest, deps);
+  if (subcommand === "delete" || subcommand === "del" || subcommand === "remove")
+    return await runProfileDelete(rest, deps);
+  if (subcommand === "patch") return await runProfilePatch(rest, deps);
+  if (subcommand === "read" || subcommand === "view" || subcommand === "get")
+    return await runProfileRead(rest, deps);
   deps.stderr(`error: unknown profiles subcommand: ${subcommand}\n`);
   deps.stderr(`${PROFILES_USAGE}`);
   return { exitCode: 2 };
