@@ -1,6 +1,6 @@
 ---
 name: orca-pi-github
-description: Push branches and open PRs as orca-pi-worker[bot] via scoped broker (setup-git + github exec). Use when worker needs git push / gh pr create without touching global config.
+description: Push branches and open PRs as orca-pi-worker[bot] via scoped broker (github exec). Use when worker needs git push / gh pr create without touching global config.
 ---
 
 # orca-pi GitHub worker
@@ -10,15 +10,13 @@ In worker terminals `ORCA_PI_GITHUB_IDENTITY=worker` is already injected — inh
 ## Push + PR
 
 ```sh
-orca-pi github setup-git --identity worker --path .
 git commit -m "…"
-git push origin HEAD   # git only; gh still needs exec below
 orca-pi github exec -- git push origin HEAD
 orca-pi github exec -- gh pr create --title "…" --body "…"
 orca-pi github exec -- gh pr edit <n> --add-label "…"
 ```
 
-- `setup-git` is worktree-scoped (never `--global`/`--system`); it resets inherited helpers so the worker helper wins deterministically.
+- Single push path: `exec` injects the worker credential per-process, so no `setup-git` step is needed. (For repeated plain-`git` sessions, `setup-git --identity worker --path .` installs a worktree-scoped helper instead — never `--global`/`--system`.)
 - `gh` ignores git helpers — always use `exec` for `gh` writes.
 - SSH remotes fail closed (`ssh-guard`, exit 128); use HTTPS.
 
