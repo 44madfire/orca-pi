@@ -699,10 +699,13 @@ describe("profile mutate: concurrent writers (P1 TOCTOU review)", () => {
   it("reaps a stale crashed-holder lock instead of deadlocking", async () => {
     const fs = memFs();
     await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
-    // Plant a lock file with an ancient mtime, simulating a crashed writer.
+    // Plant a lock file with an ancient mtime and a provably-dead pid,
+    // simulating a crashed writer. JSON pid payload is required: mtime alone
+    // never authorizes a reap (suspension-safe), only a dead pid does.
+    const deadPid = 2147483647;
     await (fs as unknown as MutationFs & { writeExclusive(path: string, content: string): Promise<void> }).writeExclusive(
       `${PROJECT}.lock`,
-      "99999@1",
+      JSON.stringify({ pid: deadPid, token: "crashed-token" }),
     );
     fs.mtimes.set(`${PROJECT}.lock`, Date.now() - 60_000);
     const receipt = await setProfileField(
@@ -768,9 +771,10 @@ describe("profile mutate: lock ownership (P1 review)", () => {
       await new Promise((r) => setTimeout(r, 5));
     }
     expect(fs.files.has(lockPath)).toBe(true);
-    // A successor lock appears (crashed-holder turnover simulated by
-    // replacing the file, as a stale reaper would after its CAS checks).
-    const successorToken = "successor-token";
+    // A successor lock appears (turnover simulated by replacing the file).
+    // JSON live payload: the release must restore it via atomic rename-claim,
+    // never delete it, even though it replaced A's entry mid-hold.
+    const successorToken = JSON.stringify({ pid: process.pid, token: "successor-token" });
     fs.files.set(lockPath, successorToken);
     releaseA();
     await holderA;
@@ -785,7 +789,7 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     const lockPath = `${PROJECT}.lock`;
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
       lockPath,
-      "crashed-holder",
+      JSON.stringify({ pid: 2147483647, token: "crashed-holder" }),
     );
     fs.mtimes.set(lockPath, Date.now() - 60_000);
     const receipt = await setProfileField(
@@ -800,9 +804,10 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     const fs = memFs();
     await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
     const lockPath = `${PROJECT}.lock`;
+    const liveContent = JSON.stringify({ pid: process.pid, token: "live-holder" });
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
       lockPath,
-      "live-holder",
+      liveContent,
     );
     // Live (fresh mtime) lock with a short deadline: the contender must time
     // out with `conflict`, never unlinking the live holder's lock.
@@ -816,7 +821,150 @@ describe("profile mutate: lock ownership (P1 review)", () => {
       (error: unknown) => (error as { code?: string }).code ?? "threw",
     );
     expect(outcome).toBe("conflict");
-    expect(fs.files.get(lockPath)).toBe("live-holder");
+    expect(fs.files.get(lockPath)).toBe(liveContent);
+    await (fs as unknown as MutationFs).unlink!(lockPath);
+  });
+
+  it("never reaps a stale-by-mtime but live-pid holder (suspension-safe)", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const lockPath = `${PROJECT}.lock`;
+    // Old mtime (would look stale) but owner pid alive (suspended/slow
+    // holder, e.g. laptop sleep missed the lease). mtime alone must never
+    // authorize a reap.
+    const liveStale = JSON.stringify({ pid: process.pid, token: "suspended-holder" });
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      lockPath,
+      liveStale,
+    );
+    fs.mtimes.set(lockPath, Date.now() - 60_000);
+    const outcome = await withMutationLock(
+      PROJECT,
+      fs,
+      () => Promise.resolve("should-not-run"),
+      { timeoutMs: 60, staleMs: 10_000 },
+    ).then(
+      () => "ran",
+      (error: unknown) => (error as { code?: string }).code ?? "threw",
+    );
+    expect(outcome).toBe("conflict");
+    expect(fs.files.get(lockPath)).toBe(liveStale);
+    await (fs as unknown as MutationFs).unlink!(lockPath);
+  });
+
+  it("reaper never deletes a successor appearing between observe and claim", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const lockPath = `${PROJECT}.lock`;
+    const deadContent = JSON.stringify({ pid: 2147483647, token: "dead-A" });
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      lockPath,
+      deadContent,
+    );
+    fs.mtimes.set(lockPath, Date.now() - 60_000);
+    // Live successor that atomically appears between the reaper's stale
+    // observation and its atomic claim (pause-after-read interleaving).
+    const successorLive = JSON.stringify({ pid: process.pid, token: "successor-B" });
+    const origRename = fs.rename.bind(fs);
+    let injected = false;
+    (fs as unknown as { rename: MutationFs["rename"] }) .rename = (async (from: string, to: string) => {
+      if (!injected && String(from) === lockPath && String(to).includes(".reap-")) {
+        injected = true;
+        // Interleave: winner acquires the free path before our claim moves it.
+        fs.files.set(lockPath, successorLive);
+        fs.mtimes.set(lockPath, Date.now());
+      }
+      return origRename(from, to);
+    }) as MutationFs["rename"];
+    const outcome = await withMutationLock(
+      PROJECT,
+      fs,
+      () => Promise.resolve("should-not-run"),
+      { timeoutMs: 80, staleMs: 10_000 },
+    ).then(
+      () => "ran",
+      (error: unknown) => (error as { code?: string }).code ?? "threw",
+    );
+    // The reaper must detect claimed !== observed and restore, never delete.
+    // It then sees a fresh live lock and fails closed with conflict.
+    expect(outcome).toBe("conflict");
+    expect(fs.files.get(lockPath)).toBe(successorLive);
+    await (fs as unknown as MutationFs).unlink!(lockPath);
+  });
+
+  it("no heartbeat rewrite can clobber a successor (lock is write-once while held)", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const lockPath = `${PROJECT}.lock`;
+    let releaseHold!: () => void;
+    const holdGate = new Promise<void>((resolve) => {
+      releaseHold = resolve;
+    });
+    const holder = withMutationLock(PROJECT, fs, () => holdGate, { staleMs: 90 });
+    for (let i = 0; i < 100 && !fs.files.has(lockPath); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(fs.files.has(lockPath)).toBe(true);
+    const writesBefore = fs.writes.filter((w) => w === lockPath).length;
+    // Successor replaces the entry mid-hold (stale-reaper turnover). A
+    // heartbeat doing read-then-write would clobber it back to the old token
+    // when its pending write lands after this replacement.
+    const successor = JSON.stringify({ pid: process.pid, token: "successor-heartbeat" });
+    fs.files.set(lockPath, successor);
+    // Wait past several old heartbeat periods (staleMs/3 ~= 30ms).
+    await new Promise((r) => setTimeout(r, 150));
+    expect(fs.files.get(lockPath)).toBe(successor);
+    const writesAfter = fs.writes.filter((w) => w === lockPath).length;
+    expect(writesAfter).toBe(writesBefore);
+    releaseHold();
+    await holder;
+    // Release restores (never deletes) the successor it stole.
+    expect(fs.files.get(lockPath)).toBe(successor);
+    await (fs as unknown as MutationFs).unlink!(lockPath);
+  });
+
+  it("release preserves a third writer racing the restore", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const lockPath = `${PROJECT}.lock`;
+    let releaseA!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const holderA = withMutationLock(PROJECT, fs, () => gate);
+    for (let i = 0; i < 100 && !fs.files.has(lockPath); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    // Successor B appears before A's release (A will steal B on claim).
+    const tokenB = JSON.stringify({ pid: process.pid, token: "successor-B" });
+    fs.files.set(lockPath, tokenB);
+    // Third writer C wins the gap between A's claim (lock missing) and A's
+    // restore: inject C inside the claim-read so restore sees EEXIST.
+    const tokenC = JSON.stringify({ pid: process.pid, token: "successor-C" });
+    const origRead = fs.readFile.bind(fs);
+    let injectedC = false;
+    (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
+      const result = await origRead(p, enc);
+      if (!injectedC && String(p).includes(".release-")) {
+        injectedC = true;
+        // Lock path is currently missing (claimed); C acquires it now.
+        try {
+          await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+            lockPath,
+            tokenC,
+          );
+        } catch {
+          // If exclusive fails, fall back to direct set for the memFs double.
+          fs.files.set(lockPath, tokenC);
+        }
+      }
+      return result;
+    }) as MutationFs["readFile"];
+    releaseA();
+    await holderA;
+    // C's live lock must survive; stolen B is discarded (its holder aborts
+    // via pre-commit compromise detection, never silently overwriting).
+    expect(fs.files.get(lockPath)).toBe(tokenC);
     await (fs as unknown as MutationFs).unlink!(lockPath);
   });
 });

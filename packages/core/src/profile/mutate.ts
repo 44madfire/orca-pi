@@ -39,9 +39,16 @@
  * - Never leave a partially-written config after validation/write failure.
  * - Stale-write races are prevented by serializing the read → validate →
  *   commit path under a per-target mutation lock (in-process mutex plus a
- *   cross-process `<target>.lock` file with stale-holder reaping). SHA-256
- *   source hashes are compared against freshly loaded state inside the lock;
- *   a mismatch returns a `conflict` instead of silently overwriting newer edits.
+ *   cross-process `<target>.lock` file). The lock file stores a JSON
+ *   `{ pid, token }` payload. A stale-by-mtime entry is only reaped after
+ *   proving the owner dead via process liveness (never on mtime alone, so
+ *   suspension/sleep can never cause a live holder to be reaped), and both
+ *   reap and release claim the path with an atomic `rename` to a unique
+ *   sidecar and restore on mismatch — never a read-then-unlink/write that
+ *   could clobber or delete a successor's lock. There is no heartbeat
+ *   rewrite (a live holder is never stale). SHA-256 source hashes are
+ *   compared against freshly loaded state inside the lock; a mismatch
+ *   returns a `conflict` instead of silently overwriting newer edits.
  * - Failed mutations leave the original document unchanged.
  * - No secret values belong in profile mutations (schema rejects unknown
  *   fields with a secrets reminder; this layer never accepts tokens).
@@ -533,14 +540,262 @@ function sleepMs(ms: number): Promise<void> {
 export interface MutationLockOptions {
   /** Max time to wait for another writer's lock (default 10_000ms). */
   timeoutMs?: number;
-  /** Locks older than this are treated as crashed-holder leftovers (default 10_000ms). */
+  /**
+   * Entries older than this become *candidates* for crashed-holder recovery
+   * (default 10_000ms). Age alone never authorizes a reap: the owner pid
+   * must also prove dead via `isProcessAlive`. A live (or unparsable) entry
+   * is always treated as held — wait then `conflict`, never delete.
+   */
   staleMs?: number;
+  /**
+   * Injectable liveness probe (tests). Defaults to `process.kill(pid, 0)`:
+   * ESRCH → dead, EPERM/success → alive, anything else → alive
+   * (fail-closed). Suspension/sleep keeps the pid alive, so a suspended
+   * holder is never reaped.
+   */
+  isProcessAlive?: (pid: number) => boolean;
+}
+
+function defaultIsProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (!!error && typeof error === "object" && (error as { code?: unknown }).code === "ESRCH") {
+      return false;
+    }
+    return true;
+  }
+}
+
+function makeMutationLockContent(token: string): string {
+  return JSON.stringify({ pid: process.pid, token });
+}
+
+function parseMutationLockContent(content: string): { pid: number; token: string } | undefined {
+  try {
+    const parsed = JSON.parse(content) as { pid?: unknown; token?: unknown };
+    if (
+      typeof parsed.pid === "number" &&
+      Number.isInteger(parsed.pid) &&
+      parsed.pid > 0 &&
+      typeof parsed.token === "string" &&
+      parsed.token.length > 0
+    ) {
+      return { pid: parsed.pid, token: parsed.token };
+    }
+    return undefined;
+  } catch {
+    // Legacy/plain-token entries carry no provable pid — fail-closed: never
+    // reap, only wait then conflict. Production has no legacy entries (the
+    // JSON format ships with UI1.1); this only affects foreign files.
+    return undefined;
+  }
+}
+
+function makeClaimPath(lockPath: string, kind: string): string {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `${lockPath}.${kind}-${process.pid}-${Date.now().toString(36)}-${rand}`;
+}
+
+/**
+ * Atomically claim `lockPath` via rename and delete the claim only when it
+ * still holds exactly `expectedContent`.
+ *
+ * Why rename: `readFile` + `unlink`/`writeFile` is TOCTOU — a successor can
+ * appear between the check and the act, and the act then deletes/clobbers
+ * the live lock. `rename` atomically moves whatever is currently at
+ * `lockPath` to a private `claimPath`; we then inspect the private copy.
+ * On mismatch we restore via exclusive create (never overwriting a new
+ * holder) so a successor is never deleted. Returns true when the old entry
+ * was removed and the path is now free.
+ */
+async function reapDeadLockClaim(
+  fs: MutationFs,
+  lockPath: string,
+  expectedContent: string,
+  isAlive: (pid: number) => boolean,
+): Promise<boolean> {
+  if (typeof fs.rename !== "function" || typeof fs.unlink !== "function") return false;
+  const writeExclusive = fs.writeExclusive;
+  if (typeof writeExclusive !== "function") return false;
+  const claimPath = makeClaimPath(lockPath, "reap");
+  try {
+    await fs.rename(lockPath, claimPath);
+  } catch (error) {
+    if (isEnoent(error)) return false;
+    throw error;
+  }
+  let claimed: string;
+  try {
+    claimed = await fs.readFile(claimPath, "utf8");
+  } catch (error) {
+    if (isEnoent(error)) return false;
+    throw error;
+  }
+  if (claimed !== expectedContent) {
+    // Stole a successor that appeared between observe and claim — restore
+    // without overwriting whoever owns the path now.
+    try {
+      await writeExclusive.call(fs, lockPath, claimed);
+      try {
+        await fs.unlink(claimPath);
+      } catch {
+        // Best effort; the path is restored.
+      }
+    } catch (error) {
+      if (isLockHeldError(error)) {
+        // A new holder won the gap; discard the stolen copy, keep theirs.
+        try {
+          await fs.unlink(claimPath);
+        } catch {
+          // Best effort.
+        }
+      } else {
+        try {
+          await fs.unlink(claimPath);
+        } catch {
+          // Best effort.
+        }
+      }
+    }
+    return false;
+  }
+  const parsed = parseMutationLockContent(claimed);
+  if (!parsed || isAlive(parsed.pid)) {
+    // No longer provably dead — put it back.
+    try {
+      await writeExclusive.call(fs, lockPath, claimed);
+      try {
+        await fs.unlink(claimPath);
+      } catch {
+        // Best effort.
+      }
+    } catch (error) {
+      if (isLockHeldError(error)) {
+        try {
+          await fs.unlink(claimPath);
+        } catch {
+          // Best effort.
+        }
+      } else {
+        try {
+          await fs.unlink(claimPath);
+        } catch {
+          // Best effort.
+        }
+      }
+    }
+    return false;
+  }
+  try {
+    await fs.unlink(claimPath);
+  } catch (error) {
+    if (!isEnoent(error)) throw error;
+  }
+  return true;
+}
+
+/**
+ * Ownership-safe release via atomic rename claim. Never deletes a
+ * successor: the path is moved to a private claim, compared, and only an
+ * exact match is deleted; a mismatch is restored via exclusive create.
+ */
+async function releaseMutationLockSafely(
+  fs: MutationFs,
+  lockPath: string,
+  myContent: string,
+): Promise<void> {
+  if (typeof fs.unlink !== "function") return;
+  if (typeof fs.rename !== "function") {
+    // No atomic claim available and no reaper runs in this mode (reaping
+    // requires rename+exclusive), so a checked unlink is safe: no concurrent
+    // deleter exists for a live holder.
+    try {
+      const current = await fs.readFile(lockPath, "utf8");
+      if (current === myContent) await fs.unlink(lockPath);
+    } catch {
+      // Best effort.
+    }
+    return;
+  }
+  const claimPath = makeClaimPath(lockPath, "release");
+  try {
+    await fs.rename(lockPath, claimPath);
+  } catch (error) {
+    if (isEnoent(error)) return;
+    return;
+  }
+  let claimed: string;
+  try {
+    claimed = await fs.readFile(claimPath, "utf8");
+  } catch {
+    return;
+  }
+  if (claimed !== myContent) {
+    // We stole a successor (we were reaped, or a turnover raced us) —
+    // restore it without overwriting a newer holder.
+    const writeExclusive = fs.writeExclusive;
+    if (typeof writeExclusive === "function") {
+      try {
+        await writeExclusive.call(fs, lockPath, claimed);
+        try {
+          await fs.unlink(claimPath);
+        } catch {
+          // Best effort.
+        }
+      } catch (error) {
+        if (isLockHeldError(error)) {
+          try {
+            await fs.unlink(claimPath);
+          } catch {
+            // Best effort.
+          }
+        } else {
+          try {
+            await fs.unlink(claimPath);
+          } catch {
+            // Best effort.
+          }
+        }
+      }
+    } else {
+      // No exclusive-create available: fail-closed. If the path is still
+      // missing, move the stolen entry back; otherwise a new holder won the
+      // gap — discard our stolen copy and keep theirs (their holder aborts
+      // via pre-commit compromise detection, never silently overwriting).
+      try {
+        await fs.readFile(lockPath, "utf8");
+        // Live successor exists — discard the stolen copy.
+        try {
+          await fs.unlink(claimPath);
+        } catch {
+          // Best effort.
+        }
+      } catch (error) {
+        if (isEnoent(error)) {
+          try {
+            await fs.rename(claimPath, lockPath);
+          } catch {
+            // Best effort; leave the claim for a later reaper.
+          }
+        }
+      }
+    }
+    return;
+  }
+  try {
+    await fs.unlink(claimPath);
+  } catch {
+    // Best effort.
+  }
 }
 
 export async function withMutationLock<T>(
   targetPath: string,
   fs: MutationFs,
-  fn: () => Promise<T>,
+  fn: (lockContent: string | undefined) => Promise<T>,
   options: MutationLockOptions = {},
 ): Promise<T> {
   return await withProcessMutex(targetPath, async () => {
@@ -562,29 +817,15 @@ export async function withMutationLock<T>(
     const lockPath = `${targetPath}.lock`;
     const timeoutMs = options.timeoutMs ?? 10_000;
     const staleMs = options.staleMs ?? 10_000;
-    // Unique ownership token: release and reap verify it, so a slow holder
-    // can never delete a successor's lock and a reaper can never mistake a
-    // live holder's replacement for the stale entry it inspected.
-    const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    const isAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+    // Unique ownership token inside a pid-tagged JSON payload. Release and
+    // reap compare the full payload; pid liveness gates every reap so a
+    // suspended/slow holder (pid alive) is never reaped. No heartbeat: live
+    // holders are never stale, so no background rewrite can clobber a
+    // successor.
+    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    const myContent = makeMutationLockContent(token);
     let held = false;
-    // Lease heartbeat: refresh the lock mtime while held so a legitimate
-    // slow holder is never classified stale. Guarded rewrite (only when the
-    // content is still ours) so a heartbeat can never clobber a successor.
-    let heartbeat: ReturnType<typeof setInterval> | undefined;
-    const startHeartbeat = (): void => {
-      if (staleMs === Number.POSITIVE_INFINITY) return;
-      const period = Math.max(50, Math.floor(staleMs / 3));
-      heartbeat = setInterval(() => {
-        fs.readFile(lockPath, "utf8").then((current) => {
-          if (current === token && fs.writeFile) {
-            return fs.writeFile(lockPath, token, "utf8").catch(() => undefined);
-          }
-          return undefined;
-        }).catch(() => undefined);
-      }, period);
-      const maybeUnref = heartbeat as unknown as { unref?: () => void };
-      if (typeof maybeUnref.unref === "function") maybeUnref.unref();
-    };
     const readLock = async (): Promise<{ content: string; mtime: number } | undefined> => {
       try {
         const content = await fs.readFile(lockPath, "utf8");
@@ -603,11 +844,20 @@ export async function withMutationLock<T>(
         throw error;
       }
     };
+    const failWithBusy = (): never => {
+      throw new ProfileMutationError({
+        code: "conflict",
+        sourceLabel: targetPath,
+        message:
+          `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
+          `Wait for it to finish, reload, and retry. No data was overwritten.`,
+      });
+    };
     if (typeof writeExclusive === "function") {
       const deadline = Date.now() + timeoutMs;
       for (;;) {
         try {
-          await writeExclusive.call(fs, lockPath, token);
+          await writeExclusive.call(fs, lockPath, myContent);
           held = true;
           break;
         } catch (error) {
@@ -615,59 +865,45 @@ export async function withMutationLock<T>(
           const seen = await readLock();
           if (seen === undefined) continue; // Released between calls; compete again.
           if (Date.now() - seen.mtime <= staleMs) {
-            if (Date.now() >= deadline) {
-              throw new ProfileMutationError({
-                code: "conflict",
-                sourceLabel: targetPath,
-                message:
-                  `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
-                  `Wait for it to finish, reload, and retry. No data was overwritten.`,
-              });
-            }
+            if (Date.now() >= deadline) failWithBusy();
             await sleepMs(15);
             continue;
           }
-          // Possibly stale: confirm the entry is quiescent (no heartbeat
-          // refresh, no replacement) before touching it.
-          await sleepMs(25);
-          const again = await readLock();
-          if (again === undefined || again.content !== seen.content || again.mtime !== seen.mtime) {
-            continue; // Live holder (heartbeat) or another reaper won; recompete.
+          // Stale by mtime — fail-closed unless the owner proves dead.
+          const parsed = parseMutationLockContent(seen.content);
+          if (!parsed || isAlive(parsed.pid)) {
+            // Live, suspended, or foreign entry: never reap on mtime alone.
+            if (Date.now() >= deadline) failWithBusy();
+            await sleepMs(15);
+            continue;
           }
-          if (typeof fs.unlink === "function") {
-            try {
-              // Ownership-checked reap: only remove the exact stale entry.
-              const current = await readLock();
-              if (current !== undefined && current.content === seen.content) {
-                await fs.unlink(lockPath);
-              }
-            } catch {
-              // Lost a race; loop around and compete again.
-            }
+          // Provably dead pid: attempt an atomic-claim reap, then recompete.
+          // The claim verifies content after the atomic move and restores on
+          // mismatch, so a successor appearing between observe and claim is
+          // never deleted.
+          try {
+            await reapDeadLockClaim(fs, lockPath, seen.content, isAlive);
+          } catch {
+            // Lost a race; loop around and compete again.
           }
           continue;
         }
       }
     }
-    startHeartbeat();
     try {
-      return await fn();
+      return await fn(held ? myContent : undefined);
     } finally {
-      if (heartbeat !== undefined) clearInterval(heartbeat);
-      if (held && typeof fs.unlink === "function") {
+      if (held) {
         try {
-          // Ownership-checked release: never delete a successor's lock.
-          const current = await readLock();
-          if (current !== undefined && current.content === token) {
-            await fs.unlink(lockPath);
-          }
+          await releaseMutationLockSafely(fs, lockPath, myContent);
         } catch {
-          // Best-effort release; an expired entry is reaped by acquirers.
+          // Best-effort release; a dead-holder entry is reaped by acquirers.
         }
       }
     }
   });
 }
+
 
 /** Pre-write re-read guard: fail with `conflict` when the file changed. */
 async function assertNoConcurrentChange(
@@ -1181,7 +1417,7 @@ async function runMutationTransaction(
   // lock (P1: two writers loading the same hash must not both commit).
   // The `expectedSourceHash` comparison below runs against freshly loaded
   // state inside the lock, so a loser always sees the winner's commit.
-  return await withMutationLock(targetPath, fs, async () => {
+  return await withMutationLock(targetPath, fs, async (lockContent) => {
   const [userLayer, projectLayer] = await Promise.all([
     loadLayerFile(paths.userPath, fs),
     loadLayerFile(paths.projectPath, fs),
@@ -1462,6 +1698,39 @@ async function runMutationTransaction(
     // Unset/patch removed the last delta but the merged profile still
     // resolves via another layer/builtin — resolve above already handled it.
     // This branch is unreachable; kept for exhaustiveness.
+  }
+
+  // Compromise detection: if our cross-process lock was reaped/stolen after
+  // acquisition, abort instead of committing a stale read (fail-closed).
+  // Same-process overlap is already excluded by the in-process mutex, so any
+  // mismatch here means another OS process owns the path now.
+  if (lockContent !== undefined) {
+    let currentLock: string | undefined;
+    try {
+      currentLock = await fs.readFile(`${targetPath}.lock`, "utf8");
+    } catch (error) {
+      if (isEnoent(error)) {
+        throw new ProfileMutationError({
+          code: "conflict",
+          profileName: input.profileName,
+          scope: input.scope,
+          sourceLabel: targetPath,
+          message:
+            `Lost profile mutation lock for "${input.profileName}" in ${input.scope} config (${targetPath}): the lock disappeared before commit. Reload and retry. No data was overwritten.`,
+        });
+      }
+      throw error;
+    }
+    if (currentLock !== lockContent) {
+      throw new ProfileMutationError({
+        code: "conflict",
+        profileName: input.profileName,
+        scope: input.scope,
+        sourceLabel: targetPath,
+        message:
+          `Concurrent profile write stole the mutation lock for "${input.profileName}" in ${input.scope} config (${targetPath}) before commit. Reload and retry. No data was overwritten.`,
+      });
+    }
   }
 
   // Stale-write guard immediately before commit.
