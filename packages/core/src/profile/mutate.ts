@@ -825,12 +825,28 @@ export async function withMutationLock<T>(
   return await withProcessMutex(targetPath, async () => {
     const ifUnavailable = options.ifUnavailable ?? "throw";
     const createdDirs: string[] = [];
-    // Tracked mkdir for P2 cleanup: records directories that were absent
-    // before use so only our own metadata is ever removed on the way out.
+    // Tracked mkdir for P2 cleanup: records the full created ancestor chain
+    // (from Node's recursive-mkdir first-created return value) so only our
+    // own metadata is ever removed on the way out — never a pre-existing
+    // user directory.
     const mkdirTracked = async (dir: string): Promise<void> => {
-      const existed = await pathExists(fs, dir);
-      await fs.mkdir(dir, { recursive: true });
-      if (!existed) createdDirs.push(dir);
+      const normalized = dir.replace(/\\/g, "/").replace(/\/+$/, "");
+      const first = await fs.mkdir(dir, { recursive: true });
+      if (typeof first === "string" && first.length > 0) {
+        const root = first.replace(/\\/g, "/").replace(/\/+$/, "");
+        const chain: string[] = [];
+        let current: string | undefined = normalized;
+        for (;;) {
+          chain.unshift(current);
+          if (current === root) break;
+          const slash = current.lastIndexOf("/");
+          if (slash <= 0) break;
+          current = current.slice(0, slash);
+        }
+        for (const d of chain) if (!createdDirs.includes(d)) createdDirs.push(d);
+        return;
+      }
+      if (!(await pathExists(fs, dir))) createdDirs.push(normalized);
     };
     // P1 (fresh-install path): the lock directory lives next to the target,
     // so the parent directory must exist before anything else. Real
@@ -866,31 +882,27 @@ export async function withMutationLock<T>(
       // `expectedSourceHash` comparison below.
       return await fn(undefined);
     }
-    try {
-      await mkdirTracked(lockDir);
-    } catch (error) {
-      if (ifUnavailable === "skip" && isPermissionDenied(error)) {
-        await cleanupCreatedDirs(fs, createdDirs);
-        return await fn(undefined);
-      }
-      throw new ProfileMutationError({
-        code: "atomic-write-failed",
-        sourceLabel: targetPath,
-        message: `Could not create lock directory ${lockDir}: ${error instanceof Error ? error.message : String(error)}. Original document left unchanged.`,
-        cause: error,
-      });
-    }
+    // 0-2. Prepare the lock dir, publish choosing BEFORE reading numbers
+    // (bakery door), then pick number = 1 + max visible. Unique names:
+    // creation never contends; on astronomical collision, clean up and retry
+    // with a fresh token. If our prepared directory vanishes underneath us
+    // (a releaser's empty-dir cleanup racing a contender that has mkdir'd
+    // but not yet published), exclusive creation fails ENOENT — re-prepare
+    // and retry rather than failing the mutation.
+    let token = "";
+    let choosing = "";
+    let numberFile = "";
+    let ownNumber = 0;
+    let preparedDir = false;
     // Bakery-style acquisition with unique files per contender. Each
     // participant only ever deletes its OWN choosing/number files — nobody
     // ever removes or renames another participant's file, even temporarily,
     // so a live holder's entries cannot go absent while it is active.
     // Priority (the ticket number) is chosen AFTER publishing the choosing
     // flag, from currently visible numbers, so a contender descheduled before
-    // publication cannot retroactively outrank an active holder: it either
-    // was visible via choosing (holders wait for it) or it picks a larger
-    // number after seeing the holder. Dead pids are ignored (never waited
-    // on), so suspension/sleep — pid still alive — can never cause a live
-    // holder to be skipped.
+    // publication cannot retroactively outrank an active holder. Dead pids
+    // are ignored (never waited on), so suspension/sleep can never cause a
+    // live holder to be skipped.
     const failWithBusy = (): never => {
       throw new ProfileMutationError({
         code: "conflict",
@@ -900,20 +912,36 @@ export async function withMutationLock<T>(
           `Wait for it to finish, reload, and retry. No data was overwritten.`,
       });
     };
-    // 1-2. Publish choosing BEFORE reading numbers (bakery door), then pick
-    // number = 1 + max visible. Unique names: creation never contends; on
-    // astronomical collision, clean up and retry with a fresh token.
-    let token = "";
-    let choosing = "";
-    let numberFile = "";
-    let ownNumber = 0;
     for (;;) {
+      if (!preparedDir) {
+        try {
+          await mkdirTracked(lockDir);
+        } catch (error) {
+          if (ifUnavailable === "skip" && isPermissionDenied(error)) {
+            await cleanupCreatedDirs(fs, createdDirs);
+            return await fn(undefined);
+          }
+          throw new ProfileMutationError({
+            code: "atomic-write-failed",
+            sourceLabel: targetPath,
+            message: `Could not create lock directory ${lockDir}: ${error instanceof Error ? error.message : String(error)}. Original document left unchanged.`,
+            cause: error,
+          });
+        }
+        preparedDir = true;
+      }
+      // Publish choosing BEFORE reading numbers (bakery door), then pick
+      // number = 1 + max visible.
       token = makeLockToken();
       choosing = choosingName(token);
       numberFile = numberName(token);
       try {
         await writeExclusive.call(fs, `${lockDir}/${choosing}`, JSON.stringify({ pid: process.pid, token, origin: ownOrigin }));
       } catch (error) {
+        if (isEnoent(error)) {
+          preparedDir = false;
+          continue;
+        }
         if (!isLockHeldError(error)) {
           if (ifUnavailable === "skip" && isPermissionDenied(error)) {
             await cleanupCreatedDirs(fs, createdDirs);
@@ -930,6 +958,11 @@ export async function withMutationLock<T>(
           if (Number.isFinite(n.number) && n.number > maxSeen) maxSeen = n.number;
         }
       } catch (error) {
+        if (isEnoent(error)) {
+          await deleteOwnFiles(fs, lockDir, [choosing]);
+          preparedDir = false;
+          continue;
+        }
         if (!isEnoent(error)) {
           await deleteOwnFiles(fs, lockDir, [choosing]);
           if (ifUnavailable === "skip" && isPermissionDenied(error)) {
@@ -949,6 +982,10 @@ export async function withMutationLock<T>(
         break;
       } catch (error) {
         await deleteOwnFiles(fs, lockDir, [choosing]);
+        if (isEnoent(error)) {
+          preparedDir = false;
+          continue;
+        }
         if (!isLockHeldError(error)) {
           if (ifUnavailable === "skip" && isPermissionDenied(error)) {
             await cleanupCreatedDirs(fs, createdDirs);

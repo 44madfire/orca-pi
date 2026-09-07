@@ -41,6 +41,7 @@ function memFs(
 ): MutationFs & {
   files: Map<string, string>;
   mtimes: Map<string, number>;
+  dirs: Set<string>;
   failNextWrite?: boolean;
   writes: string[];
 } {
@@ -80,6 +81,7 @@ function memFs(
   const fs = {
     files,
     mtimes,
+    dirs,
     writes: [] as string[],
     failNextWrite: false,
     async readFile(path: string): Promise<string> {
@@ -123,7 +125,7 @@ function memFs(
       files.set(to, files.get(from)!);
       files.delete(from);
     },
-    async mkdir(path: string, mkdirOpts?: { recursive: boolean }): Promise<undefined> {
+    async mkdir(path: string, mkdirOpts?: { recursive: boolean }): Promise<string | undefined> {
       if (isDenied(String(path))) throw denyEacces(`mkdir ${String(path)}`);
       if (mkdirOpts?.recursive) {
         // Populate the full ancestor chain like a real recursive mkdir.
@@ -136,12 +138,22 @@ function memFs(
           if (slash <= 0) break;
           current = current.slice(0, slash);
         }
+        // Mimic Node: resolve the first directory actually created (topmost
+        // newly added ancestor), or undefined when everything existed.
+        let firstCreated: string | undefined;
+        for (let i = chain.length - 1; i >= 0; i--) {
+          if (!dirs.has(chain[i] as string)) {
+            firstCreated = chain[i];
+            break;
+          }
+        }
         for (const dir of chain) dirs.add(dir);
+        return firstCreated;
       } else {
         requireParent(String(path));
-        dirs.add(String(path));
+        dirs.add(String(path).replace(/\\/g, "/").replace(/\/+$/, ""));
+        return undefined;
       }
-      return undefined;
     },
     async stat(path: string): Promise<unknown> {
       const key = String(path);
@@ -202,6 +214,7 @@ function memFs(
   return fs as unknown as MutationFs & {
     files: Map<string, string>;
     mtimes: Map<string, number>;
+    dirs: Set<string>;
     failNextWrite?: boolean;
     writes: string[];
   };
@@ -1211,8 +1224,7 @@ describe("profile mutate: unwritable opposite store (P1 review)", () => {
   });
 });
 
-describe("profile mutate: absent opposite store stays absent (P2 review)", () => {
-  it("user-scope write leaves an absent writable project dir absent", async () => {
+describe("profile mutate: absent opposite store stays absent (P2 review)", () => {  it("user-scope write leaves an absent writable project dir absent", async () => {
     const fs = memFs(
       { [USER]: "profiles:\n  a:\n    model: x\n" },
       { modelDirs: true },
@@ -1224,9 +1236,10 @@ describe("profile mutate: absent opposite store stays absent (P2 review)", () =>
     expect(receipt.resolved?.model).toBe("z");
     expect(fs.files.get(USER)).toContain("model: z");
     // Nothing was materialized next to the untargeted opposite config:
-    // no project file, no lock dir, no `.pi` tree.
+    // no project file, no lock dir, no `.pi` tree (files AND directories).
     expect(fs.files.has(PROJECT)).toBe(false);
     expect([...fs.files.keys()].some((k) => k.startsWith("/repo/p/.pi"))).toBe(false);
+    expect([...fs.dirs].some((d) => d === "/repo/p/.pi" || d.startsWith("/repo/p/.pi/"))).toBe(false);
   });
 
   it("project-scope write leaves an absent writable user dir absent", async () => {
@@ -1242,6 +1255,9 @@ describe("profile mutate: absent opposite store stays absent (P2 review)", () =>
     expect(fs.files.get(PROJECT)).toContain("model: w");
     expect(fs.files.has(USER)).toBe(false);
     expect([...fs.files.keys()].some((k) => k.startsWith("/home/u/.pi"))).toBe(false);
+    // The full created ancestor chain is undone: neither `~/.pi/agent` nor
+    // its parent `~/.pi` (both absent before use) may leak.
+    expect([...fs.dirs].some((d) => d === "/home/u/.pi" || d.startsWith("/home/u/.pi/"))).toBe(false);
   });
 
   it("concurrent dual-absent creates serialize without losing either", async () => {
@@ -1408,6 +1424,69 @@ describe("profile mutate: bakery choosing gate (P1 review)", () => {
     await (fs as unknown as MutationFs).unlink!(bNumber);
     expect(await contender).toBe("entered");
     expect(await fs.readdir!(lockDir)).toHaveLength(0);
+  });
+
+  it("a contender paused before choosing publication survives a releaser's cleanup", async () => {
+    // P1: A releases (deleting its ticket) and its empty-dir cleanup removes
+    // lockDir while cross-process contender B has mkdir'd but not yet
+    // published choosing. B's exclusive creation then fails ENOENT; B must
+    // re-prepare and acquire instead of failing the mutation.
+    const fs = memFs(
+      { [PROJECT]: "profiles:\n  a:\n    model: m\n" },
+      { modelDirs: true },
+    );
+    const dir = `${PROJECT}.lock.d`;
+    // Cross-process holder A (live, smallest ticket), simulated with direct
+    // file ops to bypass this process's mutex.
+    await fs.mkdir!(dir, { recursive: true });
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      `${dir}/n-a.json`,
+      JSON.stringify({ pid: process.pid, token: "a-holder", number: 1 }),
+    );
+    // Pause B's acquisition after lock-dir preparation, before its choosing
+    // file is created.
+    const origExclusive = (
+      fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }
+    ).writeExclusive.bind(fs);
+    let paused = false;
+    let releaseB!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    (
+      fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }
+    ).writeExclusive = (async (p: string, c: string) => {
+      if (!paused && String(p).endsWith(".choosing")) {
+        paused = true;
+        await gate;
+      }
+      return origExclusive(p, c);
+    }) as MutationFs["writeExclusive"];
+    let entered = false;
+    const contender = withMutationLock(
+      PROJECT,
+      fs,
+      () => {
+        entered = true;
+        return Promise.resolve("entered");
+      },
+      { timeoutMs: 5_000 },
+    );
+    for (let i = 0; i < 100 && !paused; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(paused).toBe(true);
+    expect(entered).toBe(false);
+    // A finishes: deletes its ticket; the empty lock dir is cleaned up.
+    await (fs as unknown as MutationFs).unlink!(`${dir}/n-a.json`);
+    expect(await fs.readdir!(dir)).toHaveLength(0);
+    await fs.rmdir!(dir);
+    // B resumes into a missing directory: it must re-prepare, acquire, and
+    // complete — never fail with ENOENT.
+    releaseB();
+    expect(await contender).toBe("entered");
+    expect(entered).toBe(true);
+    expect(await fs.readdir!(dir)).toHaveLength(0);
   });
 
   it("a timed-out contender removes its own files and wedges nothing", async () => {
