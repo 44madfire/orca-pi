@@ -59,8 +59,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { hostname, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { hostname } from "node:os";
 import { stringify as stringifyYaml } from "yaml";
 import {
   getBuiltinProfilesDocument,
@@ -179,6 +178,13 @@ export interface MutationFs {
   stat?(path: string): Promise<unknown>;
   unlink?(path: string): Promise<void>;
   /**
+   * Remove an empty directory. Used only for best-effort cleanup of lock
+   * metadata this transaction created (never removes non-empty directories;
+   * ENOENT/ENOTEMPTY are ignored). Optional: when absent, created lock
+   * directories are simply left in place.
+   */
+  rmdir?(path: string): Promise<void>;
+  /**
    * List directory entries (names only) for the cross-process lock directory
    * (`<target>.lock.d`). Optional: when absent the transaction still
    * serializes within the process via an in-memory mutex, but two OS
@@ -295,6 +301,7 @@ async function getRealFs(): Promise<MutationFs> {
     mkdir: (p, opts) => fs.mkdir(p, opts),
     stat: (p) => fs.stat(p),
     unlink: (p) => fs.unlink(p),
+    rmdir: (p) => fs.rmdir(p),
     readdir: (p) => fs.readdir(p) as Promise<string[]>,
     writeExclusive: (p, c) => fs.writeFile(p, c, { encoding: "utf8", flag: "wx" }).then(() => undefined),
   };
@@ -420,23 +427,6 @@ async function loadLayerFile(
       cause: error,
     });
   }
-}
-
-/**
- * Shared pair-lock base path for one user+project layer pair (P2).
- *
- * Used INSTEAD of the opposite scope's file lock when the opposite config
- * file is absent, so no lock metadata is materialized next to an untargeted
- * config. Keyed by the canonical absolute pair (scope order independent),
- * it lives under the OS temp dir — always writable when the target store
- * is. Same-OS transactions on one pair always overlap on at least one lock
- * (target, opposite, or pair); absence→created races that slip through
- * still fail on the both-layer pre-commit existence revalidation.
- */
-function pairLockPath(userPath: string, projectPath: string): string {
-  const key = [resolve(userPath), resolve(projectPath)].sort().join("\n");
-  const hash = createHash("sha256").update(key, "utf8").digest("hex").slice(0, 32);
-  return join(tmpdir(), `orca-pi-profiles-${hash}`, "pair");
 }
 
 function parentDirOf(filePath: string): string {  const normalized = filePath.replace(/\\/g, "/");
@@ -793,6 +783,39 @@ async function deleteOwnFiles(
   }
 }
 
+async function pathExists(fs: MutationFs, path: string): Promise<boolean> {
+  if (typeof fs.stat !== "function") return true;
+  try {
+    await fs.stat(path);
+    return true;
+  } catch (error) {
+    if (isEnoent(error)) return false;
+    return true;
+  }
+}
+
+/**
+ * Best-effort removal of lock metadata this transaction created (P2).
+ *
+ * Only directories recorded as absent-before-use are candidates, and only
+ * when currently empty — a concurrent participant's files (or a denied
+ * store) make removal fail, which is ignored. Keeps absent opposite stores
+ * absent after the transaction instead of leaving empty `.lock.d`/`.pi`
+ * trees behind. Never throws.
+ */
+async function cleanupCreatedDirs(fs: MutationFs, dirs: string[]): Promise<void> {
+  if (typeof fs.rmdir !== "function" || typeof fs.readdir !== "function") return;
+  // Deepest first so an emptied lock dir goes before its parent.
+  for (const dir of [...dirs].reverse()) {
+    try {
+      const names = await fs.readdir(dir);
+      if (names.length === 0) await fs.rmdir(dir);
+    } catch {
+      // Best effort: ENOENT/ENOTEMPTY/denied all mean "leave it".
+    }
+  }
+}
+
 export async function withMutationLock<T>(
   targetPath: string,
   fs: MutationFs,
@@ -800,21 +823,26 @@ export async function withMutationLock<T>(
   options: MutationLockOptions = {},
 ): Promise<T> {
   return await withProcessMutex(targetPath, async () => {
-    // `"skip"` is used only for the NON-target scope by
-    // runMutationTransaction: when that scope's store denies writes
-    // (EACCES/EPERM/EROFS) the body runs without holding this scope's lock.
-    // That stays safe because such a store cannot accept conflicting service
-    // commits through that layer either, while the target lock plus
-    // both-layer pre-commit revalidation still guard the commit.
     const ifUnavailable = options.ifUnavailable ?? "throw";
+    const createdDirs: string[] = [];
+    // Tracked mkdir for P2 cleanup: records directories that were absent
+    // before use so only our own metadata is ever removed on the way out.
+    const mkdirTracked = async (dir: string): Promise<void> => {
+      const existed = await pathExists(fs, dir);
+      await fs.mkdir(dir, { recursive: true });
+      if (!existed) createdDirs.push(dir);
+    };
     // P1 (fresh-install path): the lock directory lives next to the target,
     // so the parent directory must exist before anything else. Real
     // `writeFile(..., { flag: "wx" })` never creates parents — without this
     // the first mutation on a fresh store would fail ENOENT on the lock.
     try {
-      await fs.mkdir(parentDirOf(targetPath), { recursive: true });
+      await mkdirTracked(parentDirOf(targetPath));
     } catch (error) {
-      if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
+      if (ifUnavailable === "skip" && isPermissionDenied(error)) {
+        await cleanupCreatedDirs(fs, createdDirs);
+        return await fn(undefined);
+      }
       throw new ProfileMutationError({
         code: "atomic-write-failed",
         sourceLabel: targetPath,
@@ -839,9 +867,12 @@ export async function withMutationLock<T>(
       return await fn(undefined);
     }
     try {
-      await fs.mkdir(lockDir, { recursive: true });
+      await mkdirTracked(lockDir);
     } catch (error) {
-      if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
+      if (ifUnavailable === "skip" && isPermissionDenied(error)) {
+        await cleanupCreatedDirs(fs, createdDirs);
+        return await fn(undefined);
+      }
       throw new ProfileMutationError({
         code: "atomic-write-failed",
         sourceLabel: targetPath,
@@ -884,7 +915,10 @@ export async function withMutationLock<T>(
         await writeExclusive.call(fs, `${lockDir}/${choosing}`, JSON.stringify({ pid: process.pid, token, origin: ownOrigin }));
       } catch (error) {
         if (!isLockHeldError(error)) {
-          if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
+          if (ifUnavailable === "skip" && isPermissionDenied(error)) {
+            await cleanupCreatedDirs(fs, createdDirs);
+            return await fn(undefined);
+          }
           throw error;
         }
         continue;
@@ -898,7 +932,10 @@ export async function withMutationLock<T>(
       } catch (error) {
         if (!isEnoent(error)) {
           await deleteOwnFiles(fs, lockDir, [choosing]);
-          if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
+          if (ifUnavailable === "skip" && isPermissionDenied(error)) {
+            await cleanupCreatedDirs(fs, createdDirs);
+            return await fn(undefined);
+          }
           throw error;
         }
       }
@@ -913,7 +950,10 @@ export async function withMutationLock<T>(
       } catch (error) {
         await deleteOwnFiles(fs, lockDir, [choosing]);
         if (!isLockHeldError(error)) {
-          if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
+          if (ifUnavailable === "skip" && isPermissionDenied(error)) {
+            await cleanupCreatedDirs(fs, createdDirs);
+            return await fn(undefined);
+          }
           throw error;
         }
       }
@@ -983,8 +1023,10 @@ export async function withMutationLock<T>(
         enteredBody = true;
         return await fn(numberFile);
       } finally {
-        // Owner-only release: delete exactly our own number file.
+        // Owner-only release: delete exactly our own number file, then drop
+        // lock metadata we created so absent stores stay absent (P2).
         await deleteOwnFiles(fs, lockDir, [numberFile, choosing]);
+        await cleanupCreatedDirs(fs, createdDirs);
       }
     } catch (error) {
       // Election/body failure (including timeout/conflict): remove our own
@@ -992,6 +1034,7 @@ export async function withMutationLock<T>(
       // writes in this long-lived process. A pre-body permission denial
       // under `ifUnavailable: "skip"` instead runs the body uncoordinated.
       await deleteOwnFiles(fs, lockDir, [numberFile, choosing]);
+      await cleanupCreatedDirs(fs, createdDirs);
       if (!enteredBody && ifUnavailable === "skip" && isPermissionDenied(error)) {
         return await fn(undefined);
       }
@@ -1655,17 +1698,18 @@ async function runMutationTransaction(
   // extends cycle). Acquire both in deterministic path order (deadlock-free
   // since every transaction uses the same order; single acquisition when
   // both scopes resolve to the same file).
-  // P2 (absent opposite store): probe opposite-file presence BEFORE locking.
-  // When the opposite config file is absent we must not materialize lock
-  // metadata next to it — coordinate through a shared pair lock under the
-  // OS temp dir instead (keyed by the canonical layer pair).
-  const oppositePath = input.scope === "user" ? paths.projectPath : paths.userPath;
-  let oppositeExists = true;
-  try {
-    await fs.readFile(oppositePath, "utf8");
-  } catch (error) {
-    if (isEnoent(error)) oppositeExists = false;
-  }
+  // Lock plan per scope (deadlock-free: deterministic path order):
+  // - target scope: its own file lock (throw on failure) — always required
+  //   because the commit lands there;
+  // - opposite scope: its own file lock with `ifUnavailable: "skip"`, so a
+  //   scoped mutation does not need write access to the opposite store.
+  //   Skipping stays safe: an unwritable opposite store cannot accept
+  //   conflicting service commits through that layer either. Crucially the
+  //   opposite lock lives NEXT TO the opposite config (shared bytes across
+  //   the Windows/WSL boundary), so cross-runtime contenders still observe
+  //   each other and the origin gate fails closed. Created lock metadata is
+  //   removed on release when empty (P2), so an absent opposite store stays
+  //   absent.
   const userHold = { dir: `${paths.userPath}.lock.d`, content: undefined as string | undefined };
   const projectHold = { dir: `${paths.projectPath}.lock.d`, content: undefined as string | undefined };
   // The target scope always requires its lock (throw on failure); the
@@ -1680,16 +1724,15 @@ async function runMutationTransaction(
   ): Promise<ProfileMutationReceipt> => {
     const targetHold = input.scope === "user" ? userHold : projectHold;
     const oppositeHold = input.scope === "user" ? projectHold : userHold;
+    const oppositePath = input.scope === "user" ? paths.projectPath : paths.userPath;
     if (paths.userPath === paths.projectPath) {
       return await withMutationLock(targetPath, fs, async (only) => {
         targetHold.content = only ?? undefined;
         return await fn();
       });
     }
-    const pairPath = pairLockPath(paths.userPath, paths.projectPath);
-    const oppositeLockPath = oppositeExists ? oppositePath : pairPath;
-    const oppositeOpts: MutationLockOptions = oppositeExists ? { ifUnavailable: "skip" } : {};
-    if (!oppositeExists) oppositeHold.dir = `${pairPath}.lock.d`;
+    const oppositeLockPath = oppositePath;
+    const oppositeOpts: MutationLockOptions = { ifUnavailable: "skip" };
     // Deterministic path order across all transactions: deadlock-free.
     const firstIsTarget = targetPath < oppositeLockPath;
     if (firstIsTarget) {

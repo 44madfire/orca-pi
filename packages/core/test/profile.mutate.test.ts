@@ -146,9 +146,36 @@ function memFs(
     async stat(path: string): Promise<unknown> {
       const key = String(path);
       if (files.has(key)) return { isFile: () => true, mtimeMs: mtimes.get(key) ?? Date.now() };
+      const normalized = key.replace(/\\/g, "/").replace(/\/+$/, "");
+      if (dirs.has(normalized)) return { isFile: () => false, mtimeMs: Date.now() };
       const error = new Error(`ENOENT: no such file ${key}`) as NodeJS.ErrnoException;
       error.code = "ENOENT";
       throw error;
+    },
+    async rmdir(path: string): Promise<void> {
+      const key = String(path);
+      const normalized = key.replace(/\\/g, "/").replace(/\/+$/, "");
+      for (const file of files.keys()) {
+        const f = file.replace(/\\/g, "/");
+        if (f === normalized || f.startsWith(`${normalized}/`)) {
+          const error = new Error(`ENOTEMPTY: directory not empty ${key}`) as NodeJS.ErrnoException;
+          error.code = "ENOTEMPTY";
+          throw error;
+        }
+      }
+      for (const dir of dirs) {
+        if (dir !== normalized && dir.startsWith(`${normalized}/`)) {
+          const error = new Error(`ENOTEMPTY: directory not empty ${key}`) as NodeJS.ErrnoException;
+          error.code = "ENOTEMPTY";
+          throw error;
+        }
+      }
+      if (!dirs.has(normalized)) {
+        const error = new Error(`ENOENT: no such directory ${key}`) as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      dirs.delete(normalized);
     },
     async unlink(path: string): Promise<void> {
       const key = String(path);
@@ -1105,16 +1132,15 @@ describe("profile mutate: cross-scope serialization (P1 review)", () => {
     });
     // An external editor rewrites the project layer after merged-graph
     // validation but before commit: inject on the pre-commit revalidation
-    // read of the project file (initial presence probe + initial load + one
-    // pre-commit re-read precede it), so the transaction must see the
-    // changed opposite layer and conflict instead of committing an
-    // unvalidated a -> b -> a graph.
+    // read of the project file (initial load + one pre-commit re-read
+    // precede it), so the transaction must see the changed opposite layer
+    // and conflict instead of committing an unvalidated a -> b -> a graph.
     const origRead = fs.readFile.bind(fs);
     let projectReads = 0;
     (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
       if (String(p) === PROJECT) {
         projectReads += 1;
-        if (projectReads === 3) {
+        if (projectReads === 2) {
           fs.files.set(PROJECT, "profiles:\n  b:\n    extends: a\n    model: y\n");
         }
       }
@@ -1182,6 +1208,58 @@ describe("profile mutate: unwritable opposite store (P1 review)", () => {
     );
     expect(error.message).toMatch(/config directory|lock directory/i);
     expect(fs.files.has(USER)).toBe(false);
+  });
+});
+
+describe("profile mutate: absent opposite store stays absent (P2 review)", () => {
+  it("user-scope write leaves an absent writable project dir absent", async () => {
+    const fs = memFs(
+      { [USER]: "profiles:\n  a:\n    model: x\n" },
+      { modelDirs: true },
+    );
+    const receipt = await setProfileField(
+      { name: "a", scope: "user", field: "model", value: "z" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("z");
+    expect(fs.files.get(USER)).toContain("model: z");
+    // Nothing was materialized next to the untargeted opposite config:
+    // no project file, no lock dir, no `.pi` tree.
+    expect(fs.files.has(PROJECT)).toBe(false);
+    expect([...fs.files.keys()].some((k) => k.startsWith("/repo/p/.pi"))).toBe(false);
+  });
+
+  it("project-scope write leaves an absent writable user dir absent", async () => {
+    const fs = memFs(
+      { [PROJECT]: "profiles:\n  b:\n    model: y\n" },
+      { modelDirs: true },
+    );
+    const receipt = await setProfileField(
+      { name: "b", scope: "project", field: "model", value: "w" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("w");
+    expect(fs.files.get(PROJECT)).toContain("model: w");
+    expect(fs.files.has(USER)).toBe(false);
+    expect([...fs.files.keys()].some((k) => k.startsWith("/home/u/.pi"))).toBe(false);
+  });
+
+  it("concurrent dual-absent creates serialize without losing either", async () => {
+    const fs = memFs({}, { modelDirs: true });
+    // Neither config file exists: each transaction coordinates through the
+    // shared opposite file lock (transiently created, cleaned on release)
+    // rather than an OS-local side channel, so both commits land.
+    const results = await Promise.allSettled([
+      createProfile({ name: "u1", scope: "user", initial: { model: "a" } }, opts(fs)),
+      createProfile({ name: "p1", scope: "project", initial: { model: "b" } }, opts(fs)),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(2);
+    expect(fs.files.get(USER)).toContain("u1:");
+    expect(fs.files.get(PROJECT)).toContain("p1:");
+    const viewU = await readEditableProfile("u1", opts(fs));
+    const viewP = await readEditableProfile("p1", opts(fs));
+    expect(viewU.validation.ok).toBe(true);
+    expect(viewP.validation.ok).toBe(true);
   });
 });
 
