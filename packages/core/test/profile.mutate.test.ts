@@ -1042,8 +1042,44 @@ describe("profile mutate: end-to-end no silent overwrite (P1 review)", () => {
   });
 });
 
-describe("profile mutate: invalid on-disk read contract (P1 review)", () => {
-  const INVALID_PROJECT =
+describe("profile mutate: cross-scope serialization (P1 review)", () => {
+  it("concurrent user/project edits cannot commit a cycle neither validated", async () => {
+    const fs = memFs({
+      [USER]: "profiles:\n  a:\n    model: x\n",
+      [PROJECT]: "profiles:\n  b:\n    model: y\n",
+    });
+    // Writer U makes user-scope `a` extend project-scope `b` while writer P
+    // concurrently makes `b` extend `a`. Each half is valid alone; together
+    // they form a cycle. Both locks are held per transaction, so the loser
+    // revalidates against the winner's commit and fails instead of
+    // committing an unvalidated graph.
+    const results = await Promise.allSettled([
+      patchProfile({ name: "a", scope: "user", patch: { extends: "b" } }, opts(fs)),
+      patchProfile({ name: "b", scope: "project", patch: { extends: "a" } }, opts(fs)),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const reason = (rejected[0] as PromiseRejectedResult).reason;
+    expect(reason).toBeInstanceOf(ProfileMutationError);
+    expect(["resolve-failed", "validation-failed"]).toContain((reason as ProfileMutationError).code);
+    // The committed graph stays valid: exactly one extends edge landed.
+    const viewA = await readEditableProfile("a", opts(fs));
+    const viewB = await readEditableProfile("b", opts(fs));
+    expect(viewA.validation.ok).toBe(true);
+    expect(viewB.validation.ok).toBe(true);
+    const userText = fs.files.get(USER) ?? "";
+    const projectText = fs.files.get(PROJECT) ?? "";
+    const edges = [
+      userText.includes("extends: b"),
+      projectText.includes("extends: a"),
+    ].filter(Boolean);
+    expect(edges).toHaveLength(1);
+  });
+});
+
+describe("profile mutate: invalid on-disk read contract (P1 review)", () => {  const INVALID_PROJECT =
     "profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: ultra\n";
 
   it("returns a structured invalid view with issues + hashes for a schema-invalid file", async () => {

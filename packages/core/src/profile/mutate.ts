@@ -918,6 +918,48 @@ export async function withMutationLock<T>(
   });
 }
 
+/** Pre-write holder re-verification for one scope lock (fail-closed). */
+async function assertStillHolder(
+  fs: MutationFs,
+  lockDir: string,
+  lockContent: string,
+  profileName: string,
+  scope: MutationScope,
+  sourceLabel: string,
+): Promise<void> {
+  const listing = await listLockDir(fs, lockDir, defaultIsProcessAlive, lockOrigin());
+  const own = listing.numbers.find((n) => n.fileName === lockContent);
+  let stillHolder = own !== undefined && own.alive;
+  if (stillHolder) {
+    for (const c of listing.choosing) {
+      if (c.token === own!.token) continue;
+      if (!c.alive) continue;
+      stillHolder = false;
+      break;
+    }
+  }
+  if (stillHolder) {
+    for (const n of listing.numbers) {
+      if (n.token === own!.token) continue;
+      if (!n.alive) continue;
+      if (n.number !== own!.number ? n.number < own!.number : n.token < own!.token) {
+        stillHolder = false;
+        break;
+      }
+    }
+  }
+  if (!stillHolder) {
+    throw new ProfileMutationError({
+      code: "conflict",
+      profileName,
+      scope,
+      sourceLabel,
+      message:
+        `Concurrent profile write stole the mutation lock for "${profileName}" in ${scope} config (${sourceLabel}) before commit. Reload and retry. No data was overwritten.`,
+    });
+  }
+}
+
 /** Pre-write re-read guard: fail with `conflict` when the file changed. */
 async function assertNoConcurrentChange(
   targetPath: string,
@@ -1521,7 +1563,28 @@ async function runMutationTransaction(
   // lock (P1: two writers loading the same hash must not both commit).
   // The `expectedSourceHash` comparison below runs against freshly loaded
   // state inside the lock, so a loser always sees the winner's commit.
-  return await withMutationLock(targetPath, fs, async (lockContent) => {
+  // P1 (cross-scope graph validation): every transaction loads BOTH layers
+  // and validates the merged user+project graph, so user- and project-scope
+  // mutations must serialize on BOTH locks. With one lock per target file, a
+  // user write and a project write run concurrently, validate stale opposite
+  // layers, and commit a graph neither validated (e.g. a cross-layer
+  // extends cycle). Acquire both in deterministic path order (deadlock-free
+  // since every transaction uses the same order; single acquisition when
+  // both scopes resolve to the same file).
+  const lockPaths = [paths.userPath, paths.projectPath].sort();
+  const acquireBoth = async (
+    fn: (contents: { first?: string; second?: string }) => Promise<ProfileMutationReceipt>,
+  ): Promise<ProfileMutationReceipt> => {
+    if (lockPaths[0] === lockPaths[1]) {
+      return await withMutationLock(lockPaths[0], fs, async (only) => fn({ first: only }));
+    }
+    return await withMutationLock(lockPaths[0], fs, async (first) =>
+      withMutationLock(lockPaths[1], fs, async (second) => fn({ first, second })),
+    );
+  };
+  return await acquireBoth(async ({ first, second }) => {
+  const userLockContent = lockPaths[0] === paths.userPath ? first : second;
+  const projectLockContent = lockPaths[0] === paths.projectPath ? first : second;
   const [userLayer, projectLayer] = await Promise.all([
     loadLayerFile(paths.userPath, fs),
     loadLayerFile(paths.projectPath, fs),
@@ -1821,44 +1884,16 @@ async function runMutationTransaction(
     // This branch is unreachable; kept for exhaustiveness.
   }
 
-  // Compromise detection: verify we are still the elected holder before
+  // Compromise detection: verify we still hold BOTH scope locks before
   // committing (fail-closed). Same-process overlap is already excluded by
-  // the in-process mutex; with bakery candidates no compliant participant
+  // the in-process mutexes; with bakery candidates no compliant participant
   // ever deletes another's file, so losing holdership means a foreign writer
   // interfered — abort instead of committing a stale read.
-  if (lockContent !== undefined) {
-    const lockDir = `${targetPath}.lock.d`;
-    const listing = await listLockDir(fs, lockDir, defaultIsProcessAlive, lockOrigin());
-    const own = listing.numbers.find((n) => n.fileName === lockContent);
-    let stillHolder = own !== undefined && own.alive;
-    if (stillHolder) {
-      for (const c of listing.choosing) {
-        if (c.token === own!.token) continue;
-        if (!c.alive) continue;
-        stillHolder = false;
-        break;
-      }
-    }
-    if (stillHolder) {
-      for (const n of listing.numbers) {
-        if (n.token === own!.token) continue;
-        if (!n.alive) continue;
-        if (n.number !== own!.number ? n.number < own!.number : n.token < own!.token) {
-          stillHolder = false;
-          break;
-        }
-      }
-    }
-    if (!stillHolder) {
-      throw new ProfileMutationError({
-        code: "conflict",
-        profileName: input.profileName,
-        scope: input.scope,
-        sourceLabel: targetPath,
-        message:
-          `Concurrent profile write stole the mutation lock for "${input.profileName}" in ${input.scope} config (${targetPath}) before commit. Reload and retry. No data was overwritten.`,
-      });
-    }
+  if (userLockContent !== undefined) {
+    await assertStillHolder(fs, `${paths.userPath}.lock.d`, userLockContent, input.profileName, input.scope, targetPath);
+  }
+  if (projectLockContent !== undefined) {
+    await assertStillHolder(fs, `${paths.projectPath}.lock.d`, projectLockContent, input.profileName, input.scope, targetPath);
   }
 
   // Stale-write guard immediately before commit.
