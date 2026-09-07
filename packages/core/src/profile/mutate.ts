@@ -1579,32 +1579,19 @@ export async function readEditableProfile(
         : {}),
   };
   if (layerFailures.length > 0) {
-    // At least one on-disk layer is schema-invalid or unreadable: build the
-    // view from the remaining valid layers (builtins + whichever layer
-    // parsed) and report the load failure as structured invalid view data —
-    // hashes, per-layer existence, and field-path issues included — instead
-    // of throwing, so hand-edited breakage stays renderable.
-    const mergeDocs: ValidatedProfilesDocument[] = [builtinDoc];
-    if (userLayer !== undefined && Object.keys(userLayer.doc.profiles).length > 0) {
-      mergeDocs.push(userLayer.doc);
-    }
-    if (projectLayer !== undefined && Object.keys(projectLayer.doc.profiles).length > 0) {
-      mergeDocs.push(projectLayer.doc);
-    }
-    // Display merge: raw invalid entries join for names missing from the
-    // valid graph, so a custom profile living only in a broken layer reads
-    // as an existing source profile (with invalid validation) rather than
-    // unknown. Raw values are display-only: never validated, and effective
-    // resolution below treats them as-is while validation stays failed.
-    const displayMergeDocs: ValidatedProfilesDocument[] = [...mergeDocs];
-    if (!userRes.ok && userRes.rawDoc !== undefined) displayMergeDocs.push(userRes.rawDoc);
-    if (!projectRes.ok && projectRes.rawDoc !== undefined) displayMergeDocs.push(projectRes.rawDoc);
-    const mergedDoc = mergeValidatedDocuments(displayMergeDocs);
+    // At least one on-disk layer is schema-invalid or unreadable: report the
+    // load failure as structured invalid view data — hashes, per-layer
+    // existence, and field-path issues included — instead of throwing, so
+    // hand-edited breakage stays renderable.
     const issues = layerFailures.flatMap((f) => f.error.issues ?? []);
-    // Display docs: validated layers when available, otherwise the raw
-    // hand-edited values of a schema-invalid-but-parseable layer (P2), so
-    // the UI can render what is broken next to the field-path errors.
-    // Raw docs never enter mergedDoc/resolution above — display only.
+    // Display layers in fixed precedence order: each scope contributes its
+    // validated document, or its raw hand-edited fallback when that scope is
+    // schema-invalid-but-parseable (P2), so the UI can render what is broken
+    // next to the field-path errors. The display merge follows the same
+    // builtins < user < project order, so a valid project override still
+    // wins over a broken user entry and effective/provenance agree. Raw
+    // values are display-only (validation below stays failed) — the repair
+    // path revalidates strictly before anything commits.
     const validUserDoc =
       userLayer !== undefined && Object.keys(userLayer.doc.profiles).length > 0 ? userLayer.doc : undefined;
     const validProjectDoc =
@@ -1613,6 +1600,12 @@ export async function readEditableProfile(
         : undefined;
     const displayUserDoc = validUserDoc ?? (!userRes.ok ? userRes.rawDoc : undefined);
     const displayProjectDoc = validProjectDoc ?? (!projectRes.ok ? projectRes.rawDoc : undefined);
+    const displayMergeDocs: ValidatedProfilesDocument[] = [
+      builtinDoc,
+      ...(displayUserDoc !== undefined ? [displayUserDoc] : []),
+      ...(displayProjectDoc !== undefined ? [displayProjectDoc] : []),
+    ];
+    const mergedDoc = mergeValidatedDocuments(displayMergeDocs);
     const view = buildEditableView(
       name,
       {

@@ -1445,6 +1445,26 @@ describe("profile mutate: invalid on-disk read contract (P1 review)", () => {  c
     expect(view.validation.issues?.length).toBeGreaterThan(0);
     expect(view.sourceHash.project).toBe(hashSourceText(INVALID_PROJECT));
   });
+
+  it("a valid project override keeps precedence over an invalid user entry", async () => {
+    const fs = memFs({
+      [USER]: "profiles:\n  custom:\n    model: user-model\n    thinking: ultra\n",
+      [PROJECT]: "profiles:\n  custom:\n    model: project-model\n    thinking: high\n",
+    });
+    const view = await readEditableProfile("custom", opts(fs));
+    expect(view.exists).toBe(true);
+    expect(view.validation.ok).toBe(false);
+    expect(view.validation.issues?.some((issue) => issue.path.includes("thinking"))).toBe(true);
+    // Project scope wins despite the raw user fallback: effective values
+    // and provenance agree instead of showing user-invalid data as effective.
+    expect(view.effective?.model).toBe("project-model");
+    expect(view.effective?.thinking).toBe("high");
+    expect(view.fields.model?.provenance.kind).toBe("project");
+    expect(view.fields.thinking?.provenance.kind).toBe("project");
+    // Both layers' source values remain visible for diagnostics.
+    expect(view.source.user).toMatchObject({ model: "user-model" });
+    expect(view.source.project).toMatchObject({ model: "project-model" });
+  });
 });
 
 describe("profile mutate: bakery choosing gate (P1 review)", () => {
