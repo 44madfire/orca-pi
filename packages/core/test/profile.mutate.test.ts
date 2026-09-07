@@ -1042,6 +1042,38 @@ describe("profile mutate: end-to-end no silent overwrite (P1 review)", () => {
   });
 });
 
+describe("profile mutate: invalid on-disk read contract (P1 review)", () => {
+  const INVALID_PROJECT =
+    "profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: ultra\n";
+
+  it("returns a structured invalid view with issues + hashes for a schema-invalid file", async () => {
+    const fs = memFs({
+      [USER]: "profiles:\n  good:\n    model: m\n",
+      [PROJECT]: INVALID_PROJECT,
+    });
+    const view = await readEditableProfile("scout", opts(fs));
+    expect(view.validation.ok).toBe(false);
+    expect(view.validation.code).toBe("load-failed");
+    expect(view.validation.issues?.length).toBeGreaterThan(0);
+    expect(view.validation.issues?.some((issue) => issue.path.includes("thinking"))).toBe(true);
+    // Hashes + layer existence survive so the UI can show diagnostics and
+    // the caller keeps a version token for the broken file.
+    expect(view.sourceHash.project).toBe(hashSourceText(INVALID_PROJECT));
+    expect(view.sourceHash.user).toBeDefined();
+    expect(view.config.projectExists).toBe(true);
+    expect(view.config.userExists).toBe(true);
+  });
+
+  it("an unknown name with an invalid file still carries the load issues", async () => {
+    const fs = memFs({ [PROJECT]: INVALID_PROJECT });
+    const view = await readEditableProfile("nope", opts(fs));
+    expect(view.exists).toBe(false);
+    expect(view.validation.ok).toBe(false);
+    expect(view.validation.issues?.length).toBeGreaterThan(0);
+    expect(view.sourceHash.project).toBe(hashSourceText(INVALID_PROJECT));
+  });
+});
+
 describe("profile mutate: bakery choosing gate (P1 review)", () => {
   const lockDir = `${PROJECT}.lock.d`;
 

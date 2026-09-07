@@ -693,13 +693,9 @@ export async function runProfilePatch(
         ...(parsed.expectedHash !== undefined ? { expectedSourceHash: parsed.expectedHash } : {}),
       },
     );
-    return emitReceipt(deps, receipt, true);
+    return emitReceipt(deps, receipt, parsed.asJson);
   } catch (error) {
-    // Patch is a machine transaction: always emit JSON on failure when the
-    // caller asked for JSON output, otherwise human stderr.
-    const wantsJson = parsed.asJson || rawPayload.trim().startsWith("{") || rawPayload.startsWith("@");
-    void wantsJson;
-    return emitMutationFailure(deps, error, parsed.asJson || true, "patch");
+    return emitMutationFailure(deps, error, parsed.asJson, "patch");
   }
 }
 

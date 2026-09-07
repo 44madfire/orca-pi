@@ -1232,6 +1232,37 @@ export function buildEditableView(
  * resolution, provenance, validation errors with field paths, and source
  * hashes for optimistic concurrency.
  */
+/**
+ * Read one layer tolerantly for the editable view (P1 read contract).
+ *
+ * Unlike `loadLayerFile` — which throws `load-failed` for schema-invalid or
+ * unreadable files so mutations fail closed — the read path must still
+ * return a structured `EditableProfileView` (with hashes when the bytes are
+ * readable, plus validation issues/field paths) so the UI can render a
+ * broken hand-edited config instead of receiving only `{ok:false,error}`.
+ */
+async function loadLayerTolerant(
+  filePath: string,
+  fs: MutationFs,
+): Promise<
+  | { ok: true; layer: LoadedLayer }
+  | { ok: false; path: string; exists: boolean; hash?: string; error: ProfileMutationError }
+> {
+  try {
+    return { ok: true, layer: await loadLayerFile(filePath, fs) };
+  } catch (error) {
+    if (!(error instanceof ProfileMutationError) || error.code !== "load-failed") throw error;
+    // Preserve the source hash for the invalid view when the bytes stay
+    // readable (schema-invalid case); otherwise surface existence without one.
+    try {
+      const raw = await fs.readFile(filePath, "utf8");
+      return { ok: false, path: filePath, exists: true, hash: hashSourceText(raw), error };
+    } catch {
+      return { ok: false, path: filePath, exists: true, hash: undefined, error };
+    }
+  }
+}
+
 export async function readEditableProfile(
   name: string,
   options: MutationWriteOptions = {},
@@ -1240,57 +1271,117 @@ export async function readEditableProfile(
   const paths = resolveMutationPaths(options);
   const fs = await resolveFs(options.fs);
   const builtinDoc = getBuiltinProfilesDocument();
-  const [userLayer, projectLayer] = await Promise.all([
-    loadLayerFile(paths.userPath, fs).catch((error) => {
-      // A malformed layer is surfaced as invalid view data (with hashes when
-      // available) rather than a throw, so the UI can show diagnostics.
-      if (error instanceof ProfileMutationError && error.code === "load-failed") {
-        throw error;
-      }
-      throw error;
-    }),
-    loadLayerFile(paths.projectPath, fs).catch((error) => {
-      if (error instanceof ProfileMutationError && error.code === "load-failed") {
-        throw error;
-      }
-      throw error;
-    }),
+  const [userRes, projectRes] = await Promise.all([
+    loadLayerTolerant(paths.userPath, fs),
+    loadLayerTolerant(paths.projectPath, fs),
   ]);
+  const userLayer = userRes.ok ? userRes.layer : undefined;
+  const projectLayer = projectRes.ok ? projectRes.layer : undefined;
+  const layerFailures = [userRes, projectRes].filter((r) => !r.ok) as Array<
+    Extract<Awaited<ReturnType<typeof loadLayerTolerant>>, { ok: false }>
+  >;
+  const layerHashes: { user?: string; project?: string } = {
+    ...(userRes.ok
+      ? userRes.layer.hash !== undefined
+        ? { user: userRes.layer.hash }
+        : {}
+      : userRes.hash !== undefined
+        ? { user: userRes.hash }
+        : {}),
+    ...(projectRes.ok
+      ? projectRes.layer.hash !== undefined
+        ? { project: projectRes.layer.hash }
+        : {}
+      : projectRes.hash !== undefined
+        ? { project: projectRes.hash }
+        : {}),
+  };
+  if (layerFailures.length > 0) {
+    // At least one on-disk layer is schema-invalid or unreadable: build the
+    // view from the remaining valid layers (builtins + whichever layer
+    // parsed) and report the load failure as structured invalid view data —
+    // hashes, per-layer existence, and field-path issues included — instead
+    // of throwing, so hand-edited breakage stays renderable.
+    const mergeDocs: ValidatedProfilesDocument[] = [builtinDoc];
+    if (userLayer !== undefined && Object.keys(userLayer.doc.profiles).length > 0) {
+      mergeDocs.push(userLayer.doc);
+    }
+    if (projectLayer !== undefined && Object.keys(projectLayer.doc.profiles).length > 0) {
+      mergeDocs.push(projectLayer.doc);
+    }
+    const mergedDoc = mergeValidatedDocuments(mergeDocs);
+    const issues = layerFailures.flatMap((f) => f.error.issues ?? []);
+    const view = buildEditableView(
+      name,
+      {
+        mergedDoc,
+        builtinDoc,
+        ...(userLayer !== undefined && Object.keys(userLayer.doc.profiles).length > 0
+          ? { userDoc: userLayer.doc }
+          : {}),
+        ...(projectLayer !== undefined && Object.keys(projectLayer.doc.profiles).length > 0
+          ? { projectDoc: projectLayer.doc }
+          : {}),
+        userPath: paths.userPath,
+        projectPath: paths.projectPath,
+        userExists: userRes.ok
+          ? userRes.layer.exists && Object.keys(userRes.layer.doc.profiles).length > 0
+          : userRes.exists,
+        projectExists: projectRes.ok
+          ? projectRes.layer.exists && Object.keys(projectRes.layer.doc.profiles).length > 0
+          : projectRes.exists,
+      },
+      layerHashes,
+    );
+    view.validation = {
+      ok: false,
+      error: layerFailures.map((f) => f.error.message).join("\n"),
+      code: "load-failed",
+      ...(issues.length > 0 ? { issues } : {}),
+    };
+    return view;
+  }
+  if (!userRes.ok || !projectRes.ok) {
+    // Narrowed above: any failure returns early, so both layers are loaded.
+    throw new Error("unreachable: invalid layers return early");
+  }
+  const userLayerOk = userRes.layer;
+  const projectLayerOk = projectRes.layer;
   const docs: ValidatedProfilesDocument[] = [builtinDoc];
-  if (userLayer.exists) docs.push(userLayer.doc);
+  if (userLayerOk.exists) docs.push(userLayerOk.doc);
   // Empty-but-existing layers contribute nothing (no overrides).
-  if (Object.keys(userLayer.doc.profiles).length === 0 && userLayer.exists) {
+  if (Object.keys(userLayerOk.doc.profiles).length === 0 && userLayerOk.exists) {
     docs.pop();
   }
-  if (projectLayer.exists && Object.keys(projectLayer.doc.profiles).length > 0) {
-    docs.push(projectLayer.doc);
-  } else if (!userLayer.exists && projectLayer.exists && Object.keys(projectLayer.doc.profiles).length === 0) {
+  if (projectLayerOk.exists && Object.keys(projectLayerOk.doc.profiles).length > 0) {
+    docs.push(projectLayerOk.doc);
+  } else if (!userLayerOk.exists && projectLayerOk.exists && Object.keys(projectLayerOk.doc.profiles).length === 0) {
     // No-op: empty layer contributes nothing.
   }
   // Rebuild merge correctly: builtins + non-empty existing layers.
-  const mergeDocs: ValidatedProfilesDocument[] = [builtinDoc];
-  if (userLayer.exists && Object.keys(userLayer.doc.profiles).length > 0) mergeDocs.push(userLayer.doc);
-  else if (!userLayer.exists) {
+  const mergeDocsOk: ValidatedProfilesDocument[] = [builtinDoc];
+  if (userLayerOk.exists && Object.keys(userLayerOk.doc.profiles).length > 0) mergeDocsOk.push(userLayerOk.doc);
+  else if (!userLayerOk.exists) {
     // Missing layer contributes nothing.
   }
-  if (projectLayer.exists && Object.keys(projectLayer.doc.profiles).length > 0) mergeDocs.push(projectLayer.doc);
-  const mergedDoc = mergeValidatedDocuments(mergeDocs);
+  if (projectLayerOk.exists && Object.keys(projectLayerOk.doc.profiles).length > 0) mergeDocsOk.push(projectLayerOk.doc);
+  const mergedDoc = mergeValidatedDocuments(mergeDocsOk);
   void docs;
   return buildEditableView(
     name,
     {
       mergedDoc,
       builtinDoc,
-      ...(Object.keys(userLayer.doc.profiles).length > 0 ? { userDoc: userLayer.doc } : {}),
-      ...(Object.keys(projectLayer.doc.profiles).length > 0 ? { projectDoc: projectLayer.doc } : {}),
+      ...(Object.keys(userLayerOk.doc.profiles).length > 0 ? { userDoc: userLayerOk.doc } : {}),
+      ...(Object.keys(projectLayerOk.doc.profiles).length > 0 ? { projectDoc: projectLayerOk.doc } : {}),
       userPath: paths.userPath,
       projectPath: paths.projectPath,
-      userExists: userLayer.exists && Object.keys(userLayer.doc.profiles).length > 0,
-      projectExists: projectLayer.exists && Object.keys(projectLayer.doc.profiles).length > 0,
+      userExists: userLayerOk.exists && Object.keys(userLayerOk.doc.profiles).length > 0,
+      projectExists: projectLayerOk.exists && Object.keys(projectLayerOk.doc.profiles).length > 0,
     },
     {
-      ...(userLayer.hash !== undefined ? { user: userLayer.hash } : {}),
-      ...(projectLayer.hash !== undefined ? { project: projectLayer.hash } : {}),
+      ...(userLayerOk.hash !== undefined ? { user: userLayerOk.hash } : {}),
+      ...(projectLayerOk.hash !== undefined ? { project: projectLayerOk.hash } : {}),
     },
   );
 }

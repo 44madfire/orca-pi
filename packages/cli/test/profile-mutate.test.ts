@@ -187,7 +187,8 @@ describe("orca-pi profile patch (machine transaction)", () => {
       deps,
     );
     expect(patched.exitCode).toBe(0);
-    expect(out.join("")).toContain("openai/gpt-5.6");
+    // Bare patch uses the human one-line summary (no --json flag).
+    expect(out.join("")).toContain('Updated profile "p"');
 
     // Issue's suggested `--json @patch.json` shape: payload via @file.
     const { deps: deps2, out: out2, fs: fs2 } = makeDeps({
@@ -324,5 +325,60 @@ describe("orca-pi profile absent-layer versioning (P1 review)", () => {
       deps,
     );
     expect(result.exitCode).toBe(2);
+  });
+});
+
+describe("orca-pi profile patch output mode (P2 review)", () => {
+  it("bare patch uses the human one-line summary; failures go to stderr", async () => {
+    const { deps, out, err } = makeDeps({
+      "/repo/p/.pi/profiles.yaml": "profiles:\n  a:\n    model: good\n",
+    });
+    const ok = await run(
+      ["profile", "patch", "a", "--scope", "project", "--patch", '{"model":"m2"}'],
+      deps,
+    );
+    expect(ok.exitCode).toBe(0);
+    expect(out.join("")).toContain('Updated profile "a"');
+    expect(out.join("")).not.toContain('"ok"');
+    out.length = 0;
+    err.length = 0;
+    const bad = await run(
+      ["profile", "patch", "nope", "--scope", "project", "--patch", '{"model":"m"}'],
+      deps,
+    );
+    expect(bad.exitCode).toBe(1);
+    expect(err.join("")).toContain("Unknown Pi profile");
+  });
+
+  it("patch --json keeps machine output on success and failure", async () => {
+    const { deps, out } = makeDeps({
+      "/repo/p/.pi/profiles.yaml": "profiles:\n  a:\n    model: good\n",
+    });
+    const ok = await run(
+      ["profile", "patch", "a", "--scope", "project", "--patch", '{"model":"m2"}', "--json"],
+      deps,
+    );
+    expect(ok.exitCode).toBe(0);
+    expect((JSON.parse(out.join("")) as { ok: boolean }).ok).toBe(true);
+  });
+});
+
+describe("orca-pi profile read invalid config (P1 review)", () => {
+  it("read --json returns the structured invalid view with issues, not bare {ok:false}", async () => {
+    const { deps, out } = makeDeps({
+      "/repo/p/.pi/profiles.yaml":
+        "profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: ultra\n",
+    });
+    const result = await run(["profile", "read", "scout", "--json"], deps);
+    expect(result.exitCode).toBe(1);
+    const view = JSON.parse(out.join("")) as {
+      validation: { ok: boolean; code?: string; issues?: Array<{ path: string }> };
+      sourceHash: { project?: string };
+    };
+    expect(view.validation.ok).toBe(false);
+    expect(view.validation.code).toBe("load-failed");
+    expect(view.validation.issues?.length).toBeGreaterThan(0);
+    expect(view.validation.issues?.some((issue) => issue.path.includes("thinking"))).toBe(true);
+    expect(view.sourceHash.project).toBeDefined();
   });
 });
