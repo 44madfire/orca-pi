@@ -29,7 +29,9 @@ function parentDir(path: string): string {
   const normalized = String(path).replace(/\\/g, "/");
   const index = normalized.lastIndexOf("/");
   if (index <= 0) return index === 0 ? "/" : ".";
-  const parent = String(path).slice(0, index);
+  // Return the normalized parent so strict dir modeling compares one
+  // canonical form regardless of separator style (Windows vs WSL paths).
+  const parent = normalized.slice(0, index);
   return parent.length === 0 ? "/" : parent;
 }
 
@@ -62,9 +64,10 @@ function memFs(
     return error;
   };
   const dirExists = (dir: string): boolean => {
-    if (dir === "" || dir === "." || dir === "/") return true;
-    if (/^[A-Za-z]:$/.test(dir)) return true;
-    return dirs.has(dir);
+    const normalized = String(dir).replace(/\\/g, "/").replace(/\/+$/, "");
+    if (normalized === "" || normalized === "." || normalized === "/") return true;
+    if (/^[A-Za-z]:$/.test(normalized)) return true;
+    return dirs.has(normalized);
   };
   const requireParent = (path: string): void => {
     if (!modelDirs) return;
@@ -1101,16 +1104,17 @@ describe("profile mutate: cross-scope serialization (P1 review)", () => {
       [PROJECT]: "profiles:\n  b:\n    model: y\n",
     });
     // An external editor rewrites the project layer after merged-graph
-    // validation but before commit: inject on the second read of the
-    // project file (the pre-commit revalidation), so the transaction must
-    // see the changed opposite layer and conflict instead of committing an
+    // validation but before commit: inject on the pre-commit revalidation
+    // read of the project file (initial presence probe + initial load + one
+    // pre-commit re-read precede it), so the transaction must see the
+    // changed opposite layer and conflict instead of committing an
     // unvalidated a -> b -> a graph.
     const origRead = fs.readFile.bind(fs);
     let projectReads = 0;
     (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
       if (String(p) === PROJECT) {
         projectReads += 1;
-        if (projectReads === 2) {
+        if (projectReads === 3) {
           fs.files.set(PROJECT, "profiles:\n  b:\n    extends: a\n    model: y\n");
         }
       }
@@ -1367,16 +1371,17 @@ describe("profile mutate: bakery choosing gate (P1 review)", () => {
     });
     // Inject a live cross-process contender paused between publishing its
     // choosing flag and its number file, once the holder has entered the
-    // transaction body (first target read — election is already complete).
-    // The holder's final verification must ignore it — the late contender
-    // necessarily picks a larger number — instead of spuriously conflicting
-    // an ordinary contended write.
+    // transaction body (first read of the TARGET file — election and the
+    // opposite-presence probe use other paths, so this is strictly
+    // post-election). The holder's final verification must ignore it — the
+    // late contender necessarily picks a larger number — instead of
+    // spuriously conflicting an ordinary contended write.
     const lockDirs = [`${USER}.lock.d`, `${PROJECT}.lock.d`];
     const laterChoosing = JSON.stringify({ pid: process.pid, token: "later" });
     const origRead = fs.readFile.bind(fs);
     let injected = false;
     (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
-      if (!injected && (String(p) === USER || String(p) === PROJECT)) {
+      if (!injected && String(p) === PROJECT) {
         injected = true;
         for (const dir of lockDirs) {
           fs.files.set(`${dir}/c-later.choosing`, laterChoosing);

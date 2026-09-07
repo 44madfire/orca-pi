@@ -59,7 +59,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { hostname } from "node:os";
+import { hostname, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { stringify as stringifyYaml } from "yaml";
 import {
   getBuiltinProfilesDocument,
@@ -421,8 +422,24 @@ async function loadLayerFile(
   }
 }
 
-function parentDirOf(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, "/");
+/**
+ * Shared pair-lock base path for one user+project layer pair (P2).
+ *
+ * Used INSTEAD of the opposite scope's file lock when the opposite config
+ * file is absent, so no lock metadata is materialized next to an untargeted
+ * config. Keyed by the canonical absolute pair (scope order independent),
+ * it lives under the OS temp dir — always writable when the target store
+ * is. Same-OS transactions on one pair always overlap on at least one lock
+ * (target, opposite, or pair); absence→created races that slip through
+ * still fail on the both-layer pre-commit existence revalidation.
+ */
+function pairLockPath(userPath: string, projectPath: string): string {
+  const key = [resolve(userPath), resolve(projectPath)].sort().join("\n");
+  const hash = createHash("sha256").update(key, "utf8").digest("hex").slice(0, 32);
+  return join(tmpdir(), `orca-pi-profiles-${hash}`, "pair");
+}
+
+function parentDirOf(filePath: string): string {  const normalized = filePath.replace(/\\/g, "/");
   const index = normalized.lastIndexOf("/");
   if (index <= 0) return ".";
   return filePath.slice(0, index);
@@ -1638,7 +1655,19 @@ async function runMutationTransaction(
   // extends cycle). Acquire both in deterministic path order (deadlock-free
   // since every transaction uses the same order; single acquisition when
   // both scopes resolve to the same file).
-  const lockPaths = [paths.userPath, paths.projectPath].sort();
+  // P2 (absent opposite store): probe opposite-file presence BEFORE locking.
+  // When the opposite config file is absent we must not materialize lock
+  // metadata next to it — coordinate through a shared pair lock under the
+  // OS temp dir instead (keyed by the canonical layer pair).
+  const oppositePath = input.scope === "user" ? paths.projectPath : paths.userPath;
+  let oppositeExists = true;
+  try {
+    await fs.readFile(oppositePath, "utf8");
+  } catch (error) {
+    if (isEnoent(error)) oppositeExists = false;
+  }
+  const userHold = { dir: `${paths.userPath}.lock.d`, content: undefined as string | undefined };
+  const projectHold = { dir: `${paths.projectPath}.lock.d`, content: undefined as string | undefined };
   // The target scope always requires its lock (throw on failure); the
   // opposite scope uses `ifUnavailable: "skip"` so a scoped mutation does
   // not need write access to the opposite config store (P1: read-only
@@ -1647,20 +1676,42 @@ async function runMutationTransaction(
   // still serializes same-scope writers, and both layers are revalidated
   // immediately before commit while the target lock is held.
   const acquireBoth = async (
-    fn: (contents: { first?: string; second?: string }) => Promise<ProfileMutationReceipt>,
+    fn: () => Promise<ProfileMutationReceipt>,
   ): Promise<ProfileMutationReceipt> => {
-    const optsFor = (p: string): MutationLockOptions =>
-      p === targetPath ? {} : { ifUnavailable: "skip" };
-    if (lockPaths[0] === lockPaths[1]) {
-      return await withMutationLock(lockPaths[0], fs, async (only) => fn({ first: only }), optsFor(lockPaths[0]));
+    const targetHold = input.scope === "user" ? userHold : projectHold;
+    const oppositeHold = input.scope === "user" ? projectHold : userHold;
+    if (paths.userPath === paths.projectPath) {
+      return await withMutationLock(targetPath, fs, async (only) => {
+        targetHold.content = only ?? undefined;
+        return await fn();
+      });
     }
-    return await withMutationLock(lockPaths[0], fs, async (first) =>
-      withMutationLock(lockPaths[1], fs, async (second) => fn({ first, second }), optsFor(lockPaths[1])),
-    optsFor(lockPaths[0]));
+    const pairPath = pairLockPath(paths.userPath, paths.projectPath);
+    const oppositeLockPath = oppositeExists ? oppositePath : pairPath;
+    const oppositeOpts: MutationLockOptions = oppositeExists ? { ifUnavailable: "skip" } : {};
+    if (!oppositeExists) oppositeHold.dir = `${pairPath}.lock.d`;
+    // Deterministic path order across all transactions: deadlock-free.
+    const firstIsTarget = targetPath < oppositeLockPath;
+    if (firstIsTarget) {
+      return await withMutationLock(targetPath, fs, async (first) => {
+        targetHold.content = first ?? undefined;
+        return await withMutationLock(oppositeLockPath, fs, async (second) => {
+          oppositeHold.content = second ?? undefined;
+          return await fn();
+        }, oppositeOpts);
+      });
+    }
+    return await withMutationLock(oppositeLockPath, fs, async (first) => {
+      oppositeHold.content = first ?? undefined;
+      return await withMutationLock(targetPath, fs, async (second) => {
+        targetHold.content = second ?? undefined;
+        return await fn();
+      });
+    }, oppositeOpts);
   };
-  return await acquireBoth(async ({ first, second }) => {
-  const userLockContent = lockPaths[0] === paths.userPath ? first : second;
-  const projectLockContent = lockPaths[0] === paths.projectPath ? first : second;
+  return await acquireBoth(async () => {
+  const userLockContent = userHold.content;
+  const projectLockContent = projectHold.content;
   const [userLayer, projectLayer] = await Promise.all([
     loadLayerFile(paths.userPath, fs),
     loadLayerFile(paths.projectPath, fs),
@@ -1966,10 +2017,10 @@ async function runMutationTransaction(
   // ever deletes another's file, so losing holdership means a foreign writer
   // interfered — abort instead of committing a stale read.
   if (userLockContent !== undefined) {
-    await assertStillHolder(fs, `${paths.userPath}.lock.d`, userLockContent, input.profileName, input.scope, targetPath);
+    await assertStillHolder(fs, userHold.dir, userLockContent, input.profileName, input.scope, targetPath);
   }
   if (projectLockContent !== undefined) {
-    await assertStillHolder(fs, `${paths.projectPath}.lock.d`, projectLockContent, input.profileName, input.scope, targetPath);
+    await assertStillHolder(fs, projectHold.dir, projectLockContent, input.profileName, input.scope, targetPath);
   }
 
   // Stale-write guards immediately before commit (P1: both layers). The
