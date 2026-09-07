@@ -59,8 +59,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { hostname } from "node:os";
-import { stringify as stringifyYaml } from "yaml";
+import { hostname, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   getBuiltinProfilesDocument,
   isBuiltinProfileName,
@@ -429,10 +430,27 @@ async function loadLayerFile(
   }
 }
 
-function parentDirOf(filePath: string): string {  const normalized = filePath.replace(/\\/g, "/");
+function parentDirOf(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, "/");
   const index = normalized.lastIndexOf("/");
   if (index <= 0) return ".";
   return filePath.slice(0, index);
+}
+
+/**
+ * Shared pair-lock base path for one user+project layer pair.
+ *
+ * Fallback coordination when the opposite scope's file lock is skipped as
+ * unwritable (P1 asymmetric permissions): keyed by the canonical absolute
+ * pair (scope order independent) under the OS temp dir, which same-OS
+ * processes with complementary store permissions can both write. Only used
+ * when the opposite file lock cannot be held — never alongside it — and
+ * cleaned like any lock dir on release.
+ */
+function pairLockPath(userPath: string, projectPath: string): string {
+  const key = [resolve(userPath), resolve(projectPath)].sort().join("\n");
+  const hash = createHash("sha256").update(key, "utf8").digest("hex").slice(0, 32);
+  return join(tmpdir(), `orca-pi-profiles-${hash}`, "pair");
 }
 
 function tempSiblingPath(targetPath: string): string {
@@ -1447,13 +1465,26 @@ export function buildEditableView(
  * readable, plus validation issues/field paths) so the UI can render a
  * broken hand-edited config instead of receiving only `{ok:false,error}`.
  */
+interface TolerantLayerFailure {
+  ok: false;
+  path: string;
+  exists: boolean;
+  hash?: string;
+  error: ProfileMutationError;
+  /**
+   * Best-effort raw profiles map for schema-invalid-but-parseable layers
+   * (P2 read contract): the YAML parsed fine, so the hand-edited source
+   * values are preserved for display alongside the validation issues. Never
+   * merged or resolved — display only. Absent for malformed (unparseable)
+   * or unreadable layers.
+   */
+  rawDoc?: ValidatedProfilesDocument;
+}
+
 async function loadLayerTolerant(
   filePath: string,
   fs: MutationFs,
-): Promise<
-  | { ok: true; layer: LoadedLayer }
-  | { ok: false; path: string; exists: boolean; hash?: string; error: ProfileMutationError }
-> {
+): Promise<{ ok: true; layer: LoadedLayer } | TolerantLayerFailure> {
   try {
     return { ok: true, layer: await loadLayerFile(filePath, fs) };
   } catch (error) {
@@ -1462,11 +1493,50 @@ async function loadLayerTolerant(
     // readable (schema-invalid case); otherwise surface existence without one.
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      return { ok: false, path: filePath, exists: true, hash: hashSourceText(raw), error };
+      const failure: TolerantLayerFailure = { ok: false, path: filePath, exists: true, hash: hashSourceText(raw), error };
+      // Retain parseable-but-invalid source values for the UI when the
+      // failure carries schema issues (as opposed to malformed syntax).
+      if (error.issues !== undefined && error.issues.length > 0) {
+        const rawDoc = tryParseRawProfilesDocument(raw, filePath);
+        if (rawDoc !== undefined) failure.rawDoc = rawDoc;
+      }
+      return failure;
     } catch {
       return { ok: false, path: filePath, exists: true, hash: undefined, error };
     }
   }
+}
+
+/**
+ * Tolerant YAML parse for the invalid read view: returns the raw `profiles`
+ * map (cast for display; never validated, merged, or resolved) when the
+ * document parses but fails schema. Returns undefined for malformed text.
+ */
+function tryParseRawProfilesDocument(raw: string, sourceLabel: string): ValidatedProfilesDocument | undefined {
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const profiles = (parsed as { profiles?: unknown }).profiles;
+  if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) return undefined;
+  const out: Record<string, ValidatedPiProfile> = Object.create(null);
+  for (const [name, entry] of Object.entries(profiles as Record<string, unknown>)) {
+    if (name === "__proto__" || name === "constructor" || name === "prototype") continue;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const copy: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(entry as Record<string, unknown>)) {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
+      copy[key] = value;
+    }
+    (out as Record<string, ValidatedPiProfile>)[name] = {
+      ...(copy as ValidatedPiProfile),
+      sourceLabel,
+    };
+  }
+  return { profiles: out, sourceLabel };
 }
 
 export async function readEditableProfile(
@@ -1483,9 +1553,7 @@ export async function readEditableProfile(
   ]);
   const userLayer = userRes.ok ? userRes.layer : undefined;
   const projectLayer = projectRes.ok ? projectRes.layer : undefined;
-  const layerFailures = [userRes, projectRes].filter((r) => !r.ok) as Array<
-    Extract<Awaited<ReturnType<typeof loadLayerTolerant>>, { ok: false }>
-  >;
+  const layerFailures = [userRes, projectRes].filter((r) => !r.ok) as TolerantLayerFailure[];
   const layerHashes: { user?: string; project?: string } = {
     ...(userRes.ok
       ? userRes.layer.hash !== undefined
@@ -1517,17 +1585,25 @@ export async function readEditableProfile(
     }
     const mergedDoc = mergeValidatedDocuments(mergeDocs);
     const issues = layerFailures.flatMap((f) => f.error.issues ?? []);
+    // Display docs: validated layers when available, otherwise the raw
+    // hand-edited values of a schema-invalid-but-parseable layer (P2), so
+    // the UI can render what is broken next to the field-path errors.
+    // Raw docs never enter mergedDoc/resolution above — display only.
+    const validUserDoc =
+      userLayer !== undefined && Object.keys(userLayer.doc.profiles).length > 0 ? userLayer.doc : undefined;
+    const validProjectDoc =
+      projectLayer !== undefined && Object.keys(projectLayer.doc.profiles).length > 0
+        ? projectLayer.doc
+        : undefined;
+    const displayUserDoc = validUserDoc ?? (!userRes.ok ? userRes.rawDoc : undefined);
+    const displayProjectDoc = validProjectDoc ?? (!projectRes.ok ? projectRes.rawDoc : undefined);
     const view = buildEditableView(
       name,
       {
         mergedDoc,
         builtinDoc,
-        ...(userLayer !== undefined && Object.keys(userLayer.doc.profiles).length > 0
-          ? { userDoc: userLayer.doc }
-          : {}),
-        ...(projectLayer !== undefined && Object.keys(projectLayer.doc.profiles).length > 0
-          ? { projectDoc: projectLayer.doc }
-          : {}),
+        ...(displayUserDoc !== undefined ? { userDoc: displayUserDoc } : {}),
+        ...(displayProjectDoc !== undefined ? { projectDoc: displayProjectDoc } : {}),
         userPath: paths.userPath,
         projectPath: paths.projectPath,
         userExists: userRes.ok
@@ -1751,21 +1827,80 @@ async function runMutationTransaction(
   const projectHold = { dir: `${paths.projectPath}.lock.d`, content: undefined as string | undefined };
   // The target scope always requires its lock (throw on failure); the
   // opposite scope uses `ifUnavailable: "skip"` so a scoped mutation does
-  // not need write access to the opposite config store (P1: read-only
-  // checkout). Skipping stays safe: an unwritable opposite store cannot
-  // accept conflicting service commits through that layer, the target lock
-  // still serializes same-scope writers, and both layers are revalidated
-  // immediately before commit while the target lock is held.
+  // not need write access to the opposite config store (read-only
+  // checkout). When the opposite file lock is skipped as unwritable,
+  // coordination falls back to the shared pair lock below — skipping alone
+  // is unsafe under asymmetric permissions (another principal may still
+  // write the opposite store), so the transaction never runs with neither.
   const acquireBoth = async (
     fn: () => Promise<ProfileMutationReceipt>,
   ): Promise<ProfileMutationReceipt> => {
     const targetHold = input.scope === "user" ? userHold : projectHold;
     const oppositeHold = input.scope === "user" ? projectHold : userHold;
     const oppositePath = input.scope === "user" ? paths.projectPath : paths.userPath;
+    const runBody = async (): Promise<ProfileMutationReceipt> => {
+      const capableFs =
+        typeof fs.writeExclusive === "function" &&
+        typeof fs.readdir === "function" &&
+        typeof fs.unlink === "function";
+      if (capableFs && paths.userPath !== paths.projectPath && oppositeHold.content === undefined) {
+        // The opposite file lock was skipped as unwritable here. Permissions
+        // are per-principal, so another writer may still commit through that
+        // layer: coordinate through the shared pair lock instead of running
+        // without the opposite graph lock — unless there is evidence of a
+        // cross-runtime contender, which a same-OS pair lock cannot reach.
+        const oppositeLockDir = `${oppositePath}.lock.d`;
+        const ownOrigin = lockOrigin();
+        let foreignLive = false;
+        let listable = true;
+        try {
+          const listing = await listLockDir(fs, oppositeLockDir, defaultIsProcessAlive, ownOrigin);
+          foreignLive = [...listing.choosing, ...listing.numbers].some(
+            (t) =>
+              t.alive &&
+              (t.pid === undefined ||
+                (t.origin !== undefined && t.origin !== ownOrigin)),
+          );
+        } catch (error) {
+          if (!isEnoent(error)) listable = false;
+        }
+        if (foreignLive || !listable) {
+          // A live foreign-namespace ticket (or an unlistable lock dir)
+          // means cross-runtime sharing that this process cannot prove dead
+          // or coordinate via tmpdir: fail closed rather than commit
+          // uncoordinated.
+          throw new ProfileMutationError({
+            code: "conflict",
+            profileName: input.profileName,
+            scope: input.scope,
+            sourceLabel: targetPath,
+            message:
+              `Cannot coordinate the mutation lock for "${input.profileName}" in ${input.scope} config (${targetPath}): the opposite config store is not writable here and its lock shows cross-runtime activity, so no shared lock location exists. Resolve from a single environment and retry. No data was overwritten.`,
+          });
+        }
+        const pairPath = pairLockPath(paths.userPath, paths.projectPath);
+        return await withMutationLock(pairPath, fs, async (pairContent) => {
+          oppositeHold.dir = `${pairPath}.lock.d`;
+          oppositeHold.content = pairContent ?? undefined;
+          if (oppositeHold.content === undefined) {
+            throw new ProfileMutationError({
+              code: "conflict",
+              profileName: input.profileName,
+              scope: input.scope,
+              sourceLabel: targetPath,
+              message:
+                `Cannot coordinate the mutation lock for "${input.profileName}" in ${input.scope} config (${targetPath}): the opposite graph lock is unavailable. Reload and retry. No data was overwritten.`,
+            });
+          }
+          return await fn();
+        });
+      }
+      return await fn();
+    };
     if (paths.userPath === paths.projectPath) {
       return await withMutationLock(targetPath, fs, async (only) => {
         targetHold.content = only ?? undefined;
-        return await fn();
+        return await runBody();
       });
     }
     const oppositeLockPath = oppositePath;
@@ -1777,7 +1912,7 @@ async function runMutationTransaction(
         targetHold.content = first ?? undefined;
         return await withMutationLock(oppositeLockPath, fs, async (second) => {
           oppositeHold.content = second ?? undefined;
-          return await fn();
+          return await runBody();
         }, oppositeOpts);
       });
     }
@@ -1785,7 +1920,7 @@ async function runMutationTransaction(
       oppositeHold.content = first ?? undefined;
       return await withMutationLock(targetPath, fs, async (second) => {
         targetHold.content = second ?? undefined;
-        return await fn();
+        return await runBody();
       });
     }, oppositeOpts);
   };

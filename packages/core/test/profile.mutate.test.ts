@@ -37,7 +37,11 @@ function parentDir(path: string): string {
 
 function memFs(
   initial: Record<string, string> = {},
-  opts: { modelDirs?: boolean; denied?: string[] } = {},
+  opts: {
+    modelDirs?: boolean;
+    denied?: string[];
+    shared?: { files?: Map<string, string>; mtimes?: Map<string, number>; dirs?: Set<string> };
+  } = {},
 ): MutationFs & {
   files: Map<string, string>;
   mtimes: Map<string, number>;
@@ -45,12 +49,21 @@ function memFs(
   failNextWrite?: boolean;
   writes: string[];
 } {
-  const files = new Map<string, string>(Object.entries(initial));
-  const mtimes = new Map<string, number>();
-  for (const key of files.keys()) mtimes.set(key, Date.now());
+  const files = opts.shared?.files ?? new Map<string, string>(Object.entries(initial));
+  const mtimes = opts.shared?.mtimes ?? new Map<string, number>();
+  if (opts.shared === undefined) {
+    for (const key of files.keys()) mtimes.set(key, Date.now());
+  } else if (Object.keys(initial).length > 0) {
+    for (const [key, value] of Object.entries(initial)) {
+      if (!files.has(key)) {
+        files.set(key, value);
+        mtimes.set(key, Date.now());
+      }
+    }
+  }
   // Optional strict directory modeling (P1-A): writes fail ENOENT when the
   // parent was never created via recursive mkdir, like a real filesystem.
-  const dirs = new Set<string>();
+  const dirs = opts.shared?.dirs ?? new Set<string>();
   const modelDirs = opts.modelDirs === true;
   // Paths (or subtrees) that deny writes with EACCES, simulating read-only
   // stores/checkouts. Reads still succeed; only mkdir/writeExclusive fail.
@@ -1102,8 +1115,7 @@ describe("profile mutate: end-to-end no silent overwrite (P1 review)", () => {
   });
 });
 
-describe("profile mutate: cross-scope serialization (P1 review)", () => {
-  it("concurrent user/project edits cannot commit a cycle neither validated", async () => {
+describe("profile mutate: cross-scope serialization (P1 review)", () => {  it("concurrent user/project edits cannot commit a cycle neither validated", async () => {
     const fs = memFs({
       [USER]: "profiles:\n  a:\n    model: x\n",
       [PROJECT]: "profiles:\n  b:\n    model: y\n",
@@ -1169,6 +1181,85 @@ describe("profile mutate: cross-scope serialization (P1 review)", () => {
     expect(fs.files.get(USER)).toBe("profiles:\n  a:\n    model: x\n");
     const viewB = await readEditableProfile("b", opts(fs));
     expect(viewB.validation.ok).toBe(true);
+  });
+
+  it("complementary store permissions cannot commit a cycle neither validated", async () => {
+    // P1 asymmetric permissions: process U writes the user store but gets
+    // EACCES on the project lock; process P is mirrored. Both share one
+    // in-memory filesystem (separate adapters, complementary denials) so
+    // the shared pair lock — not silent skipping — must serialize them.
+    const files = new Map<string, string>([
+      [USER, "profiles:\n  a:\n    model: x\n"],
+      [PROJECT, "profiles:\n  b:\n    model: y\n"],
+    ]);
+    const shared = { files, mtimes: new Map<string, number>(), dirs: new Set<string>() };
+    const fsU = memFs({}, { denied: ["/repo/p/.pi"], shared });
+    const fsP = memFs({}, { denied: ["/home/u/.pi/agent"], shared });
+    // Spy: the shared pair lock (not silent skipping) must engage for both
+    // participants despite their complementary denials.
+    const pairMkdirs: string[] = [];
+    for (const fs of [fsU, fsP]) {
+      const origMkdir = fs.mkdir!.bind(fs);
+      (fs as unknown as { mkdir: NonNullable<MutationFs["mkdir"]> }).mkdir = (async (
+        p: string,
+        o?: { recursive: boolean },
+      ) => {
+        if (String(p).includes("orca-pi-profiles-")) pairMkdirs.push(String(p));
+        return origMkdir(p, o);
+      }) as NonNullable<MutationFs["mkdir"]>;
+    }
+    const results = await Promise.allSettled([
+      patchProfile({ name: "a", scope: "user", patch: { extends: "b" } }, opts(fsU)),
+      patchProfile({ name: "b", scope: "project", patch: { extends: "a" } }, opts(fsP)),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const reason = (rejected[0] as PromiseRejectedResult).reason;
+    expect(reason).toBeInstanceOf(ProfileMutationError);
+    expect(["resolve-failed", "validation-failed", "conflict"]).toContain(
+      (reason as ProfileMutationError).code,
+    );
+    // Exactly one extends edge landed; the final graph stays valid.
+    const probe = memFs({}, { shared });
+    const viewA = await readEditableProfile("a", opts(probe));
+    const viewB = await readEditableProfile("b", opts(probe));
+    expect(viewA.validation.ok).toBe(true);
+    expect(viewB.validation.ok).toBe(true);
+    const edges = [
+      (files.get(USER) ?? "").includes("extends: b"),
+      (files.get(PROJECT) ?? "").includes("extends: a"),
+    ].filter(Boolean);
+    expect(edges).toHaveLength(1);
+    expect(pairMkdirs.length).toBeGreaterThan(0);
+  });
+
+  it("a live foreign ticket in a denied opposite lock fails closed", async () => {
+    // The opposite store denies writes AND its lock dir shows a live
+    // foreign-namespace ticket: no shared pair lock could reach that
+    // contender, so fail closed instead of committing uncoordinated.
+    const fs = memFs(
+      {
+        [USER]: "profiles:\n  a:\n    model: x\n",
+        [PROJECT]: "profiles:\n  b:\n    model: y\n",
+      },
+      { denied: ["/repo/p/.pi"] },
+    );
+    const foreignContent = JSON.stringify({
+      pid: 2147483647,
+      token: "foreign-holder",
+      number: 1,
+      origin: "other-host|linux|wsl",
+    });
+    fs.files.set(`${PROJECT}.lock.d/n-foreign.json`, foreignContent);
+    const error = await expectMutationError(
+      patchProfile({ name: "a", scope: "user", patch: { extends: "b" } }, opts(fs)),
+      "conflict",
+    );
+    expect(error.message).toMatch(/single environment|coordinat/i);
+    expect(fs.files.get(USER)).toBe("profiles:\n  a:\n    model: x\n");
+    expect(fs.files.get(`${PROJECT}.lock.d/n-foreign.json`)).toBe(foreignContent);
   });
 });
 
@@ -1298,6 +1389,11 @@ describe("profile mutate: invalid on-disk read contract (P1 review)", () => {  c
     expect(view.sourceHash.user).toBeDefined();
     expect(view.config.projectExists).toBe(true);
     expect(view.config.userExists).toBe(true);
+    // P2: the hand-edited (invalid) source values stay visible next to the
+    // errors — the UI renders what is broken, not just issue paths.
+    expect(view.source.project).toMatchObject({ model: "anthropic/claude-haiku", thinking: "ultra" });
+    expect(view.fields.thinking?.project).toBe("ultra");
+    expect(view.fields.model?.project).toBe("anthropic/claude-haiku");
   });
 
   it("an unknown name with an invalid file still carries the load issues", async () => {
