@@ -37,8 +37,11 @@
  * Atomicity / safety:
  * - Write to a temporary sibling and atomically replace via rename.
  * - Never leave a partially-written config after validation/write failure.
- * - Stale-write races are detected via SHA-256 source hashes; a mismatch
- *   returns a `conflict` instead of silently overwriting newer edits.
+ * - Stale-write races are prevented by serializing the read → validate →
+ *   commit path under a per-target mutation lock (in-process mutex plus a
+ *   cross-process `<target>.lock` file with stale-holder reaping). SHA-256
+ *   source hashes are compared against freshly loaded state inside the lock;
+ *   a mismatch returns a `conflict` instead of silently overwriting newer edits.
  * - Failed mutations leave the original document unchanged.
  * - No secret values belong in profile mutations (schema rejects unknown
  *   fields with a secrets reminder; this layer never accepts tokens).
@@ -68,7 +71,7 @@ import {
   validateProfilesDocument,
   type ProfileIssue,
 } from "./schema.js";
-import { ProfileResolveError, resolveProfile } from "./resolve.js";
+import { ProfileResolveError, resolveAllProfiles, resolveProfile } from "./resolve.js";
 import type {
   ResolvedPiProfile,
   ValidatedPiProfile,
@@ -165,6 +168,14 @@ export interface MutationFs {
   mkdir(path: string, options?: { recursive: boolean }): Promise<string | undefined>;
   stat?(path: string): Promise<unknown>;
   unlink?(path: string): Promise<void>;
+  /**
+   * Atomic exclusive create: resolves only when `path` did not exist and
+   * this call created it; rejects with an `EEXIST`-coded error otherwise.
+   * Used for the cross-process mutation lock (`<target>.lock`). Optional:
+   * when absent the transaction still serializes within the process via an
+   * in-memory mutex, but two OS processes could interleave (see below).
+   */
+  writeExclusive?(path: string, content: string): Promise<void>;
 }
 
 export interface MutationPathOptions {
@@ -260,6 +271,7 @@ async function getRealFs(): Promise<MutationFs> {
     mkdir: (p, opts) => fs.mkdir(p, opts),
     stat: (p) => fs.stat(p),
     unlink: (p) => fs.unlink(p),
+    writeExclusive: (p, c) => fs.writeFile(p, c, { encoding: "utf8", flag: "wx" }).then(() => undefined),
   };
 }
 
@@ -464,6 +476,131 @@ async function removeTargetFile(targetPath: string, fs: MutationFs): Promise<voi
       cause: error,
     });
   }
+}
+
+/**
+ * Mutual exclusion for the read → validate → commit path (P1: lost-update fix).
+ *
+ * The stale-hash re-read alone cannot close the race: two writers loading the
+ * same hash H can both pass the check and then overwrite each other via
+ * sequential temp-file renames. Every mutation therefore runs inside:
+ *
+ * 1. an in-process async mutex per target path (serializes concurrent
+ *    mutations in this process — CLI, UI bridge, and tests alike), and
+ * 2. a cross-process file lock (`<target>.lock`, created with exclusive
+ *    `wx` semantics so exactly one OS process wins; stale locks older than
+ *    `staleMs` are reaped). When the filesystem cannot do exclusive creates
+ *    (`writeExclusive` absent, e.g. read-only test doubles), only layer 1
+ *    applies and cross-process interleaving is possible but still detected
+ *    by the post-lock fresh load + `expectedSourceHash` comparison below.
+ *
+ * The lock is held from *before* the initial load until after the atomic
+ * replace, so the second writer always loads the first writer's committed
+ * state: with a stale `expectedSourceHash` it fails `conflict` instead of
+ * silently overwriting; without one it applies onto current data (regular
+ * serialized last-writer-wins, never a stale-read overwrite).
+ */
+const processMutationMutexes = new Map<string, Promise<void>>();
+
+async function withProcessMutex<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = processMutationMutexes.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chain = prev.then(() => mine);
+  processMutationMutexes.set(key, chain);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (processMutationMutexes.get(key) === chain) processMutationMutexes.delete(key);
+  }
+}
+
+function isLockHeldError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  if ((error as { code?: unknown }).code === "EEXIST") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /EEXIST|already exists/i.test(message);
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export interface MutationLockOptions {
+  /** Max time to wait for another writer's lock (default 10_000ms). */
+  timeoutMs?: number;
+  /** Locks older than this are treated as crashed-holder leftovers (default 10_000ms). */
+  staleMs?: number;
+}
+
+async function withMutationLock<T>(
+  targetPath: string,
+  fs: MutationFs,
+  fn: () => Promise<T>,
+  options: MutationLockOptions = {},
+): Promise<T> {
+  return await withProcessMutex(targetPath, async () => {
+    const writeExclusive = fs.writeExclusive;
+    const lockPath = `${targetPath}.lock`;
+    const timeoutMs = options.timeoutMs ?? 10_000;
+    const staleMs = options.staleMs ?? 10_000;
+    let held = false;
+    if (typeof writeExclusive === "function") {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        try {
+          await writeExclusive.call(fs, lockPath, `${process.pid}@${Date.now()}`);
+          held = true;
+          break;
+        } catch (error) {
+          if (!isLockHeldError(error)) throw error;
+          let stale = false;
+          try {
+            if (typeof fs.stat === "function") {
+              const st = (await fs.stat(lockPath)) as { mtimeMs?: unknown };
+              const mtime = typeof st?.mtimeMs === "number" ? st.mtimeMs : Date.now();
+              stale = Date.now() - mtime > staleMs;
+            }
+          } catch {
+            stale = false;
+          }
+          if (stale && typeof fs.unlink === "function") {
+            try {
+              await fs.unlink(lockPath);
+            } catch {
+              // Lost the reap race; loop around and compete again.
+            }
+            continue;
+          }
+          if (Date.now() >= deadline) {
+            throw new ProfileMutationError({
+              code: "conflict",
+              sourceLabel: targetPath,
+              message:
+                `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
+                `Wait for it to finish, reload, and retry. No data was overwritten.`,
+            });
+          }
+          await sleepMs(15);
+        }
+      }
+    }
+    try {
+      return await fn();
+    } finally {
+      if (held && typeof fs.unlink === "function") {
+        try {
+          await fs.unlink(lockPath);
+        } catch {
+          // Best-effort release; a stale lock is reaped by the next acquirer.
+        }
+      }
+    }
+  });
 }
 
 /** Pre-write re-read guard: fail with `conflict` when the file changed. */
@@ -974,6 +1111,11 @@ async function runMutationTransaction(
   const fs = await resolveFs(options.fs);
   const builtinDoc = getBuiltinProfilesDocument();
 
+  // Serialize the whole read → validate → commit path under the mutation
+  // lock (P1: two writers loading the same hash must not both commit).
+  // The `expectedSourceHash` comparison below runs against freshly loaded
+  // state inside the lock, so a loser always sees the winner's commit.
+  return await withMutationLock(targetPath, fs, async () => {
   const [userLayer, projectLayer] = await Promise.all([
     loadLayerFile(paths.userPath, fs),
     loadLayerFile(paths.projectPath, fs),
@@ -1185,36 +1327,57 @@ async function runMutationTransaction(
   // Patch/unset that removed the last delta for a builtin-only name still
   // leaves the builtin — not a deletion. Only a delete of the final layer
   // entry for a non-builtin removes the profile entirely.
+  const stillExists = Object.hasOwn(postMerged.profiles, input.profileName);
   const fullyDeleted =
-    !Object.hasOwn(postMerged.profiles, input.profileName) &&
+    !stillExists &&
     (input.action === "delete" || input.action === "unset" || input.action === "patch");
 
+  // P1 (descendant invalidation): validate the ENTIRE post-merge graph, not
+  // just the touched profile. A parent edit/delete can orphan or invalidate
+  // descendants (unknown parents, cycles, inherited reviewer write tools),
+  // so every write must leave the resulting effective configuration fully
+  // valid. Fail-closed: a commit that would leave any profile unresolvable
+  // is rejected with the original document unchanged.
+  let allResolved: Readonly<Record<string, ResolvedPiProfile>>;
+  try {
+    allResolved = resolveAllProfiles(postMerged);
+  } catch (error) {
+    if (error instanceof ProfileResolveError) {
+      throw new ProfileMutationError({
+        code: "resolve-failed",
+        profileName: input.profileName,
+        scope: input.scope,
+        sourceLabel: targetPath,
+        message:
+          `Resulting profile graph is invalid after mutating "${input.profileName}" in ${targetPath}: ${error.message} ` +
+          `Every write must leave all profiles resolvable (a parent edit/delete must not orphan descendants). Original document left unchanged.`,
+        cause: error,
+      });
+    }
+    if (error instanceof ProfileValidationError) {
+      throw new ProfileMutationError({
+        code: "validation-failed",
+        profileName: input.profileName,
+        scope: input.scope,
+        issues: error.issues,
+        sourceLabel: targetPath,
+        message: `Resulting profile "${input.profileName}" is invalid:\n${error.issues.map((issue) => `  - ${issue.path}: ${issue.message}`).join("\n")}\nOriginal document left unchanged.`,
+        cause: error,
+      });
+    }
+    throw error;
+  }
+
   if (!fullyDeleted) {
-    try {
-      resolved = resolveProfile(input.profileName, postMerged);
-    } catch (error) {
-      if (error instanceof ProfileResolveError) {
-        throw new ProfileMutationError({
-          code: "resolve-failed",
-          profileName: input.profileName,
-          scope: input.scope,
-          sourceLabel: targetPath,
-          message: `Resulting profile "${input.profileName}" is invalid: ${error.message} Original document left unchanged.`,
-          cause: error,
-        });
-      }
-      if (error instanceof ProfileValidationError) {
-        throw new ProfileMutationError({
-          code: "validation-failed",
-          profileName: input.profileName,
-          scope: input.scope,
-          issues: error.issues,
-          sourceLabel: targetPath,
-          message: `Resulting profile "${input.profileName}" is invalid:\n${error.issues.map((issue) => `  - ${issue.path}: ${issue.message}`).join("\n")}\nOriginal document left unchanged.`,
-          cause: error,
-        });
-      }
-      throw error;
+    resolved = allResolved[input.profileName];
+    if (resolved === undefined) {
+      throw new ProfileMutationError({
+        code: "resolve-failed",
+        profileName: input.profileName,
+        scope: input.scope,
+        sourceLabel: targetPath,
+        message: `Resulting profile "${input.profileName}" vanished from the merged graph after mutation. Original document left unchanged.`,
+      });
     }
     const layerContext = {
       mergedDoc: postMerged,
@@ -1273,6 +1436,7 @@ async function runMutationTransaction(
     ...(provenance !== undefined ? { provenance } : {}),
     ...(validatedTarget !== undefined ? { sourceLabel: targetPath } : {}),
   };
+  });
 }
 
 // ---------------------------------------------------------------------------

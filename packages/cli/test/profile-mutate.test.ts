@@ -283,3 +283,16 @@ describe("existing inspection stays compatible after mutations", () => {
     expect((await run(["profile", "path", "--json"], deps)).exitCode).toBe(0);
   });
 });
+
+describe("orca-pi profile mutations and descendant safety (P1 review)", () => {
+  it("refuses to delete a referenced parent (exit 1, file unchanged)", async () => {
+    const { deps, out, fs } = makeDeps({
+      "/repo/p/.pi/profiles.yaml": "profiles:\n  base:\n    model: m\n  child:\n    extends: base\n    thinking: low\n",
+    });
+    const before = fs.files.get("/repo/p/.pi/profiles.yaml")!;
+    const result = await run(["profile", "delete", "base", "--scope", "project", "--json"], deps);
+    expect(result.exitCode).toBe(1);
+    expect(out.join("")).toContain("child");
+    expect(fs.files.get("/repo/p/.pi/profiles.yaml")).toBe(before);
+  });
+});

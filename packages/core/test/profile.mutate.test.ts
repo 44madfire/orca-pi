@@ -24,12 +24,16 @@ import type { ValidatedProfilesDocument } from "../src/profile/types.js";
 
 function memFs(initial: Record<string, string> = {}): MutationFs & {
   files: Map<string, string>;
+  mtimes: Map<string, number>;
   failNextWrite?: boolean;
   writes: string[];
 } {
   const files = new Map<string, string>(Object.entries(initial));
+  const mtimes = new Map<string, number>();
+  for (const key of files.keys()) mtimes.set(key, Date.now());
   const fs = {
     files,
+    mtimes,
     writes: [] as string[],
     failNextWrite: false,
     async readFile(path: string): Promise<string> {
@@ -45,7 +49,18 @@ function memFs(initial: Record<string, string> = {}): MutationFs & {
         throw new Error("injected write failure");
       }
       files.set(String(path), content);
+      mtimes.set(String(path), Date.now());
       fs.writes.push(String(path));
+    },
+    async writeExclusive(path: string, content: string): Promise<void> {
+      const key = String(path);
+      if (files.has(key)) {
+        const error = new Error(`EEXIST: ${key}`) as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      files.set(key, content);
+      mtimes.set(key, Date.now());
     },
     async rename(oldPath: string, newPath: string): Promise<void> {
       const from = String(oldPath);
@@ -63,7 +78,7 @@ function memFs(initial: Record<string, string> = {}): MutationFs & {
     },
     async stat(path: string): Promise<unknown> {
       const key = String(path);
-      if (files.has(key)) return { isFile: () => true };
+      if (files.has(key)) return { isFile: () => true, mtimeMs: mtimes.get(key) ?? Date.now() };
       const error = new Error(`ENOENT: no such file ${key}`) as NodeJS.ErrnoException;
       error.code = "ENOENT";
       throw error;
@@ -76,10 +91,12 @@ function memFs(initial: Record<string, string> = {}): MutationFs & {
         throw error;
       }
       files.delete(key);
+      mtimes.delete(key);
     },
   };
   return fs as unknown as MutationFs & {
     files: Map<string, string>;
+    mtimes: Map<string, number>;
     failNextWrite?: boolean;
     writes: string[];
   };
@@ -551,5 +568,117 @@ describe("profile mutate: merge + resolve reuse", () => {
     const resolved = resolveProfile("worker", merged as ValidatedProfilesDocument);
     expect(resolved.model).toBe("user-m");
     expect(resolved.thinking).toBe("low");
+  });
+});
+
+describe("profile mutate: descendant invalidation (P1 review)", () => {
+  it("rejects deleting a referenced parent without touching the file", async () => {
+    const fs = memFs({
+      [PROJECT]: "profiles:\n  base:\n    model: m\n  child:\n    extends: base\n    thinking: low\n",
+    });
+    const before = fs.files.get(PROJECT)!;
+    const error = await expectMutationError(
+      deleteProfile({ name: "base", scope: "project" }, opts(fs)),
+      "resolve-failed",
+    );
+    expect(error.message).toContain("child");
+    expect(fs.files.get(PROJECT)).toBe(before);
+    // The graph is untouched: child still resolves.
+    const view = await readEditableProfile("child", opts(fs));
+    expect(view.validation.ok).toBe(true);
+    expect(view.extendsChain).toEqual(["base", "child"]);
+  });
+
+  it("rejects a parent edit that invalidates an inheriting reviewer child", async () => {
+    const fs = memFs({
+      [PROJECT]:
+        "profiles:\n  parent:\n    tools: [read]\n  child:\n    extends: parent\n    githubIdentity: reviewer\n",
+    });
+    const before = fs.files.get(PROJECT)!;
+    // `child` inherits `tools` from `parent`; adding `edit` would resolve the
+    // reviewer child with source-write tools via the chain.
+    const error = await expectMutationError(
+      setProfileField({ name: "parent", scope: "project", field: "tools", value: ["read", "edit"] }, opts(fs)),
+      "resolve-failed",
+    );
+    expect(error.message).toMatch(/reviewer|edit/i);
+    expect(fs.files.get(PROJECT)).toBe(before);
+  });
+
+  it("fails closed when the graph is already invalid elsewhere", async () => {
+    const fs = memFs({
+      [PROJECT]: "profiles:\n  broken:\n    extends: does-not-exist\n",
+    });
+    // Schema-valid file, unresolvable graph: even an unrelated create is
+    // refused so no commit lands on a broken effective configuration.
+    const error = await expectMutationError(
+      createProfile({ name: "good", scope: "project", initial: { model: "x" } }, opts(fs)),
+      "resolve-failed",
+    );
+    expect(error.message).toContain("broken");
+    expect(fs.files.has(PROJECT)).toBe(true);
+    // Repairing the invalid profile itself is the way out.
+    await patchProfile({ name: "broken", scope: "project", patch: { extends: null, model: "x" } }, opts(fs));
+    const view = await readEditableProfile("broken", opts(fs));
+    expect(view.validation.ok).toBe(true);
+  });
+});
+
+describe("profile mutate: concurrent writers (P1 TOCTOU review)", () => {
+  it("serializes two writers from the same hash: one commits, one conflicts", async () => {
+    const fs = memFs();
+    const first = await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const stale = first.sourceHashAfter!;
+    // Both writers load hash H. The lock serializes them; the loser loads the
+    // winner's commit inside the lock and its stale expected hash conflicts
+    // instead of silently overwriting. Either writer may win.
+    const results = await Promise.allSettled([
+      setProfileField({ name: "a", scope: "project", field: "model", value: "two" }, opts(fs, { expectedSourceHash: stale })),
+      setProfileField({ name: "a", scope: "project", field: "model", value: "three" }, opts(fs, { expectedSourceHash: stale })),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const reason = (rejected[0] as PromiseRejectedResult).reason;
+    expect(reason).toBeInstanceOf(ProfileMutationError);
+    expect((reason as ProfileMutationError).code).toBe("conflict");
+    const view = await readEditableProfile("a", opts(fs));
+    expect(["two", "three"]).toContain(view.effective?.model);
+    // No lock droppings remain.
+    expect(fs.files.has(`${PROJECT}.lock`)).toBe(false);
+  });
+
+  it("reaps a stale crashed-holder lock instead of deadlocking", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    // Plant a lock file with an ancient mtime, simulating a crashed writer.
+    await (fs as unknown as MutationFs & { writeExclusive(path: string, content: string): Promise<void> }).writeExclusive(
+      `${PROJECT}.lock`,
+      "99999@1",
+    );
+    fs.mtimes.set(`${PROJECT}.lock`, Date.now() - 60_000);
+    const receipt = await setProfileField(
+      { name: "a", scope: "project", field: "model", value: "two" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("two");
+    expect(fs.files.has(`${PROJECT}.lock`)).toBe(false);
+  });
+
+  it("releases the lock after a validation failure so later writes proceed", async () => {
+    const fs = memFs({
+      [PROJECT]: "profiles:\n  a:\n    model: good\n",
+    });
+    await expectMutationError(
+      setProfileField({ name: "a", scope: "project", field: "thinking", value: "ultra" }, opts(fs)),
+      "validation-failed",
+    );
+    const receipt = await setProfileField(
+      { name: "a", scope: "project", field: "model", value: "better" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("better");
+    expect(fs.files.has(`${PROJECT}.lock`)).toBe(false);
   });
 });
