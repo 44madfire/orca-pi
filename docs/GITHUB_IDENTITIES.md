@@ -117,7 +117,11 @@ when refresh is impossible the original expired-token error is rethrown.
 Expiry uses a unified 5-minute refresh skew everywhere. Cached entries are
 bound to `ORCA_PI_GITHUB_<IDENT>_INSTALLATION_ID`: a token cached for
 installation 111 is discarded (never reused) after config moves to 222, and
-minting resumes from the current App config (fail closed).
+minting resumes from the current App config (fail closed). App-backed minting uses
+`@octokit/auth-app` for maintained JWT claim construction/signing and the
+installation-token exchange; the provider still owns the disk cache and five-minute
+refresh skew. The JWT-only repository-installation check retains a corrected
+10-minute App JWT helper because that endpoint does not accept IATs.
 Reviewer fail-closed verification (`GET /installation/repositories` with the
 IAT + GraphQL `viewer.login` actor binding to the trusted App login +
 distinct-from-author) remains intact; every worker `exec` (any executable can

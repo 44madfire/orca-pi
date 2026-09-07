@@ -114,7 +114,9 @@ describe("credential-provider: App JWT", () => {
       exp: number;
     };
     expect(payload.iss).toBe("12345");
-    expect(payload.exp - payload.iat).toBe(660);
+    expect(payload.iat).toBe(1_700_000_000 - 30);
+    expect(payload.exp).toBe(1_700_000_000 + 570);
+    expect(payload.exp - payload.iat).toBe(600);
   });
 });
 
@@ -152,6 +154,46 @@ describe("credential-provider: mint exchange", () => {
 });
 
 describe("credential-provider: ensureInstallationToken refresh/expiry", () => {
+  it("uses Octokit App auth with a GitHub-valid ten-minute JWT", async () => {
+    const { generateKeyPairSync } = await import("node:crypto");
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const pem = privateKey.export({ type: "pkcs1", format: "pem" }) as string;
+    const keyPath = "/keys/worker.pem";
+    const fs = memProviderFs({ [keyPath]: pem });
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const fetchFn: GithubFetchFn = vi.fn(async (_url, init) => {
+      const authorization = init.headers.Authorization ?? "";
+      const jwt = authorization.replace(/^Bearer /i, "");
+      const parts = jwt.split(".");
+      expect(parts).toHaveLength(3);
+      const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as {
+        iat: number;
+        exp: number;
+        iss: string | number;
+      };
+      expect(payload.exp - payload.iat).toBe(600);
+      expect(String(payload.iss)).toBe("12345");
+      return {
+        ok: true,
+        status: 201,
+        json: async () => ({ token: "ghs_octokit-12345678", expires_at: future }),
+        text: async () => "{}",
+      };
+    });
+    const credential = await ensureInstallationToken("worker", {
+      env: {
+        ORCA_PI_GITHUB_WORKER_APP_ID: "12345",
+        ORCA_PI_GITHUB_WORKER_PRIVATE_KEY_PATH: keyPath,
+        ORCA_PI_GITHUB_WORKER_INSTALLATION_ID: "999",
+      },
+      fs,
+      fetchFn,
+      cache: createInstallationTokenCache(),
+    });
+    expect(credential.token).toBe("ghs_octokit-12345678");
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
   it("prefers a fresh env token without minting", async () => {
     const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
     const fs = memProviderFs();

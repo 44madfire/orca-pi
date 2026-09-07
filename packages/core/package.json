@@ -16,6 +16,7 @@
     "lint": "eslint src test"
   },
   "dependencies": {
+    "@octokit/auth-app": "^6.1.4",
     "yaml": "^2.9.0"
   }
 }
