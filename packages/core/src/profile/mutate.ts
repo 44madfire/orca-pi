@@ -603,25 +603,32 @@ interface LockTicket {
  * Portable runtime identity for lock tickets (P1: Windows/WSL boundary).
  *
  * `process.kill(pid, 0)` is only meaningful inside the current OS/PID
- * namespace: a Windows PID cannot be probed from WSL and vice versa (nor
- * across machines sharing a drive). Tickets therefore carry their origin,
- * and any ticket from a different origin is treated as ALIVE (fail-closed:
- * wait, never ignore, never GC) because its death cannot be proven here. A
- * crashed foreign writer blocks until timeout → conflict, then an operator
- * removes the lock dir; it can never be silently treated as dead.
+ * namespace: a Windows PID cannot be probed from WSL and vice versa — and
+ * WSL2 distributions on one machine run in SEPARATE PID namespaces despite
+ * sharing hostname, `process.platform === "linux"`, and the same kernel
+ * (so boot IDs match too). Tickets therefore carry their origin, including
+ * the actual `WSL_DISTRO_NAME` (never a bare `wsl` literal that conflates
+ * Ubuntu with Debian), and any ticket from a different origin is treated as
+ * ALIVE (fail-closed: wait, never ignore, never GC) because its death
+ * cannot be proven here. A crashed foreign writer blocks until timeout →
+ * conflict, then an operator removes the lock dir; it can never be silently
+ * treated as dead.
  */
-function lockOrigin(): string {
+export function lockOrigin(): string {
   let host = "unknown-host";
   try {
     host = hostname();
   } catch {
     // Best effort; an unknown host still namespaces correctly per process.
   }
-  const wsl =
-    process.env.WSL_DISTRO_NAME !== undefined || process.env.WSL_INTEROP !== undefined
-      ? "wsl"
-      : "native";
-  return `${host}|${process.platform}|${wsl}`;
+  const distro = process.env.WSL_DISTRO_NAME;
+  const namespace =
+    typeof distro === "string" && distro.length > 0
+      ? distro
+      : process.env.WSL_INTEROP !== undefined
+        ? "wsl-unknown-distro"
+        : "native";
+  return `${host}|${process.platform}|${namespace}`;
 }
 
 function makeLockToken(): string {

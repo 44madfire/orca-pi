@@ -69,6 +69,7 @@ export {
   createProfile,
   deleteProfile,
   hashSourceText,
+  lockOrigin,
   parseLayerForTest,
   patchProfile,
   readEditableProfile,

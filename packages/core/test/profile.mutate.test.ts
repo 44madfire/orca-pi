@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { hostname } from "node:os";
 import {
   buildEditableView,
   cloneProfile,
   createProfile,
   deleteProfile,
   hashSourceText,
+  lockOrigin,
   patchProfile,
   readEditableProfile,
   serializeProfilesDocument,
@@ -1222,8 +1224,7 @@ describe("profile mutate: bakery choosing gate (P1 review)", () => {
   });
 });
 
-describe("profile mutate: single-filesystem boundary (P2 review)", () => {
-  it("emptied-layer removal without unlink fails closed, never touches the host FS", async () => {
+describe("profile mutate: single-filesystem boundary (P2 review)", () => {  it("emptied-layer removal without unlink fails closed, never touches the host FS", async () => {
     const full = memFs({
       [PROJECT]: "profiles:\n  solo:\n    model: m\n",
     });
@@ -1238,5 +1239,69 @@ describe("profile mutate: single-filesystem boundary (P2 review)", () => {
     expect(error.message).toMatch(/does not support deletion|left unchanged/i);
     // The injected file is untouched; nothing was deleted anywhere.
     expect(full.files.get(PROJECT)).toContain("solo:");
+  });
+});
+
+describe("profile mutate: PID-namespace origin (P1 review)", () => {
+  const lockDir = `${PROJECT}.lock.d`;
+
+  function withDistro<T>(distro: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const key = "WSL_DISTRO_NAME";
+    const had = Object.hasOwn(process.env, key);
+    const prev = process.env[key];
+    if (distro === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = distro;
+    }
+    return fn().finally(() => {
+      if (had) process.env[key] = prev as string;
+      else delete process.env[key];
+    });
+  }
+
+  it("lockOrigin distinguishes WSL distributions sharing host and platform", async () => {
+    const ubuntu = await withDistro("Ubuntu", () => Promise.resolve(lockOrigin()));
+    const debian = await withDistro("Debian", () => Promise.resolve(lockOrigin()));
+    expect(ubuntu).toContain("Ubuntu");
+    expect(debian).toContain("Debian");
+    expect(ubuntu).not.toBe(debian);
+  });
+
+  it("a bare-wsl ticket is foreign once the local distro is known", async () => {
+    // Old origins collapsed every distro to a bare `wsl` literal, so Ubuntu
+    // and Debian compared equal and a dead-pid probe decided liveness across
+    // PID namespaces. With distro-qualified origins the same ticket is
+    // foreign here: it must block and survive GC even though its pid probes
+    // dead locally.
+    await withDistro("Debian", async () => {
+      const fs = memFs();
+      await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+      await fs.mkdir!(lockDir, { recursive: true });
+      const legacyWslOrigin = `${hostname()}|${process.platform}|wsl`;
+      expect(lockOrigin()).not.toBe(legacyWslOrigin);
+      const content = JSON.stringify({
+        pid: 2147483647,
+        token: "legacy-wsl-holder",
+        number: 1,
+        origin: legacyWslOrigin,
+      });
+      await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+        `${lockDir}/n-legacy.json`,
+        content,
+      );
+      const outcome = await withMutationLock(
+        PROJECT,
+        fs,
+        () => Promise.resolve("should-not-run"),
+        { timeoutMs: 60 },
+      ).then(
+        () => "ran",
+        (error: unknown) => (error as { code?: string }).code ?? "threw",
+      );
+      expect(outcome).toBe("conflict");
+      expect(fs.files.get(`${lockDir}/n-legacy.json`)).toBe(content);
+      await (fs as unknown as MutationFs).unlink!(`${lockDir}/n-legacy.json`);
+    });
   });
 });

@@ -189,6 +189,7 @@ export {
   createProfile,
   deleteProfile,
   hashSourceText,
+  lockOrigin,
   patchProfile,
   readEditableProfile,
   serializeProfilesDocument,
