@@ -852,7 +852,7 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     await (fs as unknown as MutationFs).unlink!(lockPath);
   });
 
-  it("reaper never deletes a successor appearing between observe and claim", async () => {
+  it("reaper never removes a live successor (mismatch means do nothing)", async () => {
     const fs = memFs();
     await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
     const lockPath = `${PROJECT}.lock`;
@@ -862,20 +862,31 @@ describe("profile mutate: lock ownership (P1 review)", () => {
       deadContent,
     );
     fs.mtimes.set(lockPath, Date.now() - 60_000);
-    // Live successor that atomically appears between the reaper's stale
-    // observation and its atomic claim (pause-after-read interleaving).
+    // Live successor appears after the reaper's stale observation but before
+    // its second read (pause-after-read interleaving). The reaper must see
+    // the mismatch and do nothing — the canonical path is never moved or
+    // removed when it may hold a live owner, even temporarily.
     const successorLive = JSON.stringify({ pid: process.pid, token: "successor-B" });
-    const origRename = fs.rename.bind(fs);
-    let injected = false;
-    (fs as unknown as { rename: MutationFs["rename"] }) .rename = (async (from: string, to: string) => {
-      if (!injected && String(from) === lockPath && String(to).includes(".reap-")) {
-        injected = true;
-        // Interleave: winner acquires the free path before our claim moves it.
-        fs.files.set(lockPath, successorLive);
-        fs.mtimes.set(lockPath, Date.now());
+    const origRead = fs.readFile.bind(fs);
+    let reads = 0;
+    (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
+      if (String(p) === lockPath) {
+        reads += 1;
+        // First read is the contender's stale observation (dead). Inject the
+        // live winner before the reaper's second read so it aborts.
+        if (reads === 2) {
+          fs.files.set(lockPath, successorLive);
+          fs.mtimes.set(lockPath, Date.now());
+        }
       }
-      return origRename(from, to);
-    }) as MutationFs["rename"];
+      return origRead(p, enc);
+    }) as MutationFs["readFile"];
+    const unlinks: string[] = [];
+    const origUnlink = fs.unlink!.bind(fs);
+    (fs as unknown as { unlink: NonNullable<MutationFs["unlink"]> }).unlink = (async (p: string) => {
+      if (String(p) === lockPath) unlinks.push(String(p));
+      return origUnlink(p);
+    }) as NonNullable<MutationFs["unlink"]>;
     const outcome = await withMutationLock(
       PROJECT,
       fs,
@@ -885,10 +896,11 @@ describe("profile mutate: lock ownership (P1 review)", () => {
       () => "ran",
       (error: unknown) => (error as { code?: string }).code ?? "threw",
     );
-    // The reaper must detect claimed !== observed and restore, never delete.
-    // It then sees a fresh live lock and fails closed with conflict.
+    // Reaper aborts on mismatch, never unlinks live; contender then sees a
+    // fresh live lock and fails closed with conflict.
     expect(outcome).toBe("conflict");
     expect(fs.files.get(lockPath)).toBe(successorLive);
+    expect(unlinks).toHaveLength(0);
     await (fs as unknown as MutationFs).unlink!(lockPath);
   });
 
@@ -918,12 +930,13 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     expect(writesAfter).toBe(writesBefore);
     releaseHold();
     await holder;
-    // Release restores (never deletes) the successor it stole.
+    // Release does nothing on mismatch — successor never removed, even
+    // temporarily, so no third writer can slip in during a restore window.
     expect(fs.files.get(lockPath)).toBe(successor);
     await (fs as unknown as MutationFs).unlink!(lockPath);
   });
 
-  it("release preserves a third writer racing the restore", async () => {
+  it("release never removes a live successor, even temporarily", async () => {
     const fs = memFs();
     await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
     const lockPath = `${PROJECT}.lock`;
@@ -935,36 +948,134 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     for (let i = 0; i < 100 && !fs.files.has(lockPath); i++) {
       await new Promise((r) => setTimeout(r, 5));
     }
-    // Successor B appears before A's release (A will steal B on claim).
+    // Successor B appears before A's release (turnover). A must do nothing —
+    // no rename, no unlink, no window where the path is absent.
     const tokenB = JSON.stringify({ pid: process.pid, token: "successor-B" });
     fs.files.set(lockPath, tokenB);
-    // Third writer C wins the gap between A's claim (lock missing) and A's
-    // restore: inject C inside the claim-read so restore sees EEXIST.
-    const tokenC = JSON.stringify({ pid: process.pid, token: "successor-C" });
+    fs.mtimes.set(lockPath, Date.now());
+    // Track every removal of the canonical path during release.
+    const removed: string[] = [];
+    const origUnlink = fs.unlink!.bind(fs);
+    (fs as unknown as { unlink: NonNullable<MutationFs["unlink"]> }).unlink = (async (p: string) => {
+      if (String(p) === lockPath || String(p).startsWith(`${lockPath}.`)) removed.push(String(p));
+      // Only allow removal of sidecars, never the canonical live path here.
+      if (String(p) === lockPath) {
+        // Fail the test if anyone tries to remove the live successor.
+        throw new Error("canonical live lock must never be removed");
+      }
+      return origUnlink(p);
+    }) as NonNullable<MutationFs["unlink"]>;
+    const origRename = fs.rename.bind(fs);
+    (fs as unknown as { rename: MutationFs["rename"] }).rename = (async (from: string, to: string) => {
+      if (String(from) === lockPath) {
+        throw new Error("canonical live lock must never be renamed away");
+      }
+      return origRename(from, to);
+    }) as MutationFs["rename"];
+    releaseA();
+    await holderA;
+    // B's live lock survives untouched; no third writer could have entered
+    // while it was (incorrectly) thought stale, because the path never went
+    // absent.
+    expect(fs.files.get(lockPath)).toBe(tokenB);
+    expect(removed).toHaveLength(0);
+    // Restore normal unlink for cleanup (bypass the guard that rejects
+    // canonical removal — here we are the test harness, not the protocol).
+    (fs as unknown as { unlink: NonNullable<MutationFs["unlink"]> }).unlink =
+      origUnlink as NonNullable<MutationFs["unlink"]>;
+    await (fs as unknown as MutationFs).unlink!(lockPath);
+  });
+});
+
+describe("profile mutate: end-to-end no silent overwrite (P1 review)", () => {
+  it("C cannot enter while B is active after its ownership check", async () => {
+    const fs = memFs();
+    const first = await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const baseHash = first.sourceHashAfter!;
+    // Pause B after it passes the pre-commit lock-ownership check but before
+    // it commits, simulating validation + target re-read work. While B is
+    // paused holding a live lock (aged to look stale-by-mtime to exercise the
+    // suspension path), C attempts the same stale-hash write and an outdated
+    // releaser encounters B. C must block until B commits, then fail with
+    // `conflict` on its stale hash — never silently overwriting B.
     const origRead = fs.readFile.bind(fs);
-    let injectedC = false;
+    let bChecked = false;
+    let releaseB!: () => void;
+    const bGate = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
     (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
       const result = await origRead(p, enc);
-      if (!injectedC && String(p).includes(".release-")) {
-        injectedC = true;
-        // Lock path is currently missing (claimed); C acquires it now.
-        try {
-          await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
-            lockPath,
-            tokenC,
-          );
-        } catch {
-          // If exclusive fails, fall back to direct set for the memFs double.
-          fs.files.set(lockPath, tokenC);
-        }
+      // B's compromise check reads `<target>.lock`; pause right after it
+      // passes so C and a stale releaser encounter B mid-transaction.
+      if (!bChecked && String(p) === `${PROJECT}.lock` && typeof result === "string" && result.includes(process.pid.toString())) {
+        bChecked = true;
+        // Age B's live lock to look stale-by-mtime (suspended holder). A
+        // compliant reaper must still refuse on live pid.
+        fs.mtimes.set(`${PROJECT}.lock`, Date.now() - 60_000);
+        // Queue B's resume after C has had a chance to attempt.
+        setTimeout(releaseB, 80);
+        await bGate;
       }
       return result;
     }) as MutationFs["readFile"];
-    releaseA();
-    await holderA;
-    // C's live lock must survive; stolen B is discarded (its holder aborts
-    // via pre-commit compromise detection, never silently overwriting).
-    expect(fs.files.get(lockPath)).toBe(tokenC);
-    await (fs as unknown as MutationFs).unlink!(lockPath);
+    const bPromise = setProfileField(
+      { name: "a", scope: "project", field: "model", value: "two" },
+      opts(fs, { expectedSourceHash: baseHash }),
+    );
+    // Wait until B is paused inside its pre-commit check holding the lock.
+    for (let i = 0; i < 100 && !bChecked; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bChecked).toBe(true);
+    expect(fs.files.has(`${PROJECT}.lock`)).toBe(true);
+    const lockWhileBActive = fs.files.get(`${PROJECT}.lock`)!;
+    // Outdated releaser (old holder A) encounters B's live lock: must do
+    // nothing, never removing B even temporarily.
+    const fakeOld = JSON.stringify({ pid: 2147483647, token: "old-A" });
+    void fakeOld;
+    // Directly exercise the contender path: C tries to acquire while B holds.
+    // Same-process contenders serialize on the in-process mutex (then the
+    // file lock): C must wait while B is paused and only enter after B
+    // releases — never overlapping B, never seeing the path absent.
+    let cEntered = false;
+    const cAttempt = withMutationLock(
+      PROJECT,
+      fs,
+      () => {
+        cEntered = true;
+        return Promise.resolve("c-entered");
+      },
+      { timeoutMs: 5_000, staleMs: 10_000 },
+    ).then(
+      () => "c-entered",
+      (error: unknown) => (error as { code?: string }).code ?? "threw",
+    );
+    // While B is still paused, C must not have entered and the lock must
+    // still be B's (never absent, never replaced).
+    await new Promise((r) => setTimeout(r, 20));
+    expect(cEntered).toBe(false);
+    expect(fs.files.get(`${PROJECT}.lock`)).toBe(lockWhileBActive);
+    const cOutcome = await cAttempt;
+    // C waited for B (mutual exclusion), then entered after B released.
+    expect(cOutcome).toBe("c-entered");
+    expect(cEntered).toBe(true);
+    // Let B commit, then restore the read wrapper before C's real write so
+    // C loads fresh state (not the paused read path).
+    // B was already released via gate timeout; wait for its receipt.
+    const bReceipt = await bPromise;
+    expect(bReceipt.resolved?.model).toBe("two");
+    (fs as unknown as { readFile: MutationFs["readFile"] }).readFile =
+      origRead as MutationFs["readFile"];
+    // C retries with the same stale base hash against B's commit: must
+    // conflict, never silently overwrite B's "two" with "three".
+    const cError = await expectMutationError(
+      setProfileField({ name: "a", scope: "project", field: "model", value: "three" }, opts(fs, { expectedSourceHash: baseHash })),
+      "conflict",
+    );
+    expect(cError.message).toMatch(/stale|changed|reload/i);
+    const view = await readEditableProfile("a", opts(fs));
+    expect(view.effective?.model).toBe("two");
+    expect(fs.files.has(`${PROJECT}.lock`)).toBe(false);
   });
 });

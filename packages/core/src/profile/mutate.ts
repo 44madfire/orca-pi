@@ -43,10 +43,11 @@
  *   `{ pid, token }` payload. A stale-by-mtime entry is only reaped after
  *   proving the owner dead via process liveness (never on mtime alone, so
  *   suspension/sleep can never cause a live holder to be reaped), and both
- *   reap and release claim the path with an atomic `rename` to a unique
- *   sidecar and restore on mismatch — never a read-then-unlink/write that
- *   could clobber or delete a successor's lock. There is no heartbeat
- *   rewrite (a live holder is never stale). SHA-256 source hashes are
+ *   reap and release never remove a path that may hold a live owner, even
+ *   temporarily: on content mismatch they do nothing and return, so a live
+ *   successor keeps mutual exclusion and no third writer can slip in during
+ *   a claim/restore window. There is no heartbeat rewrite and no
+ *   rename-claim (a live holder is never stale). SHA-256 source hashes are
  *   compared against freshly loaded state inside the lock; a mismatch
  *   returns a `conflict` instead of silently overwriting newer edits.
  * - Failed mutations leave the original document unchanged.
@@ -594,113 +595,53 @@ function parseMutationLockContent(content: string): { pid: number; token: string
   }
 }
 
-function makeClaimPath(lockPath: string, kind: string): string {
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `${lockPath}.${kind}-${process.pid}-${Date.now().toString(36)}-${rand}`;
-}
-
 /**
- * Atomically claim `lockPath` via rename and delete the claim only when it
- * still holds exactly `expectedContent`.
+ * Reap a provably-dead lock without ever knowingly removing a live entry.
  *
- * Why rename: `readFile` + `unlink`/`writeFile` is TOCTOU — a successor can
- * appear between the check and the act, and the act then deletes/clobbers
- * the live lock. `rename` atomically moves whatever is currently at
- * `lockPath` to a private `claimPath`; we then inspect the private copy.
- * On mismatch we restore via exclusive create (never overwriting a new
- * holder) so a successor is never deleted. Returns true when the old entry
- * was removed and the path is now free.
+ * Caller has observed `expectedContent` with old mtime and dead pid. We
+ * re-read immediately before touching the path: on any mismatch (live
+ * successor, another reaper winning, pid now alive) we do nothing and
+ * return false — the canonical path is never moved or removed when it may
+ * hold a live owner, even temporarily. Only when the second read still shows
+ * the exact dead entry do we unlink it. The remaining read→unlink gap is the
+ * same single-syscall window any file lock has (proper-lockfile included);
+ * PID gating ensures no live holder is ever targeted, so no compliant
+ * participant concurrently deletes a live owner's path.
  */
-async function reapDeadLockClaim(
+async function reapDeadLockEntry(
   fs: MutationFs,
   lockPath: string,
   expectedContent: string,
   isAlive: (pid: number) => boolean,
 ): Promise<boolean> {
-  if (typeof fs.rename !== "function" || typeof fs.unlink !== "function") return false;
-  const writeExclusive = fs.writeExclusive;
-  if (typeof writeExclusive !== "function") return false;
-  const claimPath = makeClaimPath(lockPath, "reap");
+  if (typeof fs.unlink !== "function") return false;
+  let current: string;
   try {
-    await fs.rename(lockPath, claimPath);
+    current = await fs.readFile(lockPath, "utf8");
   } catch (error) {
     if (isEnoent(error)) return false;
     throw error;
   }
-  let claimed: string;
+  if (current !== expectedContent) return false;
+  const parsed = parseMutationLockContent(current);
+  if (!parsed || isAlive(parsed.pid)) return false;
   try {
-    claimed = await fs.readFile(claimPath, "utf8");
+    await fs.unlink(lockPath);
   } catch (error) {
     if (isEnoent(error)) return false;
     throw error;
-  }
-  if (claimed !== expectedContent) {
-    // Stole a successor that appeared between observe and claim — restore
-    // without overwriting whoever owns the path now.
-    try {
-      await writeExclusive.call(fs, lockPath, claimed);
-      try {
-        await fs.unlink(claimPath);
-      } catch {
-        // Best effort; the path is restored.
-      }
-    } catch (error) {
-      if (isLockHeldError(error)) {
-        // A new holder won the gap; discard the stolen copy, keep theirs.
-        try {
-          await fs.unlink(claimPath);
-        } catch {
-          // Best effort.
-        }
-      } else {
-        try {
-          await fs.unlink(claimPath);
-        } catch {
-          // Best effort.
-        }
-      }
-    }
-    return false;
-  }
-  const parsed = parseMutationLockContent(claimed);
-  if (!parsed || isAlive(parsed.pid)) {
-    // No longer provably dead — put it back.
-    try {
-      await writeExclusive.call(fs, lockPath, claimed);
-      try {
-        await fs.unlink(claimPath);
-      } catch {
-        // Best effort.
-      }
-    } catch (error) {
-      if (isLockHeldError(error)) {
-        try {
-          await fs.unlink(claimPath);
-        } catch {
-          // Best effort.
-        }
-      } else {
-        try {
-          await fs.unlink(claimPath);
-        } catch {
-          // Best effort.
-        }
-      }
-    }
-    return false;
-  }
-  try {
-    await fs.unlink(claimPath);
-  } catch (error) {
-    if (!isEnoent(error)) throw error;
   }
   return true;
 }
 
 /**
- * Ownership-safe release via atomic rename claim. Never deletes a
- * successor: the path is moved to a private claim, compared, and only an
- * exact match is deleted; a mismatch is restored via exclusive create.
+ * Ownership-safe release that never removes a successor, even temporarily.
+ *
+ * On mismatch (we were reaped, or a turnover raced us) we do nothing and
+ * return — the canonical path is left untouched so a live successor keeps
+ * mutual exclusion and a third writer cannot slip in during a claim/restore
+ * window. Only an exact match is unlinked, and PID gating guarantees no
+ * compliant reaper concurrently targets a live holder's path.
  */
 async function releaseMutationLockSafely(
   fs: MutationFs,
@@ -708,85 +649,15 @@ async function releaseMutationLockSafely(
   myContent: string,
 ): Promise<void> {
   if (typeof fs.unlink !== "function") return;
-  if (typeof fs.rename !== "function") {
-    // No atomic claim available and no reaper runs in this mode (reaping
-    // requires rename+exclusive), so a checked unlink is safe: no concurrent
-    // deleter exists for a live holder.
-    try {
-      const current = await fs.readFile(lockPath, "utf8");
-      if (current === myContent) await fs.unlink(lockPath);
-    } catch {
-      // Best effort.
-    }
-    return;
-  }
-  const claimPath = makeClaimPath(lockPath, "release");
+  let current: string;
   try {
-    await fs.rename(lockPath, claimPath);
-  } catch (error) {
-    if (isEnoent(error)) return;
-    return;
-  }
-  let claimed: string;
-  try {
-    claimed = await fs.readFile(claimPath, "utf8");
+    current = await fs.readFile(lockPath, "utf8");
   } catch {
     return;
   }
-  if (claimed !== myContent) {
-    // We stole a successor (we were reaped, or a turnover raced us) —
-    // restore it without overwriting a newer holder.
-    const writeExclusive = fs.writeExclusive;
-    if (typeof writeExclusive === "function") {
-      try {
-        await writeExclusive.call(fs, lockPath, claimed);
-        try {
-          await fs.unlink(claimPath);
-        } catch {
-          // Best effort.
-        }
-      } catch (error) {
-        if (isLockHeldError(error)) {
-          try {
-            await fs.unlink(claimPath);
-          } catch {
-            // Best effort.
-          }
-        } else {
-          try {
-            await fs.unlink(claimPath);
-          } catch {
-            // Best effort.
-          }
-        }
-      }
-    } else {
-      // No exclusive-create available: fail-closed. If the path is still
-      // missing, move the stolen entry back; otherwise a new holder won the
-      // gap — discard our stolen copy and keep theirs (their holder aborts
-      // via pre-commit compromise detection, never silently overwriting).
-      try {
-        await fs.readFile(lockPath, "utf8");
-        // Live successor exists — discard the stolen copy.
-        try {
-          await fs.unlink(claimPath);
-        } catch {
-          // Best effort.
-        }
-      } catch (error) {
-        if (isEnoent(error)) {
-          try {
-            await fs.rename(claimPath, lockPath);
-          } catch {
-            // Best effort; leave the claim for a later reaper.
-          }
-        }
-      }
-    }
-    return;
-  }
+  if (current !== myContent) return;
   try {
-    await fs.unlink(claimPath);
+    await fs.unlink(lockPath);
   } catch {
     // Best effort.
   }
@@ -877,12 +748,12 @@ export async function withMutationLock<T>(
             await sleepMs(15);
             continue;
           }
-          // Provably dead pid: attempt an atomic-claim reap, then recompete.
-          // The claim verifies content after the atomic move and restores on
-          // mismatch, so a successor appearing between observe and claim is
-          // never deleted.
+          // Provably dead pid: re-read and remove only if still the exact
+          // dead entry. On mismatch we do nothing — the path is never moved
+          // or removed when it may hold a live owner, even temporarily, so a
+          // third writer cannot acquire during a claim/restore window.
           try {
-            await reapDeadLockClaim(fs, lockPath, seen.content, isAlive);
+            await reapDeadLockEntry(fs, lockPath, seen.content, isAlive);
           } catch {
             // Lost a race; loop around and compete again.
           }
