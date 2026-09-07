@@ -457,7 +457,7 @@ function octokitRequestForFetch(fetchFn: GithubFetchFn, apiBase: string): Octoki
 
     const body: Record<string, unknown> = {};
     for (const [name, value] of Object.entries(parameters)) {
-      if (name === "headers" || name === "mediaType" || name === "installation_id") continue;
+      if (name === "headers" || name === "mediaType") continue;
       const placeholder = `{${name}}`;
       if (endpoint.includes(placeholder)) {
         endpoint = endpoint.replace(placeholder, encodeURIComponent(String(value)));

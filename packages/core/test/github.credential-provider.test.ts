@@ -161,7 +161,8 @@ describe("credential-provider: ensureInstallationToken refresh/expiry", () => {
     const keyPath = "/keys/worker.pem";
     const fs = memProviderFs({ [keyPath]: pem });
     const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    const fetchFn: GithubFetchFn = vi.fn(async (_url, init) => {
+    const fetchFn: GithubFetchFn = vi.fn(async (url, init) => {
+      expect(url).toBe("https://api.github.com/app/installations/999/access_tokens");
       const authorization = init.headers.Authorization ?? "";
       const jwt = authorization.replace(/^Bearer /i, "");
       const parts = jwt.split(".");
