@@ -584,92 +584,113 @@ function defaultIsProcessAlive(pid: number): boolean {
   }
 }
 
-interface LockCandidate {
+interface LockTicket {
   fileName: string;
   pid: number | undefined;
   token: string;
-  createdAt: number;
+  number: number;
   alive: boolean;
 }
 
-function makeLockCandidateName(): string {
-  const rand = Math.random().toString(36).slice(2, 12);
-  return `${process.pid}-${Date.now().toString(36)}-${rand}.json`;
+function makeLockToken(): string {
+  return `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
-function makeLockCandidateContent(token: string, createdAt: number): string {
-  return JSON.stringify({ pid: process.pid, token, createdAt });
+function choosingName(token: string): string {
+  return `c-${token}.choosing`;
 }
 
-function parseLockCandidate(
+function numberName(token: string): string {
+  return `n-${token}.json`;
+}
+
+function parseLockTicket(
   fileName: string,
   content: string,
   isAlive: (pid: number) => boolean,
-): LockCandidate {
+  kind: "choosing" | "number",
+): LockTicket {
   try {
-    const parsed = JSON.parse(content) as { pid?: unknown; token?: unknown; createdAt?: unknown };
+    const parsed = JSON.parse(content) as { pid?: unknown; token?: unknown; number?: unknown };
     if (
       typeof parsed.pid === "number" &&
       Number.isInteger(parsed.pid) &&
       parsed.pid > 0 &&
       typeof parsed.token === "string" &&
-      parsed.token.length > 0 &&
-      typeof parsed.createdAt === "number" &&
-      Number.isFinite(parsed.createdAt)
+      parsed.token.length > 0
     ) {
-      return {
-        fileName,
-        pid: parsed.pid,
-        token: parsed.token,
-        createdAt: parsed.createdAt,
-        alive: isAlive(parsed.pid),
-      };
+      if (kind === "choosing") {
+        return { fileName, pid: parsed.pid, token: parsed.token, number: 0, alive: isAlive(parsed.pid) };
+      }
+      if (typeof parsed.number === "number" && Number.isFinite(parsed.number)) {
+        return { fileName, pid: parsed.pid, token: parsed.token, number: parsed.number, alive: isAlive(parsed.pid) };
+      }
     }
   } catch {
     // Fall through to foreign-file handling below.
   }
   // Foreign/unparsable entries carry no provable liveness — fail-closed:
-  // treat as alive (blocks contenders until timeout → conflict, manual `rm`
-  // of the lock dir recovers). Production never writes these (JSON format
-  // ships with UI1.1); this only affects foreign files.
-  return { fileName, pid: undefined, token: fileName, createdAt: 0, alive: true };
+  // choosing files block (a contender may be mid-publication); number files
+  // act as live holder with number 0 (oldest, blocks until timeout →
+  // conflict, manual `rm` of the lock dir recovers). Production never writes
+  // these (JSON format ships with UI1.1); this only affects foreign files.
+  if (kind === "choosing") {
+    return { fileName, pid: undefined, token: fileName, number: 0, alive: true };
+  }
+  return { fileName, pid: undefined, token: fileName, number: 0, alive: true };
 }
 
-function electHolder(candidates: LockCandidate[]): LockCandidate | undefined {
-  const alive = candidates.filter((c) => c.alive);
-  if (alive.length === 0) return undefined;
-  alive.sort((a, b) => {
-    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
-    return a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0;
-  });
-  return alive[0];
+interface LockListing {
+  choosing: LockTicket[];
+  numbers: LockTicket[];
 }
 
-async function listLockCandidates(
+async function listLockDir(
   fs: MutationFs,
   lockDir: string,
   isAlive: (pid: number) => boolean,
-): Promise<LockCandidate[]> {
-  if (typeof fs.readdir !== "function") return [];
+): Promise<LockListing> {
+  const choosing: LockTicket[] = [];
+  const numbers: LockTicket[] = [];
+  if (typeof fs.readdir !== "function") return { choosing, numbers };
   let names: string[];
   try {
     names = await fs.readdir(lockDir);
   } catch (error) {
-    if (isEnoent(error)) return [];
+    if (isEnoent(error)) return { choosing, numbers };
     throw error;
   }
-  const out: LockCandidate[] = [];
   for (const name of names) {
     if (name === "." || name === "..") continue;
     try {
-      const content = await fs.readFile(`${lockDir}/${name}`, "utf8");
-      out.push(parseLockCandidate(name, content, isAlive));
+      if (name.startsWith("c-") && name.endsWith(".choosing")) {
+        const content = await fs.readFile(`${lockDir}/${name}`, "utf8");
+        choosing.push(parseLockTicket(name, content, isAlive, "choosing"));
+      } else if (name.startsWith("n-") && name.endsWith(".json")) {
+        const content = await fs.readFile(`${lockDir}/${name}`, "utf8");
+        numbers.push(parseLockTicket(name, content, isAlive, "number"));
+      }
     } catch (error) {
       if (isEnoent(error)) continue;
       throw error;
     }
   }
-  return out;
+  return { choosing, numbers };
+}
+
+async function deleteOwnFiles(
+  fs: MutationFs,
+  lockDir: string,
+  files: string[],
+): Promise<void> {
+  if (typeof fs.unlink !== "function") return;
+  for (const f of files) {
+    try {
+      await fs.unlink(`${lockDir}/${f}`);
+    } catch {
+      // Best effort; dead files are ignored (never block) and GC'd by holders.
+    }
+  }
 }
 
 export async function withMutationLock<T>(
@@ -694,7 +715,8 @@ export async function withMutationLock<T>(
       });
     }
     const writeExclusive = fs.writeExclusive;
-    const canCoordinate = typeof writeExclusive === "function" && typeof fs.readdir === "function";
+    const canCoordinate =
+      typeof writeExclusive === "function" && typeof fs.readdir === "function";
     const lockDir = `${targetPath}.lock.d`;
     const timeoutMs = options.timeoutMs ?? 10_000;
     const isAlive = options.isProcessAlive ?? defaultIsProcessAlive;
@@ -715,100 +737,141 @@ export async function withMutationLock<T>(
         cause: error,
       });
     }
-    // Unique candidate per contender: creation never contends, and each
-    // participant only ever deletes its OWN file on release. No one — reaper,
-    // releaser, or contender — ever removes or renames another participant's
-    // file, even temporarily, so a live holder's path cannot go absent while
-    // it is active and no third writer can slip in.
-    const ownToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
-    const createdAt = Date.now();
-    const ownContent = makeLockCandidateContent(ownToken, createdAt);
-    let ownFile = makeLockCandidateName();
+    // Bakery-style acquisition with unique files per contender. Each
+    // participant only ever deletes its OWN choosing/number files — nobody
+    // ever removes or renames another participant's file, even temporarily,
+    // so a live holder's entries cannot go absent while it is active.
+    // Priority (the ticket number) is chosen AFTER publishing the choosing
+    // flag, from currently visible numbers, so a contender descheduled before
+    // publication cannot retroactively outrank an active holder: it either
+    // was visible via choosing (holders wait for it) or it picks a larger
+    // number after seeing the holder. Dead pids are ignored (never waited
+    // on), so suspension/sleep — pid still alive — can never cause a live
+    // holder to be skipped.
+    const failWithBusy = (): never => {
+      throw new ProfileMutationError({
+        code: "conflict",
+        sourceLabel: targetPath,
+        message:
+          `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
+          `Wait for it to finish, reload, and retry. No data was overwritten.`,
+      });
+    };
+    // 1-2. Publish choosing BEFORE reading numbers (bakery door), then pick
+    // number = 1 + max visible. Unique names: creation never contends; on
+    // astronomical collision, clean up and retry with a fresh token.
+    let token = "";
+    let choosing = "";
+    let numberFile = "";
+    let ownNumber = 0;
     for (;;) {
+      token = makeLockToken();
+      choosing = choosingName(token);
+      numberFile = numberName(token);
       try {
-        await writeExclusive.call(fs, `${lockDir}/${ownFile}`, ownContent);
-        break;
+        await writeExclusive.call(fs, `${lockDir}/${choosing}`, JSON.stringify({ pid: process.pid, token }));
       } catch (error) {
         if (!isLockHeldError(error)) throw error;
-        // Astronomically unlikely random collision: retry with a fresh name.
-        ownFile = makeLockCandidateName();
+        continue;
       }
-    }
-    return await runWithElectedLock(fs, lockDir, targetPath, ownFile, isAlive, timeoutMs, fn);
-  });
-}
-
-async function runWithElectedLock<T>(
-  fs: MutationFs,
-  lockDir: string,
-  targetPath: string,
-  ownFile: string,
-  isAlive: (pid: number) => boolean,
-  timeoutMs: number,
-  fn: (ownLockFile: string | undefined) => Promise<T>,
-): Promise<T> {
-  const failWithBusy = (): never => {
-    throw new ProfileMutationError({
-      code: "conflict",
-      sourceLabel: targetPath,
-      message:
-        `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
-        `Wait for it to finish, reload, and retry. No data was overwritten.`,
-    });
-  };
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const candidates = await listLockCandidates(fs, lockDir, isAlive);
-    const holder = electHolder(candidates);
-    if (holder !== undefined && holder.fileName === ownFile) break;
-    if (holder === undefined) {
-      // No alive holder (only dead entries, or our listing raced our own
-      // creation). Dead entries are ignored, not removed, to acquire — but
-      // if we are the only alive entry yet the election missed us (listing
-      // raced creation), recompete immediately.
-      const ownListed = candidates.some((c) => c.fileName === ownFile);
-      if (ownListed) break;
-      // Our file not yet visible; retry immediately.
-      continue;
-    }
-    if (Date.now() >= deadline) failWithBusy();
-    await sleepMs(15);
-  }
-  // We are the elected holder: opportunistically garbage-collect proven-dead
-  // non-holder files (owner-dead proof via pid, never a live file). This is
-  // the only non-owner deletion in the protocol, and it can only touch dead
-  // entries — never the live holder's (ours) or another live contender's.
-  if (typeof fs.unlink === "function") {
-    try {
-      const candidates = await listLockCandidates(fs, lockDir, isAlive);
-      for (const c of candidates) {
-        if (c.fileName === ownFile) continue;
-        if (c.alive) continue;
-        if (c.pid === undefined) continue;
-        try {
-          await fs.unlink(`${lockDir}/${c.fileName}`);
-        } catch {
-          // Lost a race with another holder's GC; ignore.
+      let maxSeen = 0;
+      try {
+        const listing = await listLockDir(fs, lockDir, isAlive);
+        for (const n of listing.numbers) {
+          if (Number.isFinite(n.number) && n.number > maxSeen) maxSeen = n.number;
+        }
+      } catch (error) {
+        if (!isEnoent(error)) {
+          await deleteOwnFiles(fs, lockDir, [choosing]);
+          throw error;
         }
       }
-    } catch {
-      // Best-effort GC; election already succeeded.
-    }
-  }
-  try {
-    return await fn(ownFile);
-  } finally {
-    // Owner-only release: delete exactly our own unique file. No content
-    // check, no rename, no interaction with any other participant's file.
-    if (typeof fs.unlink === "function") {
+      ownNumber = maxSeen + 1;
       try {
-        await fs.unlink(`${lockDir}/${ownFile}`);
-      } catch {
-        // Best effort; a dead-holder file is ignored (never blocks) by
-        // future elections and reaped by the next holder's GC.
+        await writeExclusive.call(
+          fs,
+          `${lockDir}/${numberFile}`,
+          JSON.stringify({ pid: process.pid, token, number: ownNumber }),
+        );
+        break;
+      } catch (error) {
+        await deleteOwnFiles(fs, lockDir, [choosing]);
+        if (!isLockHeldError(error)) throw error;
       }
     }
-  }
+    // Owner cleanup covers EVERYTHING after publication: election timeouts,
+    // listing failures, and the body all remove our own files (never anyone
+    // else's), so a timed-out contender cannot wedge the process with an
+    // orphaned live candidate.
+    try {
+      // 2b. (number already published above.)
+      // 3. Clear choosing: our number is now visible, holders need not wait.
+      await deleteOwnFiles(fs, lockDir, [choosing]);
+      const isSmaller = (aNumber: number, aToken: string, bNumber: number, bToken: string): boolean => {
+        if (aNumber !== bNumber) return aNumber < bNumber;
+        return aToken < bToken;
+      };
+      // 4. Bakery wait: spin while any live contender is choosing (except our
+      // cleared flag) or holds a smaller (number, token). Dead pids are
+      // ignored immediately — never waited on, never removed to proceed.
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const listing = await listLockDir(fs, lockDir, isAlive);
+        let waitFor: string | undefined;
+        for (const c of listing.choosing) {
+          if (c.token === token) continue;
+          if (!c.alive) continue;
+          waitFor = c.fileName;
+          break;
+        }
+        if (waitFor === undefined) {
+          for (const n of listing.numbers) {
+            if (n.token === token) continue;
+            if (!n.alive) continue;
+            if (isSmaller(n.number, n.token, ownNumber, token)) {
+              waitFor = n.fileName;
+              break;
+            }
+          }
+        }
+        if (waitFor === undefined) break;
+        if (Date.now() >= deadline) failWithBusy();
+        await sleepMs(15);
+      }
+      // 5. Holder: opportunistically GC proven-dead files (pid dead, never a
+      // live file). The only non-owner deletion in the protocol, and it can
+      // only touch dead entries.
+      if (typeof fs.unlink === "function") {
+        try {
+          const listing = await listLockDir(fs, lockDir, isAlive);
+          for (const entry of [...listing.choosing, ...listing.numbers]) {
+            if (entry.token === token) continue;
+            if (entry.alive) continue;
+            if (entry.pid === undefined) continue;
+            try {
+              await fs.unlink(`${lockDir}/${entry.fileName}`);
+            } catch {
+              // Lost a race with another holder's GC; ignore.
+            }
+          }
+        } catch {
+          // Best-effort GC; election already succeeded.
+        }
+      }
+      try {
+        return await fn(numberFile);
+      } finally {
+        // Owner-only release: delete exactly our own number file.
+        await deleteOwnFiles(fs, lockDir, [numberFile, choosing]);
+      }
+    } catch (error) {
+      // Election/body failure (including timeout/conflict): remove our own
+      // files before propagating so no orphaned live candidate wedges later
+      // writes in this long-lived process.
+      await deleteOwnFiles(fs, lockDir, [numberFile, choosing]);
+      throw error;
+    }
+  });
 }
 
 /** Pre-write re-read guard: fail with `conflict` when the file changed. */
@@ -1625,14 +1688,32 @@ async function runMutationTransaction(
 
   // Compromise detection: verify we are still the elected holder before
   // committing (fail-closed). Same-process overlap is already excluded by
-  // the in-process mutex; with directory candidates no compliant participant
+  // the in-process mutex; with bakery candidates no compliant participant
   // ever deletes another's file, so losing holdership means a foreign writer
   // interfered — abort instead of committing a stale read.
   if (lockContent !== undefined) {
     const lockDir = `${targetPath}.lock.d`;
-    const candidates = await listLockCandidates(fs, lockDir, defaultIsProcessAlive);
-    const holder = electHolder(candidates);
-    const stillHolder = holder !== undefined && holder.fileName === lockContent;
+    const listing = await listLockDir(fs, lockDir, defaultIsProcessAlive);
+    const own = listing.numbers.find((n) => n.fileName === lockContent);
+    let stillHolder = own !== undefined && own.alive;
+    if (stillHolder) {
+      for (const c of listing.choosing) {
+        if (c.token === own!.token) continue;
+        if (!c.alive) continue;
+        stillHolder = false;
+        break;
+      }
+    }
+    if (stillHolder) {
+      for (const n of listing.numbers) {
+        if (n.token === own!.token) continue;
+        if (!n.alive) continue;
+        if (n.number !== own!.number ? n.number < own!.number : n.token < own!.token) {
+          stillHolder = false;
+          break;
+        }
+      }
+    }
     if (!stillHolder) {
       throw new ProfileMutationError({
         code: "conflict",

@@ -70,6 +70,7 @@ type ParsedScopeOptions = {
   dataPayload?: string;
   extendsParent?: string;
   expectedHash?: string;
+  expectedAbsent?: boolean;
   userConfig?: string;
   projectConfig?: string;
   projectRoot?: string;
@@ -171,6 +172,9 @@ function parseMutationArgs(args: readonly string[]): ParsedScopeOptions {
         out.expectedHash = taken.value;
         index += taken.consumed;
       }
+    } else if (arg === "--expected-absent") {
+      out.expectedAbsent = true;
+      index += 1;
     } else if (arg === "--user-config" || arg.startsWith("--user-config=")) {
       const taken = takeFlagValue(args, index, "--user-config");
       if (taken.error) {
@@ -209,6 +213,9 @@ function parseMutationArgs(args: readonly string[]): ParsedScopeOptions {
       index += 1;
     }
   }
+  if (out.expectedAbsent === true && out.expectedHash !== undefined) {
+    out.unknown.push("--expected-hash and --expected-absent must not be combined");
+  }
   return out;
 }
 
@@ -235,7 +242,11 @@ function mutationBaseOptions(
     ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
     ...(deps.osHomedir !== undefined ? { osHomedir: deps.osHomedir } : {}),
     ...(fs ? { fs } : {}),
-    ...(parsed.expectedHash !== undefined ? { expectedSourceHash: parsed.expectedHash } : {}),
+    ...(parsed.expectedAbsent === true && parsed.expectedHash === undefined
+      ? { expectedSourceHash: null }
+      : parsed.expectedHash !== undefined && parsed.expectedAbsent !== true
+        ? { expectedSourceHash: parsed.expectedHash }
+        : {}),
   };
 }
 
@@ -397,18 +408,21 @@ function emitReceipt(
 const MUTATION_USAGE = `orca-pi profile — mutate Pi role profiles (UI1.1 machine API)
 
 Usage:
-  orca-pi profile create <name> --scope <user|project> [--extends <parent>] [--data <json|@file>] [--expected-hash <hash>] [--json]
-  orca-pi profile clone <source> <dest> --scope <user|project> [--expected-hash <hash>] [--json]
-  orca-pi profile set <name> <field> <value> --scope <user|project> [--expected-hash <hash>] [--json]
-  orca-pi profile unset <name> <field> --scope <user|project> [--expected-hash <hash>] [--json]
-  orca-pi profile delete <name> --scope <user|project> [--expected-hash <hash>] [--json]
-  orca-pi profile patch <name> --scope <user|project> (--patch <json|@file> | --data <json|@file> | --json <json|@file>) [--expected-hash <hash>]
+  orca-pi profile create <name> --scope <user|project> [--extends <parent>] [--data <json|@file>] [--expected-hash <hash>|--expected-absent] [--json]
+  orca-pi profile clone <source> <dest> --scope <user|project> [--expected-hash <hash>|--expected-absent] [--json]
+  orca-pi profile set <name> <field> <value> --scope <user|project> [--expected-hash <hash>|--expected-absent] [--json]
+  orca-pi profile unset <name> <field> --scope <user|project> [--expected-hash <hash>|--expected-absent] [--json]
+  orca-pi profile delete <name> --scope <user|project> [--expected-hash <hash>|--expected-absent] [--json]
+  orca-pi profile patch <name> --scope <user|project> (--patch <json|@file> | --data <json|@file> | --json <json|@file>) [--expected-hash <hash>|--expected-absent]
   orca-pi profile read <name> [--json]
 
 Mutable fields: ${MUTABLE_PROFILE_FIELDS.join(", ")}
 Scopes: user, project (explicit --scope is always required for writes).
 Payloads are JSON objects; use null to delete a field in patch. --expected-hash
-enables optimistic concurrency (stale writes fail with conflict).
+enables optimistic concurrency (stale writes fail with conflict); --expected-absent
+asserts the target scope file is still absent (both read while missing → first
+create wins, second conflicts instead of silently replacing). The two flags
+must not be combined.
 `;
 
 export function mutationUsage(): string {

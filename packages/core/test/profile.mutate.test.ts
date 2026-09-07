@@ -716,8 +716,8 @@ describe("profile mutate: concurrent writers (P1 TOCTOU review)", () => {
     // ignored for election (never block), and the next holder GCs them.
     await fs.mkdir!(lockDir, { recursive: true });
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
-      `${lockDir}/1-0-dead.json`,
-      JSON.stringify({ pid: 2147483647, token: "crashed-token", createdAt: 1 }),
+      `${lockDir}/n-aaa-dead.json`,
+      JSON.stringify({ pid: 2147483647, token: "aaa-dead", number: 1 }),
     );
     const receipt = await setProfileField(
       { name: "a", scope: "project", field: "model", value: "two" },
@@ -778,12 +778,13 @@ describe("profile mutate: lock ownership (P1 review)", () => {
       releaseA = resolve;
     });
     const holderA = withMutationLock(PROJECT, fs, () => gate);
-    // Wait until A's candidate file exists.
+    // Wait until A's number file exists (choosing is cleared on election).
     let aFile = "";
     for (let i = 0; i < 100; i++) {
       const names = await fs.readdir!(lockDir).catch(() => [] as string[]);
-      if (names.length > 0) {
-        aFile = names[0];
+      const numbered = names.find((n) => n.startsWith("n-"));
+      if (numbered) {
+        aFile = numbered;
         break;
       }
       await new Promise((r) => setTimeout(r, 5));
@@ -791,10 +792,10 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     expect(aFile).not.toBe("");
     // A cross-process successor waiter B appears (newer, so A stays holder).
     // B must survive A's release untouched.
-    const bFile = `99999-zzzz-b.json`;
+    const bFile = `n-zzz-b.json`;
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
       `${lockDir}/${bFile}`,
-      JSON.stringify({ pid: process.pid, token: "successor-B", createdAt: Date.now() + 100_000 }),
+      JSON.stringify({ pid: process.pid, token: "zzz-b", number: 999 }),
     );
     const unlinked: string[] = [];
     const origUnlink = fs.unlink!.bind(fs);
@@ -804,8 +805,10 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     }) as NonNullable<MutationFs["unlink"]>;
     releaseA();
     await holderA;
-    // A removed exactly its own file; B's file was never touched.
-    expect(unlinked).toEqual([`${lockDir}/${aFile}`]);
+    // A removed exactly its own number file; B's file was never touched.
+    // (The already-cleared choosing path may record a best-effort ENOENT
+    // attempt; only number-file removals matter for the invariant.)
+    expect(unlinked.filter((p) => p.endsWith(".json"))).toEqual([`${lockDir}/${aFile}`]);
     expect(fs.files.has(`${lockDir}/${bFile}`)).toBe(true);
     expect(fs.files.has(`${lockDir}/${aFile}`)).toBe(false);
     (fs as unknown as { unlink: NonNullable<MutationFs["unlink"]> }).unlink =
@@ -817,15 +820,15 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     const fs = memFs();
     await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
     await fs.mkdir!(lockDir, { recursive: true });
-    const liveContent = JSON.stringify({ pid: process.pid, token: "live-holder", createdAt: 5 });
+    const liveContent = JSON.stringify({ pid: process.pid, token: "live-holder", number: 5 });
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
-      `${lockDir}/live.json`,
+      `${lockDir}/n-live.json`,
       liveContent,
     );
     // Age the entry far past any lease to simulate suspension/sleep. There is
     // no mtime lease: a live pid is never ignored, so the contender must wait
     // then conflict, never acquire alongside the holder.
-    fs.mtimes.set(`${lockDir}/live.json`, Date.now() - 60_000);
+    fs.mtimes.set(`${lockDir}/n-live.json`, Date.now() - 60_000);
     const outcome = await withMutationLock(
       PROJECT,
       fs,
@@ -836,8 +839,8 @@ describe("profile mutate: lock ownership (P1 review)", () => {
       (error: unknown) => (error as { code?: string }).code ?? "threw",
     );
     expect(outcome).toBe("conflict");
-    expect(fs.files.get(`${lockDir}/live.json`)).toBe(liveContent);
-    await (fs as unknown as MutationFs).unlink!(`${lockDir}/live.json`);
+    expect(fs.files.get(`${lockDir}/n-live.json`)).toBe(liveContent);
+    await (fs as unknown as MutationFs).unlink!(`${lockDir}/n-live.json`);
   });
 
   it("dead candidates never block and are GC'd by the next holder", async () => {
@@ -845,8 +848,8 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
     await fs.mkdir!(lockDir, { recursive: true });
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
-      `${lockDir}/dead.json`,
-      JSON.stringify({ pid: 2147483647, token: "dead", createdAt: 1 }),
+      `${lockDir}/n-dead.json`,
+      JSON.stringify({ pid: 2147483647, token: "dead", number: 1 }),
     );
     // A live contender must acquire immediately (dead is ignored), then GC
     // removes the dead file on the way in.
@@ -871,8 +874,9 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     let ownFile = "";
     for (let i = 0; i < 100; i++) {
       const names = await fs.readdir!(lockDir).catch(() => [] as string[]);
-      if (names.length > 0) {
-        ownFile = names[0];
+      const numbered = names.find((n) => n.startsWith("n-"));
+      if (numbered) {
+        ownFile = numbered;
         break;
       }
       await new Promise((r) => setTimeout(r, 5));
@@ -883,21 +887,21 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     // A successor waiter replaces nothing (unique files): it just adds its
     // own file. No heartbeat may rewrite or remove anything.
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
-      `${lockDir}/waiter.json`,
-      JSON.stringify({ pid: process.pid, token: "waiter", createdAt: Date.now() + 100_000 }),
+      `${lockDir}/n-waiter.json`,
+      JSON.stringify({ pid: process.pid, token: "waiter", number: 999 }),
     );
     await new Promise((r) => setTimeout(r, 150));
     const during = (await fs.readdir!(lockDir)).slice().sort();
     expect(during).toContain(ownFile);
-    expect(during).toContain("waiter.json");
+    expect(during).toContain("n-waiter.json");
     expect(fs.writes.filter((w) => w.startsWith(lockDir)).length).toBe(writesBefore);
     expect(before).toContain(ownFile);
     releaseHold();
     await holder;
     // Holder removed only its own file; the waiter remains.
     expect(fs.files.has(`${lockDir}/${ownFile}`)).toBe(false);
-    expect(fs.files.has(`${lockDir}/waiter.json`)).toBe(true);
-    await (fs as unknown as MutationFs).unlink!(`${lockDir}/waiter.json`);
+    expect(fs.files.has(`${lockDir}/n-waiter.json`)).toBe(true);
+    await (fs as unknown as MutationFs).unlink!(`${lockDir}/n-waiter.json`);
   });
 
   it("never renames another participant's lock file", async () => {
@@ -915,8 +919,8 @@ describe("profile mutate: lock ownership (P1 review)", () => {
     // must never rename any lock-dir entry (no claim/restore window).
     await fs.mkdir!(lockDir, { recursive: true });
     await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
-      `${lockDir}/dead.json`,
-      JSON.stringify({ pid: 2147483647, token: "dead", createdAt: 1 }),
+      `${lockDir}/n-dead.json`,
+      JSON.stringify({ pid: 2147483647, token: "dead", number: 1 }),
     );
     await withMutationLock(PROJECT, fs, () => Promise.resolve(undefined));
     expect(renamed).toHaveLength(0);
@@ -1034,6 +1038,85 @@ describe("profile mutate: end-to-end no silent overwrite (P1 review)", () => {
     expect(cError.message).toMatch(/stale|changed|reload/i);
     const view = await readEditableProfile("a", opts(fs));
     expect(view.effective?.model).toBe("two");
+    expect(await fs.readdir!(lockDir)).toHaveLength(0);
+  });
+});
+
+describe("profile mutate: bakery choosing gate (P1 review)", () => {
+  const lockDir = `${PROJECT}.lock.d`;
+
+  it("a contender published late cannot outrank: choosing blocks entry", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    await fs.mkdir!(lockDir, { recursive: true });
+    // B announces (choosing) but pauses before publishing its number — the
+    // exact late-publisher interleaving. A must wait on the live choosing
+    // flag instead of entering and later being retroactively outranked.
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      `${lockDir}/c-paused-b.choosing`,
+      JSON.stringify({ pid: process.pid, token: "paused-B" }),
+    );
+    let entered = false;
+    const contender = withMutationLock(
+      PROJECT,
+      fs,
+      () => {
+        entered = true;
+        return Promise.resolve("entered");
+      },
+      { timeoutMs: 2_000 },
+    );
+    await new Promise((r) => setTimeout(r, 60));
+    // Still waiting on B's choosing; B's flag untouched (nobody deletes
+    // another participant's file).
+    expect(entered).toBe(false);
+    expect(fs.files.has(`${lockDir}/c-paused-b.choosing`)).toBe(true);
+    // B resumes: publishes a larger number and clears choosing. A (number 1)
+    // outranks B (999) and enters.
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      `${lockDir}/n-paused-b.json`,
+      JSON.stringify({ pid: process.pid, token: "paused-B", number: 999 }),
+    );
+    await (fs as unknown as MutationFs).unlink!(`${lockDir}/c-paused-b.choosing`);
+    expect(await contender).toBe("entered");
+    expect(entered).toBe(true);
+    // A cleaned up exactly its own files; the simulated B number file (a
+    // foreign live entry the test harness owns) is never touched by A.
+    expect(await fs.readdir!(lockDir)).toEqual(["n-paused-b.json"]);
+    await (fs as unknown as MutationFs).unlink!(`${lockDir}/n-paused-b.json`);
+    expect(await fs.readdir!(lockDir)).toHaveLength(0);
+  });
+
+  it("a timed-out contender removes its own files and wedges nothing", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    await fs.mkdir!(lockDir, { recursive: true });
+    // External live holder with the smallest number.
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      `${lockDir}/n-holder.json`,
+      JSON.stringify({ pid: process.pid, token: "holder", number: 1 }),
+    );
+    const outcome = await withMutationLock(
+      PROJECT,
+      fs,
+      () => Promise.resolve("should-not-run"),
+      { timeoutMs: 60 },
+    ).then(
+      () => "ran",
+      (error: unknown) => (error as { code?: string }).code ?? "threw",
+    );
+    expect(outcome).toBe("conflict");
+    // Only the external holder remains: the timed-out contender cleaned up
+    // its own choosing + number files, leaving no orphaned live candidate.
+    expect(await fs.readdir!(lockDir)).toEqual(["n-holder.json"]);
+    // Release the external holder: a subsequent mutation in the same
+    // long-lived process must succeed (no orphan wedge).
+    await (fs as unknown as MutationFs).unlink!(`${lockDir}/n-holder.json`);
+    const receipt = await setProfileField(
+      { name: "a", scope: "project", field: "model", value: "two" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("two");
     expect(await fs.readdir!(lockDir)).toHaveLength(0);
   });
 });

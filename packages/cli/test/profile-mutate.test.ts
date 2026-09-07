@@ -296,3 +296,33 @@ describe("orca-pi profile mutations and descendant safety (P1 review)", () => {
     expect(fs.files.get("/repo/p/.pi/profiles.yaml")).toBe(before);
   });
 });
+
+describe("orca-pi profile absent-layer versioning (P1 review)", () => {
+  it("two clients reading a missing layer: first --expected-absent wins, second conflicts", async () => {
+    const { deps, out } = makeDeps({});
+    // Both clients read while the project file is absent (no hash to send).
+    const first = await run(
+      ["profile", "create", "first", "--scope", "project", "--expected-absent", "--json"],
+      deps,
+    );
+    expect(first.exitCode).toBe(0);
+    out.length = 0;
+    // Stale second creator still asserts absence: must conflict, never
+    // silently replace the first value.
+    const second = await run(
+      ["profile", "create", "second", "--scope", "project", "--expected-absent", "--json"],
+      deps,
+    );
+    expect(second.exitCode).toBe(1);
+    expect(out.join("")).toMatch(/conflict|absent|stale/i);
+  });
+
+  it("rejects combining --expected-hash with --expected-absent (exit 2)", async () => {
+    const { deps } = makeDeps({});
+    const result = await run(
+      ["profile", "create", "x", "--scope", "project", "--expected-hash", "abc", "--expected-absent"],
+      deps,
+    );
+    expect(result.exitCode).toBe(2);
+  });
+});
