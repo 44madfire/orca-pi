@@ -177,11 +177,20 @@ export interface MutationFs {
   stat?(path: string): Promise<unknown>;
   unlink?(path: string): Promise<void>;
   /**
+   * List directory entries (names only) for the cross-process lock directory
+   * (`<target>.lock.d`). Optional: when absent the transaction still
+   * serializes within the process via an in-memory mutex, but two OS
+   * processes could interleave (see below).
+   */
+  readdir?(path: string): Promise<string[]>;
+  /**
    * Atomic exclusive create: resolves only when `path` did not exist and
    * this call created it; rejects with an `EEXIST`-coded error otherwise.
-   * Used for the cross-process mutation lock (`<target>.lock`). Optional:
-   * when absent the transaction still serializes within the process via an
-   * in-memory mutex, but two OS processes could interleave (see below).
+   * Used for lock-directory candidates (`<target>.lock.d/<unique>`), which
+   * are unique per contender so creation never contends. Optional: when
+   * absent (or when `readdir` is absent) the transaction still serializes
+   * within the process via an in-memory mutex, but two OS processes could
+   * interleave (see below).
    */
   writeExclusive?(path: string, content: string): Promise<void>;
 }
@@ -198,13 +207,18 @@ export interface MutationPathOptions {
 export interface MutationWriteOptions extends MutationPathOptions {
   fs?: MutationFs;
   /**
-   * Optimistic-concurrency guard: SHA-256 of the target file as last seen
-   * by the caller (from a previous read receipt). When provided and the
-   * current file hash differs, the mutation fails with `conflict` instead
-   * of overwriting. Omit to skip the caller-side check (the pre-write
-   * re-read guard still applies).
+   * Optimistic-concurrency guard for the target scope's file: SHA-256 of the
+   * target file as last seen by the caller (from a previous read receipt).
+   * - `string`: the file must still exist with exactly this hash.
+   * - `null`: the file must still be absent ("I read this scope while the
+   *   file did not exist" — e.g. builtin-only with no override file yet).
+   * - `undefined` (omit): skip the caller-side check (the pre-write re-read
+   *   guard still applies for `string` mismatches, but absence cannot be
+   *   asserted). UI clients should always send an explicit `string` or
+   *   `null` so two creators from "no file" cannot silently overwrite each
+   *   other; a mismatch fails with `conflict` instead of overwriting.
    */
-  expectedSourceHash?: string;
+  expectedSourceHash?: string | null;
 }
 
 /** SHA-256 hex of raw file text (stale-write version). */
@@ -279,6 +293,7 @@ async function getRealFs(): Promise<MutationFs> {
     mkdir: (p, opts) => fs.mkdir(p, opts),
     stat: (p) => fs.stat(p),
     unlink: (p) => fs.unlink(p),
+    readdir: (p) => fs.readdir(p) as Promise<string[]>,
     writeExclusive: (p, c) => fs.writeFile(p, c, { encoding: "utf8", flag: "wx" }).then(() => undefined),
   };
 }
@@ -542,17 +557,16 @@ export interface MutationLockOptions {
   /** Max time to wait for another writer's lock (default 10_000ms). */
   timeoutMs?: number;
   /**
-   * Entries older than this become *candidates* for crashed-holder recovery
-   * (default 10_000ms). Age alone never authorizes a reap: the owner pid
-   * must also prove dead via `isProcessAlive`. A live (or unparsable) entry
-   * is always treated as held — wait then `conflict`, never delete.
+   * Ignored (kept for backward compatibility). Dead contenders are ignored
+   * immediately via PID liveness — there is no mtime lease, so suspension or
+   * sleep can never cause a live holder to be reaped.
    */
   staleMs?: number;
   /**
    * Injectable liveness probe (tests). Defaults to `process.kill(pid, 0)`:
    * ESRCH → dead, EPERM/success → alive, anything else → alive
    * (fail-closed). Suspension/sleep keeps the pid alive, so a suspended
-   * holder is never reaped.
+   * holder is never ignored.
    */
   isProcessAlive?: (pid: number) => boolean;
 }
@@ -570,108 +584,103 @@ function defaultIsProcessAlive(pid: number): boolean {
   }
 }
 
-function makeMutationLockContent(token: string): string {
-  return JSON.stringify({ pid: process.pid, token });
+interface LockCandidate {
+  fileName: string;
+  pid: number | undefined;
+  token: string;
+  createdAt: number;
+  alive: boolean;
 }
 
-function parseMutationLockContent(content: string): { pid: number; token: string } | undefined {
+function makeLockCandidateName(): string {
+  const rand = Math.random().toString(36).slice(2, 12);
+  return `${process.pid}-${Date.now().toString(36)}-${rand}.json`;
+}
+
+function makeLockCandidateContent(token: string, createdAt: number): string {
+  return JSON.stringify({ pid: process.pid, token, createdAt });
+}
+
+function parseLockCandidate(
+  fileName: string,
+  content: string,
+  isAlive: (pid: number) => boolean,
+): LockCandidate {
   try {
-    const parsed = JSON.parse(content) as { pid?: unknown; token?: unknown };
+    const parsed = JSON.parse(content) as { pid?: unknown; token?: unknown; createdAt?: unknown };
     if (
       typeof parsed.pid === "number" &&
       Number.isInteger(parsed.pid) &&
       parsed.pid > 0 &&
       typeof parsed.token === "string" &&
-      parsed.token.length > 0
+      parsed.token.length > 0 &&
+      typeof parsed.createdAt === "number" &&
+      Number.isFinite(parsed.createdAt)
     ) {
-      return { pid: parsed.pid, token: parsed.token };
+      return {
+        fileName,
+        pid: parsed.pid,
+        token: parsed.token,
+        createdAt: parsed.createdAt,
+        alive: isAlive(parsed.pid),
+      };
     }
-    return undefined;
   } catch {
-    // Legacy/plain-token entries carry no provable pid — fail-closed: never
-    // reap, only wait then conflict. Production has no legacy entries (the
-    // JSON format ships with UI1.1); this only affects foreign files.
-    return undefined;
+    // Fall through to foreign-file handling below.
   }
+  // Foreign/unparsable entries carry no provable liveness — fail-closed:
+  // treat as alive (blocks contenders until timeout → conflict, manual `rm`
+  // of the lock dir recovers). Production never writes these (JSON format
+  // ships with UI1.1); this only affects foreign files.
+  return { fileName, pid: undefined, token: fileName, createdAt: 0, alive: true };
 }
 
-/**
- * Reap a provably-dead lock without ever knowingly removing a live entry.
- *
- * Caller has observed `expectedContent` with old mtime and dead pid. We
- * re-read immediately before touching the path: on any mismatch (live
- * successor, another reaper winning, pid now alive) we do nothing and
- * return false — the canonical path is never moved or removed when it may
- * hold a live owner, even temporarily. Only when the second read still shows
- * the exact dead entry do we unlink it. The remaining read→unlink gap is the
- * same single-syscall window any file lock has (proper-lockfile included);
- * PID gating ensures no live holder is ever targeted, so no compliant
- * participant concurrently deletes a live owner's path.
- */
-async function reapDeadLockEntry(
+function electHolder(candidates: LockCandidate[]): LockCandidate | undefined {
+  const alive = candidates.filter((c) => c.alive);
+  if (alive.length === 0) return undefined;
+  alive.sort((a, b) => {
+    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+    return a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0;
+  });
+  return alive[0];
+}
+
+async function listLockCandidates(
   fs: MutationFs,
-  lockPath: string,
-  expectedContent: string,
+  lockDir: string,
   isAlive: (pid: number) => boolean,
-): Promise<boolean> {
-  if (typeof fs.unlink !== "function") return false;
-  let current: string;
+): Promise<LockCandidate[]> {
+  if (typeof fs.readdir !== "function") return [];
+  let names: string[];
   try {
-    current = await fs.readFile(lockPath, "utf8");
+    names = await fs.readdir(lockDir);
   } catch (error) {
-    if (isEnoent(error)) return false;
+    if (isEnoent(error)) return [];
     throw error;
   }
-  if (current !== expectedContent) return false;
-  const parsed = parseMutationLockContent(current);
-  if (!parsed || isAlive(parsed.pid)) return false;
-  try {
-    await fs.unlink(lockPath);
-  } catch (error) {
-    if (isEnoent(error)) return false;
-    throw error;
+  const out: LockCandidate[] = [];
+  for (const name of names) {
+    if (name === "." || name === "..") continue;
+    try {
+      const content = await fs.readFile(`${lockDir}/${name}`, "utf8");
+      out.push(parseLockCandidate(name, content, isAlive));
+    } catch (error) {
+      if (isEnoent(error)) continue;
+      throw error;
+    }
   }
-  return true;
-}
-
-/**
- * Ownership-safe release that never removes a successor, even temporarily.
- *
- * On mismatch (we were reaped, or a turnover raced us) we do nothing and
- * return — the canonical path is left untouched so a live successor keeps
- * mutual exclusion and a third writer cannot slip in during a claim/restore
- * window. Only an exact match is unlinked, and PID gating guarantees no
- * compliant reaper concurrently targets a live holder's path.
- */
-async function releaseMutationLockSafely(
-  fs: MutationFs,
-  lockPath: string,
-  myContent: string,
-): Promise<void> {
-  if (typeof fs.unlink !== "function") return;
-  let current: string;
-  try {
-    current = await fs.readFile(lockPath, "utf8");
-  } catch {
-    return;
-  }
-  if (current !== myContent) return;
-  try {
-    await fs.unlink(lockPath);
-  } catch {
-    // Best effort.
-  }
+  return out;
 }
 
 export async function withMutationLock<T>(
   targetPath: string,
   fs: MutationFs,
-  fn: (lockContent: string | undefined) => Promise<T>,
+  fn: (ownLockFile: string | undefined) => Promise<T>,
   options: MutationLockOptions = {},
 ): Promise<T> {
   return await withProcessMutex(targetPath, async () => {
-    // P1 (fresh-install path): the lock file lives next to the target, so
-    // the parent directory must exist before exclusive creation. Real
+    // P1 (fresh-install path): the lock directory lives next to the target,
+    // so the parent directory must exist before anything else. Real
     // `writeFile(..., { flag: "wx" })` never creates parents — without this
     // the first mutation on a fresh store would fail ENOENT on the lock.
     try {
@@ -685,96 +694,122 @@ export async function withMutationLock<T>(
       });
     }
     const writeExclusive = fs.writeExclusive;
-    const lockPath = `${targetPath}.lock`;
+    const canCoordinate = typeof writeExclusive === "function" && typeof fs.readdir === "function";
+    const lockDir = `${targetPath}.lock.d`;
     const timeoutMs = options.timeoutMs ?? 10_000;
-    const staleMs = options.staleMs ?? 10_000;
     const isAlive = options.isProcessAlive ?? defaultIsProcessAlive;
-    // Unique ownership token inside a pid-tagged JSON payload. Release and
-    // reap compare the full payload; pid liveness gates every reap so a
-    // suspended/slow holder (pid alive) is never reaped. No heartbeat: live
-    // holders are never stale, so no background rewrite can clobber a
-    // successor.
-    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
-    const myContent = makeMutationLockContent(token);
-    let held = false;
-    const readLock = async (): Promise<{ content: string; mtime: number } | undefined> => {
-      try {
-        const content = await fs.readFile(lockPath, "utf8");
-        let mtime = Date.now();
-        try {
-          if (typeof fs.stat === "function") {
-            const st = (await fs.stat(lockPath)) as { mtimeMs?: unknown };
-            if (typeof st?.mtimeMs === "number") mtime = st.mtimeMs;
-          }
-        } catch {
-          // Stat raced a release; treat as missing below via re-read.
-        }
-        return { content, mtime };
-      } catch (error) {
-        if (isEnoent(error)) return undefined;
-        throw error;
-      }
-    };
-    const failWithBusy = (): never => {
-      throw new ProfileMutationError({
-        code: "conflict",
-        sourceLabel: targetPath,
-        message:
-          `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
-          `Wait for it to finish, reload, and retry. No data was overwritten.`,
-      });
-    };
-    if (typeof writeExclusive === "function") {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        try {
-          await writeExclusive.call(fs, lockPath, myContent);
-          held = true;
-          break;
-        } catch (error) {
-          if (!isLockHeldError(error)) throw error;
-          const seen = await readLock();
-          if (seen === undefined) continue; // Released between calls; compete again.
-          if (Date.now() - seen.mtime <= staleMs) {
-            if (Date.now() >= deadline) failWithBusy();
-            await sleepMs(15);
-            continue;
-          }
-          // Stale by mtime — fail-closed unless the owner proves dead.
-          const parsed = parseMutationLockContent(seen.content);
-          if (!parsed || isAlive(parsed.pid)) {
-            // Live, suspended, or foreign entry: never reap on mtime alone.
-            if (Date.now() >= deadline) failWithBusy();
-            await sleepMs(15);
-            continue;
-          }
-          // Provably dead pid: re-read and remove only if still the exact
-          // dead entry. On mismatch we do nothing — the path is never moved
-          // or removed when it may hold a live owner, even temporarily, so a
-          // third writer cannot acquire during a claim/restore window.
-          try {
-            await reapDeadLockEntry(fs, lockPath, seen.content, isAlive);
-          } catch {
-            // Lost a race; loop around and compete again.
-          }
-          continue;
-        }
-      }
+    if (!canCoordinate) {
+      // No cross-process coordination available (e.g. read-only test doubles):
+      // in-process mutex above still serializes this process; cross-process
+      // interleaving is possible but detected by the post-lock fresh load +
+      // `expectedSourceHash` comparison below.
+      return await fn(undefined);
     }
     try {
-      return await fn(held ? myContent : undefined);
-    } finally {
-      if (held) {
-        try {
-          await releaseMutationLockSafely(fs, lockPath, myContent);
-        } catch {
-          // Best-effort release; a dead-holder entry is reaped by acquirers.
-        }
+      await fs.mkdir(lockDir, { recursive: true });
+    } catch (error) {
+      throw new ProfileMutationError({
+        code: "atomic-write-failed",
+        sourceLabel: targetPath,
+        message: `Could not create lock directory ${lockDir}: ${error instanceof Error ? error.message : String(error)}. Original document left unchanged.`,
+        cause: error,
+      });
+    }
+    // Unique candidate per contender: creation never contends, and each
+    // participant only ever deletes its OWN file on release. No one — reaper,
+    // releaser, or contender — ever removes or renames another participant's
+    // file, even temporarily, so a live holder's path cannot go absent while
+    // it is active and no third writer can slip in.
+    const ownToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    const createdAt = Date.now();
+    const ownContent = makeLockCandidateContent(ownToken, createdAt);
+    let ownFile = makeLockCandidateName();
+    for (;;) {
+      try {
+        await writeExclusive.call(fs, `${lockDir}/${ownFile}`, ownContent);
+        break;
+      } catch (error) {
+        if (!isLockHeldError(error)) throw error;
+        // Astronomically unlikely random collision: retry with a fresh name.
+        ownFile = makeLockCandidateName();
       }
     }
+    return await runWithElectedLock(fs, lockDir, targetPath, ownFile, isAlive, timeoutMs, fn);
   });
 }
 
+async function runWithElectedLock<T>(
+  fs: MutationFs,
+  lockDir: string,
+  targetPath: string,
+  ownFile: string,
+  isAlive: (pid: number) => boolean,
+  timeoutMs: number,
+  fn: (ownLockFile: string | undefined) => Promise<T>,
+): Promise<T> {
+  const failWithBusy = (): never => {
+    throw new ProfileMutationError({
+      code: "conflict",
+      sourceLabel: targetPath,
+      message:
+        `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
+        `Wait for it to finish, reload, and retry. No data was overwritten.`,
+    });
+  };
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const candidates = await listLockCandidates(fs, lockDir, isAlive);
+    const holder = electHolder(candidates);
+    if (holder !== undefined && holder.fileName === ownFile) break;
+    if (holder === undefined) {
+      // No alive holder (only dead entries, or our listing raced our own
+      // creation). Dead entries are ignored, not removed, to acquire — but
+      // if we are the only alive entry yet the election missed us (listing
+      // raced creation), recompete immediately.
+      const ownListed = candidates.some((c) => c.fileName === ownFile);
+      if (ownListed) break;
+      // Our file not yet visible; retry immediately.
+      continue;
+    }
+    if (Date.now() >= deadline) failWithBusy();
+    await sleepMs(15);
+  }
+  // We are the elected holder: opportunistically garbage-collect proven-dead
+  // non-holder files (owner-dead proof via pid, never a live file). This is
+  // the only non-owner deletion in the protocol, and it can only touch dead
+  // entries — never the live holder's (ours) or another live contender's.
+  if (typeof fs.unlink === "function") {
+    try {
+      const candidates = await listLockCandidates(fs, lockDir, isAlive);
+      for (const c of candidates) {
+        if (c.fileName === ownFile) continue;
+        if (c.alive) continue;
+        if (c.pid === undefined) continue;
+        try {
+          await fs.unlink(`${lockDir}/${c.fileName}`);
+        } catch {
+          // Lost a race with another holder's GC; ignore.
+        }
+      }
+    } catch {
+      // Best-effort GC; election already succeeded.
+    }
+  }
+  try {
+    return await fn(ownFile);
+  } finally {
+    // Owner-only release: delete exactly our own unique file. No content
+    // check, no rename, no interaction with any other participant's file.
+    if (typeof fs.unlink === "function") {
+      try {
+        await fs.unlink(`${lockDir}/${ownFile}`);
+      } catch {
+        // Best effort; a dead-holder file is ignored (never blocks) by
+        // future elections and reaped by the next holder's GC.
+      }
+    }
+  }
+}
 
 /** Pre-write re-read guard: fail with `conflict` when the file changed. */
 async function assertNoConcurrentChange(
@@ -1296,20 +1331,37 @@ async function runMutationTransaction(
 
   const targetLayer = input.scope === "user" ? userLayer : projectLayer;
 
-  // Caller-side optimistic concurrency: compare expected hash to the hash
-  // observed at load time before doing any work.
+  // Caller-side optimistic concurrency: compare expected version to the
+  // version observed at load time before doing any work. `null` asserts the
+  // target file is still absent; a `string` asserts it still exists with
+  // exactly that hash. Both are compared inside the lock against freshly
+  // loaded state, so a loser always sees the winner's commit.
   if (options.expectedSourceHash !== undefined) {
-    const current = targetLayer.hash;
-    if (current !== options.expectedSourceHash) {
-      throw new ProfileMutationError({
-        code: "conflict",
-        profileName: input.profileName,
-        scope: input.scope,
-        sourceLabel: targetPath,
-        message:
-          `Stale write for profile "${input.profileName}" in ${input.scope} config (${targetPath}): expected source hash ${options.expectedSourceHash.slice(0, 12)}… ` +
-          `but found ${current ? `${current.slice(0, 12)}…` : "no file"}. Reload and retry. No data was overwritten.`,
-      });
+    if (options.expectedSourceHash === null) {
+      if (targetLayer.exists) {
+        throw new ProfileMutationError({
+          code: "conflict",
+          profileName: input.profileName,
+          scope: input.scope,
+          sourceLabel: targetPath,
+          message:
+            `Stale write for profile "${input.profileName}" in ${input.scope} config (${targetPath}): expected no file (read while absent) ` +
+            `but found source hash ${targetLayer.hash!.slice(0, 12)}…. Reload and retry. No data was overwritten.`,
+        });
+      }
+    } else {
+      const current = targetLayer.hash;
+      if (current !== options.expectedSourceHash) {
+        throw new ProfileMutationError({
+          code: "conflict",
+          profileName: input.profileName,
+          scope: input.scope,
+          sourceLabel: targetPath,
+          message:
+            `Stale write for profile "${input.profileName}" in ${input.scope} config (${targetPath}): expected source hash ${options.expectedSourceHash.slice(0, 12)}… ` +
+            `but found ${current ? `${current.slice(0, 12)}…` : "no file"}. Reload and retry. No data was overwritten.`,
+        });
+      }
     }
   }
 
@@ -1571,28 +1623,17 @@ async function runMutationTransaction(
     // This branch is unreachable; kept for exhaustiveness.
   }
 
-  // Compromise detection: if our cross-process lock was reaped/stolen after
-  // acquisition, abort instead of committing a stale read (fail-closed).
-  // Same-process overlap is already excluded by the in-process mutex, so any
-  // mismatch here means another OS process owns the path now.
+  // Compromise detection: verify we are still the elected holder before
+  // committing (fail-closed). Same-process overlap is already excluded by
+  // the in-process mutex; with directory candidates no compliant participant
+  // ever deletes another's file, so losing holdership means a foreign writer
+  // interfered — abort instead of committing a stale read.
   if (lockContent !== undefined) {
-    let currentLock: string | undefined;
-    try {
-      currentLock = await fs.readFile(`${targetPath}.lock`, "utf8");
-    } catch (error) {
-      if (isEnoent(error)) {
-        throw new ProfileMutationError({
-          code: "conflict",
-          profileName: input.profileName,
-          scope: input.scope,
-          sourceLabel: targetPath,
-          message:
-            `Lost profile mutation lock for "${input.profileName}" in ${input.scope} config (${targetPath}): the lock disappeared before commit. Reload and retry. No data was overwritten.`,
-        });
-      }
-      throw error;
-    }
-    if (currentLock !== lockContent) {
+    const lockDir = `${targetPath}.lock.d`;
+    const candidates = await listLockCandidates(fs, lockDir, defaultIsProcessAlive);
+    const holder = electHolder(candidates);
+    const stillHolder = holder !== undefined && holder.fileName === lockContent;
+    if (!stillHolder) {
       throw new ProfileMutationError({
         code: "conflict",
         profileName: input.profileName,
@@ -1653,7 +1694,7 @@ export interface CreateProfileInput {
   name: string;
   scope: MutationScope;
   initial?: Record<string, unknown>;
-  expectedSourceHash?: string;
+  expectedSourceHash?: string | null;
 }
 
 export async function createProfile(
@@ -1679,7 +1720,7 @@ export interface CloneProfileInput {
   dest: string;
   scope: MutationScope;
   initial?: Record<string, unknown>;
-  expectedSourceHash?: string;
+  expectedSourceHash?: string | null;
 }
 
 export async function cloneProfile(
@@ -1705,7 +1746,7 @@ export interface PatchProfileInput {
   name: string;
   scope: MutationScope;
   patch: Record<string, unknown>;
-  expectedSourceHash?: string;
+  expectedSourceHash?: string | null;
 }
 
 export async function patchProfile(
@@ -1740,7 +1781,7 @@ export interface SetFieldInput {
   scope: MutationScope;
   field: string;
   value: unknown;
-  expectedSourceHash?: string;
+  expectedSourceHash?: string | null;
 }
 
 export async function setProfileField(
@@ -1766,7 +1807,7 @@ export interface UnsetFieldInput {
   name: string;
   scope: MutationScope;
   field: string;
-  expectedSourceHash?: string;
+  expectedSourceHash?: string | null;
 }
 
 export async function unsetProfileField(
@@ -1783,7 +1824,7 @@ export async function unsetProfileField(
 export interface DeleteProfileInput {
   name: string;
   scope: MutationScope;
-  expectedSourceHash?: string;
+  expectedSourceHash?: string | null;
 }
 
 export async function deleteProfile(
