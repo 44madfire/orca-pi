@@ -2,7 +2,7 @@
  * Out-of-LLM GitHub App credential provider (OP1.12).
  *
  * Mints/refreshes Worker and Reviewer installation tokens outside model
- * context from local App private keys. Private keys are consumed from a
+ * context from local App private keys using @octokit/auth-app. Private keys are consumed from a
  * local secret path (never prompt/task/profile text), tokens are cached
  * with expiry and refreshed before expiration, and token/private-key
  * values never appear in logs/errors/output.
@@ -27,6 +27,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { createAppAuth, type StrategyOptions } from "@octokit/auth-app";
 import {
   expiryEnvVarForIdentity,
   redactSecretsFromText,
@@ -303,7 +304,7 @@ async function saveDiskTokenEntry(
 }
 
 // ---------------------------------------------------------------------------
-// App JWT (RS256) — pure except for node:crypto signing
+// App JWT (RS256) — retained for JWT-only endpoints; installation mint uses Octokit
 // ---------------------------------------------------------------------------
 
 function base64url(input: Buffer | string): string {
@@ -342,9 +343,13 @@ export function createAppJwt(options: {
     );
   }
   const nowSec = Math.floor((options.nowMs ?? Date.now()) / 1000);
+  // GitHub enforces a maximum ten-minute JWT lifetime. Keep the issued-at
+  // safety margin inside that lifetime (rather than now-60 through now+600,
+  // which produces an 11-minute token and is rejected with 401).
+  const issuedAt = nowSec - 30;
   const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const payload = base64url(
-    JSON.stringify({ iat: nowSec - 60, exp: nowSec + 600, iss: appId }),
+    JSON.stringify({ iat: issuedAt, exp: issuedAt + 600, iss: appId }),
   );
   const signingInput = `${header}.${payload}`;
   let signature: Buffer;
@@ -407,9 +412,153 @@ function defaultFetchFn(): GithubFetchFn {
   };
 }
 
+type OctokitRequest = NonNullable<StrategyOptions["request"]>;
+
+type OctokitErrorLike = {
+  status?: unknown;
+  response?: { status?: unknown };
+};
+
+function statusFromOctokitError(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const candidate = error as OctokitErrorLike;
+  if (typeof candidate.status === "number") return candidate.status;
+  if (typeof candidate.response?.status === "number") return candidate.response.status;
+  return undefined;
+}
+
 /**
- * Exchange an App JWT for an installation access token
- * (`POST /app/installations/{id}/access_tokens`). Never logs JWT/token.
+ * Adapt the repository's injectable fetch shape to Octokit's request shape.
+ * Production uses Octokit's own request implementation; this adapter keeps
+ * unit tests deterministic and preserves support for a custom API base.
+ */
+function octokitRequestForFetch(fetchFn: GithubFetchFn, apiBase: string): OctokitRequest {
+  const request = async (
+    route: string | URL,
+    parameters: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> => {
+    const match = /^(GET|POST|PUT|PATCH|DELETE|HEAD)\s+(.+)$/.exec(String(route));
+    if (!match) throw new Error("Unsupported Octokit request route");
+    const method = match[1]!;
+    let endpoint = match[2]!;
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+
+    const suppliedHeaders = parameters.headers;
+    if (suppliedHeaders && typeof suppliedHeaders === "object") {
+      for (const [name, value] of Object.entries(suppliedHeaders as Record<string, unknown>)) {
+        if (typeof value !== "string") continue;
+        headers[name.toLowerCase() === "authorization" ? "Authorization" : name] = value;
+      }
+    }
+
+    const body: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(parameters)) {
+      if (name === "headers" || name === "mediaType") continue;
+      const placeholder = `{${name}}`;
+      if (endpoint.includes(placeholder)) {
+        endpoint = endpoint.replace(placeholder, encodeURIComponent(String(value)));
+      } else {
+        body[name] = value;
+      }
+    }
+
+    const init: { method: string; headers: Record<string, string>; body?: string } = {
+      method,
+      headers,
+    };
+    if (method !== "GET" && method !== "HEAD" && Object.keys(body).length > 0) {
+      init.body = JSON.stringify(body);
+    }
+    const url = `${apiBase}${endpoint}`;
+    const response = await fetchFn(url, init);
+    const data = await response.json().catch(() => undefined);
+    if (!response.ok) {
+      const error = new Error(`GitHub request failed (${response.status})`) as Error & { status?: number };
+      error.status = response.status;
+      throw error;
+    }
+    return { data, status: response.status, headers: {}, url };
+  };
+  return request as unknown as OctokitRequest;
+}
+
+/**
+ * Mint an installation token with Octokit's maintained App-auth strategy.
+ * `@octokit/auth-app` still uses the required App JWT internally, but owns JWT
+ * claim construction, signing, and the installation-token exchange.
+ */
+async function mintInstallationTokenWithOctokit(options: {
+  appId: string;
+  privateKeyPem: string;
+  installationId: string;
+  fetchFn?: GithubFetchFn;
+  apiBase?: string;
+}): Promise<MintedInstallationToken> {
+  const installationId = options.installationId.trim();
+  if (!installationId) {
+    throw new GithubAuthError(
+      "app",
+      "missing-credential",
+      `Missing GitHub App installation id: export ORCA_PI_GITHUB_<IDENTITY>_INSTALLATION_ID (numeric, from the App install URL) outside LLM context and retry.`,
+    );
+  }
+
+  const base = apiBaseUrl(options.apiBase);
+  const endpoint = `/app/installations/${encodeURIComponent(installationId)}/access_tokens`;
+  const needsCustomRequest = options.fetchFn !== undefined || base !== "https://api.github.com";
+  try {
+    const authOptions: StrategyOptions = {
+      appId: options.appId,
+      privateKey: options.privateKeyPem,
+      ...(needsCustomRequest
+        ? { request: octokitRequestForFetch(options.fetchFn ?? defaultFetchFn(), base) }
+        : {}),
+    };
+    const auth = createAppAuth(authOptions);
+    const authentication = await auth({ type: "installation", installationId, refresh: true });
+    const token = authentication.token.trim();
+    if (!token) throw new Error("Octokit returned an empty installation token");
+    const expiresAt = new Date(authentication.expiresAt);
+    if (Number.isNaN(expiresAt.getTime())) throw new Error("Octokit returned an invalid token expiry");
+    return { token, expiresAt };
+  } catch (error) {
+    const status = statusFromOctokitError(error);
+    if (status === 401) {
+      throw new GithubAuthError(
+        "app",
+        "expired-token",
+        `GitHub rejected the App JWT for ${endpoint} (401) via @octokit/auth-app. The App private key, App id, or JWT clock may be wrong — verify ORCA_PI_GITHUB_<IDENTITY>_APP_ID and the PEM at ORCA_PI_GITHUB_<IDENTITY>_PRIVATE_KEY_PATH outside LLM context and retry.`,
+      );
+    }
+    if (status === 403 || status === 404) {
+      throw new GithubAuthError(
+        "app",
+        "unauthorized-installation",
+        `GitHub denied installation-token mint for installation "${installationId}" via @octokit/auth-app (${status}). The App may not be installed on the target repository or the installation id is wrong — verify the App installation outside LLM context.`,
+      );
+    }
+    if (status !== undefined) {
+      throw new GithubApiError(
+        endpoint,
+        status,
+        `GitHub installation-token mint via @octokit/auth-app failed (${status}).`,
+      );
+    }
+    throw new GithubAuthError(
+      "app",
+      "helper-failed",
+      `Could not mint installation token via @octokit/auth-app: ${redactSecretsFromText(error instanceof Error ? error.message : String(error), [options.privateKeyPem]) || "unknown error"}.`,
+    );
+  }
+}
+
+/**
+ * Low-level App JWT exchange retained for injected callers and tests.
+ * Production installation minting uses @octokit/auth-app. Never logs JWT/token.
  */
 export async function mintInstallationToken(options: {
   installationId: string;
@@ -774,10 +923,10 @@ export async function ensureInstallationToken(
     ...(options.homedir !== undefined ? { homedir: options.homedir } : {}),
     ...(options.osHomedir !== undefined ? { osHomedir: options.osHomedir } : {}),
   });
-  const jwt = createAppJwt({ appId: app.appId, privateKeyPem: pem, nowMs });
-  const minted = await mintInstallationToken({
+  const minted = await mintInstallationTokenWithOctokit({
+    appId: app.appId,
+    privateKeyPem: pem,
     installationId: app.installationId,
-    appJwt: jwt,
     ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
     ...(options.apiBase ? { apiBase: options.apiBase } : {}),
   });
@@ -811,7 +960,7 @@ export async function ensureInstallationToken(
   } catch {
     // Best-effort only.
   }
-  // Scrub JWT from any chance of retention (strings are immutable, but drop refs).
-  void fingerprintForDiagnostics(jwt);
+  // Octokit owns the short-lived App JWT internally; this provider retains only
+  // the installation token needed by the existing cache contract.
   return credential;
 }
