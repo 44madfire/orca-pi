@@ -510,20 +510,124 @@ export function validateBridgeMessage(value: unknown): string | null {
   ]);
   if (needsOp.has(kind) && typeof v["opId"] !== "string") return "missing-opId";
   if (findCredentialField(value) !== null) return "credential-field";
+  const isStr = (x: unknown): x is string => typeof x === "string";
+  const isRec = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === "object" && !Array.isArray(x);
+  const sessionId = (code: string): string | null => (isStr(v["sessionId"]) ? null : code);
   switch (kind) {
+    case "hello": {
+      const host = v["host"] as { protocol?: unknown } | undefined;
+      if (!isRec(v["host"]) || host?.protocol !== BRIDGE_PROTOCOL_VERSION) return "hello-bad-protocol";
+      if (!isStr(v["workspaceRoot"])) return "hello-missing-workspaceRoot";
+      break;
+    }
+    case "acquire": {
+      if (!isStr(v["workspaceRoot"])) return "acquire-missing-workspaceRoot";
+      break;
+    }
+    case "release":
+    case "get_history":
+    case "get_session": {
+      const bad = sessionId(`${kind}-missing-sessionId`);
+      if (bad) return bad;
+      break;
+    }
     case "dispatch": {
-      const msg = (v["message"] ?? null) as { text?: unknown } | null;
-      if (!msg || typeof msg.text !== "string") return "dispatch-missing-text";
+      const bad = sessionId("dispatch-missing-sessionId");
+      if (bad) return bad;
+      const msg = v["message"];
+      if (!isRec(msg) || typeof msg["text"] !== "string") return "dispatch-missing-text";
+      break;
+    }
+    case "cancel": {
+      const bad = sessionId("cancel-missing-sessionId");
+      if (bad) return bad;
+      break;
+    }
+    case "answer_prompt": {
+      if (!isStr(v["requestId"])) return "answer_prompt-missing-requestId";
+      if (typeof v["cancelled"] !== "boolean") return "answer_prompt-missing-cancelled";
+      break;
+    }
+    case "set_options": {
+      const bad = sessionId("set_options-missing-sessionId");
+      if (bad) return bad;
+      if (!isRec(v["options"])) return "set_options-missing-options";
+      break;
+    }
+    case "close": {
+      if (v["mode"] !== "graceful" && v["mode"] !== "force") return "close-missing-mode";
+      break;
+    }
+    case "hello_ok": {
+      const provider = v["provider"];
+      if (!isRec(provider) || !isStr(provider["id"]) || !isStr(provider["version"]) || typeof provider["protocol"] !== "number") {
+        return "hello_ok-missing-provider";
+      }
+      if (!isRec(v["capabilities"])) return "hello_ok-missing-capabilities";
+      break;
+    }
+    case "hello_error":
+    case "error": {
+      const error = v["error"];
+      if (!isRec(error) || !isStr(error["code"]) || !isStr(error["message"])) return `${kind}-missing-error`;
+      break;
+    }
+    case "acquired": {
+      if (!isStr(v["sessionId"])) return "acquired-missing-sessionId";
+      if (typeof v["resumed"] !== "boolean") return "acquired-missing-resumed";
+      if (!isRec(v["metadata"])) return "acquired-missing-metadata";
+      break;
+    }
+    case "released": {
+      const bad = sessionId("released-missing-sessionId");
+      if (bad) return bad;
+      break;
+    }
+    case "dispatch_ack": {
+      const bad = sessionId("dispatch_ack-missing-sessionId");
+      if (bad) return bad;
+      if (v["status"] !== "accepted" && v["status"] !== "rejected" && v["status"] !== "unknown") {
+        return "dispatch_ack-missing-status";
+      }
+      break;
+    }
+    case "cancelled": {
+      const bad = sessionId("cancelled-missing-sessionId");
+      if (bad) return bad;
+      if (!isStr(v["targetOpId"])) return "cancelled-missing-targetOpId";
+      if (typeof v["settled"] !== "boolean") return "cancelled-missing-settled";
+      break;
+    }
+    case "options_updated": {
+      const bad = sessionId("options_updated-missing-sessionId");
+      if (bad) return bad;
+      if (!isRec(v["options"])) return "options_updated-missing-options";
+      break;
+    }
+    case "history": {
+      const bad = sessionId("history-missing-sessionId");
+      if (bad) return bad;
+      if (!Array.isArray(v["entries"])) return "history-missing-entries";
+      break;
+    }
+    case "session": {
+      const bad = sessionId("session-missing-sessionId");
+      if (bad) return bad;
+      if (!isRec(v["metadata"])) return "session-missing-metadata";
       break;
     }
     case "session_event": {
       if (typeof v["sessionId"] !== "string") return "event-missing-sessionId";
-      if (v["event"] === null || typeof v["event"] !== "object") return "event-missing-event";
+      if (!isRec(v["event"]) || !isStr((v["event"] as Record<string, unknown>)["type"])) return "event-missing-event";
       break;
     }
-    case "hello": {
-      const host = v["host"] as { protocol?: unknown } | undefined;
-      if (!host || host.protocol !== BRIDGE_PROTOCOL_VERSION) return "hello-bad-protocol";
+    case "closed": {
+      if (!isRec(v["exit"])) return "closed-missing-exit";
+      break;
+    }
+    case "exiting": {
+      if (!isRec(v["exit"])) return "exiting-missing-exit";
+      if (!isStr(v["reason"])) return "exiting-missing-reason";
       break;
     }
     default:
@@ -538,9 +642,9 @@ export function isBridgeMessage(value: unknown): boolean {
 }
 
 const SECRET_VALUE_PATTERNS: ReadonlyArray<{ name: string; re: RegExp }> = [
-  { name: "bearer", re: /bearer\s+[A-Za-z0-9\-._~+/=]{16,}/i },
-  { name: "api-key", re: /sk-(?:proj-)?[A-Za-z0-9\-_]{16,}/ },
-  { name: "oauth", re: /ya29\.[A-Za-z0-9\-_]{16,}|xox[bpas]-[A-Za-z0-9\-_]{8,}/ },
+  { name: "bearer", re: /bearer\s+[A-Za-z0-9\-._~+/=]{16,}/gi },
+  { name: "api-key", re: /sk-(?:proj-)?[A-Za-z0-9\-_]{16,}/g },
+  { name: "oauth", re: /ya29\.[A-Za-z0-9\-_]{16,}|xox[bpas]-[A-Za-z0-9\-_]{8,}/g },
 ];
 
 /**

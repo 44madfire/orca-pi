@@ -280,24 +280,43 @@ export class BridgeHost {
       await this.abandonChildBestEffort();
       throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_HELLO_FAILED");
     }
-    if (ack.kind === "hello_error") {
-      this.helloError = `provider-refused: ${ack.error.code}`;
+    try {
+      if (ack.kind === "hello_error") {
+        this.helloError = `provider-refused: ${ack.error.code}`;
+        await this.abandonChildBestEffort();
+        throw new BridgeUnavailableError(sanitizeReason(`provider-refused: ${ack.error.code}`), ack.error.code);
+      }
+      if (ack.kind !== "hello_ok") {
+        this.helloError = `unexpected-hello-reply: ${ack.kind}`;
+        await this.abandonChildBestEffort();
+        throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_HELLO_UNEXPECTED");
+      }
+      // Defense in depth: wire validation should already have dropped a
+      // malformed hello_ok (→ hello timeout above), but never dereference
+      // provider/capabilities blindly — a raw TypeError must not escape with
+      // the helper still resident.
+      const provider = (ack as { provider?: unknown }).provider as { protocol?: unknown } | undefined;
+      const capabilities = (ack as { capabilities?: unknown }).capabilities;
+      if (!provider || typeof provider.protocol !== "number" || !capabilities || typeof capabilities !== "object") {
+        this.helloError = `malformed-hello-ok`;
+        await this.abandonChildBestEffort();
+        throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_HELLO_UNEXPECTED");
+      }
+      if (provider.protocol !== BRIDGE_PROTOCOL_VERSION) {
+        this.helloError = `incompatible-protocol: provider=${String(provider.protocol)} host=${BRIDGE_PROTOCOL_VERSION}`;
+        await this.abandonChildBestEffort();
+        throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_INCOMPATIBLE");
+      }
+      this.provider = ack.provider;
+      this.capabilities = ack.capabilities;
+      return { available: true, reason: "bridge-ready", provider: this.provider, capabilities: this.capabilities };
+    } catch (error) {
+      if (error instanceof BridgeUnavailableError) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      this.helloError = `hello-failed: ${reason}`;
       await this.abandonChildBestEffort();
-      throw new BridgeUnavailableError(sanitizeReason(`provider-refused: ${ack.error.code}`), ack.error.code);
+      throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_HELLO_FAILED");
     }
-    if (ack.kind !== "hello_ok") {
-      this.helloError = `unexpected-hello-reply: ${ack.kind}`;
-      await this.abandonChildBestEffort();
-      throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_HELLO_UNEXPECTED");
-    }
-    if (ack.provider.protocol !== BRIDGE_PROTOCOL_VERSION) {
-      this.helloError = `incompatible-protocol: provider=${ack.provider.protocol} host=${BRIDGE_PROTOCOL_VERSION}`;
-      await this.abandonChildBestEffort();
-      throw new BridgeUnavailableError(sanitizeReason(this.helloError), "BRIDGE_INCOMPATIBLE");
-    }
-    this.provider = ack.provider;
-    this.capabilities = ack.capabilities;
-    return { available: true, reason: "bridge-ready", provider: this.provider, capabilities: this.capabilities };
   }
 
   /**

@@ -59,6 +59,52 @@ describe("bridge protocol validation (SNC1.3)", () => {
     expect(redactSecretsFromText("plain diagnostic", 100)).toBe("plain diagnostic");
     expect(redactSecretsFromText("x".repeat(1000), 10)).toHaveLength(10);
   });
+
+  it("redacts every secret occurrence, not just the first per kind", () => {
+    const twoBearers = "bearer abcdefghijklmnop then bearer qrstuvwxyz123456";
+    const redactedBearers = redactSecretsFromText(twoBearers, 200);
+    expect(redactedBearers).not.toContain("abcdefghijklmnop");
+    expect(redactedBearers).not.toContain("qrstuvwxyz123456");
+    const twoKeys = "sk-proj-abcdefghijklmnopqr and sk-1234567890abcdef";
+    const redactedKeys = redactSecretsFromText(twoKeys, 200);
+    expect(redactedKeys).not.toContain("abcdefghijklmnopqr");
+    expect(redactedKeys).not.toContain("1234567890abcdef");
+    const mixed = "bearer abcdefghijklmnop sk-proj-abcdefghijklmnopqr bearer qrstuvwxyz123456";
+    expect(redactSecretsFromText(mixed, 200)).not.toMatch(/[A-Za-z0-9]{16}/);
+  });
+
+  it("validates every wire variant's required payload fields", () => {
+    // Malformed hello_ok (the reported crash): accepted opId alone is not enough.
+    expect(validateBridgeMessage({ v: 1, kind: "hello_ok", opId: "x" })).toBe("hello_ok-missing-provider");
+    expect(validateBridgeMessage({ v: 1, kind: "hello_ok", opId: "x", provider: { id: "p", version: "v", protocol: 1 } })).toBe(
+      "hello_ok-missing-capabilities",
+    );
+    // Host → provider variants.
+    expect(validateBridgeMessage({ v: 1, kind: "hello", opId: "x", host: { protocol: 1 } })).toBe("hello-missing-workspaceRoot");
+    expect(validateBridgeMessage({ v: 1, kind: "acquire", opId: "x" })).toBe("acquire-missing-workspaceRoot");
+    expect(validateBridgeMessage({ v: 1, kind: "release", opId: "x" })).toBe("release-missing-sessionId");
+    expect(validateBridgeMessage({ v: 1, kind: "dispatch", opId: "x", message: { text: "hi" } })).toBe("dispatch-missing-sessionId");
+    expect(validateBridgeMessage({ v: 1, kind: "cancel", opId: "x" })).toBe("cancel-missing-sessionId");
+    expect(validateBridgeMessage({ v: 1, kind: "answer_prompt", opId: "x", requestId: "r" })).toBe("answer_prompt-missing-cancelled");
+    expect(validateBridgeMessage({ v: 1, kind: "answer_prompt", opId: "x", cancelled: false })).toBe("answer_prompt-missing-requestId");
+    expect(validateBridgeMessage({ v: 1, kind: "set_options", opId: "x", sessionId: "s" })).toBe("set_options-missing-options");
+    expect(validateBridgeMessage({ v: 1, kind: "get_history", opId: "x" })).toBe("get_history-missing-sessionId");
+    expect(validateBridgeMessage({ v: 1, kind: "get_session", opId: "x" })).toBe("get_session-missing-sessionId");
+    expect(validateBridgeMessage({ v: 1, kind: "close", opId: "x", mode: "eventually" })).toBe("close-missing-mode");
+    // Provider → host variants.
+    expect(validateBridgeMessage({ v: 1, kind: "hello_error", opId: "x" })).toBe("hello_error-missing-error");
+    expect(validateBridgeMessage({ v: 1, kind: "acquired", opId: "x", sessionId: "s", resumed: true })).toBe("acquired-missing-metadata");
+    expect(validateBridgeMessage({ v: 1, kind: "released", opId: "x" })).toBe("released-missing-sessionId");
+    expect(validateBridgeMessage({ v: 1, kind: "dispatch_ack", opId: "x", sessionId: "s", status: "maybe" })).toBe("dispatch_ack-missing-status");
+    expect(validateBridgeMessage({ v: 1, kind: "cancelled", opId: "x", sessionId: "s", targetOpId: "t" })).toBe("cancelled-missing-settled");
+    expect(validateBridgeMessage({ v: 1, kind: "options_updated", opId: "x", sessionId: "s" })).toBe("options_updated-missing-options");
+    expect(validateBridgeMessage({ v: 1, kind: "history", opId: "x", sessionId: "s" })).toBe("history-missing-entries");
+    expect(validateBridgeMessage({ v: 1, kind: "session", opId: "x", sessionId: "s" })).toBe("session-missing-metadata");
+    expect(validateBridgeMessage({ v: 1, kind: "session_event", sessionId: "s", event: { noType: true } })).toBe("event-missing-event");
+    expect(validateBridgeMessage({ v: 1, kind: "closed", opId: "x" })).toBe("closed-missing-exit");
+    expect(validateBridgeMessage({ v: 1, kind: "exiting", exit: { code: 0, signal: null } })).toBe("exiting-missing-reason");
+    expect(validateBridgeMessage({ v: 1, kind: "error", error: { code: "X" } })).toBe("error-missing-error");
+  });
 });
 
 describe("Pi mapping stays out of the generic core (SNC1.3)", () => {

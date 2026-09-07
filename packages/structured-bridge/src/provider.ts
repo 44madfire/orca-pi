@@ -40,6 +40,8 @@ interface ProviderSession {
   history: BridgeHistoryEntry[];
   options: BridgeSessionOptions;
   activeOpId: string | null;
+  /** FIFO of accepted steer/followUp dispatches waiting for the active turn to settle. */
+  queue: DispatchRequest[];
   cancelledOps: Set<string>;
   pendingPrompt: { requestId: string; opId: string } | null;
   entryCounter: number;
@@ -111,7 +113,72 @@ export class BridgeProvider {
       });
       return;
     }
-    void this.onMessage(parsed as HostToProviderMessage);
+    // onMessage awaits handleDispatch: a rejected provider turn must never
+    // become an unhandled rejection with a stuck activeOpId. Funnel failures
+    // into a shaped turn_end/settled + error record instead.
+    this.onMessage(parsed as HostToProviderMessage).catch((error: unknown) => {
+      this.failMessage(parsed as HostToProviderMessage, error);
+    });
+  }
+
+  /** Shaped recovery for an async provider failure (dispatch streaming). */
+  protected failMessage(msg: HostToProviderMessage, error: unknown): void {
+    if (msg.kind !== "dispatch") {
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId: msg.opId,
+        error: { code: "HANDLER_FAILED", message: `provider failed to handle ${msg.kind}` },
+      });
+      return;
+    }
+    const session = this.sessions.get(msg.sessionId);
+    if (!session) {
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId: msg.opId,
+        sessionId: msg.sessionId,
+        error: { code: "HANDLER_FAILED", message: "provider failed to handle dispatch" },
+      });
+      return;
+    }
+    this.failStream(session, msg.opId, error);
+  }
+
+  /**
+   * Shaped recovery for a failed turn: error `turn_end` + `settled` (so the
+   * host re-enables input) and turn completion (unsticks the session and
+   * drains any queued steer/followUp). Error detail is sanitized and never
+   * echoes prompt text.
+   */
+  protected failStream(session: ProviderSession, opId: string, error: unknown): void {
+    const detail = error instanceof Error && error.message ? error.message.replace(/[\r\n]+/g, " ").trim().slice(0, 200) : "unknown failure";
+    this.emit(session, opId, { type: "turn_end", stopReason: "error", errorMessage: `provider dispatch failed: ${detail}` });
+    this.emit(session, opId, { type: "settled", willRetry: false });
+    this.finishTurn(session, opId);
+  }
+
+  /**
+   * Clear the active turn (when it is `opId`) and start the next queued
+   * steer/followUp request, if any. The single choke point for turn
+   * completion: every handleDispatch return path must go through here so a
+   * queued request never runs concurrently with the active turn.
+   */
+  protected finishTurn(session: ProviderSession, opId: string): void {
+    if (session.activeOpId === opId) {
+      session.activeOpId = null;
+      session.metadata.isStreaming = false;
+    }
+    const next = session.queue.shift();
+    if (!next) return;
+    if (session.activeOpId !== null) return;
+    session.activeOpId = next.opId;
+    session.metadata.isStreaming = true;
+    // Already acked accepted when queued; stream without re-acking.
+    this.handleDispatch(session, next).catch((error: unknown) => {
+      this.failMessage(next, error);
+    });
   }
 
   protected async onMessage(msg: HostToProviderMessage): Promise<void> {
@@ -191,6 +258,7 @@ export class BridgeProvider {
       history: [],
       options: { ...(msg.options ?? {}) },
       activeOpId: null,
+      queue: [],
       cancelledOps: new Set(),
       pendingPrompt: null,
       entryCounter: 0,
@@ -210,8 +278,16 @@ export class BridgeProvider {
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: "empty-text" });
       return;
     }
-    if (session.activeOpId && (msg.queue ?? "reject") === "reject") {
-      this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: "already-streaming (use steer/followUp or cancel)" });
+    if (session.activeOpId) {
+      if ((msg.queue ?? "reject") === "reject") {
+        this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: "already-streaming (use steer/followUp or cancel)" });
+        return;
+      }
+      // Queued steer/followUp: accept now, stream FIFO after the active turn
+      // settles. activeOpId keeps identifying the running turn so cancel and
+      // session state never confuse the queued request with it.
+      this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
+      session.queue.push(msg);
       return;
     }
     session.activeOpId = msg.opId;
@@ -220,15 +296,14 @@ export class BridgeProvider {
     await this.handleDispatch(session, msg);
   }
 
-  /** Subclass hook: stream `session_event` records, then clear `activeOpId`. Base is a no-op settle. */
+  /** Subclass hook: stream `session_event` records, then finish the turn (drains queued steer/followUp). Base is a no-op settle. */
   protected async handleDispatch(_session: ProviderSession, msg: DispatchRequest): Promise<void> {
     const session = this.sessions.get(msg.sessionId);
     if (!session) return;
     this.emit(session, msg.opId, { type: "turn_start" });
     this.emit(session, msg.opId, { type: "turn_end", stopReason: "stop" });
     this.emit(session, msg.opId, { type: "settled", willRetry: false });
-    session.activeOpId = null;
-    session.metadata.isStreaming = false;
+    this.finishTurn(session, msg.opId);
   }
 
   protected onCancel(opId: string, sessionId: string, targetOpId?: string): void {
@@ -240,7 +315,10 @@ export class BridgeProvider {
     }
     const target = targetOpId ?? session.activeOpId ?? "";
     if (target !== "") session.cancelledOps.add(target);
-    const settled = session.activeOpId === null || session.activeOpId === target;
+    // `settled` reports actual state: cancel only marks the turn; the
+    // `session_event{settled}` record arrives later. Idle (nothing streaming)
+    // is already settled; anything else is not, regardless of target.
+    const settled = session.activeOpId === null;
     this.send({ v: 1, kind: "cancelled", opId, sessionId, targetOpId: target, settled });
   }
 
@@ -311,19 +389,28 @@ export class BridgeProvider {
       this.send({ v: 1, kind: "error", opId, sessionId, error: { code: "UNKNOWN_SESSION", message: "unknown session" } });
       return;
     }
-    let entries = session.history;
+    const full = session.history;
+    // leafId always names the session leaf (full history), never the page end.
+    const leafId = full.length > 0 ? full[full.length - 1]?.id : undefined;
+    let rest = full;
     if (cursor) {
-      const idx = entries.findIndex((e) => e.id === cursor);
-      entries = idx === -1 ? [] : entries.slice(idx + 1);
+      const idx = rest.findIndex((e) => e.id === cursor);
+      rest = idx === -1 ? [] : rest.slice(idx + 1);
     }
-    if (limit !== undefined) entries = entries.slice(0, limit);
+    let entries = rest;
+    let nextCursor: string | undefined;
+    if (limit !== undefined && rest.length > limit) {
+      entries = rest.slice(0, limit);
+      nextCursor = entries.length > 0 ? entries[entries.length - 1]?.id : undefined;
+    }
     this.send({
       v: 1,
       kind: "history",
       opId,
       sessionId,
       entries,
-      ...(entries.length > 0 ? { leafId: entries[entries.length - 1]?.id } : {}),
+      ...(nextCursor ? { nextCursor } : {}),
+      ...(leafId ? { leafId } : {}),
     });
   }
 
@@ -416,9 +503,14 @@ export class MockExternalProvider extends BridgeProvider {
       this.emit(session, opId, { type: "turn_start" });
       this.emit(session, opId, { type: "turn_end", stopReason: "error", errorMessage: "mock rejected prompt" });
       this.emit(session, opId, { type: "settled", willRetry: false });
-      session.activeOpId = null;
-      session.metadata.isStreaming = false;
+      this.finishTurn(session, opId);
       return;
+    }
+    if (text === "__throw__") {
+      // Deterministic async-failure hook: rejects after accept so the
+      // onMessage catch path (shaped turn_end/settled, unstuck session)
+      // is covered without subclassing in tests.
+      throw new Error("mock handleDispatch failure");
     }
 
     this.appendHistory(session, { role: "user", text });
@@ -445,7 +537,11 @@ export class MockExternalProvider extends BridgeProvider {
     const opId = pending?.opId;
     if (!opId) return;
     const answer = cancelled ? "(cancelled)" : String(value ?? "(answered)");
-    void this.streamFakeResponse(session, opId, `mock answered ${requestId} with ${answer}`);
+    // Resume asynchronously; a streaming failure must still settle the turn
+    // instead of becoming an unhandled rejection with a stuck session.
+    this.streamFakeResponse(session, opId, `mock answered ${requestId} with ${answer}`).catch((error: unknown) => {
+      this.failStream(session, opId, error);
+    });
   }
 
   private async streamFakeResponse(session: ProviderSession, opId: string, fullText: string): Promise<void> {
@@ -455,8 +551,7 @@ export class MockExternalProvider extends BridgeProvider {
         this.emit(session, opId, { type: "turn_end", stopReason: "aborted", errorMessage: "cancelled by host" });
         this.emit(session, opId, { type: "settled", willRetry: false });
         session.cancelledOps.delete(opId);
-        session.activeOpId = null;
-        session.metadata.isStreaming = false;
+        this.finishTurn(session, opId);
         return;
       }
       this.emit(session, opId, { type: "text_delta", delta: fullText.slice(i, i + this.chunkSize), contentIndex: 0 });
@@ -473,7 +568,6 @@ export class MockExternalProvider extends BridgeProvider {
       this.emit(session, opId, { type: "turn_end", stopReason: "stop" });
       this.emit(session, opId, { type: "settled", willRetry: false });
     }
-    session.activeOpId = null;
-    session.metadata.isStreaming = false;
+    this.finishTurn(session, opId);
   }
 }

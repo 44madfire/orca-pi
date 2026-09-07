@@ -727,6 +727,82 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     await host.dispose();
   });
 
+  it("tears down the helper on a malformed hello_ok (no raw TypeError, no resident child)", async () => {
+    const proc = createFakeProc();
+    proc.stdin.write = ((s: string) => {
+      for (const line of s.split("\n")) {
+        if (line.trim() === "") continue;
+        const msg = JSON.parse(line) as { opId: string; kind: string };
+        if (msg.kind === "hello") {
+          // Well-formed opId but missing provider/capabilities: wire
+          // validation must drop it so hello fails closed via timeout.
+          proc.stdout.emit("data", Buffer.from(serializeBridgeLine({ v: 1, kind: "hello_ok", opId: msg.opId }), "utf8"));
+        }
+      }
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "malformed-hello-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn: (() => proc) as never,
+      helloTimeoutMs: 150,
+      requestTimeoutMs: 150,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    // Must resolve (not throw a TypeError) and leave no resident helper.
+    const support = await host.probeSupport();
+    expect(support.available).toBe(false);
+    expect(proc.killedWith).toContain("SIGKILL");
+    await host.dispose();
+  });
+
+  it("queues a busy steer after the active turn (FIFO, no interleave)", async () => {
+    const { host } = createMockPair({ textChunkSize: 4 });
+    await host.probeSupport();
+    const { sessionId } = await host.acquire();
+    const seen: { opId?: string; type: string }[] = [];
+    const bothSettled = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`settled x2 timeout (got ${seen.length} events)`)), 5000);
+      const off = host.onSessionEvent((envelope) => {
+        seen.push({ ...(envelope.opId ? { opId: envelope.opId } : {}), type: envelope.event.type });
+        if (seen.filter((e) => e.type === "settled").length === 2) {
+          clearTimeout(timer);
+          off();
+          resolve();
+        }
+      });
+    });
+    const first = await host.dispatch({ sessionId, text: "first " + "x".repeat(64) });
+    expect(first.status).toBe("accepted");
+    const second = await host.dispatch({ sessionId, text: "steered", queue: "steer" });
+    expect(second.status).toBe("accepted");
+    expect(second.opId).not.toBe(first.opId);
+    await bothSettled;
+    const firstSettledAt = seen.findIndex((e) => e.opId === first.opId && e.type === "settled");
+    const secondStartAt = seen.findIndex((e) => e.opId === second.opId && e.type === "turn_start");
+    expect(firstSettledAt).toBeGreaterThanOrEqual(0);
+    expect(secondStartAt).toBeGreaterThan(firstSettledAt);
+    expect(seen.findIndex((e) => e.opId === first.opId && e.type === "text_delta" && seen.indexOf(e) > secondStartAt)).toBe(-1);
+    await host.dispose();
+  });
+
+  it("reports cancel settled honestly via the returned flag", async () => {
+    const { host } = createMockPair({ textChunkSize: 2 });
+    await host.probeSupport();
+    const { sessionId } = await host.acquire();
+    const settled = collectUntilSettled(host);
+    const outcome = await host.dispatch({ sessionId, text: "long " + "y".repeat(200) });
+    expect(outcome.status).toBe("accepted");
+    // Active turn: marked, not yet settled — the settled event still follows.
+    const cancelled = await host.cancel(sessionId, outcome.opId);
+    expect(cancelled.settled).toBe(false);
+    await settled;
+    // Idle session: already settled.
+    await expect(host.cancel(sessionId)).resolves.toEqual({ settled: true });
+    await host.dispose();
+  });
+
   it("drives a real external OS process and restarts it independently", async () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const cli = path.resolve(here, "../dist/mock-provider-cli.js");

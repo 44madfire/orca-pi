@@ -118,8 +118,11 @@ cancel/resume.
   (bogus thinking levels and text-only-model images are rejected
   client-side because Pi itself is lenient).
 - `BridgeHistoryEntry{id,parentId?,role,text?,timestamp}` + `leafId` give
-  Orca a durable cursor (`get_history{cursor}` returns strictly-after
-  entries) for `unknown`-dispatch reconciliation.
+  Orca a durable cursor for `unknown`-dispatch reconciliation:
+  `get_history{cursor}` returns strictly-after entries; when `limit`
+  truncates, the reply carries `nextCursor` (last returned id) for the next
+  page, while `leafId` always names the session leaf (never the page end).
+  Absent `nextCursor` means the page reached the leaf.
 - `BridgeSessionMetadata{sessionId,providerSessionId?,workspaceRoot,model?,thinkingLevel?,messageCount,isStreaming,createdAt}`
   is the minimal identity Orca's structured lease needs. No paths beyond
   `workspaceRoot`, no env, no credentials (§6).
@@ -193,6 +196,16 @@ The mock provider (`MockExternalProvider`, `mock-provider-cli.js`) honors:
   `answer_prompt` resumes the turn (tests options/dialogs).
 - `cancel` mid-stream → `turn_end{aborted}` → `settled`.
 - Busy session + `queue:reject` (default) → `dispatch_ack{rejected}`.
+- Busy session + `queue:steer|followUp` → `dispatch_ack{accepted}` and the
+  request streams FIFO after the active turn settles (never concurrently;
+  `activeOpId` keeps identifying the running turn for cancel). Base treats
+  both modes as FIFO; Pi-specific steer-before-next-call vs after-settle
+  ordering is SNC1.4 transport concern.
+- `__throw__` → accepted, then the turn fails asynchronously with
+  `turn_end{error}` + `settled` (covers provider-failure recovery).
+- `cancel` replies `settled:true` only when nothing is streaming (idle);
+  cancelling an active turn replies `settled:false` with the `settled`
+  event to follow.
 - New instance = empty sessions (restart-independence proof).
 
 ## 10. Pi mapping (orca-pi owned, not Orca core)
