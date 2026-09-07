@@ -473,6 +473,103 @@ export function assertNoCredentialFields(value: unknown, where: string): void {
   if (hit) throw new BridgeProtocolError(`refusing to send ${where}: forbidden credential field "${hit}"`);
 }
 
+function isStr(x: unknown): x is string {
+  return typeof x === "string";
+}
+
+function isRec(x: unknown): x is Record<string, unknown> {
+  return x !== null && typeof x === "object" && !Array.isArray(x);
+}
+
+const CAPABILITY_KEYS = [
+  "textStreaming",
+  "thinking",
+  "tools",
+  "images",
+  "extensionDialogs",
+  "history",
+  "options",
+  "cancel",
+  "resume",
+] as const;
+
+/** Every capability flag is required: Orca UI gates controls on each boolean. */
+function validateCapabilities(caps: unknown): string | null {
+  if (!isRec(caps)) return "hello_ok-missing-capabilities";
+  for (const key of CAPABILITY_KEYS) {
+    if (typeof caps[key] !== "boolean") return "hello_ok-bad-capabilities";
+  }
+  return null;
+}
+
+/** Inner fields the host lease/session APIs rely on. */
+function validateSessionMetadata(meta: unknown, missingCode: string, badCode: string): string | null {
+  if (!isRec(meta)) return missingCode;
+  if (!isStr(meta["sessionId"])) return badCode;
+  if (!isStr(meta["workspaceRoot"])) return badCode;
+  if (typeof meta["messageCount"] !== "number") return badCode;
+  if (typeof meta["isStreaming"] !== "boolean") return badCode;
+  if (!isStr(meta["createdAt"])) return badCode;
+  return null;
+}
+
+const ENTRY_ROLES: ReadonlySet<string> = new Set(["user", "assistant", "tool", "system"]);
+
+/** History entries the journal/UI renders must carry identity + role. */
+function validateHistoryEntries(entries: unknown): string | null {
+  if (!Array.isArray(entries)) return "history-missing-entries";
+  for (const entry of entries) {
+    if (!isRec(entry) || !isStr(entry["id"]) || !ENTRY_ROLES.has(entry["role"] as string)) {
+      return "history-bad-entry";
+    }
+  }
+  return null;
+}
+
+/** Per-event payload the renderer/correlation relies on. */
+function validateProviderEvent(event: unknown): string | null {
+  if (!isRec(event) || !isStr(event["type"])) return "event-missing-event";
+  const field = (key: string): unknown => event[key];
+  switch (event["type"] as string) {
+    case "text_delta":
+      return isStr(field("delta")) ? null : "event-bad-text_delta";
+    case "thinking_delta":
+      return isStr(field("delta")) ? null : "event-bad-thinking_delta";
+    case "tool_start":
+      return isStr(field("toolCallId")) && isStr(field("toolName")) ? null : "event-bad-tool_start";
+    case "tool_progress":
+      return isStr(field("toolCallId")) && isStr(field("partialResult")) ? null : "event-bad-tool_progress";
+    case "tool_end":
+      return isStr(field("toolCallId")) && isStr(field("result")) && typeof field("isError") === "boolean"
+        ? null
+        : "event-bad-tool_end";
+    case "turn_end": {
+      const stop = field("stopReason");
+      return stop === "stop" || stop === "aborted" || stop === "error" ? null : "event-bad-turn_end";
+    }
+    case "prompt_request":
+      return isStr(field("requestId")) && isRec(field("prompt")) ? null : "event-bad-prompt_request";
+    case "error":
+      return isStr(field("code")) && isStr(field("message")) ? null : "event-bad-error";
+    default:
+      // turn_start, text_start/end, thinking_start/end, settled: type-only.
+      return null;
+  }
+}
+
+function validateExitBlock(exit: unknown): boolean {
+  return (
+    isRec(exit) &&
+    (typeof exit["code"] === "number" || exit["code"] === null) &&
+    (typeof exit["signal"] === "string" || exit["signal"] === null)
+  );
+}
+
+function validateLimit(limit: unknown): string | null {
+  if (limit === undefined) return null;
+  return Number.isInteger(limit) && (limit as number) >= 1 ? null : "get_history-bad-limit";
+}
+
 /**
  * Validate the shape of one parsed bridge record.
  * Returns null when valid, otherwise a short machine-readable reason
@@ -510,25 +607,38 @@ export function validateBridgeMessage(value: unknown): string | null {
   ]);
   if (needsOp.has(kind) && typeof v["opId"] !== "string") return "missing-opId";
   if (findCredentialField(value) !== null) return "credential-field";
-  const isStr = (x: unknown): x is string => typeof x === "string";
-  const isRec = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === "object" && !Array.isArray(x);
   const sessionId = (code: string): string | null => (isStr(v["sessionId"]) ? null : code);
+  const optStr = (key: string, code: string): string | null =>
+    v[key] === undefined || isStr(v[key]) ? null : code;
   switch (kind) {
     case "hello": {
-      const host = v["host"] as { protocol?: unknown } | undefined;
-      if (!isRec(v["host"]) || host?.protocol !== BRIDGE_PROTOCOL_VERSION) return "hello-bad-protocol";
+      if (!isRec(v["host"]) || !isStr(v["host"].id) || !isStr(v["host"].version)) return "hello-bad-protocol";
+      if (v["host"].protocol !== BRIDGE_PROTOCOL_VERSION) return "hello-bad-protocol";
       if (!isStr(v["workspaceRoot"])) return "hello-missing-workspaceRoot";
       break;
     }
     case "acquire": {
       if (!isStr(v["workspaceRoot"])) return "acquire-missing-workspaceRoot";
+      const badSession = optStr("sessionId", "acquire-bad-sessionId");
+      if (badSession) return badSession;
+      const badResume = optStr("resumePath", "acquire-bad-resumePath");
+      if (badResume) return badResume;
+      if (v["options"] !== undefined && !isRec(v["options"])) return "acquire-bad-options";
       break;
     }
     case "release":
-    case "get_history":
     case "get_session": {
       const bad = sessionId(`${kind}-missing-sessionId`);
       if (bad) return bad;
+      break;
+    }
+    case "get_history": {
+      const bad = sessionId("get_history-missing-sessionId");
+      if (bad) return bad;
+      const badCursor = optStr("cursor", "get_history-bad-cursor");
+      if (badCursor) return badCursor;
+      const badLimit = validateLimit(v["limit"]);
+      if (badLimit) return badLimit;
       break;
     }
     case "dispatch": {
@@ -536,11 +646,19 @@ export function validateBridgeMessage(value: unknown): string | null {
       if (bad) return bad;
       const msg = v["message"];
       if (!isRec(msg) || typeof msg["text"] !== "string") return "dispatch-missing-text";
+      if (msg["images"] !== undefined) {
+        if (!Array.isArray(msg["images"])) return "dispatch-bad-images";
+        for (const image of msg["images"]) {
+          if (!isRec(image) || !isStr(image["data"]) || !isStr(image["mimeType"])) return "dispatch-bad-images";
+        }
+      }
       break;
     }
     case "cancel": {
       const bad = sessionId("cancel-missing-sessionId");
       if (bad) return bad;
+      const badTarget = optStr("targetOpId", "cancel-bad-targetOpId");
+      if (badTarget) return badTarget;
       break;
     }
     case "answer_prompt": {
@@ -556,6 +674,8 @@ export function validateBridgeMessage(value: unknown): string | null {
     }
     case "close": {
       if (v["mode"] !== "graceful" && v["mode"] !== "force") return "close-missing-mode";
+      const bad = optStr("sessionId", "close-bad-sessionId");
+      if (bad) return bad;
       break;
     }
     case "hello_ok": {
@@ -563,7 +683,8 @@ export function validateBridgeMessage(value: unknown): string | null {
       if (!isRec(provider) || !isStr(provider["id"]) || !isStr(provider["version"]) || typeof provider["protocol"] !== "number") {
         return "hello_ok-missing-provider";
       }
-      if (!isRec(v["capabilities"])) return "hello_ok-missing-capabilities";
+      const badCaps = validateCapabilities(v["capabilities"]);
+      if (badCaps) return badCaps;
       break;
     }
     case "hello_error":
@@ -575,7 +696,8 @@ export function validateBridgeMessage(value: unknown): string | null {
     case "acquired": {
       if (!isStr(v["sessionId"])) return "acquired-missing-sessionId";
       if (typeof v["resumed"] !== "boolean") return "acquired-missing-resumed";
-      if (!isRec(v["metadata"])) return "acquired-missing-metadata";
+      const badMeta = validateSessionMetadata(v["metadata"], "acquired-missing-metadata", "acquired-bad-metadata");
+      if (badMeta) return badMeta;
       break;
     }
     case "released": {
@@ -607,26 +729,29 @@ export function validateBridgeMessage(value: unknown): string | null {
     case "history": {
       const bad = sessionId("history-missing-sessionId");
       if (bad) return bad;
-      if (!Array.isArray(v["entries"])) return "history-missing-entries";
+      const badEntries = validateHistoryEntries(v["entries"]);
+      if (badEntries) return badEntries;
       break;
     }
     case "session": {
       const bad = sessionId("session-missing-sessionId");
       if (bad) return bad;
-      if (!isRec(v["metadata"])) return "session-missing-metadata";
+      const badMeta = validateSessionMetadata(v["metadata"], "session-missing-metadata", "session-bad-metadata");
+      if (badMeta) return badMeta;
       break;
     }
     case "session_event": {
       if (typeof v["sessionId"] !== "string") return "event-missing-sessionId";
-      if (!isRec(v["event"]) || !isStr((v["event"] as Record<string, unknown>)["type"])) return "event-missing-event";
+      const badEvent = validateProviderEvent(v["event"]);
+      if (badEvent) return badEvent;
       break;
     }
     case "closed": {
-      if (!isRec(v["exit"])) return "closed-missing-exit";
+      if (!validateExitBlock(v["exit"])) return "closed-missing-exit";
       break;
     }
     case "exiting": {
-      if (!isRec(v["exit"])) return "exiting-missing-exit";
+      if (!validateExitBlock(v["exit"])) return "exiting-missing-exit";
       if (!isStr(v["reason"])) return "exiting-missing-reason";
       break;
     }

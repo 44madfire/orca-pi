@@ -29,6 +29,7 @@ import { spawn } from "node:child_process";
 import {
   assertNoCredentialFields,
   BRIDGE_PROTOCOL_VERSION,
+  BridgeProtocolError,
   BridgeUnavailableError,
   createOpId,
   DEFAULT_CLOSE_GRACE_MS,
@@ -671,6 +672,12 @@ export class BridgeHost {
   }
 
   async getHistory(sessionId: string, cursor?: string, limit?: number): Promise<{ entries: BridgeHistoryEntry[]; nextCursor?: string; leafId?: string }> {
+    // API-boundary validation (programmer error): fail before any I/O so an
+    // invalid limit can never read as an empty first page. Wire validation
+    // enforces the same rule provider-side.
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      throw new BridgeProtocolError("get_history limit must be a positive integer");
+    }
     await this.ensureStarted();
     const opId = createOpId("his");
     const res = (await this.sendAndWait(

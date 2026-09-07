@@ -80,7 +80,12 @@ describe("bridge protocol validation (SNC1.3)", () => {
       "hello_ok-missing-capabilities",
     );
     // Host → provider variants.
-    expect(validateBridgeMessage({ v: 1, kind: "hello", opId: "x", host: { protocol: 1 } })).toBe("hello-missing-workspaceRoot");
+    expect(
+      validateBridgeMessage({ v: 1, kind: "hello", opId: "x", host: { id: "orca", version: "t", protocol: 1 } }),
+    ).toBe("hello-missing-workspaceRoot");
+    expect(validateBridgeMessage({ v: 1, kind: "hello", opId: "x", host: { protocol: 1 }, workspaceRoot: "/w" })).toBe(
+      "hello-bad-protocol",
+    );
     expect(validateBridgeMessage({ v: 1, kind: "acquire", opId: "x" })).toBe("acquire-missing-workspaceRoot");
     expect(validateBridgeMessage({ v: 1, kind: "release", opId: "x" })).toBe("release-missing-sessionId");
     expect(validateBridgeMessage({ v: 1, kind: "dispatch", opId: "x", message: { text: "hi" } })).toBe("dispatch-missing-sessionId");
@@ -104,6 +109,72 @@ describe("bridge protocol validation (SNC1.3)", () => {
     expect(validateBridgeMessage({ v: 1, kind: "closed", opId: "x" })).toBe("closed-missing-exit");
     expect(validateBridgeMessage({ v: 1, kind: "exiting", exit: { code: 0, signal: null } })).toBe("exiting-missing-reason");
     expect(validateBridgeMessage({ v: 1, kind: "error", error: { code: "X" } })).toBe("error-missing-error");
+  });
+
+  it("validates required inner fields downstream code relies on", () => {
+    const caps = {
+      textStreaming: true,
+      thinking: true,
+      tools: true,
+      images: true,
+      extensionDialogs: true,
+      history: true,
+      options: true,
+      cancel: true,
+      resume: true,
+    };
+    const provider = { id: "p", version: "v", protocol: 1 };
+    // Empty capabilities must not read as available: every flag is required.
+    expect(validateBridgeMessage({ v: 1, kind: "hello_ok", opId: "x", provider, capabilities: {} })).toBe(
+      "hello_ok-bad-capabilities",
+    );
+    expect(validateBridgeMessage({ v: 1, kind: "hello_ok", opId: "x", provider, capabilities: { ...caps, tools: "yes" } })).toBe(
+      "hello_ok-bad-capabilities",
+    );
+    expect(validateBridgeMessage({ v: 1, kind: "hello_ok", opId: "x", provider, capabilities: caps })).toBeNull();
+    // Session metadata inner fields.
+    const meta = { sessionId: "s", workspaceRoot: "/w", messageCount: 0, isStreaming: false, createdAt: "t" };
+    expect(validateBridgeMessage({ v: 1, kind: "acquired", opId: "x", sessionId: "s", resumed: false, metadata: {} })).toBe(
+      "acquired-bad-metadata",
+    );
+    expect(validateBridgeMessage({ v: 1, kind: "acquired", opId: "x", sessionId: "s", resumed: false, metadata: meta })).toBeNull();
+    expect(validateBridgeMessage({ v: 1, kind: "session", opId: "x", sessionId: "s", metadata: { sessionId: "s" } })).toBe(
+      "session-bad-metadata",
+    );
+    // History entry identity + role.
+    expect(
+      validateBridgeMessage({ v: 1, kind: "history", opId: "x", sessionId: "s", entries: [{ id: "e1", role: "wizard" }] }),
+    ).toBe("history-bad-entry");
+    expect(
+      validateBridgeMessage({ v: 1, kind: "history", opId: "x", sessionId: "s", entries: [{ role: "user" }] }),
+    ).toBe("history-bad-entry");
+    expect(
+      validateBridgeMessage({ v: 1, kind: "history", opId: "x", sessionId: "s", entries: [{ id: "e1", role: "user" }] }),
+    ).toBeNull();
+    // Event payloads the renderer correlates on.
+    expect(validateBridgeMessage({ v: 1, kind: "session_event", sessionId: "s", event: { type: "text_delta" } })).toBe(
+      "event-bad-text_delta",
+    );
+    expect(
+      validateBridgeMessage({ v: 1, kind: "session_event", sessionId: "s", event: { type: "tool_end", toolCallId: "c" } }),
+    ).toBe("event-bad-tool_end");
+    expect(validateBridgeMessage({ v: 1, kind: "session_event", sessionId: "s", event: { type: "turn_end", stopReason: "maybe" } })).toBe(
+      "event-bad-turn_end",
+    );
+    expect(
+      validateBridgeMessage({
+        v: 1,
+        kind: "session_event",
+        sessionId: "s",
+        event: { type: "prompt_request", requestId: "r", prompt: { kind: "select" } },
+      }),
+    ).toBeNull();
+    // Exit blocks and limits.
+    expect(validateBridgeMessage({ v: 1, kind: "closed", opId: "x", exit: { code: "zero", signal: null } })).toBe("closed-missing-exit");
+    for (const limit of [0, -1, 1.5, "3", NaN]) {
+      expect(validateBridgeMessage({ v: 1, kind: "get_history", opId: "x", sessionId: "s", limit })).toBe("get_history-bad-limit");
+    }
+    expect(validateBridgeMessage({ v: 1, kind: "get_history", opId: "x", sessionId: "s", limit: 3 })).toBeNull();
   });
 });
 

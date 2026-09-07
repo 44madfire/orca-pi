@@ -803,6 +803,24 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     await host.dispose();
   });
 
+  it("rejects invalid history limits at the API boundary without spawning", async () => {
+    let spawns = 0;
+    const host = new BridgeHost({
+      bridgeCommand: "never-spawned",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn: (() => {
+        spawns += 1;
+        return createFakeProc();
+      }) as never,
+    });
+    await expect(host.getHistory("ses_1", undefined, 0)).rejects.toThrow(/positive integer/);
+    await expect(host.getHistory("ses_1", undefined, -2)).rejects.toThrow(/positive integer/);
+    await expect(host.getHistory("ses_1", undefined, 1.5)).rejects.toThrow(/positive integer/);
+    expect(spawns).toBe(0);
+    await host.dispose();
+  });
+
   it("drives a real external OS process and restarts it independently", async () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const cli = path.resolve(here, "../dist/mock-provider-cli.js");

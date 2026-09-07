@@ -149,12 +149,14 @@ export class BridgeProvider {
   /**
    * Shaped recovery for a failed turn: error `turn_end` + `settled` (so the
    * host re-enables input) and turn completion (unsticks the session and
-   * drains any queued steer/followUp). Error detail is sanitized and never
-   * echoes prompt text.
+   * drains any queued steer/followUp). The message is a stable generic
+   * string: raw exception text is never forwarded because it can carry
+   * prompt fragments, credentials, or request payloads that value
+   * redaction cannot reliably strip.
    */
-  protected failStream(session: ProviderSession, opId: string, error: unknown): void {
-    const detail = error instanceof Error && error.message ? error.message.replace(/[\r\n]+/g, " ").trim().slice(0, 200) : "unknown failure";
-    this.emit(session, opId, { type: "turn_end", stopReason: "error", errorMessage: `provider dispatch failed: ${detail}` });
+  protected failStream(session: ProviderSession, opId: string, _error: unknown): void {
+    void _error;
+    this.emit(session, opId, { type: "turn_end", stopReason: "error", errorMessage: "provider dispatch failed" });
     this.emit(session, opId, { type: "settled", willRetry: false });
     this.finishTurn(session, opId);
   }
@@ -384,6 +386,13 @@ export class BridgeProvider {
 
   protected onGetHistory(opId: string, sessionId: string, cursor?: string, limit?: number): void {
     if (!this.requireHello(opId)) return;
+    // Wire validation normally rejects non-positive-integer limits first;
+    // this explicit branch defines the semantics for direct callers too:
+    // `limit` must be a positive integer, never 0/negative/fractional.
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      this.send({ v: 1, kind: "error", opId, sessionId, error: { code: "BAD_LIMIT", message: "limit must be a positive integer" } });
+      return;
+    }
     const session = this.sessions.get(sessionId);
     if (!session) {
       this.send({ v: 1, kind: "error", opId, sessionId, error: { code: "UNKNOWN_SESSION", message: "unknown session" } });

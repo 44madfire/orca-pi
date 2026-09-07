@@ -122,7 +122,11 @@ cancel/resume.
   `get_history{cursor}` returns strictly-after entries; when `limit`
   truncates, the reply carries `nextCursor` (last returned id) for the next
   page, while `leafId` always names the session leaf (never the page end).
-  Absent `nextCursor` means the page reached the leaf.
+  Absent `nextCursor` means the page reached the leaf. `limit` must be a
+  positive integer: `0`/negative/fractional limits are rejected
+  fail-closed (`get_history-bad-limit` on the wire,
+  `BridgeProtocolError` at the host API) so a caller can never stall on
+  an empty first page that looks like the leaf.
 - `BridgeSessionMetadata{sessionId,providerSessionId?,workspaceRoot,model?,thinkingLevel?,messageCount,isStreaming,createdAt}`
   is the minimal identity Orca's structured lease needs. No paths beyond
   `workspaceRoot`, no env, no credentials (§6).
@@ -134,9 +138,13 @@ Forbidden on the wire in **both** directions (`FORBIDDEN_BRIDGE_KEYS`):
 `refreshToken`, `bearer`, `secret(s)`, `password` (case/underscore
 insensitive, substring-suffix match). `validateBridgeMessage()` returns
 `credential-field`; both sides drop/send `error{BAD_MESSAGE}` instead of
-processing. Stderr is bounded (`MAX_STDERR_BYTES`) and
-`redactSecretsFromText()`-scrubbed; errors never include prompt text —
-only opIds, kinds, and codes.
+processing. Key screening alone cannot catch secret *values* inside free
+text, so provider turn failures use a stable generic message
+(`turn_end{error, errorMessage:"provider dispatch failed"}`) and never
+forward raw exception text, which can carry prompt fragments, tokens, or
+request payloads. Stderr is bounded (`MAX_STDERR_BYTES`) and every
+`redactSecretsFromText()` pattern replaces *all* occurrences; errors
+never include prompt text — only opIds, kinds, and codes.
 
 ## 7. Failure semantics (fail closed)
 

@@ -164,6 +164,45 @@ describe("MockExternalProvider (SNC1.3)", () => {
     expect(full.leafId).toBe(leaf);
   });
 
+  it("never forwards exception text across the bridge on turn failure", async () => {
+    const promptFragment = "super secret user prompt fragment xyzzy";
+    const secretValue = "sk-proj-abcdefghijklmnopqr";
+    class LeakyProvider extends MockExternalProvider {
+      protected override async handleDispatch(): Promise<void> {
+        throw new Error(`boom on ${promptFragment} with ${secretValue}`);
+      }
+    }
+    const provider = new LeakyProvider();
+    const { out, hello, send } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "hello" } });
+    await new Promise((r) => setTimeout(r, 30));
+    const events = out.filter((m) => m.kind === "session_event").map((m) => (m as unknown as { event: Record<string, unknown> }).event);
+    expect(events.find((e) => e["type"] === "turn_end")).toMatchObject({ stopReason: "error" });
+    expect(events.some((e) => e["type"] === "settled")).toBe(true);
+    const wire = out.map((m) => JSON.stringify(m)).join("\n");
+    expect(wire).not.toContain(promptFragment);
+    expect(wire).not.toContain(secretValue);
+    expect(wire).not.toContain("boom on");
+  });
+
+  it("rejects non-positive-integer history limits fail-closed", async () => {
+    const provider = new MockExternalProvider();
+    const { out, hello, send } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    // limit: 0 must not read as an empty first page (callers would stall at
+    // the leaf): it is a wire-shape rejection with no entries at all.
+    send({ v: 1, kind: "get_history", opId: "his_0", sessionId, limit: 0 });
+    const rejected = lastOfKind(out, "error");
+    expect(rejected).toMatchObject({ opId: "his_0" });
+    expect(JSON.stringify(rejected)).toContain("get_history-bad-limit");
+    expect(out.some((m) => m.kind === "history" && (m as { opId?: string }).opId === "his_0")).toBe(false);
+  });
+
   it("keeps no global state across instances (restart independence)", async () => {
     const first = new MockExternalProvider();
     const d1 = drive(first);
