@@ -1079,6 +1079,39 @@ describe("profile mutate: cross-scope serialization (P1 review)", () => {
     ].filter(Boolean);
     expect(edges).toHaveLength(1);
   });
+
+  it("an out-of-band opposite-layer edit before commit rejects the write", async () => {
+    const fs = memFs({
+      [USER]: "profiles:\n  a:\n    model: x\n",
+      [PROJECT]: "profiles:\n  b:\n    model: y\n",
+    });
+    // An external editor rewrites the project layer after merged-graph
+    // validation but before commit: inject on the second read of the
+    // project file (the pre-commit revalidation), so the transaction must
+    // see the changed opposite layer and conflict instead of committing an
+    // unvalidated a -> b -> a graph.
+    const origRead = fs.readFile.bind(fs);
+    let projectReads = 0;
+    (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
+      if (String(p) === PROJECT) {
+        projectReads += 1;
+        if (projectReads === 2) {
+          fs.files.set(PROJECT, "profiles:\n  b:\n    extends: a\n    model: y\n");
+        }
+      }
+      return origRead(p, enc);
+    }) as MutationFs["readFile"];
+    const error = await expectMutationError(
+      patchProfile({ name: "a", scope: "user", patch: { extends: "b" } }, opts(fs)),
+      "conflict",
+    );
+    expect(error.message).toMatch(/stale|changed|reload/i);
+    // Target layer untouched; the external opposite-layer edit stands alone
+    // (no cycle was ever committed).
+    expect(fs.files.get(USER)).toBe("profiles:\n  a:\n    model: x\n");
+    const viewB = await readEditableProfile("b", opts(fs));
+    expect(viewB.validation.ok).toBe(true);
+  });
 });
 
 describe("profile mutate: invalid on-disk read contract (P1 review)", () => {  const INVALID_PROJECT =
@@ -1188,6 +1221,43 @@ describe("profile mutate: bakery choosing gate (P1 review)", () => {
     );
     expect(receipt.resolved?.model).toBe("two");
     expect(await fs.readdir!(lockDir)).toHaveLength(0);
+  });
+
+  it("a later contender paused in choosing does not displace the holder", async () => {
+    const fs = memFs({
+      [PROJECT]: "profiles:\n  a:\n    model: good\n",
+    });
+    // Inject a live cross-process contender paused between publishing its
+    // choosing flag and its number file, once the holder has entered the
+    // transaction body (first target read — election is already complete).
+    // The holder's final verification must ignore it — the late contender
+    // necessarily picks a larger number — instead of spuriously conflicting
+    // an ordinary contended write.
+    const lockDirs = [`${USER}.lock.d`, `${PROJECT}.lock.d`];
+    const laterChoosing = JSON.stringify({ pid: process.pid, token: "later" });
+    const origRead = fs.readFile.bind(fs);
+    let injected = false;
+    (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
+      if (!injected && (String(p) === USER || String(p) === PROJECT)) {
+        injected = true;
+        for (const dir of lockDirs) {
+          fs.files.set(`${dir}/c-later.choosing`, laterChoosing);
+        }
+      }
+      return origRead(p, enc);
+    }) as MutationFs["readFile"];
+    const receipt = await setProfileField(
+      { name: "a", scope: "project", field: "model", value: "better" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("better");
+    expect(injected).toBe(true);
+    // The late contender's choosing flags were never deleted (only their
+    // owner removes them) and the holder committed normally.
+    for (const dir of lockDirs) {
+      expect(fs.files.get(`${dir}/c-later.choosing`)).toBe(laterChoosing);
+      await (fs as unknown as MutationFs).unlink!(`${dir}/c-later.choosing`);
+    }
   });
 
   it("a live foreign-namespace ticket is never treated as dead (Windows/WSL)", async () => {

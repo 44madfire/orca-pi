@@ -925,7 +925,17 @@ export async function withMutationLock<T>(
   });
 }
 
-/** Pre-write holder re-verification for one scope lock (fail-closed). */
+/**
+ * Pre-write holder re-verification for one scope lock (fail-closed).
+ *
+ * Consistent with bakery acquisition: only live NUMBER tickets participate
+ * in holdership. A live `choosing` flag from a contender that started after
+ * this holder was elected does not displace it — that contender necessarily
+ * picks a larger number once it reads the holder's published ticket — so
+ * choosing files are deliberately ignored here (the acquisition wait loop,
+ * not this check, is where choosing blocks entry). A missing/dead own
+ * ticket or a smaller live number still aborts with `conflict`.
+ */
 async function assertStillHolder(
   fs: MutationFs,
   lockDir: string,
@@ -937,14 +947,6 @@ async function assertStillHolder(
   const listing = await listLockDir(fs, lockDir, defaultIsProcessAlive, lockOrigin());
   const own = listing.numbers.find((n) => n.fileName === lockContent);
   let stillHolder = own !== undefined && own.alive;
-  if (stillHolder) {
-    for (const c of listing.choosing) {
-      if (c.token === own!.token) continue;
-      if (!c.alive) continue;
-      stillHolder = false;
-      break;
-    }
-  }
   if (stillHolder) {
     for (const n of listing.numbers) {
       if (n.token === own!.token) continue;
@@ -1903,7 +1905,15 @@ async function runMutationTransaction(
     await assertStillHolder(fs, `${paths.projectPath}.lock.d`, projectLockContent, input.profileName, input.scope, targetPath);
   }
 
-  // Stale-write guard immediately before commit.
+  // Stale-write guards immediately before commit (P1: both layers). The
+  // merged-graph validation above depends on BOTH source files, and those
+  // files stay authoritative (editors, scripts, older CLIs bypass the lock),
+  // so re-check existence+hash for the target layer AND the opposite layer
+  // while both locks are held. Either changing fails with `conflict` instead
+  // of committing a graph that was never validated.
+  const otherLayer = input.scope === "user" ? projectLayer : userLayer;
+  const otherPath = input.scope === "user" ? paths.projectPath : paths.userPath;
+  await assertNoConcurrentChange(otherPath, otherLayer.hash, otherLayer.exists, fs, input.profileName, input.scope);
   await assertNoConcurrentChange(targetPath, targetLayer.hash, targetLayer.exists, fs, input.profileName, input.scope);
 
   const existedBefore = targetLayer.exists;
