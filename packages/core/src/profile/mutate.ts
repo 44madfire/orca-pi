@@ -737,8 +737,25 @@ async function listLockDir(
         numbers.push(parseLockTicket(name, content, isAlive, "number", ownOrigin ?? lockOrigin()));
       }
     } catch (error) {
-      if (isEnoent(error)) continue;
-      throw error;
+      if (!isEnoent(error)) throw error;
+      // An entry that vanishes mid-scan is a contender transitioning or
+      // releasing — never an error. The only legal transition is
+      // choosing → number under the SAME token (numbers are published
+      // before the choosing flag is cleared; nothing is ever renamed), so a
+      // vanished choosing flag is followed to its number file directly.
+      // Without this, a snapshot containing `c-B.choosing` but predating
+      // `n-B.json` would miss B's smaller ticket entirely after B
+      // transitions, admitting two holders from the same source version.
+      // A vanished number file means its owner released: safely ignored.
+      if (name.startsWith("c-") && name.endsWith(".choosing")) {
+        const token = name.slice("c-".length, -".choosing".length);
+        try {
+          const content = await fs.readFile(`${lockDir}/n-${token}.json`, "utf8");
+          numbers.push(parseLockTicket(`n-${token}.json`, content, isAlive, "number", ownOrigin ?? lockOrigin()));
+        } catch (followError) {
+          if (!isEnoent(followError)) throw followError;
+        }
+      }
     }
   }
   return { choosing, numbers };

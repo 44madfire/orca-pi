@@ -1257,6 +1257,77 @@ describe("profile mutate: bakery choosing gate (P1 review)", () => {
     expect(await fs.readdir!(lockDir)).toHaveLength(0);
   });
 
+  it("a choosing-to-number transition mid-scan cannot hide a smaller ticket", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    await fs.mkdir!(lockDir, { recursive: true });
+    // Contender B announces (choosing) with a smaller ticket (number 0 beats
+    // any elected number >= 1) but pauses before publishing its number file.
+    const bChoosing = `${lockDir}/c-small-b.choosing`;
+    const bNumber = `${lockDir}/n-small-b.json`;
+    const bNumberContent = JSON.stringify({ pid: process.pid, token: "small-B", number: 0 });
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      bChoosing,
+      JSON.stringify({ pid: process.pid, token: "small-B" }),
+    );
+    let entered = false;
+    const contender = withMutationLock(
+      PROJECT,
+      fs,
+      () => {
+        entered = true;
+        return Promise.resolve("entered");
+      },
+      { timeoutMs: 2_000 },
+    );
+    // Wait until the waiter is spinning on B's choosing flag (its own number
+    // is published and visible).
+    for (let i = 0; i < 100; i++) {
+      const names = await fs.readdir!(lockDir).catch(() => [] as string[]);
+      if (names.some((n) => n.startsWith("n-") && n !== "n-small-b.json")) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(entered).toBe(false);
+    // Pause the waiter after its readdir snapshot returns B's choosing
+    // filename: publish B's smaller number and remove choosing, then resume.
+    // The waiter must follow the vanished choosing entry to B's number file
+    // and keep waiting — never enter ahead of the smaller ticket.
+    const origRead = fs.readFile.bind(fs);
+    let paused = false;
+    let releaseWaiter!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseWaiter = resolve;
+    });
+    (fs as unknown as { readFile: MutationFs["readFile"] }).readFile = (async (p: string, enc: "utf8") => {
+      if (!paused && String(p) === bChoosing) {
+        paused = true;
+        await gate;
+      }
+      return origRead(p, enc);
+    }) as MutationFs["readFile"];
+    // Give the waiter a chance to reach the paused read, then transition B.
+    for (let i = 0; i < 100 && !paused; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(paused).toBe(true);
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      bNumber,
+      bNumberContent,
+    );
+    await (fs as unknown as MutationFs).unlink!(bChoosing);
+    releaseWaiter();
+    // Let several election rounds run: the waiter must still not have
+    // entered, and B's smaller ticket must be untouched.
+    await new Promise((r) => setTimeout(r, 80));
+    expect(entered).toBe(false);
+    expect(fs.files.get(bNumber)).toBe(bNumberContent);
+    // B releases: the waiter (larger number) then enters and cleans up only
+    // its own files.
+    await (fs as unknown as MutationFs).unlink!(bNumber);
+    expect(await contender).toBe("entered");
+    expect(await fs.readdir!(lockDir)).toHaveLength(0);
+  });
+
   it("a timed-out contender removes its own files and wedges nothing", async () => {
     const fs = memFs();
     await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
