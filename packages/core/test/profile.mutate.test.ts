@@ -1119,4 +1119,56 @@ describe("profile mutate: bakery choosing gate (P1 review)", () => {
     expect(receipt.resolved?.model).toBe("two");
     expect(await fs.readdir!(lockDir)).toHaveLength(0);
   });
+
+  it("a live foreign-namespace ticket is never treated as dead (Windows/WSL)", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    await fs.mkdir!(lockDir, { recursive: true });
+    // A ticket from another OS/PID namespace (e.g. native Windows vs WSL):
+    // its pid probe would report ESRCH/dead here, but cross-namespace death
+    // can never be proven, so it must block contenders and survive GC.
+    const foreignContent = JSON.stringify({
+      pid: 2147483647,
+      token: "foreign-holder",
+      number: 1,
+      origin: "other-host|win32|native",
+    });
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      `${lockDir}/n-foreign.json`,
+      foreignContent,
+    );
+    const outcome = await withMutationLock(
+      PROJECT,
+      fs,
+      () => Promise.resolve("should-not-run"),
+      { timeoutMs: 60 },
+    ).then(
+      () => "ran",
+      (error: unknown) => (error as { code?: string }).code ?? "threw",
+    );
+    expect(outcome).toBe("conflict");
+    // Never ignored, never GC'd: still exactly the foreign file.
+    expect(fs.files.get(`${lockDir}/n-foreign.json`)).toBe(foreignContent);
+    expect(await fs.readdir!(lockDir)).toEqual(["n-foreign.json"]);
+    await (fs as unknown as MutationFs).unlink!(`${lockDir}/n-foreign.json`);
+  });
+});
+
+describe("profile mutate: single-filesystem boundary (P2 review)", () => {
+  it("emptied-layer removal without unlink fails closed, never touches the host FS", async () => {
+    const full = memFs({
+      [PROJECT]: "profiles:\n  solo:\n    model: m\n",
+    });
+    // Injected writable adapter that omits `unlink` (like some embedders).
+    const { unlink: _dropped, ...rest } = full as unknown as Record<string, unknown>;
+    void _dropped;
+    const fs = rest as unknown as MutationFs;
+    const error = await expectMutationError(
+      deleteProfile({ name: "solo", scope: "project" }, opts(fs)),
+      "atomic-write-failed",
+    );
+    expect(error.message).toMatch(/does not support deletion|left unchanged/i);
+    // The injected file is untouched; nothing was deleted anywhere.
+    expect(full.files.get(PROJECT)).toContain("solo:");
+  });
 });

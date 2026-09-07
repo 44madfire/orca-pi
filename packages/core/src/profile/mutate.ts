@@ -59,6 +59,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { hostname } from "node:os";
 import { stringify as stringifyYaml } from "yaml";
 import {
   getBuiltinProfilesDocument,
@@ -483,13 +484,18 @@ async function atomicWriteText(
 }
 
 async function removeTargetFile(targetPath: string, fs: MutationFs): Promise<void> {
+  // Single-filesystem boundary (P2): an injected adapter without `unlink`
+  // must never escape to the real host filesystem. Fail closed instead of
+  // deleting an unrelated host path that happens to share the name.
+  if (typeof fs.unlink !== "function") {
+    throw new ProfileMutationError({
+      code: "atomic-write-failed",
+      sourceLabel: targetPath,
+      message: `Could not remove emptied config ${targetPath}: the injected filesystem does not support deletion. Original document left unchanged.`,
+    });
+  }
   try {
-    if (fs.unlink) {
-      await fs.unlink(targetPath);
-      return;
-    }
-    const real = await getRealFs();
-    await real.unlink!(targetPath);
+    await fs.unlink(targetPath);
   } catch (error) {
     if (isEnoent(error)) return;
     throw new ProfileMutationError({
@@ -589,7 +595,33 @@ interface LockTicket {
   pid: number | undefined;
   token: string;
   number: number;
+  origin?: string;
   alive: boolean;
+}
+
+/**
+ * Portable runtime identity for lock tickets (P1: Windows/WSL boundary).
+ *
+ * `process.kill(pid, 0)` is only meaningful inside the current OS/PID
+ * namespace: a Windows PID cannot be probed from WSL and vice versa (nor
+ * across machines sharing a drive). Tickets therefore carry their origin,
+ * and any ticket from a different origin is treated as ALIVE (fail-closed:
+ * wait, never ignore, never GC) because its death cannot be proven here. A
+ * crashed foreign writer blocks until timeout → conflict, then an operator
+ * removes the lock dir; it can never be silently treated as dead.
+ */
+function lockOrigin(): string {
+  let host = "unknown-host";
+  try {
+    host = hostname();
+  } catch {
+    // Best effort; an unknown host still namespaces correctly per process.
+  }
+  const wsl =
+    process.env.WSL_DISTRO_NAME !== undefined || process.env.WSL_INTEROP !== undefined
+      ? "wsl"
+      : "native";
+  return `${host}|${process.platform}|${wsl}`;
 }
 
 function makeLockToken(): string {
@@ -609,9 +641,10 @@ function parseLockTicket(
   content: string,
   isAlive: (pid: number) => boolean,
   kind: "choosing" | "number",
+  ownOrigin: string,
 ): LockTicket {
   try {
-    const parsed = JSON.parse(content) as { pid?: unknown; token?: unknown; number?: unknown };
+    const parsed = JSON.parse(content) as { pid?: unknown; token?: unknown; number?: unknown; origin?: unknown };
     if (
       typeof parsed.pid === "number" &&
       Number.isInteger(parsed.pid) &&
@@ -619,11 +652,17 @@ function parseLockTicket(
       typeof parsed.token === "string" &&
       parsed.token.length > 0
     ) {
+      // Cross-namespace tickets (different host/platform/WSL marker) can
+      // never be proven dead from here: a foreign `process.kill` probe is
+      // meaningless, so fail closed as alive. Missing origin means a legacy
+      // same-process ticket (unmerged iterations only) — probe locally.
+      const foreign = typeof parsed.origin === "string" && parsed.origin !== ownOrigin;
+      const alive = foreign ? true : isAlive(parsed.pid);
       if (kind === "choosing") {
-        return { fileName, pid: parsed.pid, token: parsed.token, number: 0, alive: isAlive(parsed.pid) };
+        return { fileName, pid: parsed.pid, token: parsed.token, number: 0, origin: typeof parsed.origin === "string" ? parsed.origin : undefined, alive };
       }
       if (typeof parsed.number === "number" && Number.isFinite(parsed.number)) {
-        return { fileName, pid: parsed.pid, token: parsed.token, number: parsed.number, alive: isAlive(parsed.pid) };
+        return { fileName, pid: parsed.pid, token: parsed.token, number: parsed.number, origin: typeof parsed.origin === "string" ? parsed.origin : undefined, alive };
       }
     }
   } catch {
@@ -649,6 +688,7 @@ async function listLockDir(
   fs: MutationFs,
   lockDir: string,
   isAlive: (pid: number) => boolean,
+  ownOrigin?: string,
 ): Promise<LockListing> {
   const choosing: LockTicket[] = [];
   const numbers: LockTicket[] = [];
@@ -665,10 +705,10 @@ async function listLockDir(
     try {
       if (name.startsWith("c-") && name.endsWith(".choosing")) {
         const content = await fs.readFile(`${lockDir}/${name}`, "utf8");
-        choosing.push(parseLockTicket(name, content, isAlive, "choosing"));
+        choosing.push(parseLockTicket(name, content, isAlive, "choosing", ownOrigin ?? lockOrigin()));
       } else if (name.startsWith("n-") && name.endsWith(".json")) {
         const content = await fs.readFile(`${lockDir}/${name}`, "utf8");
-        numbers.push(parseLockTicket(name, content, isAlive, "number"));
+        numbers.push(parseLockTicket(name, content, isAlive, "number", ownOrigin ?? lockOrigin()));
       }
     } catch (error) {
       if (isEnoent(error)) continue;
@@ -716,10 +756,13 @@ export async function withMutationLock<T>(
     }
     const writeExclusive = fs.writeExclusive;
     const canCoordinate =
-      typeof writeExclusive === "function" && typeof fs.readdir === "function";
+      typeof writeExclusive === "function" &&
+      typeof fs.readdir === "function" &&
+      typeof fs.unlink === "function";
     const lockDir = `${targetPath}.lock.d`;
     const timeoutMs = options.timeoutMs ?? 10_000;
     const isAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+    const ownOrigin = lockOrigin();
     if (!canCoordinate) {
       // No cross-process coordination available (e.g. read-only test doubles):
       // in-process mutex above still serializes this process; cross-process
@@ -769,14 +812,14 @@ export async function withMutationLock<T>(
       choosing = choosingName(token);
       numberFile = numberName(token);
       try {
-        await writeExclusive.call(fs, `${lockDir}/${choosing}`, JSON.stringify({ pid: process.pid, token }));
+        await writeExclusive.call(fs, `${lockDir}/${choosing}`, JSON.stringify({ pid: process.pid, token, origin: ownOrigin }));
       } catch (error) {
         if (!isLockHeldError(error)) throw error;
         continue;
       }
       let maxSeen = 0;
       try {
-        const listing = await listLockDir(fs, lockDir, isAlive);
+        const listing = await listLockDir(fs, lockDir, isAlive, ownOrigin);
         for (const n of listing.numbers) {
           if (Number.isFinite(n.number) && n.number > maxSeen) maxSeen = n.number;
         }
@@ -791,7 +834,7 @@ export async function withMutationLock<T>(
         await writeExclusive.call(
           fs,
           `${lockDir}/${numberFile}`,
-          JSON.stringify({ pid: process.pid, token, number: ownNumber }),
+          JSON.stringify({ pid: process.pid, token, number: ownNumber, origin: ownOrigin }),
         );
         break;
       } catch (error) {
@@ -816,7 +859,7 @@ export async function withMutationLock<T>(
       // ignored immediately — never waited on, never removed to proceed.
       const deadline = Date.now() + timeoutMs;
       for (;;) {
-        const listing = await listLockDir(fs, lockDir, isAlive);
+        const listing = await listLockDir(fs, lockDir, isAlive, ownOrigin);
         let waitFor: string | undefined;
         for (const c of listing.choosing) {
           if (c.token === token) continue;
@@ -838,16 +881,17 @@ export async function withMutationLock<T>(
         if (Date.now() >= deadline) failWithBusy();
         await sleepMs(15);
       }
-      // 5. Holder: opportunistically GC proven-dead files (pid dead, never a
-      // live file). The only non-owner deletion in the protocol, and it can
-      // only touch dead entries.
+      // 5. Holder: opportunistically GC proven-dead same-origin files (pid
+      // dead, never a live file, never a foreign-origin file whose death
+      // cannot be proven here). The only non-owner deletion in the protocol.
       if (typeof fs.unlink === "function") {
         try {
-          const listing = await listLockDir(fs, lockDir, isAlive);
+          const listing = await listLockDir(fs, lockDir, isAlive, ownOrigin);
           for (const entry of [...listing.choosing, ...listing.numbers]) {
             if (entry.token === token) continue;
             if (entry.alive) continue;
             if (entry.pid === undefined) continue;
+            if (entry.origin !== undefined && entry.origin !== ownOrigin) continue;
             try {
               await fs.unlink(`${lockDir}/${entry.fileName}`);
             } catch {
@@ -1693,7 +1737,7 @@ async function runMutationTransaction(
   // interfered — abort instead of committing a stale read.
   if (lockContent !== undefined) {
     const lockDir = `${targetPath}.lock.d`;
-    const listing = await listLockDir(fs, lockDir, defaultIsProcessAlive);
+    const listing = await listLockDir(fs, lockDir, defaultIsProcessAlive, lockOrigin());
     const own = listing.numbers.find((n) => n.fileName === lockContent);
     let stillHolder = own !== undefined && own.alive;
     if (stillHolder) {
