@@ -436,4 +436,42 @@ describe("orca-pi profile read invalid config (P1 review)", () => {
     expect(view.validation.issues?.some((issue) => issue.path.includes("thinking"))).toBe(true);
     expect(view.sourceHash.project).toBeDefined();
   });
+
+  it("an invalid custom profile reads as existing and repairs through set", async () => {
+    const broken = "profiles:\n  custom:\n    model: openai/gpt-5.6\n    thinking: ultra\n";
+    const { deps, out, err, fs } = makeDeps({ "/repo/p/.pi/profiles.yaml": broken });
+    const read = await run(["profile", "read", "custom", "--json"], deps);
+    expect(read.exitCode).toBe(1);
+    const view = JSON.parse(out.join("")) as {
+      exists: boolean;
+      validation: { ok: boolean; issues?: Array<{ path: string }> };
+      sourceHash: { project?: string };
+    };
+    expect(view.exists).toBe(true);
+    expect(view.validation.ok).toBe(false);
+    expect(view.validation.issues?.some((issue) => issue.path.includes("thinking"))).toBe(true);
+    out.length = 0;
+    const repaired = await run(
+      ["profile", "set", "custom", "thinking", "high", "--scope", "project", "--expected-hash", view.sourceHash.project as string, "--json"],
+      deps,
+    );
+    expect(repaired.exitCode).toBe(0);
+    expect(fs.files.get("/repo/p/.pi/profiles.yaml")).not.toContain("ultra");
+    out.length = 0;
+    err.length = 0;
+    // Human read reports the validation error, not "Unknown Pi profile".
+    const human = await run(["profile", "read", "custom"], deps);
+    expect(human.exitCode).toBe(0);
+    expect(err.join("")).toBe("");
+  });
+
+  it("human read of a broken custom profile shows invalid, not unknown", async () => {
+    const { deps, err } = makeDeps({
+      "/repo/p/.pi/profiles.yaml": "profiles:\n  custom:\n    model: m\n    thinking: ultra\n",
+    });
+    const result = await run(["profile", "read", "custom"], deps);
+    expect(result.exitCode).toBe(1);
+    expect(err.join("")).toContain("invalid");
+    expect(err.join("")).not.toContain("Unknown Pi profile");
+  });
 });

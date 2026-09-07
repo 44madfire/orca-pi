@@ -1370,6 +1370,47 @@ describe("profile mutate: absent opposite store stays absent (P2 review)", () =>
   });
 });
 
+describe("profile mutate: repair of an invalid target layer (P1 review)", () => {
+  const BROKEN_PROJECT = "profiles:\n  custom:\n    model: openai/gpt-5.6\n    thinking: ultra\n";
+
+  it("reads an invalid custom profile as existing with issues", async () => {
+    const fs = memFs({ [PROJECT]: BROKEN_PROJECT });
+    const view = await readEditableProfile("custom", opts(fs));
+    expect(view.exists).toBe(true);
+    expect(view.validation.ok).toBe(false);
+    expect(view.validation.code).toBe("load-failed");
+    expect(view.validation.issues?.some((issue) => issue.path.includes("thinking"))).toBe(true);
+    expect(view.source.project).toMatchObject({ model: "openai/gpt-5.6", thinking: "ultra" });
+    expect(view.sourceHash.project).toBe(hashSourceText(BROKEN_PROJECT));
+  });
+
+  it("repairs the invalid field with an expected hash and commits", async () => {
+    const fs = memFs({ [PROJECT]: BROKEN_PROJECT });
+    const before = await readEditableProfile("custom", opts(fs));
+    const receipt = await setProfileField(
+      { name: "custom", scope: "project", field: "thinking", value: "high" },
+      opts(fs, { expectedSourceHash: before.sourceHash.project }),
+    );
+    expect(receipt.resolved?.thinking).toBe("high");
+    const text = fs.files.get(PROJECT)!;
+    expect(text).toContain("high");
+    expect(text).not.toContain("ultra");
+    const after = await readEditableProfile("custom", opts(fs));
+    expect(after.validation.ok).toBe(true);
+    expect(after.effective?.thinking).toBe("high");
+  });
+
+  it("an unrelated mutation that keeps the invalid value fails with bytes unchanged", async () => {
+    const fs = memFs({ [PROJECT]: BROKEN_PROJECT });
+    const error = await expectMutationError(
+      setProfileField({ name: "custom", scope: "project", field: "model", value: "other" }, opts(fs)),
+      "validation-failed",
+    );
+    expect(error.message).toMatch(/thinking|ultra|invalid/i);
+    expect(fs.files.get(PROJECT)).toBe(BROKEN_PROJECT);
+  });
+});
+
 describe("profile mutate: invalid on-disk read contract (P1 review)", () => {  const INVALID_PROJECT =
     "profiles:\n  scout:\n    model: anthropic/claude-haiku\n    thinking: ultra\n";
 

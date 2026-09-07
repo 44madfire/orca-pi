@@ -1469,6 +1469,7 @@ interface TolerantLayerFailure {
   ok: false;
   path: string;
   exists: boolean;
+  rawText?: string;
   hash?: string;
   error: ProfileMutationError;
   /**
@@ -1493,7 +1494,14 @@ async function loadLayerTolerant(
     // readable (schema-invalid case); otherwise surface existence without one.
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      const failure: TolerantLayerFailure = { ok: false, path: filePath, exists: true, hash: hashSourceText(raw), error };
+      const failure: TolerantLayerFailure = {
+        ok: false,
+        path: filePath,
+        exists: true,
+        rawText: raw,
+        hash: hashSourceText(raw),
+        error,
+      };
       // Retain parseable-but-invalid source values for the UI when the
       // failure carries schema issues (as opposed to malformed syntax).
       if (error.issues !== undefined && error.issues.length > 0) {
@@ -1583,7 +1591,15 @@ export async function readEditableProfile(
     if (projectLayer !== undefined && Object.keys(projectLayer.doc.profiles).length > 0) {
       mergeDocs.push(projectLayer.doc);
     }
-    const mergedDoc = mergeValidatedDocuments(mergeDocs);
+    // Display merge: raw invalid entries join for names missing from the
+    // valid graph, so a custom profile living only in a broken layer reads
+    // as an existing source profile (with invalid validation) rather than
+    // unknown. Raw values are display-only: never validated, and effective
+    // resolution below treats them as-is while validation stays failed.
+    const displayMergeDocs: ValidatedProfilesDocument[] = [...mergeDocs];
+    if (!userRes.ok && userRes.rawDoc !== undefined) displayMergeDocs.push(userRes.rawDoc);
+    if (!projectRes.ok && projectRes.rawDoc !== undefined) displayMergeDocs.push(projectRes.rawDoc);
+    const mergedDoc = mergeValidatedDocuments(displayMergeDocs);
     const issues = layerFailures.flatMap((f) => f.error.issues ?? []);
     // Display docs: validated layers when available, otherwise the raw
     // hand-edited values of a schema-invalid-but-parseable layer (P2), so
@@ -1927,10 +1943,24 @@ async function runMutationTransaction(
   return await acquireBoth(async () => {
   const userLockContent = userHold.content;
   const projectLockContent = projectHold.content;
-  const [userLayer, projectLayer] = await Promise.all([
-    loadLayerFile(paths.userPath, fs),
-    loadLayerFile(paths.projectPath, fs),
-  ]);
+  // Scope-aware layer loads (P1 repair contract): the opposite layer stays
+  // strict — an invalid opposite file fails closed — while the TARGET layer
+  // tolerates a schema-invalid-but-parseable file long enough to repair it:
+  // the raw entries become the mutation starting point, and the
+  // post-mutation source document must validate before anything commits
+  // (required #28 order: load → apply → validate). Malformed (unparseable)
+  // or unreadable targets still fail closed with the original load error.
+  const loadTargetLayer = async (targetFilePath: string): Promise<LoadedLayer> => {
+    const res = await loadLayerTolerant(targetFilePath, fs);
+    if (res.ok) return res.layer;
+    if (res.rawDoc !== undefined) {
+      return { doc: res.rawDoc, rawText: res.rawText, hash: res.hash, exists: true, path: targetFilePath };
+    }
+    throw res.error;
+  };
+  const [userLayer, projectLayer] = await (input.scope === "user"
+    ? Promise.all([loadTargetLayer(paths.userPath), loadLayerFile(paths.projectPath, fs)])
+    : Promise.all([loadLayerFile(paths.userPath, fs), loadTargetLayer(paths.projectPath)]));
 
   const targetLayer = input.scope === "user" ? userLayer : projectLayer;
 
