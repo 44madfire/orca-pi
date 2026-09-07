@@ -35,7 +35,7 @@ function parentDir(path: string): string {
 
 function memFs(
   initial: Record<string, string> = {},
-  opts: { modelDirs?: boolean } = {},
+  opts: { modelDirs?: boolean; denied?: string[] } = {},
 ): MutationFs & {
   files: Map<string, string>;
   mtimes: Map<string, number>;
@@ -49,6 +49,18 @@ function memFs(
   // parent was never created via recursive mkdir, like a real filesystem.
   const dirs = new Set<string>();
   const modelDirs = opts.modelDirs === true;
+  // Paths (or subtrees) that deny writes with EACCES, simulating read-only
+  // stores/checkouts. Reads still succeed; only mkdir/writeExclusive fail.
+  const denied = (opts.denied ?? []).map((d) => String(d).replace(/\\/g, "/").replace(/\/+$/, ""));
+  const isDenied = (path: string): boolean => {
+    const normalized = String(path).replace(/\\/g, "/").replace(/\/+$/, "");
+    return denied.some((d) => normalized === d || normalized.startsWith(`${d}/`));
+  };
+  const denyEacces = (what: string): NodeJS.ErrnoException => {
+    const error = new Error(`EACCES: permission denied ${what}`) as NodeJS.ErrnoException;
+    error.code = "EACCES";
+    return error;
+  };
   const dirExists = (dir: string): boolean => {
     if (dir === "" || dir === "." || dir === "/") return true;
     if (/^[A-Za-z]:$/.test(dir)) return true;
@@ -80,12 +92,14 @@ function memFs(
         throw new Error("injected write failure");
       }
       requireParent(String(path));
+      if (isDenied(parentDir(String(path)))) throw denyEacces(`write ${String(path)}`);
       files.set(String(path), content);
       mtimes.set(String(path), Date.now());
       fs.writes.push(String(path));
     },
     async writeExclusive(path: string, content: string): Promise<void> {
       const key = String(path);
+      if (isDenied(parentDir(key))) throw denyEacces(`write ${key}`);
       requireParent(key);
       if (files.has(key)) {
         const error = new Error(`EEXIST: ${key}`) as NodeJS.ErrnoException;
@@ -107,6 +121,7 @@ function memFs(
       files.delete(from);
     },
     async mkdir(path: string, mkdirOpts?: { recursive: boolean }): Promise<undefined> {
+      if (isDenied(String(path))) throw denyEacces(`mkdir ${String(path)}`);
       if (mkdirOpts?.recursive) {
         // Populate the full ancestor chain like a real recursive mkdir.
         let current = String(path).replace(/\\/g, "/").replace(/\/+$/, "");
@@ -1111,6 +1126,58 @@ describe("profile mutate: cross-scope serialization (P1 review)", () => {
     expect(fs.files.get(USER)).toBe("profiles:\n  a:\n    model: x\n");
     const viewB = await readEditableProfile("b", opts(fs));
     expect(viewB.validation.ok).toBe(true);
+  });
+});
+
+describe("profile mutate: unwritable opposite store (P1 review)", () => {
+  it("user-scope write succeeds with an unwritable project store", async () => {
+    const fs = memFs(
+      {
+        [USER]: "profiles:\n  a:\n    model: x\n",
+        [PROJECT]: "profiles:\n  b:\n    model: y\n",
+      },
+      { denied: ["/repo/p/.pi"] },
+    );
+    // The opposite (project) layer stays readable; only its lock/store
+    // writes are denied. The target mutation must still succeed without
+    // creating anything next to the opposite config.
+    const receipt = await setProfileField(
+      { name: "a", scope: "user", field: "model", value: "z" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("z");
+    expect(fs.files.get(USER)).toContain("model: z");
+    expect(fs.files.get(PROJECT)).toBe("profiles:\n  b:\n    model: y\n");
+    expect(await fs.readdir!(`${USER}.lock.d`)).toHaveLength(0);
+    expect(fs.files.has(`${PROJECT}.lock.d/c-x`)).toBe(false);
+  });
+
+  it("project-scope write succeeds with an unwritable user store", async () => {
+    const fs = memFs(
+      {
+        [USER]: "profiles:\n  a:\n    model: x\n",
+        [PROJECT]: "profiles:\n  b:\n    model: y\n",
+      },
+      { denied: ["/home/u/.pi/agent"] },
+    );
+    const receipt = await setProfileField(
+      { name: "b", scope: "project", field: "model", value: "w" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("w");
+    expect(fs.files.get(PROJECT)).toContain("model: w");
+    expect(fs.files.get(USER)).toBe("profiles:\n  a:\n    model: x\n");
+    expect(await fs.readdir!(`${PROJECT}.lock.d`)).toHaveLength(0);
+  });
+
+  it("a denied target store still fails closed", async () => {
+    const fs = memFs({}, { denied: ["/home/u/.pi/agent"] });
+    const error = await expectMutationError(
+      createProfile({ name: "x", scope: "user", initial: { model: "m" } }, opts(fs)),
+      "atomic-write-failed",
+    );
+    expect(error.message).toMatch(/config directory|lock directory/i);
+    expect(fs.files.has(USER)).toBe(false);
   });
 });
 

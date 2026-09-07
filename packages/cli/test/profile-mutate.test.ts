@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { run } from "../src/main.js";
 import type { CliDeps } from "../src/main.js";
 import type { CommandResult } from "@orca-pi/core";
@@ -325,6 +328,58 @@ describe("orca-pi profile absent-layer versioning (P1 review)", () => {
       deps,
     );
     expect(result.exitCode).toBe(2);
+  });
+
+  it("a read-only injected fs fails closed without touching the host FS", async () => {
+    // Real host sentinel: if the mutation fell back to the real filesystem
+    // it would create/modify this file. It must stay exactly as written.
+    const dir = mkdtempSync(join(tmpdir(), "orca-pi-fs-boundary-"));
+    const sentinel = join(dir, "profiles.yaml");
+    writeFileSync(sentinel, "profiles:\n  keep:\n    model: host\n");
+    try {
+      const out: string[] = [];
+      const err: string[] = [];
+      const readOnlyFs = {
+        async readFile(path: unknown) {
+          void path;
+          const error = new Error("ENOENT: no such file") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        },
+        async stat(path: unknown) {
+          void path;
+          const error = new Error("ENOENT: no such file") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        },
+      };
+      const runner = {
+        async run(): Promise<CommandResult> {
+          return { stdout: "", stderr: "", exitCode: 0 };
+        },
+      };
+      const deps: CliDeps = {
+        runner,
+        stdout: (text: string) => out.push(text),
+        stderr: (text: string) => err.push(text),
+        version: "0.1.0-test",
+        projectRoot: "/repo/p",
+        env: {},
+        homedir: "/home/u",
+        fs: readOnlyFs as unknown as CliDeps["fs"],
+        userConfigPathOverride: "/home/u/.pi/agent/profiles.yaml",
+        projectConfigPathOverride: sentinel,
+      };
+      const result = await run(
+        ["profile", "create", "evil", "--scope", "project", "--json"],
+        deps,
+      );
+      expect(result.exitCode).toBe(1);
+      expect(out.join("") + err.join("")).toMatch(/does not support mutations|refusing/i);
+      expect(readFileSync(sentinel, "utf8")).toBe("profiles:\n  keep:\n    model: host\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -258,16 +258,16 @@ function buildMutationFs(
     typeof (injected as { writeFile?: unknown }).writeFile === "function" &&
     typeof (injected as { rename?: unknown }).rename === "function" &&
     typeof (injected as { mkdir?: unknown }).mkdir === "function";
-  if (hasWrite) {
-    return injected as unknown as import("@orca-pi/core").MutationFs;
+  if (!hasWrite) {
+    // Fail closed (P2): an explicitly supplied filesystem that cannot accept
+    // mutations must never silently fall back to the real host filesystem —
+    // a read-only test/embedding boundary could otherwise read from the
+    // injected fixture yet write/delete real host profile files.
+    throw new Error(
+      "Injected filesystem does not support mutations (writeFile/rename/mkdir are required); refusing to fall back to the real filesystem.",
+    );
   }
-  // Read-only injected fs (existing list/show tests): fall through to the
-  // real filesystem for writes via the service default. Reads still use the
-  // injected layer through load indirection? The service resolves fs as a
-  // whole, so we cannot mix. When the injected fs lacks write support we
-  // return undefined so the service uses the real fs — callers that need
-  // hermetic writes must inject a full MutationFs (see tests).
-  return undefined;
+  return injected as unknown as import("@orca-pi/core").MutationFs;
 }
 
 async function resolveFsForPayload(

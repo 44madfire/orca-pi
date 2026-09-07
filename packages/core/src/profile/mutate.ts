@@ -555,6 +555,13 @@ function isLockHeldError(error: unknown): boolean {
   return /EEXIST|already exists/i.test(message);
 }
 
+/** Permission-denied class: the store cannot be written by this process. */
+function isPermissionDenied(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "EACCES" || code === "EPERM" || code === "EROFS";
+}
+
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -575,6 +582,18 @@ export interface MutationLockOptions {
    * holder is never ignored.
    */
   isProcessAlive?: (pid: number) => boolean;
+  /**
+   * What to do when this scope's lock cannot be coordinated because its
+   * store denies writes (EACCES/EPERM/EROFS). `"throw"` (default) fails the
+   * mutation; `"skip"` runs the body without holding this scope's lock.
+   * `"skip"` is only safe for the NON-target scope of a transaction issued
+   * against a readable opposite layer: a store that denies writes cannot
+   * accept conflicting service commits through that layer either, while the
+   * target lock plus both-layer pre-commit revalidation still guard the
+   * commit. Used so a scoped mutation does not require write access to the
+   * opposite config store (e.g. user edit inside a read-only checkout).
+   */
+  ifUnavailable?: "throw" | "skip";
 }
 
 function defaultIsProcessAlive(pid: number): boolean {
@@ -747,6 +766,13 @@ export async function withMutationLock<T>(
   options: MutationLockOptions = {},
 ): Promise<T> {
   return await withProcessMutex(targetPath, async () => {
+    // `"skip"` is used only for the NON-target scope by
+    // runMutationTransaction: when that scope's store denies writes
+    // (EACCES/EPERM/EROFS) the body runs without holding this scope's lock.
+    // That stays safe because such a store cannot accept conflicting service
+    // commits through that layer either, while the target lock plus
+    // both-layer pre-commit revalidation still guard the commit.
+    const ifUnavailable = options.ifUnavailable ?? "throw";
     // P1 (fresh-install path): the lock directory lives next to the target,
     // so the parent directory must exist before anything else. Real
     // `writeFile(..., { flag: "wx" })` never creates parents — without this
@@ -754,6 +780,7 @@ export async function withMutationLock<T>(
     try {
       await fs.mkdir(parentDirOf(targetPath), { recursive: true });
     } catch (error) {
+      if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
       throw new ProfileMutationError({
         code: "atomic-write-failed",
         sourceLabel: targetPath,
@@ -780,6 +807,7 @@ export async function withMutationLock<T>(
     try {
       await fs.mkdir(lockDir, { recursive: true });
     } catch (error) {
+      if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
       throw new ProfileMutationError({
         code: "atomic-write-failed",
         sourceLabel: targetPath,
@@ -821,7 +849,10 @@ export async function withMutationLock<T>(
       try {
         await writeExclusive.call(fs, `${lockDir}/${choosing}`, JSON.stringify({ pid: process.pid, token, origin: ownOrigin }));
       } catch (error) {
-        if (!isLockHeldError(error)) throw error;
+        if (!isLockHeldError(error)) {
+          if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
+          throw error;
+        }
         continue;
       }
       let maxSeen = 0;
@@ -833,6 +864,7 @@ export async function withMutationLock<T>(
       } catch (error) {
         if (!isEnoent(error)) {
           await deleteOwnFiles(fs, lockDir, [choosing]);
+          if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
           throw error;
         }
       }
@@ -846,13 +878,17 @@ export async function withMutationLock<T>(
         break;
       } catch (error) {
         await deleteOwnFiles(fs, lockDir, [choosing]);
-        if (!isLockHeldError(error)) throw error;
+        if (!isLockHeldError(error)) {
+          if (ifUnavailable === "skip" && isPermissionDenied(error)) return await fn(undefined);
+          throw error;
+        }
       }
     }
     // Owner cleanup covers EVERYTHING after publication: election timeouts,
     // listing failures, and the body all remove our own files (never anyone
     // else's), so a timed-out contender cannot wedge the process with an
     // orphaned live candidate.
+    let enteredBody = false;
     try {
       // 2b. (number already published above.)
       // 3. Clear choosing: our number is now visible, holders need not wait.
@@ -910,6 +946,7 @@ export async function withMutationLock<T>(
         }
       }
       try {
+        enteredBody = true;
         return await fn(numberFile);
       } finally {
         // Owner-only release: delete exactly our own number file.
@@ -918,8 +955,12 @@ export async function withMutationLock<T>(
     } catch (error) {
       // Election/body failure (including timeout/conflict): remove our own
       // files before propagating so no orphaned live candidate wedges later
-      // writes in this long-lived process.
+      // writes in this long-lived process. A pre-body permission denial
+      // under `ifUnavailable: "skip"` instead runs the body uncoordinated.
       await deleteOwnFiles(fs, lockDir, [numberFile, choosing]);
+      if (!enteredBody && ifUnavailable === "skip" && isPermissionDenied(error)) {
+        return await fn(undefined);
+      }
       throw error;
     }
   });
@@ -1581,15 +1622,24 @@ async function runMutationTransaction(
   // since every transaction uses the same order; single acquisition when
   // both scopes resolve to the same file).
   const lockPaths = [paths.userPath, paths.projectPath].sort();
+  // The target scope always requires its lock (throw on failure); the
+  // opposite scope uses `ifUnavailable: "skip"` so a scoped mutation does
+  // not need write access to the opposite config store (P1: read-only
+  // checkout). Skipping stays safe: an unwritable opposite store cannot
+  // accept conflicting service commits through that layer, the target lock
+  // still serializes same-scope writers, and both layers are revalidated
+  // immediately before commit while the target lock is held.
   const acquireBoth = async (
     fn: (contents: { first?: string; second?: string }) => Promise<ProfileMutationReceipt>,
   ): Promise<ProfileMutationReceipt> => {
+    const optsFor = (p: string): MutationLockOptions =>
+      p === targetPath ? {} : { ifUnavailable: "skip" };
     if (lockPaths[0] === lockPaths[1]) {
-      return await withMutationLock(lockPaths[0], fs, async (only) => fn({ first: only }));
+      return await withMutationLock(lockPaths[0], fs, async (only) => fn({ first: only }), optsFor(lockPaths[0]));
     }
     return await withMutationLock(lockPaths[0], fs, async (first) =>
-      withMutationLock(lockPaths[1], fs, async (second) => fn({ first, second })),
-    );
+      withMutationLock(lockPaths[1], fs, async (second) => fn({ first, second }), optsFor(lockPaths[1])),
+    optsFor(lockPaths[0]));
   };
   return await acquireBoth(async ({ first, second }) => {
   const userLockContent = lockPaths[0] === paths.userPath ? first : second;
