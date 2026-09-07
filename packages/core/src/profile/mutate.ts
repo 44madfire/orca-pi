@@ -537,66 +537,132 @@ export interface MutationLockOptions {
   staleMs?: number;
 }
 
-async function withMutationLock<T>(
+export async function withMutationLock<T>(
   targetPath: string,
   fs: MutationFs,
   fn: () => Promise<T>,
   options: MutationLockOptions = {},
 ): Promise<T> {
   return await withProcessMutex(targetPath, async () => {
+    // P1 (fresh-install path): the lock file lives next to the target, so
+    // the parent directory must exist before exclusive creation. Real
+    // `writeFile(..., { flag: "wx" })` never creates parents — without this
+    // the first mutation on a fresh store would fail ENOENT on the lock.
+    try {
+      await fs.mkdir(parentDirOf(targetPath), { recursive: true });
+    } catch (error) {
+      throw new ProfileMutationError({
+        code: "atomic-write-failed",
+        sourceLabel: targetPath,
+        message: `Could not create config directory ${parentDirOf(targetPath)}: ${error instanceof Error ? error.message : String(error)}. Original document left unchanged.`,
+        cause: error,
+      });
+    }
     const writeExclusive = fs.writeExclusive;
     const lockPath = `${targetPath}.lock`;
     const timeoutMs = options.timeoutMs ?? 10_000;
     const staleMs = options.staleMs ?? 10_000;
+    // Unique ownership token: release and reap verify it, so a slow holder
+    // can never delete a successor's lock and a reaper can never mistake a
+    // live holder's replacement for the stale entry it inspected.
+    const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
     let held = false;
+    // Lease heartbeat: refresh the lock mtime while held so a legitimate
+    // slow holder is never classified stale. Guarded rewrite (only when the
+    // content is still ours) so a heartbeat can never clobber a successor.
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const startHeartbeat = (): void => {
+      if (staleMs === Number.POSITIVE_INFINITY) return;
+      const period = Math.max(50, Math.floor(staleMs / 3));
+      heartbeat = setInterval(() => {
+        fs.readFile(lockPath, "utf8").then((current) => {
+          if (current === token && fs.writeFile) {
+            return fs.writeFile(lockPath, token, "utf8").catch(() => undefined);
+          }
+          return undefined;
+        }).catch(() => undefined);
+      }, period);
+      const maybeUnref = heartbeat as unknown as { unref?: () => void };
+      if (typeof maybeUnref.unref === "function") maybeUnref.unref();
+    };
+    const readLock = async (): Promise<{ content: string; mtime: number } | undefined> => {
+      try {
+        const content = await fs.readFile(lockPath, "utf8");
+        let mtime = Date.now();
+        try {
+          if (typeof fs.stat === "function") {
+            const st = (await fs.stat(lockPath)) as { mtimeMs?: unknown };
+            if (typeof st?.mtimeMs === "number") mtime = st.mtimeMs;
+          }
+        } catch {
+          // Stat raced a release; treat as missing below via re-read.
+        }
+        return { content, mtime };
+      } catch (error) {
+        if (isEnoent(error)) return undefined;
+        throw error;
+      }
+    };
     if (typeof writeExclusive === "function") {
       const deadline = Date.now() + timeoutMs;
       for (;;) {
         try {
-          await writeExclusive.call(fs, lockPath, `${process.pid}@${Date.now()}`);
+          await writeExclusive.call(fs, lockPath, token);
           held = true;
           break;
         } catch (error) {
           if (!isLockHeldError(error)) throw error;
-          let stale = false;
-          try {
-            if (typeof fs.stat === "function") {
-              const st = (await fs.stat(lockPath)) as { mtimeMs?: unknown };
-              const mtime = typeof st?.mtimeMs === "number" ? st.mtimeMs : Date.now();
-              stale = Date.now() - mtime > staleMs;
+          const seen = await readLock();
+          if (seen === undefined) continue; // Released between calls; compete again.
+          if (Date.now() - seen.mtime <= staleMs) {
+            if (Date.now() >= deadline) {
+              throw new ProfileMutationError({
+                code: "conflict",
+                sourceLabel: targetPath,
+                message:
+                  `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
+                  `Wait for it to finish, reload, and retry. No data was overwritten.`,
+              });
             }
-          } catch {
-            stale = false;
-          }
-          if (stale && typeof fs.unlink === "function") {
-            try {
-              await fs.unlink(lockPath);
-            } catch {
-              // Lost the reap race; loop around and compete again.
-            }
+            await sleepMs(15);
             continue;
           }
-          if (Date.now() >= deadline) {
-            throw new ProfileMutationError({
-              code: "conflict",
-              sourceLabel: targetPath,
-              message:
-                `Concurrent profile write in progress for ${targetPath}: another writer holds the mutation lock. ` +
-                `Wait for it to finish, reload, and retry. No data was overwritten.`,
-            });
+          // Possibly stale: confirm the entry is quiescent (no heartbeat
+          // refresh, no replacement) before touching it.
+          await sleepMs(25);
+          const again = await readLock();
+          if (again === undefined || again.content !== seen.content || again.mtime !== seen.mtime) {
+            continue; // Live holder (heartbeat) or another reaper won; recompete.
           }
-          await sleepMs(15);
+          if (typeof fs.unlink === "function") {
+            try {
+              // Ownership-checked reap: only remove the exact stale entry.
+              const current = await readLock();
+              if (current !== undefined && current.content === seen.content) {
+                await fs.unlink(lockPath);
+              }
+            } catch {
+              // Lost a race; loop around and compete again.
+            }
+          }
+          continue;
         }
       }
     }
+    startHeartbeat();
     try {
       return await fn();
     } finally {
+      if (heartbeat !== undefined) clearInterval(heartbeat);
       if (held && typeof fs.unlink === "function") {
         try {
-          await fs.unlink(lockPath);
+          // Ownership-checked release: never delete a successor's lock.
+          const current = await readLock();
+          if (current !== undefined && current.content === token) {
+            await fs.unlink(lockPath);
+          }
         } catch {
-          // Best-effort release; a stale lock is reaped by the next acquirer.
+          // Best-effort release; an expired entry is reaped by acquirers.
         }
       }
     }

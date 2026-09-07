@@ -10,6 +10,7 @@ import {
   serializeProfilesDocument,
   setProfileField,
   unsetProfileField,
+  withMutationLock,
   ProfileMutationError,
   type MutationFs,
 } from "../src/profile/mutate.js";
@@ -22,7 +23,18 @@ import {
 import { getCandidateConfigPaths, getUserProfilesPath } from "../src/profile/load.js";
 import type { ValidatedProfilesDocument } from "../src/profile/types.js";
 
-function memFs(initial: Record<string, string> = {}): MutationFs & {
+function parentDir(path: string): string {
+  const normalized = String(path).replace(/\\/g, "/");
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) return index === 0 ? "/" : ".";
+  const parent = String(path).slice(0, index);
+  return parent.length === 0 ? "/" : parent;
+}
+
+function memFs(
+  initial: Record<string, string> = {},
+  opts: { modelDirs?: boolean } = {},
+): MutationFs & {
   files: Map<string, string>;
   mtimes: Map<string, number>;
   failNextWrite?: boolean;
@@ -31,6 +43,23 @@ function memFs(initial: Record<string, string> = {}): MutationFs & {
   const files = new Map<string, string>(Object.entries(initial));
   const mtimes = new Map<string, number>();
   for (const key of files.keys()) mtimes.set(key, Date.now());
+  // Optional strict directory modeling (P1-A): writes fail ENOENT when the
+  // parent was never created via recursive mkdir, like a real filesystem.
+  const dirs = new Set<string>();
+  const modelDirs = opts.modelDirs === true;
+  const dirExists = (dir: string): boolean => {
+    if (dir === "" || dir === "." || dir === "/") return true;
+    if (/^[A-Za-z]:$/.test(dir)) return true;
+    return dirs.has(dir);
+  };
+  const requireParent = (path: string): void => {
+    if (!modelDirs) return;
+    if (!dirExists(parentDir(path))) {
+      const error = new Error(`ENOENT: no such directory ${parentDir(path)}`) as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    }
+  };
   const fs = {
     files,
     mtimes,
@@ -48,12 +77,14 @@ function memFs(initial: Record<string, string> = {}): MutationFs & {
         (fs as { failNextWrite?: boolean }).failNextWrite = false;
         throw new Error("injected write failure");
       }
+      requireParent(String(path));
       files.set(String(path), content);
       mtimes.set(String(path), Date.now());
       fs.writes.push(String(path));
     },
     async writeExclusive(path: string, content: string): Promise<void> {
       const key = String(path);
+      requireParent(key);
       if (files.has(key)) {
         const error = new Error(`EEXIST: ${key}`) as NodeJS.ErrnoException;
         error.code = "EEXIST";
@@ -73,7 +104,23 @@ function memFs(initial: Record<string, string> = {}): MutationFs & {
       files.set(to, files.get(from)!);
       files.delete(from);
     },
-    async mkdir(): Promise<undefined> {
+    async mkdir(path: string, mkdirOpts?: { recursive: boolean }): Promise<undefined> {
+      if (mkdirOpts?.recursive) {
+        // Populate the full ancestor chain like a real recursive mkdir.
+        let current = String(path).replace(/\\/g, "/").replace(/\/+$/, "");
+        const chain: string[] = [];
+        for (;;) {
+          if (current === "" || current === "." || current === "/" || /^[A-Za-z]:$/.test(current)) break;
+          chain.push(current);
+          const slash = current.lastIndexOf("/");
+          if (slash <= 0) break;
+          current = current.slice(0, slash);
+        }
+        for (const dir of chain) dirs.add(dir);
+      } else {
+        requireParent(String(path));
+        dirs.add(String(path));
+      }
       return undefined;
     },
     async stat(path: string): Promise<unknown> {
@@ -680,5 +727,96 @@ describe("profile mutate: concurrent writers (P1 TOCTOU review)", () => {
     );
     expect(receipt.resolved?.model).toBe("better");
     expect(fs.files.has(`${PROJECT}.lock`)).toBe(false);
+  });
+});
+
+describe("profile mutate: fresh-store lock ordering (P1 review)", () => {
+  it("creates the parent directory before acquiring the lock", async () => {
+    // Strict directory modeling: nothing exists, not even `.pi/`. Before the
+    // fix, lock acquisition (`writeExclusive`) threw ENOENT and the first
+    // mutation on a fresh store never reached the write path.
+    const fs = memFs({}, { modelDirs: true });
+    const receipt = await createProfile(
+      { name: "fresh", scope: "project", initial: { model: "x" } },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("x");
+    expect(fs.files.get(PROJECT)).toContain("fresh:");
+    expect(fs.files.has(`${PROJECT}.lock`)).toBe(false);
+  });
+
+  it("creates a fresh user store the same way", async () => {
+    const fs = memFs({}, { modelDirs: true });
+    await setProfileField({ name: "scout", scope: "user", field: "model", value: "m" }, opts(fs));
+    expect(fs.files.get(USER)).toContain("model: m");
+  });
+});
+
+describe("profile mutate: lock ownership (P1 review)", () => {
+  it("a slow holder's release never deletes a successor's lock", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const lockPath = `${PROJECT}.lock`;
+    // Holder A acquires the lock and pauses mid-transaction.
+    let releaseA!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const holderA = withMutationLock(PROJECT, fs, () => gate);
+    // Wait until A's lock file exists.
+    for (let i = 0; i < 100 && !fs.files.has(lockPath); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(fs.files.has(lockPath)).toBe(true);
+    // A successor lock appears (crashed-holder turnover simulated by
+    // replacing the file, as a stale reaper would after its CAS checks).
+    const successorToken = "successor-token";
+    fs.files.set(lockPath, successorToken);
+    releaseA();
+    await holderA;
+    // A's ownership-checked release must leave the successor's lock alone.
+    expect(fs.files.get(lockPath)).toBe(successorToken);
+    await (fs as unknown as MutationFs).unlink!(lockPath);
+  });
+
+  it("a stale lock is reaped and the writer commits", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const lockPath = `${PROJECT}.lock`;
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      lockPath,
+      "crashed-holder",
+    );
+    fs.mtimes.set(lockPath, Date.now() - 60_000);
+    const receipt = await setProfileField(
+      { name: "a", scope: "project", field: "model", value: "two" },
+      opts(fs),
+    );
+    expect(receipt.resolved?.model).toBe("two");
+    expect(fs.files.has(lockPath)).toBe(false);
+  });
+
+  it("a fresh lock is never reaped: contenders wait then conflict or proceed", async () => {
+    const fs = memFs();
+    await createProfile({ name: "a", scope: "project", initial: { model: "one" } }, opts(fs));
+    const lockPath = `${PROJECT}.lock`;
+    await (fs as unknown as MutationFs & { writeExclusive(p: string, c: string): Promise<void> }).writeExclusive(
+      lockPath,
+      "live-holder",
+    );
+    // Live (fresh mtime) lock with a short deadline: the contender must time
+    // out with `conflict`, never unlinking the live holder's lock.
+    const outcome = await withMutationLock(
+      PROJECT,
+      fs,
+      () => Promise.resolve("should-not-run"),
+      { timeoutMs: 60, staleMs: 10_000 },
+    ).then(
+      () => "ran",
+      (error: unknown) => (error as { code?: string }).code ?? "threw",
+    );
+    expect(outcome).toBe("conflict");
+    expect(fs.files.get(lockPath)).toBe("live-holder");
+    await (fs as unknown as MutationFs).unlink!(lockPath);
   });
 });
