@@ -166,6 +166,9 @@ never include prompt text — only opIds, kinds, and codes.
 | Hello timeout / `hello_error` / version mismatch | `available:false`, `reason` kept, helper torn down (no resident process) | Pi TUI + one-line notice |
 | `dispatch` while unavailable/disposed/never-started | `{status:rejected, reason: bridge-unavailable…}` (explicit `ensureStarted`/`restart` may still start fresh) | Fall back to TUI send |
 | `dispatch` with `queue` outside `reject\|steer\|followUp` | wire rejection (`dispatch-bad-queue`), never accepted/queued | Fix the sender; busy sessions keep honest accept/reject |
+| `dispatch_ack` naming another session | `{status:unknown}` (ambiguous — the provider may still have consumed the prompt) | Reconcile via history; do not auto-resend |
+| `history`/`session`/`options_updated`/`cancelled` naming another session | refused (`BRIDGE_SESSION_MISMATCH` throw; foreign entries never returned) | Toast + TUI fallback; explicit `restart()` if the provider stays corrupt |
+| `acquired` with `metadata.sessionId` ≠ outer id (or remapped resume id) | acquisition rejected (`BRIDGE_SESSION_MISMATCH`), nothing stored | Retry acquire; explicit `restart()` if the provider stays corrupt |
 | `dispatch` after a previously healthy provider exited *or* errored (even with no `exit` after `error`) | `{status:rejected, reason: bridge-unavailable…}` — no implicit respawn; explicit `restart()` respawns | Fall back to TUI; offer explicit reconnect |
 | Provider `dispatch_ack{rejected}` | `{status:rejected}` | Surface `reason`, keep TUI available |
 | Dispatch timeout / malformed ack / exit racing an in-flight send | `{status:unknown}` | "Check history before retrying — never auto-resend" |

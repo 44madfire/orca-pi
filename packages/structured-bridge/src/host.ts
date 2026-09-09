@@ -546,6 +546,11 @@ export class BridgeHost {
     };
     const res = (await this.sendAndWait(req, this.requestTimeout())) as AcquiredResponse;
     if (res.kind !== "acquired") throw new BridgeUnavailableError(`acquire failed: ${res.kind}`, "BRIDGE_ACQUIRE_FAILED");
+    // A resume request names its session: a different id back is cross-wiring.
+    // Metadata identity must always agree with the outer session id.
+    if ((init.sessionId && res.sessionId !== init.sessionId) || res.metadata.sessionId !== res.sessionId) {
+      throw new BridgeUnavailableError(`acquire session mismatch (refusing untrusted session)`, "BRIDGE_SESSION_MISMATCH");
+    }
     this.sessions.set(res.sessionId, res.metadata);
     return { sessionId: res.sessionId, resumed: res.resumed, metadata: res.metadata };
   }
@@ -618,6 +623,12 @@ export class BridgeHost {
       return { status: "unknown", opId, reason: `malformed-dispatch-ack: ${ack.kind} (reconcile via history)` };
     }
     const typed = ack as DispatchAck;
+    // A wrong-session ack stays ambiguous: the provider may still have
+    // consumed the prompt despite corrupt correlation metadata, so this is
+    // `unknown` (reconcile via history), never a definite rejection.
+    if (typed.sessionId !== req.sessionId) {
+      return { status: "unknown", opId, reason: "session-mismatch: dispatch_ack for another session (reconcile via history; do not auto-resend)" };
+    }
     if (typed.status === "accepted" || typed.status === "rejected") {
       return { status: typed.status, opId, ...(typed.reason ? { reason: sanitizeReason(typed.reason) } : {}) };
     }
@@ -638,6 +649,7 @@ export class BridgeHost {
       this.requestTimeout(),
     )) as CancelledResponse;
     if (res.kind !== "cancelled") throw new BridgeUnavailableError(`cancel failed: ${res.kind}`, "BRIDGE_CANCEL_FAILED");
+    this.requireResponseSession(res, sessionId, "cancel");
     return { settled: res.settled };
   }
 
@@ -668,6 +680,7 @@ export class BridgeHost {
       this.requestTimeout(),
     )) as OptionsUpdatedResponse;
     if (res.kind !== "options_updated") throw new BridgeUnavailableError(`set_options failed: ${res.kind}`, "BRIDGE_OPTIONS_FAILED");
+    this.requireResponseSession(res, sessionId, "set_options");
     return res.options;
   }
 
@@ -692,6 +705,9 @@ export class BridgeHost {
       this.requestTimeout(),
     )) as HistoryResponse;
     if (res.kind !== "history") throw new BridgeUnavailableError(`get_history failed: ${res.kind}`, "BRIDGE_HISTORY_FAILED");
+    // Refuse foreign entries rather than returning them: the response
+    // identity is stripped below, so the caller could never detect it after.
+    this.requireResponseSession(res, sessionId, "get_history");
     return { entries: res.entries, ...(res.nextCursor ? { nextCursor: res.nextCursor } : {}), ...(res.leafId ? { leafId: res.leafId } : {}) };
   }
 
@@ -703,6 +719,10 @@ export class BridgeHost {
       this.requestTimeout(),
     )) as SessionResponse;
     if (res.kind !== "session") throw new BridgeUnavailableError(`get_session failed: ${res.kind}`, "BRIDGE_SESSION_FAILED");
+    this.requireResponseSession(res, sessionId, "get_session");
+    if (res.metadata.sessionId !== sessionId) {
+      throw new BridgeUnavailableError(`get_session session mismatch (refusing untrusted session)`, "BRIDGE_SESSION_MISMATCH");
+    }
     this.sessions.set(sessionId, res.metadata);
     return res.metadata;
   }
@@ -768,6 +788,20 @@ export class BridgeHost {
 
   private requestTimeout(): number {
     return this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+
+  /**
+   * Per-session response correlation: every session-scoped provider reply
+   * must name the requested session. opId alone is not enough — a
+   * stale/buggy provider could otherwise cross-wire concurrent structured
+   * sessions (e.g. history entries from session B returned for session A,
+   * where the host strips the response identity and the caller could never
+   * detect it). Mismatches never poison host state.
+   */
+  private requireResponseSession(response: { sessionId?: string }, expected: string, op: string): void {
+    if (response.sessionId !== expected) {
+      throw new BridgeUnavailableError(`${op} session mismatch (refusing untrusted session)`, "BRIDGE_SESSION_MISMATCH");
+    }
   }
 
   private sendAndWait(message: HostToProviderMessage, timeoutMs: number): Promise<ProviderToHostMessage> {

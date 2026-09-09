@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { BridgeHost, type SessionEventEnvelope } from "../src/host.js";
 import { MockExternalProvider } from "../src/provider.js";
 import { serializeBridgeLine } from "../src/framing.js";
-import { BRIDGE_PROTOCOL_VERSION } from "../src/protocol.js";
+import { BRIDGE_PROTOCOL_VERSION, BridgeUnavailableError } from "../src/protocol.js";
 
 /** Minimal ChildProcess stand-in for BridgeHost tests. */
 function createFakeProc() {
@@ -818,6 +818,167 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     await expect(host.getHistory("ses_1", undefined, -2)).rejects.toThrow(/positive integer/);
     await expect(host.getHistory("ses_1", undefined, 1.5)).rejects.toThrow(/positive integer/);
     expect(spawns).toBe(0);
+    await host.dispose();
+  });
+
+  it("wrong-session dispatch ack stays ambiguous unknown (never accepted)", async () => {
+    const proc = createFakeProc();
+    const dispatchWrites: string[] = [];
+    proc.stdin.write = ((s: string) => {
+      for (const line of s.split("\n")) {
+        if (line.trim() === "") continue;
+        const msg = JSON.parse(line) as { opId: string; kind: string; sessionId?: string };
+        if (msg.kind === "hello") {
+          proc.stdout.emit(
+            "data",
+            Buffer.from(
+              serializeBridgeLine({ v: 1, kind: "hello_ok", opId: msg.opId, provider: { id: "xwire", version: "0", protocol: 1 }, capabilities: { textStreaming: true, thinking: true, tools: true, images: true, extensionDialogs: true, history: true, options: true, cancel: true, resume: true } }),
+              "utf8",
+            ),
+          );
+        } else if (msg.kind === "close") {
+          proc.stdout.emit(
+            "data",
+            Buffer.from(
+              serializeBridgeLine({ v: 1, kind: "closed", opId: msg.opId, exit: { code: 0, signal: null } }),
+              "utf8",
+            ),
+          );
+        } else if (msg.kind === "dispatch") {
+          dispatchWrites.push(line);
+          // Same opId, valid shape, but a DIFFERENT session: must not read as accepted.
+          proc.stdout.emit(
+            "data",
+            Buffer.from(
+              serializeBridgeLine({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: "ses_B", status: "accepted" }),
+              "utf8",
+            ),
+          );
+        }
+      }
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "xwire-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn: (() => proc) as never,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 1000,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    expect((await host.probeSupport()).available).toBe(true);
+    const outcome = await host.dispatch({ sessionId: "ses_A", text: "hi" });
+    expect(outcome.status).toBe("unknown");
+    expect(outcome.reason).toMatch(/mismatch/);
+    // Ambiguous — but never auto-resent as fresh work.
+    expect(dispatchWrites).toHaveLength(1);
+    await host.dispose();
+  });
+
+  it("wrong-session history/session/options/cancel responses are refused", async () => {
+    const proc = createFakeProc();
+    const metaFor = (id: string) => ({ sessionId: id, workspaceRoot: "/tmp/ws", messageCount: 0, isStreaming: false, createdAt: new Date().toISOString() });
+    proc.stdin.write = ((s: string) => {
+      for (const line of s.split("\n")) {
+        if (line.trim() === "") continue;
+        const msg = JSON.parse(line) as { opId: string; kind: string; sessionId?: string; options?: unknown };
+        const reply = (body: Record<string, unknown>): void => {
+          proc.stdout.emit("data", Buffer.from(serializeBridgeLine(body), "utf8"));
+        };
+        if (msg.kind === "hello") {
+          reply({ v: 1, kind: "hello_ok", opId: msg.opId, provider: { id: "xwire", version: "0", protocol: 1 }, capabilities: { textStreaming: true, thinking: true, tools: true, images: true, extensionDialogs: true, history: true, options: true, cancel: true, resume: true } });
+        } else if (msg.kind === "acquire") {
+          reply({ v: 1, kind: "acquired", opId: msg.opId, sessionId: "ses_A", resumed: false, metadata: metaFor("ses_A") });
+        } else if (msg.kind === "get_history") {
+          reply({ v: 1, kind: "history", opId: msg.opId, sessionId: "ses_B", entries: [{ id: "e9", role: "user", text: "foreign", timestamp: new Date().toISOString() }], leafId: "e9" });
+        } else if (msg.kind === "get_session") {
+          reply({ v: 1, kind: "session", opId: msg.opId, sessionId: "ses_B", metadata: metaFor("ses_B") });
+        } else if (msg.kind === "set_options") {
+          reply({ v: 1, kind: "options_updated", opId: msg.opId, sessionId: "ses_B", options: {} });
+        } else if (msg.kind === "cancel") {
+          reply({ v: 1, kind: "cancelled", opId: msg.opId, sessionId: "ses_B", targetOpId: "t", settled: true });
+        } else if (msg.kind === "close") {
+          reply({ v: 1, kind: "closed", opId: msg.opId, exit: { code: 0, signal: null } });
+        }
+      }
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "xwire-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn: (() => proc) as never,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 1000,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    expect((await host.probeSupport()).available).toBe(true);
+    await host.acquire();
+    const expectMismatch = async (fn: () => Promise<unknown>): Promise<void> => {
+      try {
+        await fn();
+      } catch (error) {
+        expect(error).toBeInstanceOf(BridgeUnavailableError);
+        expect((error as BridgeUnavailableError).code).toBe("BRIDGE_SESSION_MISMATCH");
+        return;
+      }
+      expect.unreachable("expected BRIDGE_SESSION_MISMATCH");
+    };
+    await expectMismatch(() => host.getHistory("ses_A"));
+    await expectMismatch(() => host.getSession("ses_A"));
+    await expectMismatch(() => host.setOptions("ses_A", { thinkingLevel: "high" }));
+    await expectMismatch(() => host.cancel("ses_A"));
+    await host.dispose();
+  });
+
+  it("acquire rejects inconsistent session identity without poisoning the host", async () => {
+    const proc = createFakeProc();
+    let acquires = 0;
+    const metaFor = (id: string) => ({ sessionId: id, workspaceRoot: "/tmp/ws", messageCount: 0, isStreaming: false, createdAt: new Date().toISOString() });
+    proc.stdin.write = ((s: string) => {
+      for (const line of s.split("\n")) {
+        if (line.trim() === "") continue;
+        const msg = JSON.parse(line) as { opId: string; kind: string; sessionId?: string };
+        const reply = (body: Record<string, unknown>): void => {
+          proc.stdout.emit("data", Buffer.from(serializeBridgeLine(body), "utf8"));
+        };
+        if (msg.kind === "hello") {
+          reply({ v: 1, kind: "hello_ok", opId: msg.opId, provider: { id: "xwire", version: "0", protocol: 1 }, capabilities: { textStreaming: true, thinking: true, tools: true, images: true, extensionDialogs: true, history: true, options: true, cancel: true, resume: true } });
+        } else if (msg.kind === "acquire") {
+          acquires += 1;
+          if (acquires === 1) {
+            // Outer id and metadata id disagree: untrusted, reject.
+            reply({ v: 1, kind: "acquired", opId: msg.opId, sessionId: "ses_A", resumed: false, metadata: metaFor("ses_B") });
+          } else if (acquires === 2) {
+            // Resume remap: requested ses_X, answered ses_Y.
+            reply({ v: 1, kind: "acquired", opId: msg.opId, sessionId: "ses_Y", resumed: true, metadata: metaFor("ses_Y") });
+          } else {
+            reply({ v: 1, kind: "acquired", opId: msg.opId, sessionId: msg.sessionId ?? "ses_C", resumed: false, metadata: metaFor(msg.sessionId ?? "ses_C") });
+          }
+        } else if (msg.kind === "close") {
+          reply({ v: 1, kind: "closed", opId: msg.opId, exit: { code: 0, signal: null } });
+        }
+      }
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "xwire-provider",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/ws",
+      spawnFn: (() => proc) as never,
+      helloTimeoutMs: 1000,
+      requestTimeoutMs: 1000,
+      closeGraceMs: 20,
+      killGraceMs: 20,
+    });
+    expect((await host.probeSupport()).available).toBe(true);
+    await expect(host.acquire()).rejects.toMatchObject({ code: "BRIDGE_SESSION_MISMATCH" });
+    await expect(host.acquire({ sessionId: "ses_X" })).rejects.toMatchObject({ code: "BRIDGE_SESSION_MISMATCH" });
+    // The connection itself is kept: a consistent acquisition still works and
+    // the rejected sessions were never stored.
+    const fresh = await host.acquire();
+    expect(fresh.sessionId).toBe("ses_C");
+    expect(host.support.available).toBe(true);
     await host.dispose();
   });
 
