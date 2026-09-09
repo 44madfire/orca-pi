@@ -1,26 +1,40 @@
 # Orca Integration (SNC1.3 dev branch)
 
-> Scope note (review feedback on #22): this package is the **bridge
-> protocol/host/provider testbed prerequisite** for #13. It does **not** by
-> itself close #13: the Orca-fork `ExternalStructuredSessionAdapter`, dev
-> flag, journal/Native Chat wiring, and fork-side mock E2E remain as the
-> follow-up that actually creates a *real Orca structured session* (§6).
-> Host-callback assertions in `test/host.test.ts` are explicitly a
-> “Native Chat stand-in” until that fork work lands.
+> Status: the Orca-side seam is implemented on the writable fork
+> `44madfire/orca` branch `snc1.3-external-structured-bridge`
+> (commit `b4935c78`, parent `stablyai/orca`). That branch vendors the
+> three provider-neutral files below plus a thin
+> `ExternalStructuredSessionAdapter`, dev-only flag/config, journal/Native
+> Chat translation, and fork-side mock E2E (13 tests incl. a live-OS-process
+> acquire → dispatch → streamed fake response → settled proof). This package
+> remains the bridge protocol/host/provider testbed prerequisite for #13;
+> host-callback assertions in `test/host.test.ts` stay a "Native Chat
+> stand-in" — the *real* Orca structured session proof lives fork-side.
 
-How the future Orca fork wires the generic seam without widening the
-public plugin surface. Until the fork exists, this package carries the
-full seam + mock so `orca-pi` development is unblocked.
+How the Orca fork wires the generic seam without widening the
+public plugin surface. The canonical fork/branch is recorded above; until
+an upstream PR lands, this package carries the full seam + mock so
+`orca-pi` development stays unblocked.
 
-## 1. What to vendor
+## 1. What was vendored (canonical fork state)
 
-Copy three files into the Orca dev branch (temporary, small enough to
-carry even if upstream declines the seam):
+Vendored verbatim into the fork dev branch under
+`src/main/native-chat/agent-session-wire/external/` (temporary, small
+enough to carry even if upstream declines the seam):
 
 ```text
-packages/structured-bridge/src/framing.ts   → orca/.../bridge/framing.ts
-packages/structured-bridge/src/protocol.ts  → orca/.../bridge/protocol.ts
-packages/structured-bridge/src/host.ts      → orca/.../bridge/host.ts
+packages/structured-bridge/src/framing.ts   → orca/.../external/bridge-framing.ts
+packages/structured-bridge/src/protocol.ts  → orca/.../external/bridge-protocol.ts
+packages/structured-bridge/src/host.ts      → orca/.../external/bridge-host.ts (+ providerPid getter)
+```
+
+Plus fork-side (provider-neutral, no Pi imports):
+
+```text
+orca/.../external/external-structured-bridge-config.ts  # dev-only flag + ORCA_PI_BRIDGE_COMMAND
+orca/.../external/external-structured-session-adapter.ts # StructuredAgentSessionAdapter impl
+orca/.../external/external-structured-session-adapter.test.ts # 13 tests incl. live-process E2E
+orca/.../external/README.md # fork-side dev setup + failure semantics
 ```
 
 `provider.ts` + `mock-provider-cli.js` + `pi-mapping.ts` stay in
@@ -49,45 +63,39 @@ is present, plus `--bridge-command <path>` override. Missing/incompatible
 bridge → `probeSupport(){available:false}` → ordinary Pi TUI path,
 untouched. Packaged Orca never requires the bridge.
 
-## 3. Wiring sketch (Orca fork)
+## 3. Wiring (as implemented fork-side)
 
 ```ts
-import { BridgeHost } from "./bridge/host.js";
+import { ExternalStructuredSessionAdapter } from './external/external-structured-session-adapter.js'
 
-const bridge = new BridgeHost({
-  bridgeCommand: process.env.ORCA_PI_BRIDGE_COMMAND ?? "",
-  bridgeArgs: [],
-  workspaceRoot: orcaSelectedCwd, // exact Orca workspace/cwd (SNC1.4)
-  env: { /* explicit overlay only; never dump process.env over the bridge */ },
-});
+const adapter = new ExternalStructuredSessionAdapter({
+  resolveWorkspacePath: (workspaceId) => resolveWorkspace(workspaceId),
+  readProcessStartTime,
+})
+// Dev gate first — ordinary Pi TUI path stays untouched when unsupported:
+if (!adapter.supportsCreate(location, 'external')) return openPiTuiTerminal()
 
-const support = await bridge.probeSupport();
-if (!support.available) {
-  // Fail closed: keep the normal Pi TUI path. One-line notice, no crash.
-  return openPiTuiTerminal();
-}
+const acquired = await adapter.acquire({ identity, fence, spawnToken, events: sink })
+// adapter routes session_event → sink appends carrying Native Chat blocks:
+// text_delta → assistant streaming bubble, thinking_* → reasoning channel,
+// tool_* → tool-call card, prompt_request → approval/question dialog,
+// settled → activity cleared, input re-enabled.
 
-const { sessionId } = await bridge.acquire({ options: { model, thinkingLevel } });
-bridge.onSessionEvent(({ event }) => {
-  // Append to Orca journal + render in Native Chat:
-  // text_delta → streaming bubble, thinking_* → thinking channel,
-  // tool_* → tool card, prompt_request → options dialog,
-  // settled → re-enable input.
-});
-bridge.onLifecycle(({ kind, message }) => logger.warn(`bridge ${kind}: ${message}`));
+// Outbox send flow:
+const outcome = await adapter.dispatch({ sessionId, clientMessageId, body, fence })
+if (outcome.state === 'accepted') leaseToProvider(sessionId, outcome.providerIdentity)
+else if (outcome.state === 'rejected') toastAndOfferTui(outcome.reason)
+else /* unknown */ reconcileViaHistoryThenConfirmBeforeRetry(sessionId)
 
-// Outbox send flow (SNC1.4):
-const outcome = await bridge.dispatch({ sessionId, text });
-if (outcome.status === "accepted") leaseToProvider(sessionId, outcome.opId);
-else if (outcome.status === "rejected") toastAndOfferTui(outcome.reason);
-else /* unknown */ reconcileViaHistoryThenConfirmBeforeRetry(sessionId);
+// Esc cancels the active turn:
+await adapter.cancelTurn({ sessionId, turnId: activeOpId, fence })
 
-// Esc cancels the active turn (SNC1.4):
-await bridge.cancel(sessionId, activeOpId);
-
-// Teardown joins Orca teardown:
-disposables.push(() => bridge.dispose());
+// Teardown joins Orca teardown (release + bounded dispose, no resident helper):
+disposables.push(() => adapter.disposeSession(sessionId))
 ```
+
+The pre-adapter `BridgeHost` sketch from earlier revisions is superseded by
+the adapter above; raw-host usage remains valid for transport debugging only.
 
 ## 4. Manual E2E (mock, no Pi)
 
@@ -109,23 +117,44 @@ input, restart (dispose + new host) starts empty, and killing the mock
 makes the host report `available:false` / `dispatch{rejected}` so the Pi
 TUI path remains.
 
-## 5. Remaining fork work to close #13
+Fork-side Native Chat proof (real adapter, not a stand-in) runs headlessly
+without Pi or Electron:
 
-This PR must stay **part of #13, not `Closes #13`** until the fork lands:
+```sh
+# In a checkout of 44madfire/orca @ snc1.3-external-structured-bridge:
+vitest run src/main/native-chat/agent-session-wire/external
+# 13 tests: config gating, fail-closed acquire, accepted mock turn streamed
+# into journal-sink Native Chat blocks, unknown preservation, prompt
+# request/answer-once, option validation, teardown, plus a live-OS-process
+# BridgeHost + inline mock E2E (acquire → dispatch → streamed fake response
+# → settled, then restart-independence).
+```
 
-- [ ] Vendor `framing.ts` + `protocol.ts` + `host.ts` into the Orca fork
-  (temporary dev branch) and write the thin
-  `ExternalStructuredSessionAdapter` against the fork's **current**
-  `StructuredAgentSessionAdapter` contract (delegate to `BridgeHost`,
-  translate `session_event` → journal appends + Native Chat renders, keep
-  Orca ownership of journal/lease/fencing/outbox/rendering/sync).
-- [ ] Add the explicit dev-only flag + `ORCA_PI_BRIDGE_COMMAND` path
-  (no plugin-manifest widening), fail-closed fallback to the Pi TUI path.
-- [ ] Prove with a mock provider creating a **real Orca structured session**
-  streaming a fake response into the **normal Native Chat UI**, restartable
-  independently of Orca, with teardown joined to Orca teardown.
+## 5. Fork landing record (SNC1.3)
+
+- [x] Vendored `framing.ts` + `protocol.ts` + `host.ts` (+ `providerPid`
+  getter) into `44madfire/orca@snc1.3-external-structured-bridge` under
+  `src/main/native-chat/agent-session-wire/external/` with the thin
+  `ExternalStructuredSessionAdapter` against the current
+  `StructuredAgentSessionAdapter` contract (delegates to `BridgeHost`,
+  translates `session_event` → journal appends + Native Chat renders, Orca
+  keeps journal/lease/fencing/outbox/rendering/sync ownership).
+- [x] Explicit dev-only flag (`--enable-external-structured-bridge`) +
+  `ORCA_PI_BRIDGE_COMMAND` path (no plugin-manifest widening), fail-closed
+  fallback to the Pi TUI path.
+- [x] Mock provider proves the adapter path headlessly (real `BridgeHost` +
+  live OS process → real adapter session → streamed fake response into
+  journal-sink Native Chat blocks → `settled`; restart starts empty;
+  teardown leaves no resident helper). Full Native Chat UI click-through
+  with the `orca-pi` mock provider remains the manual gate before closing
+  #13 (see §4).
 - [ ] Open the upstream PR(s) to `stablyai/orca` (small provider-neutral
   seam) or carry the temporary dev branch.
+
+Temporary dev mappings to replace in SNC1.8 before any upstream PR:
+codex-namespaced provider handle (`external:<bridgeSessionId>`),
+`legacy`/`external` journal identities, empty model catalog, text-only
+dispatch. Tracked in the fork `external/README.md`.
 
 ## 6. Upstream strategy
 
