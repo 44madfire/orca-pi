@@ -119,6 +119,27 @@ describe("MockExternalProvider (SNC1.3)", () => {
     expect(stream.filter((m) => m.opId === "dsp_2" && m.event.type === "settled")).toHaveLength(1);
   });
 
+  it("rejects an invalid queue value on a busy session (no accepted ack)", async () => {
+    const provider = new MockExternalProvider({ textChunkSize: 2 });
+    const { out, hello, send } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "long " + "y".repeat(64) } });
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_1", status: "accepted" });
+    // "typo" is not a queue mode: wire validation rejects it before any
+    // accept/queue handling, so no dispatch_ack is emitted for dsp_2.
+    send({ v: 1, kind: "dispatch", opId: "dsp_2", sessionId, message: { text: "oops" }, queue: "typo" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(out.some((m) => m.kind === "dispatch_ack" && (m as { opId?: string }).opId === "dsp_2")).toBe(false);
+    expect(lastOfKind(out, "error")).toMatchObject({ opId: "dsp_2" });
+    expect(JSON.stringify(lastOfKind(out, "error"))).toContain("dispatch-bad-queue");
+    // The active turn is undisturbed and still settles normally.
+    await new Promise((r) => setTimeout(r, 80));
+    const settled = out.filter((m) => m.kind === "session_event");
+    expect(settled.some((m) => (m as unknown as { opId?: string }).opId === "dsp_1")).toBe(true);
+  });
+
   it("reports cancel settled state honestly (active vs idle)", async () => {
     const provider = new MockExternalProvider({ textChunkSize: 2 });
     const { out, hello, send } = drive(provider);

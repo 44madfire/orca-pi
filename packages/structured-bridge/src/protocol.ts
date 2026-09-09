@@ -510,6 +510,21 @@ function validateSessionMetadata(meta: unknown, missingCode: string, badCode: st
   if (typeof meta["messageCount"] !== "number") return badCode;
   if (typeof meta["isStreaming"] !== "boolean") return badCode;
   if (!isStr(meta["createdAt"])) return badCode;
+  if (meta["providerSessionId"] !== undefined && !isStr(meta["providerSessionId"])) return badCode;
+  if (meta["model"] !== undefined && !isStr(meta["model"])) return badCode;
+  if (meta["thinkingLevel"] !== undefined && !isStr(meta["thinkingLevel"])) return badCode;
+  return null;
+}
+
+const QUEUE_MODES: ReadonlySet<string> = new Set(["reject", "steer", "followUp"]);
+
+/** Option-bag inner fields session/lease code relies on. Extra keys stay forward-compatible. */
+function validateSessionOptions(opts: unknown, missingCode: string, badCode: string): string | null {
+  if (!isRec(opts)) return missingCode;
+  if (opts["model"] !== undefined && !isStr(opts["model"])) return badCode;
+  if (opts["thinkingLevel"] !== undefined && !isStr(opts["thinkingLevel"])) return badCode;
+  if (opts["queueMode"] !== undefined && !QUEUE_MODES.has(opts["queueMode"] as string)) return badCode;
+  if (opts["autoCompaction"] !== undefined && typeof opts["autoCompaction"] !== "boolean") return badCode;
   return null;
 }
 
@@ -547,13 +562,49 @@ function validateProviderEvent(event: unknown): string | null {
       const stop = field("stopReason");
       return stop === "stop" || stop === "aborted" || stop === "error" ? null : "event-bad-turn_end";
     }
-    case "prompt_request":
-      return isStr(field("requestId")) && isRec(field("prompt")) ? null : "event-bad-prompt_request";
+    case "prompt_request": {
+      if (!isStr(field("requestId"))) return "event-bad-prompt_request";
+      const prompt = field("prompt");
+      if (!isRec(prompt) || !isStr(prompt["kind"])) return "event-bad-prompt_request";
+      switch (prompt["kind"] as string) {
+        case "select": {
+          const options: unknown = prompt["options"];
+          if (!isStr(prompt["title"])) return "event-bad-prompt_request";
+          if (!Array.isArray(options) || options.length === 0 || !options.every((o) => typeof o === "string")) {
+            return "event-bad-prompt_request";
+          }
+          break;
+        }
+        case "confirm":
+          if (!isStr(prompt["title"]) || !isStr(prompt["message"])) return "event-bad-prompt_request";
+          break;
+        case "input":
+          if (!isStr(prompt["title"])) return "event-bad-prompt_request";
+          if (prompt["placeholder"] !== undefined && !isStr(prompt["placeholder"])) return "event-bad-prompt_request";
+          break;
+        case "editor":
+          if (!isStr(prompt["title"])) return "event-bad-prompt_request";
+          if (prompt["prefill"] !== undefined && !isStr(prompt["prefill"])) return "event-bad-prompt_request";
+          break;
+        default:
+          return "event-bad-prompt_request";
+      }
+      if (field("timeoutMs") !== undefined && typeof field("timeoutMs") !== "number") return "event-bad-prompt_request";
+      return null;
+    }
     case "error":
       return isStr(field("code")) && isStr(field("message")) ? null : "event-bad-error";
-    default:
-      // turn_start, text_start/end, thinking_start/end, settled: type-only.
+    case "turn_start":
+    case "text_start":
+    case "text_end":
+    case "thinking_start":
+    case "thinking_end":
+    case "settled":
+      // Type-only variants: no payload downstream relies on.
       return null;
+    default:
+      // Unknown event types must not reach session listeners as trusted state.
+      return "event-unknown-type";
   }
 }
 
@@ -623,7 +674,10 @@ export function validateBridgeMessage(value: unknown): string | null {
       if (badSession) return badSession;
       const badResume = optStr("resumePath", "acquire-bad-resumePath");
       if (badResume) return badResume;
-      if (v["options"] !== undefined && !isRec(v["options"])) return "acquire-bad-options";
+      if (v["options"] !== undefined) {
+        const badOptions = validateSessionOptions(v["options"], "acquire-bad-options", "acquire-bad-options");
+        if (badOptions) return badOptions;
+      }
       break;
     }
     case "release":
@@ -646,6 +700,7 @@ export function validateBridgeMessage(value: unknown): string | null {
       if (bad) return bad;
       const msg = v["message"];
       if (!isRec(msg) || typeof msg["text"] !== "string") return "dispatch-missing-text";
+      if (v["queue"] !== undefined && !QUEUE_MODES.has(v["queue"] as string)) return "dispatch-bad-queue";
       if (msg["images"] !== undefined) {
         if (!Array.isArray(msg["images"])) return "dispatch-bad-images";
         for (const image of msg["images"]) {
@@ -669,7 +724,8 @@ export function validateBridgeMessage(value: unknown): string | null {
     case "set_options": {
       const bad = sessionId("set_options-missing-sessionId");
       if (bad) return bad;
-      if (!isRec(v["options"])) return "set_options-missing-options";
+      const badOptions = validateSessionOptions(v["options"], "set_options-missing-options", "set_options-bad-options");
+      if (badOptions) return badOptions;
       break;
     }
     case "close": {
@@ -723,7 +779,8 @@ export function validateBridgeMessage(value: unknown): string | null {
     case "options_updated": {
       const bad = sessionId("options_updated-missing-sessionId");
       if (bad) return bad;
-      if (!isRec(v["options"])) return "options_updated-missing-options";
+      const badOptions = validateSessionOptions(v["options"], "options_updated-missing-options", "options_updated-bad-options");
+      if (badOptions) return badOptions;
       break;
     }
     case "history": {

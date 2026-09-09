@@ -87,6 +87,12 @@ settled{willRetry?}
   (`select`/`confirm`/`input`/`editor`); the host replies `answer_prompt`.
   Fire-and-forget chrome (`setTitle`/`setStatus`/`notify`/…) is never sent
   over this bridge — providers must not depend on it.
+  `session_event` is a closed world: only the `type` values above validate;
+  unknown types are dropped, never forwarded to listeners as trusted
+  state. `prompt_request` carries the full dialog shape per prompt kind
+  (`select` needs non-empty string `options`; `confirm` needs `message`;
+  `input`/`editor` titles required, `placeholder`/`prefill` strings when
+  present) so UI code can rely on the fields existing.
 
 Example (mock, LF-only, one line each):
 
@@ -113,10 +119,16 @@ cancel/resume.
 
 ## 5. Options / history / session metadata
 
-- `BridgeSessionOptions{model?,thinkingLevel?,queueMode?,autoCompaction?}`
-  is opaque to the generic core; Pi validation lives in `pi-mapping.ts`
-  (bogus thinking levels and text-only-model images are rejected
-  client-side because Pi itself is lenient).
+- `BridgeSessionOptions` is a closed shape: `model`/`thinkingLevel`
+  strings, `queueMode` ∈ `reject|steer|followUp`, `autoCompaction`
+  boolean (extra keys stay forward-compatible; wrong types fail closed
+  at validation). The same shape is enforced on `acquire.options`,
+  `set_options.options`, and `options_updated.options`, and on the
+  optional `model`/`thinkingLevel`/`providerSessionId` metadata fields —
+  so a malformed helper can never get a typed `42` persisted into
+  session metadata. Pi *value* validation (bogus thinking levels,
+  text-only-model images) additionally lives in `pi-mapping.ts` because
+  Pi itself is lenient.
 - `BridgeHistoryEntry{id,parentId?,role,text?,timestamp}` + `leafId` give
   Orca a durable cursor for `unknown`-dispatch reconciliation:
   `get_history{cursor}` returns strictly-after entries; when `limit`
@@ -153,6 +165,7 @@ never include prompt text — only opIds, kinds, and codes.
 | Missing binary / spawn error | `probeSupport() → {available:false}` | Ordinary Pi TUI, untouched |
 | Hello timeout / `hello_error` / version mismatch | `available:false`, `reason` kept, helper torn down (no resident process) | Pi TUI + one-line notice |
 | `dispatch` while unavailable/disposed/never-started | `{status:rejected, reason: bridge-unavailable…}` (explicit `ensureStarted`/`restart` may still start fresh) | Fall back to TUI send |
+| `dispatch` with `queue` outside `reject\|steer\|followUp` | wire rejection (`dispatch-bad-queue`), never accepted/queued | Fix the sender; busy sessions keep honest accept/reject |
 | `dispatch` after a previously healthy provider exited *or* errored (even with no `exit` after `error`) | `{status:rejected, reason: bridge-unavailable…}` — no implicit respawn; explicit `restart()` respawns | Fall back to TUI; offer explicit reconnect |
 | Provider `dispatch_ack{rejected}` | `{status:rejected}` | Surface `reason`, keep TUI available |
 | Dispatch timeout / malformed ack / exit racing an in-flight send | `{status:unknown}` | "Check history before retrying — never auto-resend" |

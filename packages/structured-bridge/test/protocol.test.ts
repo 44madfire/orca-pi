@@ -166,8 +166,53 @@ describe("bridge protocol validation (SNC1.3)", () => {
         v: 1,
         kind: "session_event",
         sessionId: "s",
-        event: { type: "prompt_request", requestId: "r", prompt: { kind: "select" } },
+        event: { type: "prompt_request", requestId: "r", prompt: { kind: "select", title: "Pick", options: ["a"] } },
       }),
+    ).toBeNull();
+    // Unknown event types never become trusted listener state.
+    expect(validateBridgeMessage({ v: 1, kind: "session_event", sessionId: "s", event: { type: "bogus" } })).toBe(
+      "event-unknown-type",
+    );
+    // Prompt unions: each kind's required fields, unknown kinds rejected.
+    const promptCases: Array<{ prompt: unknown; valid: boolean }> = [
+      { prompt: { kind: "select", title: "Pick", options: ["a", "b"] }, valid: true },
+      { prompt: { kind: "select" }, valid: false },
+      { prompt: { kind: "select", title: "Pick", options: [] }, valid: false },
+      { prompt: { kind: "select", title: "Pick", options: [42] }, valid: false },
+      { prompt: { kind: "confirm", title: "Sure?", message: "Really" }, valid: true },
+      { prompt: { kind: "confirm", title: "Sure?" }, valid: false },
+      { prompt: { kind: "input", title: "Name" }, valid: true },
+      { prompt: { kind: "input", title: "Name", placeholder: 7 }, valid: false },
+      { prompt: { kind: "editor", title: "Edit", prefill: "x" }, valid: true },
+      { prompt: { kind: "wizard" }, valid: false },
+    ];
+    for (const { prompt, valid } of promptCases) {
+      expect(
+        validateBridgeMessage({ v: 1, kind: "session_event", sessionId: "s", event: { type: "prompt_request", requestId: "r", prompt } }),
+      ).toBe(valid ? null : "event-bad-prompt_request");
+    }
+    // Options bags: shared string/enum/boolean shapes.
+    expect(validateBridgeMessage({ v: 1, kind: "set_options", opId: "x", sessionId: "s", options: { thinkingLevel: 42 } })).toBe(
+      "set_options-bad-options",
+    );
+    expect(
+      validateBridgeMessage({ v: 1, kind: "set_options", opId: "x", sessionId: "s", options: { queueMode: "eventually" } }),
+    ).toBe("set_options-bad-options");
+    expect(
+      validateBridgeMessage({
+        v: 1,
+        kind: "set_options",
+        opId: "x",
+        sessionId: "s",
+        options: { model: "m", thinkingLevel: "high", queueMode: "steer", autoCompaction: true },
+      }),
+    ).toBeNull();
+    // Dispatch queue enum.
+    expect(
+      validateBridgeMessage({ v: 1, kind: "dispatch", opId: "x", sessionId: "s", message: { text: "hi" }, queue: "typo" }),
+    ).toBe("dispatch-bad-queue");
+    expect(
+      validateBridgeMessage({ v: 1, kind: "dispatch", opId: "x", sessionId: "s", message: { text: "hi" }, queue: "followUp" }),
     ).toBeNull();
     // Exit blocks and limits.
     expect(validateBridgeMessage({ v: 1, kind: "closed", opId: "x", exit: { code: "zero", signal: null } })).toBe("closed-missing-exit");
