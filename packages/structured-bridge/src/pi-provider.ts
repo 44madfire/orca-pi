@@ -145,14 +145,23 @@ interface PiRuntime {
   /** Pi-side session id observed via `get_state` (for lease identity). */
   piSessionId?: string;
   /**
-   * FIFO of Pi-owned queued `steer`/`followUp` opIds (accepted only after Pi
-   * `prompt{streamingBehavior}` succeeded). Promoted at the per-turn boundary
-   * (see `turn_end` handling): the next `turn_start` after a completed turn
-   * attributes to the queued op — never merely resident in provider memory
-   * (SNC1.4 P1: accepted means Pi-owned). `agent_settled` means Pi has no
-   * queued continuation left, so promotion must not wait for it.
+   * FIFO of Pi-owned queued turns (accepted only after Pi
+   * `prompt{streamingBehavior}` succeeded). Each entry preserves its queue
+   * mode and text so promotion respects delivery boundaries and history stays
+   * in transcript order (queued users journal at delivery, not at accept).
+   * Promoted at the per-turn boundary (`turn_end` for completed non-tool
+   * turns); `agent_settled` means Pi has no continuation left and never
+   * promotes (see streaming). Never merely provider memory: accepted means
+   * Pi-owned (SNC1.4).
    */
-  piQueuedOps: string[];
+  piQueuedOps: Array<{ opId: string; queue: "steer" | "followUp"; text: string }>;
+  /**
+   * Ambiguous queued candidate (`steer`/`followUp` write may have landed but
+   * its response was lost). Tracked until Pi turn/queue evidence resolves it:
+   * a later turn for its text promotes it (journaled then), while a final
+   * `settled` with no such turn drops it unjournaled. Never auto-resent.
+   */
+  ambiguousQueued: { opId: string; queue: "steer" | "followUp"; text: string } | null;
   /**
    * Optimistic user text for an ambiguous `prompt` (write may have landed but
    * the response was lost). NOT journaled yet: `turn_end` journals it first
@@ -378,7 +387,7 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompt: null,
       entryCounter: 0,
     });
-    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, piQueuedOps: [], pendingUserText: null };
+    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, piQueuedOps: [], ambiguousQueued: null, pendingUserText: null };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
     if (session) this.attachPiStreaming(sessionId, session, runtime);
@@ -438,8 +447,20 @@ export class PiBridgeProvider extends BridgeProvider {
 
   // -- streaming: Pi events -> bridge session_event --------------------------
 
+  /** True when a raw Pi `turn_end` continues the same prompt (tool loop), not a queued delivery. */
+  private isToolContinuationTurn(record: Record<string, unknown>): boolean {
+    if (record["type"] !== "turn_end") return false;
+    const message = record["message"] as Record<string, unknown> | undefined;
+    if (message && message["stopReason"] === "toolUse") return true;
+    const toolResults = record["toolResults"];
+    if (Array.isArray(toolResults) && toolResults.length > 0) return true;
+    return false;
+  }
+
   private attachPiStreaming(sessionId: string, session: ProviderSession, runtime: PiRuntime): void {
     const onEvent = (event: PiServerEvent): void => {
+      const raw = event as unknown as Record<string, unknown>;
+      const rawIsToolContinuation = this.isToolContinuationTurn(raw);
       const activeOpId = session.activeOpId;
       // No active turn: only forward stateless chrome that Orca can use
       // without a turn (currently none — queue_update/compaction are SNC1.5+).
@@ -459,25 +480,60 @@ export class PiBridgeProvider extends BridgeProvider {
           // Deltas stream to the UI but are not journaled until text_end.
         }
         if (bridgeEvent.type === "prompt_request") {
-          session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: activeOpId ?? "" };
+          const currentOp = session.activeOpId ?? activeOpId ?? "";
+          session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: currentOp };
           this.send({
             v: 1,
             kind: "session_event",
             sessionId,
-            ...(activeOpId ? { opId: activeOpId } : {}),
+            ...(currentOp ? { opId: currentOp } : {}),
             event: bridgeEvent,
           });
           continue;
         }
+        if (bridgeEvent.type === "turn_start") {
+          // Authoritative receipt proof for an ambiguous idle prompt: Pi
+          // started the turn, so journal the pending user now (before any
+          // assistant text) so a later exit-before-`turn_end` still leaves
+          // history evidence that prevents a duplicate retry.
+          let currentOp = session.activeOpId ?? activeOpId;
+          if (currentOp && runtime.pendingUserText !== null) {
+            this.appendHistory(session, { role: "user", text: runtime.pendingUserText });
+            runtime.pendingUserText = null;
+            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+          }
+          // Ambiguous queued delivery resolved by turn evidence: a new turn
+          // after the previous completed turn (with no confirmed queued op
+          // promoted) must be the ambiguous queued message's turn (basic
+          // text has no multi-turn continuation without tools; tool
+          // continuations never promote ambiguous follow-ups — see `turn_end`
+          // guard). Promote now so this turn attributes to the queued op.
+          if (runtime.ambiguousQueued && runtime.piQueuedOps.length === 0) {
+            const amb = runtime.ambiguousQueued;
+            runtime.ambiguousQueued = null;
+            this.appendHistory(session, { role: "user", text: amb.text });
+            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+            session.activeOpId = amb.opId;
+            session.metadata.isStreaming = true;
+            runtime.activeText = "";
+            runtime.pendingUserText = null;
+            currentOp = amb.opId;
+          }
+          const opForEvent = session.activeOpId ?? currentOp;
+          if (!opForEvent) continue;
+          this.send({ v: 1, kind: "session_event", sessionId, opId: opForEvent, event: bridgeEvent });
+          continue;
+        }
         if (bridgeEvent.type === "settled") {
+          const currentOp = session.activeOpId ?? activeOpId;
           this.send({
             v: 1,
             kind: "session_event",
             sessionId,
-            ...(activeOpId ? { opId: activeOpId } : {}),
+            ...(currentOp ? { opId: currentOp } : {}),
             event: bridgeEvent,
           });
-          if (activeOpId) {
+          if (currentOp) {
             // Fallback journaling for turns that settle without a `turn_end`
             // (robustness; the normal path journals per turn below). Pending
             // ambiguous users journal first so order stays user→assistant.
@@ -487,29 +543,34 @@ export class PiBridgeProvider extends BridgeProvider {
             }
             if (runtime.activeText !== "") {
               this.appendHistory(session, { role: "assistant", text: runtime.activeText });
-              session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
-            } else {
-              session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
             }
+            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
             runtime.activeText = "";
-            // `agent_settled` means Pi has no queued continuation left: any
-            // still-tracked Pi-owned ops never ran, so drop them rather than
-            // promoting a turn Pi already finished past.
+            // `agent_settled` means Pi has no queued continuation left: drop
+            // confirmed queued ops that never ran and any unresolved ambiguous
+            // queued candidate (it never became current) rather than promoting
+            // a turn Pi already finished past.
             runtime.piQueuedOps.splice(0);
-            this.finishTurn(session, activeOpId);
-            if (session.activeOpId === null) session.metadata.isStreaming = false;
+            runtime.ambiguousQueued = null;
+            // Only finish when the settled op is still active (a synthesized
+            // per-turn `settled` below already cleared promoted predecessors).
+            if (session.activeOpId === currentOp) {
+              this.finishTurn(session, currentOp);
+              if (session.activeOpId === null) session.metadata.isStreaming = false;
+            }
           }
           continue;
         }
         if (bridgeEvent.type === "turn_end") {
+          const currentOp = session.activeOpId ?? activeOpId;
           this.send({
             v: 1,
             kind: "session_event",
             sessionId,
-            ...(activeOpId ? { opId: activeOpId } : {}),
+            ...(currentOp ? { opId: currentOp } : {}),
             event: bridgeEvent,
           });
-          if (activeOpId) {
+          if (currentOp) {
             // Per-turn boundary: journal this turn (pending ambiguous user
             // first, then assistant) so later turns attribute correctly.
             // Tool-only turns journal nothing (SNC1.5 owns tool journaling).
@@ -522,28 +583,41 @@ export class PiBridgeProvider extends BridgeProvider {
             }
             session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
             runtime.activeText = "";
-            // Promote the next Pi-owned queued turn (if any) so its upcoming
-            // `turn_start`/deltas attribute to the queued op, not the
-            // completed one. `agent_settled` (final, no continuation left)
-            // never promotes — see above.
-            const nextPiOp = runtime.piQueuedOps.shift();
-            if (nextPiOp !== undefined) {
-              session.activeOpId = nextPiOp;
-              session.metadata.isStreaming = true;
-              runtime.activeText = "";
-              runtime.pendingUserText = null;
-              // Queued user history was journaled at Pi-accept time, so the
-              // promoted turn only needs its assistant journaled at its own
-              // `turn_end` below.
+            // Tool-loop continuation (same prompt, more LLM calls to come)
+            // must NOT promote queued follow-ups: the next turn still belongs
+            // to the current prompt. Only completed non-tool turns promote.
+            // `steer` (before next LLM) and single-turn text promote here;
+            // `followUp` during a tool loop waits for the final stop turn.
+            if (!rawIsToolContinuation) {
+              const nextPiOp = runtime.piQueuedOps.shift();
+              if (nextPiOp !== undefined) {
+                // Every accepted dispatch gets exactly one `settled`: complete
+                // the finished op now before transferring ownership, since the
+                // final Pi `agent_settled` will arrive under the new op.
+                this.send({ v: 1, kind: "session_event", sessionId, opId: currentOp, event: { type: "settled", willRetry: false } });
+                // Deferred queued-user ordering: journal the queued user at
+                // delivery (now), after the completed turn's assistant, so
+                // history stays A-user, A-assistant, B-user, … (never B-user
+                // before A-assistant).
+                this.appendHistory(session, { role: "user", text: nextPiOp.text });
+                session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+                session.activeOpId = nextPiOp.opId;
+                session.metadata.isStreaming = true;
+                runtime.activeText = "";
+                runtime.pendingUserText = null;
+              }
             }
           }
           continue;
         }
-        // turn_start/text_*/thinking_*/tool_*: stream with the active turn id.
-        // Outside a turn (e.g. late `turn_end` after settle) they are dropped
+        // text_*/thinking_*/tool_*: stream with the active turn id.
+        // Outside a turn (e.g. late events after settle) they are dropped
         // rather than journaled under a wrong op.
-        if (!activeOpId) continue;
-        this.send({ v: 1, kind: "session_event", sessionId, opId: activeOpId, event: bridgeEvent });
+        {
+          const currentOp = session.activeOpId ?? activeOpId;
+          if (!currentOp) continue;
+          this.send({ v: 1, kind: "session_event", sessionId, opId: currentOp, event: bridgeEvent });
+        }
       }
     };
     try {
@@ -565,6 +639,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // users are dropped unjournaled (Pi never confirmed them). 
     if (runtime) {
       runtime.piQueuedOps.splice(0);
+      runtime.ambiguousQueued = null;
       runtime.pendingUserText = null;
       runtime.activeText = "";
     }
@@ -614,10 +689,12 @@ export class PiBridgeProvider extends BridgeProvider {
       // Busy + steer/followUp: `accepted` means Pi definitely owns the
       // prompt, never merely provider memory. Submit to Pi now with the
       // corresponding `streamingBehavior` and wait for Pi's success before
-      // acking. Pi queues internally; the op is tracked in `piQueuedOps`
-      // for attribution at the per-turn boundary (promoted on the completed
-      // `turn_end`, so the next `turn_start` carries the queued op). A crash
-      // after this ack loses nothing Pi had not already accepted.
+      // acking. Pi queues internally; the op is tracked with its mode/text
+      // for per-turn promotion that respects steer/followUp and tool-loop
+      // boundaries (see `turn_end`). History journals the queued user at
+      // delivery (promotion), never at accept, so order stays A-user,
+      // A-assistant, B-user, … A crash after this ack loses nothing Pi had
+      // not already accepted.
       const queuedCmd = mapBridgeDispatchToPiPrompt(msg.opId, msg.message, msg.queue ?? "followUp");
       try {
         await runtime.conn.prompt(queuedCmd.message, {
@@ -639,6 +716,11 @@ export class PiBridgeProvider extends BridgeProvider {
           });
           return;
         }
+        // Ambiguous queued write (may have landed but the response was lost):
+        // track it until Pi turn evidence resolves it. A later turn for its
+        // text promotes it (journaled then, in order); a final `settled`
+        // with no such turn drops it unjournaled. Never auto-resent.
+        runtime.ambiguousQueued = { opId: msg.opId, queue: (msg.queue ?? "followUp") as "steer" | "followUp", text: msg.message.text };
         this.send({
           v: 1,
           kind: "dispatch_ack",
@@ -649,13 +731,10 @@ export class PiBridgeProvider extends BridgeProvider {
         });
         return;
       }
-      // Pi owns the queued prompt: journal the user turn now (confirmed) and
-      // track it for per-turn promotion. Later Pi `turn_start`/deltas for
-      // this turn attribute to `msg.opId` once the current turn ends (see
-      // `turn_end` promotion in streaming).
-      this.appendHistory(session, { role: "user", text: msg.message.text });
-      session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
-      runtime.piQueuedOps.push(msg.opId);
+      // Pi owns the queued prompt: track it (with mode/text) for per-turn
+      // promotion. The user journals at delivery (promotion), not here, so
+      // history stays in transcript order (see `turn_end`).
+      runtime.piQueuedOps.push({ opId: msg.opId, queue: (msg.queue ?? "followUp") as "steer" | "followUp", text: msg.message.text });
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
       return;
     }

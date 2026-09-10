@@ -834,6 +834,188 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     }
   });
 
+  it("gives every accepted dispatch exactly one settled (queued promotion completes the predecessor)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "A" } });
+    await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B" }, queue: "steer" });
+    await new Promise((r) => setTimeout(r, 20));
+    // A completes; promotion synthesizes A's settled before B starts.
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-done" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sessionEvents(out, "dsp_A").filter((e) => e.event.type === "settled")).toHaveLength(1);
+    expect(sessionEvents(out, "dsp_B").filter((e) => e.event.type === "settled")).toHaveLength(1);
+  });
+
+  it("recovers an ambiguous queued steer via later turn evidence (never auto-resent)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "A" } });
+    await new Promise((r) => setTimeout(r, 20));
+    // Make the queued steer land-but-timeout: Pi queues internally, response lost.
+    const realPrompt = fakes[0]?.prompt.bind(fakes[0]);
+    if (fakes[0] && realPrompt) {
+      fakes[0].prompt = async (message: string, promptOpts?: { streamingBehavior?: string }): Promise<void> => {
+        if (message === "B-ambiguous") {
+          await realPrompt(message, promptOpts);
+          throw Object.assign(new Error("timed out"), { code: "request-timeout", ambiguous: true });
+        }
+        return realPrompt(message, promptOpts);
+      };
+    }
+    send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B-ambiguous" }, queue: "steer" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_B", status: "unknown" });
+    // A completes; B's later turn (landed despite the timeout) promotes the
+    // ambiguous candidate and journals in order — no resend needed.
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-landed" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sessionEvents(out, "dsp_B").some((e) => e.event.type === "turn_start")).toBe(true);
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ role: string; text?: string }> };
+    expect(history.entries.some((e) => e.role === "user" && e.text === "B-ambiguous")).toBe(true);
+    expect(history.entries.some((e) => e.role === "assistant" && e.text === "b-landed")).toBe(true);
+    expect(fakes[0]?.prompts.filter((p) => p.message === "B-ambiguous")).toHaveLength(1);
+  });
+
+  it("does not promote a queued followUp at a tool-use turn_end (same-prompt continuation wins)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "tool task" } });
+    await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "dispatch", opId: "dsp_F", sessionId, message: { text: "followup" }, queue: "followUp" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_F", status: "accepted" });
+    // Tool loop: first turn ends with toolUse (continuation of A, not delivery
+    // of F). The next turn still belongs to A.
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "toolUse" }, toolResults: [{ role: "toolResult" }] } as unknown as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-continued" } } as unknown as PiServerEvent);
+    // No promotion at the tool boundary: continuation still attributes to A.
+    expect(sessionEvents(out, "dsp_F").some((e) => e.event.type === "turn_start")).toBe(false);
+    // Final stop turn promotes F; F's turn then attributes correctly.
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "f-done" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sessionEvents(out, "dsp_F").some((e) => e.event.type === "turn_start")).toBe(true);
+  });
+
+  it("preserves a landed ambiguous user through exit-before-turn_end (no duplicate retry)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        const originalPrompt = fake.prompt.bind(fake);
+        fake.prompt = async (message: string, promptOpts?: { images?: readonly unknown[]; streamingBehavior?: string }): Promise<void> => {
+          fake.state.isStreaming = true;
+          fake.emit({ type: "turn_start" } as PiServerEvent);
+          await originalPrompt(message, promptOpts);
+          throw Object.assign(new Error("timed out"), { code: "request-timeout", ambiguous: true });
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "started then died" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ status: "unknown" });
+    // Pi proved receipt (turn_start journaled the user) then died before turn_end.
+    fakes[0]?.die(1, null);
+    await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ role: string; text?: string }> };
+    expect(history.entries.some((e) => e.role === "user" && e.text === "started then died")).toBe(true);
+  });
+
+  it("journals queued users in transcript order (A-user, A-assistant, B-user, B-assistant)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "A" } });
+    await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B" }, queue: "steer" });
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-out" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-out" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ role: string; text?: string }> };
+    const seq = history.entries.map((e) => `${e.role}:${e.text ?? ""}`);
+    expect(seq).toEqual(["user:A", "assistant:a-out", "user:B", "assistant:b-out"]);
+  });
+
   it("dispose() closes every Pi child with observed exit (signal/EOF fallback)", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({

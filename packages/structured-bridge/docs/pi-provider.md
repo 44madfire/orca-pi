@@ -36,20 +36,26 @@ keystroke injection anywhere on this path.
 
 - `accepted` only after Pi `prompt success:true` (Pi definitely owns it) —
   including queued `steer`/`followUp`, submitted to Pi with the matching
-  `streamingBehavior` *before* acking and tracked in `piQueuedOps` for
-  per-turn promotion (promoted on the completed `turn_end`, so the next
-  `turn_start` carries the queued op; `agent_settled` means no continuation
-  left and never promotes).
+  `streamingBehavior` *before* acking and tracked with mode/text for per-turn
+  promotion. Completed non-tool `turn_end`s promote (synthesizing the finished
+  op's `settled` first, so every accepted op gets exactly one completion);
+  tool-continuation `turn_end`s (`toolUse`/non-empty results, same prompt)
+  never promote queued follow-ups. `agent_settled` means no continuation left
+  and never promotes. Ambiguous queued writes track as candidates until turn
+  evidence resolves them (promoted on their turn, dropped unjournaled on final
+  `settled`).
 - `rejected` only for definite refusal (`success:false`, empty text,
   unknown session, busy + `queue:reject`, Pi-exited reacquire hint).
 - `unknown` for ambiguity (timeout/exit/close after the write). Pending-op
   state (`activeOpId`/`isStreaming` + unjournaled `pendingUserText`) is
-  retained *before* the write; `turn_end` journals pending-user→assistant in
-  order, so a landed-but-timed-out turn still recovers via `get_history`
-  without fabricating turns Pi never received. Idle reconciliation (`get_state`)
-  clears unlanded pending turns (history stays clean). Fully landed turns that
-  settle before the timeout journal once (no duplication). The provider sends
-  `unknown` fast; callers reconcile via history and never auto-resend.
+  retained *before* the write; `turn_start` proves receipt (journaling the
+  pending user immediately, so exit-before-`turn_end` still leaves history
+  evidence), then `turn_end` journals user→assistant in order. Idle
+  reconciliation (`get_state`) clears unlanded pending turns (history stays
+  clean); fully landed turns that settle before the timeout journal once (no
+  duplication). Queued users journal at delivery (promotion), preserving
+  A-user, A-assistant, B-user, … order. The provider sends `unknown` fast;
+  callers reconcile via history and never auto-resend.
 
 ## 3. Streaming
 
