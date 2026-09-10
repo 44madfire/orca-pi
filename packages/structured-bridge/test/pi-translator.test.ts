@@ -120,9 +120,17 @@ describe("mapPiRecordToBridgeEvents SNC1.5 (stable ids, bounded chrome)", () => 
 // -- pure translator: coalescing, dedupe, separation, lifecycle --------------
 
 describe("PiTranslator SNC1.5 (pure, no I/O)", () => {
-  it("dedupes same-id tool_start (toolcall_end then execution_start → one card)", () => {
+  it("dedupes identical same-id tool_start but forwards authoritative-args reconciliation", () => {
     const t = new PiTranslator();
-    const first = t.applyPiRecord({
+    // Provisional start without args → forwarded (first card).
+    const provisional = t.applyPiRecord({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, id: "call_1", toolName: "read" },
+    });
+    expect(provisional).toHaveLength(1);
+    // Authoritative end with args → forwarded as same-id reconciliation so the
+    // UI coalesces one row WITH faithful arguments (SNC1.5 requirement).
+    const reconciled = t.applyPiRecord({
       type: "message_update",
       assistantMessageEvent: {
         type: "toolcall_end",
@@ -130,16 +138,16 @@ describe("PiTranslator SNC1.5 (pure, no I/O)", () => {
         toolCall: { id: "call_1", name: "read", arguments: { path: "a" } },
       },
     });
-    expect(first).toHaveLength(1);
-    expect(first[0]?.type).toBe("tool_start");
-    const second = t.applyPiRecord({
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]).toMatchObject({ type: "tool_start", toolCallId: "call_1", args: { path: "a" } });
+    // Identical re-announce (same args) → dropped (no duplicate card).
+    const duplicate = t.applyPiRecord({
       type: "tool_execution_start",
       toolCallId: "call_1",
       toolName: "read",
       args: { path: "a" },
     });
-    // Dedupe: no second card (reconciles, never duplicates).
-    expect(second).toEqual([]);
+    expect(duplicate).toEqual([]);
     expect(t.hasTransient()).toBe(true);
   });
 
@@ -217,6 +225,29 @@ describe("PiTranslator SNC1.5 (pure, no I/O)", () => {
     expect(entries.filter((e) => e.role === "assistant")).toHaveLength(1);
     expect(entries.find((e) => e.role === "assistant")?.text).toBe("done.");
     expect(entries.some((e) => e.text.includes("reasoning"))).toBe(false);
+  });
+
+  it("reconciles per content index (finalized block plus delta-only block both survive abort)", () => {
+    // P2: one text index finalized, another with only deltas (aborted before
+    // its final) — both must journal, concatenated in index order.
+    const t = new PiTranslator();
+    t.notePendingUser("multi-block");
+    t.applyPiRecord({ type: "turn_start" });
+    t.applyPiRecord({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "first " },
+    });
+    t.applyPiRecord({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "second" },
+    });
+    t.applyPiRecord({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "-partial" },
+    });
+    expect(t.currentAssistantText()).toBe("first second-partial");
+    const entries = t.drainTurnEnd();
+    expect(entries.find((e) => e.role === "assistant")?.text).toBe("first second-partial");
   });
 
   it("replaces (never appends) cumulative partialResult; tool_end reconciles with isError", () => {
@@ -351,11 +382,23 @@ describe("SNC1.5 fixture replay (real Pi shapes → intelligible bridge)", () =>
         translator.notePendingUser("second task");
       }
     }
-    // Tool activity surfaced with stable ids (no duplicate cards for same id).
-    const starts = seen.filter((e) => e.type === "tool_start");
+    // Tool activity surfaced with stable ids; same-id reconciliation events
+    // (provisional start then authoritative args) coalesce by id in Orca —
+    // the last `tool_start` per id carries faithful arguments (P1).
+    const starts = seen.filter((e) => e.type === "tool_start") as Array<{ type: string; toolCallId?: string; args?: unknown; toolName?: string }>;
     expect(starts.length).toBeGreaterThanOrEqual(2);
-    const ids = starts.map((s) => s.toolCallId);
-    expect(new Set(ids).size).toBe(starts.length);
+    const byId = new Map<string, Array<{ args?: unknown }>>();
+    for (const s of starts) {
+      const list = byId.get(s.toolCallId ?? "") ?? [];
+      list.push({ ...(s.args !== undefined ? { args: s.args } : {}) });
+      byId.set(s.toolCallId ?? "", list);
+    }
+    // Two tools in the fixture (read + bash); each id's LAST start carries args.
+    expect(byId.size).toBe(2);
+    for (const [, events] of byId) {
+      const last = events[events.length - 1];
+      expect(last?.args).toBeDefined();
+    }
     // Tool progress uses replace semantics (each forwarded; translator keeps latest).
     expect(seen.some((e) => e.type === "tool_progress")).toBe(true);
     expect(seen.some((e) => e.type === "tool_end")).toBe(true);
@@ -654,5 +697,50 @@ describe("PiBridgeProvider SNC1.5 (tool/thinking/error/lifecycle fidelity)", () 
     send({ v: 1, kind: "cancel", opId: "cnl_1", sessionId });
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "cancelled")).toMatchObject({ settled: true });
+  });
+
+  it("never leaks a late tool_end after settle into the next dispatch (P1)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    // First agent completes cleanly.
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "first" } });
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "one" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    // Late tool completion races in after settle with no active op: dropped
+    // (no event) and must not mutate translator state.
+    const beforeLate = sessionEvents(out, "dsp_1").length;
+    fakes[0]?.emit({ type: "tool_execution_end", toolCallId: "stale_1", toolName: "read", result: "stale-bytes", isError: false } as unknown as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sessionEvents(out, "dsp_1")).toHaveLength(beforeLate);
+    expect(sessionEvents(out, undefined).filter((e) => e.event.type === "tool_end" && (e.event["toolCallId"] as string) === "stale_1")).toHaveLength(0);
+    // Next dispatch runs a fresh agent: the stale tool must be absent.
+    send({ v: 1, kind: "dispatch", opId: "dsp_2", sessionId, message: { text: "second" } });
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "two" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sessionEvents(out, "dsp_2").some((e) => e.event.type === "settled")).toBe(true);
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ role: string; text?: string }> };
+    expect(history.entries.some((e) => e.text === "stale-bytes")).toBe(false);
+    expect(history.entries.filter((e) => e.role === "assistant").map((e) => e.text)).toEqual(["one", "two"]);
   });
 });

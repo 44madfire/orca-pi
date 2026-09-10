@@ -85,6 +85,7 @@ import {
 import { BridgeProvider, type ProviderSession } from "./provider.js";
 import {
   mapBridgeDispatchToPiPrompt,
+  mapPiRecordToBridgeEvents,
   piBridgeCapabilities,
   validatePiDispatch,
 } from "./pi-mapping.js";
@@ -556,11 +557,35 @@ export class PiBridgeProvider extends BridgeProvider {
   private attachPiStreaming(sessionId: string, session: ProviderSession, runtime: PiRuntime): void {
     const onEvent = (event: PiServerEvent): void => {
       const activeOpId = session.activeOpId;
-      // No active turn: only forward stateless chrome that Orca can use
-      // without a turn (dialogs). Queue/compaction/retry/unknown already map
-      // to `[]` (bounded) so they never reach here as state changes.
+      const hasActiveOp = (session.activeOpId ?? activeOpId) !== null;
+      // No active turn: turn-scoped events must not mutate translator state
+      // (P1: a late `tool_execution_end` after `agent_settled` would otherwise
+      // repopulate `translator.tools`, survive `resetTurn()` on the next
+      // dispatch, and leak into the next turn's history). Use the pure mapper
+      // with no state change: forward only stateless dialogs (actionable via
+      // requestId), drop everything else. Queue/compaction/retry/unknown
+      // already map to `[]` (bounded) so they never reach here as changes.
       // Dialogs arriving without an active turn are still actionable: emit
       // them without an opId so Orca can answer via requestId.
+      if (!hasActiveOp) {
+        let stateless: ReturnType<typeof mapPiRecordToBridgeEvents>;
+        try {
+          stateless = mapPiRecordToBridgeEvents(event as unknown as Record<string, unknown>);
+        } catch {
+          return;
+        }
+        for (const bridgeEvent of stateless) {
+          if (bridgeEvent.type !== "prompt_request") continue;
+          session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: "" };
+          this.send({
+            v: 1,
+            kind: "session_event",
+            sessionId,
+            event: bridgeEvent,
+          });
+        }
+        return;
+      }
       let mapped: ReturnType<PiTranslator["applyPiRecord"]>;
       try {
         mapped = runtime.translator.applyPiRecord(event as unknown as Record<string, unknown>);
@@ -784,7 +809,11 @@ export class PiBridgeProvider extends BridgeProvider {
     // success journals immediately; ambiguity reconciles against Pi state.
     session.activeOpId = msg.opId;
     session.metadata.isStreaming = true;
-    runtime.translator.resetTurn();
+    // Fresh agent: clear ALL prior translator state (not just per-turn text)
+    // so a late event that raced `settle()` can never leak into the new turn
+    // even if the no-active-op gate above missed it (defense in depth with
+    // the gate; `notePendingUser` re-arms the new turn immediately after).
+    runtime.translator.resetAll();
     runtime.translator.notePendingUser(msg.message.text);
     runtime.activeText = "";
     runtime.pendingUserText = msg.message.text;

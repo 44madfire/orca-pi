@@ -150,12 +150,14 @@ export class PiTranslator {
    * Apply one Pi record through the pure mapper, update translator state,
    * and return the filtered bridge events (dedupe + reconcile, never fabricate).
    *
-   * - `tool_start` for an already-announced `toolCallId` is dropped (the final
-   *   reconciles: execution args are authoritative, same-id re-announce would
-   *   duplicate the card — Orca coalesces by id, so one card per id).
+   * - `tool_start` for an already-announced `toolCallId` forwards a same-id
+   *   reconciliation event only when the new event carries newly authoritative
+   *   args (provisional `toolcall_start` without args, then `toolcall_end` /
+   *   `tool_execution_start` with full args) so Orca coalesces one row per id
+   *   with faithful arguments; otherwise dropped (no duplicate cards).
    * - `text_end`/`thinking_end` finals are recorded as authoritative (deltas
-   *   stay streaming-only; journaling uses finals, falling back to deltas only
-   *   when the final carries no content).
+   *   stay streaming-only; journaling reconciles per content index — final
+   *   when present, else that index's deltas — so aborted partials survive).
    * - `turn_start` marks receipt proof (caller journals pending user first).
    * - `turn_end`/`settled` are passed through (caller drains journals, then
    *   calls `drainTurnEnd()`/`settle()`).
@@ -218,14 +220,20 @@ export class PiTranslator {
         case "tool_start": {
           const existing = this.tools.get(event.toolCallId);
           if (existing) {
-            // Same-id re-announce (toolcall_end then execution_start): reconcile
-            // by keeping the first announcement's identity and updating args
-            // only when the new event carries them authoritatively. Drop the
-            // duplicate card so Orca shows one tool row per id.
-            if (event.args !== undefined) {
+            // Same-id re-announce (e.g. provisional `toolcall_start` without
+            // args, then `toolcall_end` / `tool_execution_start` with full
+            // args): update state and forward a same-id reconciliation event
+            // when the new args are newly authoritative so Orca coalesces one
+            // row per id WITH faithful arguments (SNC1.5 requirement); drop
+            // otherwise (no duplicate cards for identical re-announces).
+            if (event.args !== undefined && !argsEqual(existing.args, event.args)) {
               this.tools.set(event.toolCallId, { ...existing, args: event.args });
+              out.push(event);
+            } else if (event.args === undefined) {
+              // No new information: drop (keep the authoritative args already stored).
+            } else {
+              // Identical args re-announce: drop.
             }
-            // Drop: no second card.
           } else {
             this.tools.set(event.toolCallId, {
               toolCallId: event.toolCallId,
@@ -300,33 +308,31 @@ export class PiTranslator {
   }
 
   /**
-   * Current assistant text for journaling: finals concatenated in index order
-   * when any final exists, otherwise deltas concatenated (partial/aborted
-   * turns where Pi never sent a final but did stream deltas). Empty string
-   * means "tool-only turn — journal no assistant entry" (SNC1.5 owns tool
-   * journaling separately so tool stdout never becomes prose).
+   * Current assistant text for journaling: per content index, prefer that
+   * index's final when present, else that index's accumulated deltas (aborted
+   * partials where Pi streamed deltas but never sent a final); concatenated
+   * in index order. Empty string means "tool-only turn — journal no assistant
+   * entry" (SNC1.5 owns tool journaling separately so tool stdout never
+   * becomes prose). Per-index reconcile (not all-finals-or-all-deltas) so an
+   * aborted turn with one finalized block plus one delta-only block keeps both.
    */
   currentAssistantText(): string {
-    if (this.textFinals.size > 0) {
-      const ordered = [...this.textFinals.entries()].sort((a, b) => a[0] - b[0]);
-      return ordered.map(([, text]) => text).join("");
-    }
-    if (this.textDeltas.size > 0) {
-      const ordered = [...this.textDeltas.entries()].sort((a, b) => a[0] - b[0]);
-      return ordered.map(([, delta]) => delta).join("");
-    }
-    return "";
+    const indices = new Set<number>([...this.textFinals.keys(), ...this.textDeltas.keys()]);
+    if (indices.size === 0) return "";
+    return [...indices]
+      .sort((a, b) => a - b)
+      .map((idx) => this.textFinals.get(idx) ?? this.textDeltas.get(idx) ?? "")
+      .join("");
   }
 
-  /** Thinking is never journaled as prose — exposed only for diagnostics/tests. */
+  /** Thinking is never journaled as prose — exposed only for diagnostics/tests (same per-index reconcile). */
   currentThinkingText(): string {
-    if (this.thinkingFinals.size > 0) {
-      return [...this.thinkingFinals.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t).join("");
-    }
-    if (this.thinkingDeltas.size > 0) {
-      return [...this.thinkingDeltas.entries()].sort((a, b) => a[0] - b[0]).map(([, d]) => d).join("");
-    }
-    return "";
+    const indices = new Set<number>([...this.thinkingFinals.keys(), ...this.thinkingDeltas.keys()]);
+    if (indices.size === 0) return "";
+    return [...indices]
+      .sort((a, b) => a - b)
+      .map((idx) => this.thinkingFinals.get(idx) ?? this.thinkingDeltas.get(idx) ?? "")
+      .join("");
   }
 
   /** Undrained completed tools (for `turn_end` journaling). */
@@ -413,5 +419,16 @@ export class PiTranslator {
     this.drainedToolIds.clear();
     this.sawTurnStart = false;
     this.sawSettled = false;
+  }
+}
+
+/** Structural args equality for same-id reconciliation (opaque payloads). */
+function argsEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
   }
 }
