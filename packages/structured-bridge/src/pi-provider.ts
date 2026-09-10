@@ -55,6 +55,7 @@
 
 import {
   PiRpcConnection,
+  redactSecrets,
   resolvePiRpcEnv,
   toPiRpcProcessSpec,
   type PiImageAttachment,
@@ -69,6 +70,7 @@ import {
 } from "@orca-pi/pi-rpc";
 import {
   BRIDGE_PROTOCOL_VERSION,
+  redactSecretsFromText,
   type AcquireRequest,
   type BridgeCapabilities,
   type BridgeSessionMetadata,
@@ -172,11 +174,22 @@ function nowIso(): string {
 }
 
 function sanitizeCode(text: string): string {
+  // Secret-safe one-line diagnostic: single line, then both redactors (Pi RPC
+  // secrets/paths plus bridge bearer/key patterns), bounded to 220 chars.
+  // Never carries prompt text — callers pass only codes and safe summaries.
   const clean = text.replace(/[\r\n]+/g, " ").trim();
-  return clean.length > 220 ? `${clean.slice(0, 217)}...` : clean;
+  return redactSecretsFromText(redactSecrets(clean), 220);
 }
 
 const DEFAULT_CLOSE_GRACE_MS = 2000;
+
+/** Aggregate observed child exits: first non-clean result wins, else clean. */
+function aggregateExits(exits: Array<{ code: number | null; signal: string | null }>): { code: number | null; signal: string | null } {
+  for (const exit of exits) {
+    if (exit.signal !== null || (exit.code !== null && exit.code !== 0)) return { code: exit.code, signal: exit.signal };
+  }
+  return { code: 0, signal: null };
+}
 
 export class PiBridgeProvider extends BridgeProvider {
   private readonly piRuntimes = new Map<string, PiRuntime>();
@@ -191,10 +204,15 @@ export class PiBridgeProvider extends BridgeProvider {
   private readonly resolvePiSpec?: PiSpecResolver;
 
   constructor(opts: PiBridgeProviderOptions = {}) {
+    // SNC1.4 truthfulness: model/thinking controls are SNC1.6 and
+    // history/branch/resume is SNC1.7, so `options`/`resume` stay false until
+    // those translators land — otherwise Orca would expose controls and resume
+    // paths that silently diverge from actual Pi child state.
+    const snc14Capabilities: BridgeCapabilities = { ...piBridgeCapabilities(), options: false, resume: false };
     super({
       providerId: opts.providerId ?? "pi",
       providerVersion: opts.providerVersion ?? "0.1.0",
-      capabilities: opts.capabilities ?? piBridgeCapabilities(),
+      capabilities: opts.capabilities ?? snc14Capabilities,
     });
     this.piCommand = opts.piCommand ?? "pi";
     this.piArgs = opts.piArgs ?? [];
@@ -232,7 +250,7 @@ export class PiBridgeProvider extends BridgeProvider {
         this.onPiCancel(msg.opId, msg.sessionId, msg.targetOpId);
         return;
       case "close":
-        await this.onPiClose(msg.opId, msg.sessionId);
+        await this.onPiClose(msg.opId, msg.sessionId, msg.mode);
         return;
       default:
         await super.onMessage(msg);
@@ -407,21 +425,38 @@ export class PiBridgeProvider extends BridgeProvider {
     return extra;
   }
 
+  /** Secret-safe Pi failure summary: `PiRpcError` messages are safe by
+   * construction (command name + id + redacted tail, never prompt text), so
+   * only those are quoted — foreign error text is never forwarded because it
+   * can carry prompt fragments, paths, or token-like values. */
+  private safePiDetail(error: unknown): string | null {
+    const maybe = error as { toSecretSafeString?: unknown } | null;
+    if (maybe && typeof maybe.toSecretSafeString === "function") {
+      try {
+        const summary = (maybe.toSecretSafeString as () => unknown)();
+        if (typeof summary === "string" && summary !== "") return sanitizeCode(summary);
+      } catch {
+        // Fall through to code-only generic below.
+      }
+    }
+    return null;
+  }
+
   private classifyStartupError(error: unknown): string {
     const code = (error as { code?: unknown })?.code;
-    const message = error instanceof Error ? error.message : String(error);
-    if (code === "spawn-failed") return `Pi executable not found or not runnable (spawn-failed). Install Pi on PATH or set an explicit Pi command. ${sanitizeCode(message)}`;
-    if (code === "startup-failed") return `Pi exited during startup (startup-failed). Check auth/model/config. ${sanitizeCode(message)}`;
-    if (code === "startup-timeout") return `Pi did not become ready in time (startup-timeout). Check model/auth and retry. ${sanitizeCode(message)}`;
-    return `Pi failed to start: ${sanitizeCode(message)}`;
+    const detail = this.safePiDetail(error);
+    const suffix = detail ? ` ${detail}` : "";
+    if (code === "spawn-failed") return `Pi executable not found or not runnable (spawn-failed). Install Pi on PATH or set an explicit Pi command.${suffix}`;
+    if (code === "startup-failed") return `Pi exited during startup (startup-failed). Check auth/model/config.${suffix}`;
+    if (code === "startup-timeout") return `Pi did not become ready in time (startup-timeout). Check model/auth and retry.${suffix}`;
+    return `Pi failed to start.${suffix}`;
   }
 
   private shortPiError(error: unknown): string {
-    if (error instanceof Error) {
-      const code = (error as { code?: unknown }).code;
-      return sanitizeCode(typeof code === "string" ? `${code}: ${error.message}` : error.message);
-    }
-    return sanitizeCode(String(error));
+    const detail = this.safePiDetail(error);
+    if (detail) return detail;
+    const code = (error as { code?: unknown })?.code;
+    return sanitizeCode(typeof code === "string" ? code : "pi-error");
   }
 
   private async refreshMetadataBestEffort(sessionId: string): Promise<void> {
@@ -628,6 +663,21 @@ export class PiBridgeProvider extends BridgeProvider {
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: validation.reason ?? "invalid-dispatch" });
       return;
     }
+    // SNC1.4 is basic text chat: leading-`/` extension commands are handled
+    // immediately by Pi (success without any turn lifecycle), which would
+    // leave this single-turn provider streaming forever. Reject them honestly
+    // instead of stranding the session; interactive prompts land in SNC1.6.
+    if (msg.message.text.trimStart().startsWith("/")) {
+      this.send({
+        v: 1,
+        kind: "dispatch_ack",
+        opId: msg.opId,
+        sessionId: msg.sessionId,
+        status: "rejected",
+        reason: "extension-command (interactive prompts land in SNC1.6; send plain text)",
+      });
+      return;
+    }
     if (session.activeOpId) {
       // SNC1.4 single-turn honesty: while a turn streams, every new dispatch
       // — including `steer`/`followUp` — is honestly rejected without touching
@@ -798,6 +848,10 @@ export class PiBridgeProvider extends BridgeProvider {
     if (target !== "") session.cancelledOps.add(target);
     const settled = session.activeOpId === null;
     this.send({ v: 1, kind: "cancelled", opId, sessionId, targetOpId: target, settled });
+    // Fence the abort to the requested target: a stale cancel for a settled
+    // op must never abort the currently streaming (unrelated) turn. An
+    // omitted target means Esc-for-active (abort whatever streams, if anything).
+    if (targetOpId !== undefined && targetOpId !== session.activeOpId) return;
     if (session.activeOpId === null || runtime.conn.isClosed) return;
     // Fire-and-forget abort: Pi's `abort` response may arrive after
     // `agent_settled` (proven in `abort-queue.jsonl`), so never block the
@@ -857,25 +911,26 @@ export class PiBridgeProvider extends BridgeProvider {
     this.send({ v: 1, kind: "released", opId, sessionId });
   }
 
-  private async onPiClose(opId: string, sessionId?: string): Promise<void> {
+  private async onPiClose(opId: string, sessionId?: string, mode: "graceful" | "force" = "graceful"): Promise<void> {
     if (sessionId) {
-      await this.teardownPiRuntime(sessionId);
+      const exit = await this.teardownPiRuntime(sessionId, mode);
       this.sessions.delete(sessionId);
-      this.send({ v: 1, kind: "closed", opId, sessionId, exit: { code: 0, signal: null } });
+      this.send({ v: 1, kind: "closed", opId, sessionId, exit });
       return;
     }
-    // Provider shutdown: bounded graceful close of every Pi child, then ack.
+    // Provider shutdown: bounded close of every Pi child in the requested mode,
+    // then ack with the observed aggregate exit (first non-clean child wins).
     // The host follows with stdin EOF/SIGTERM/SIGKILL; the CLI also exits on
     // EOF/SIGTERM (see `pi-provider-cli.ts`) so no Pi child leaks.
     const ids = [...this.piRuntimes.keys()];
-    await Promise.all(ids.map((id) => this.teardownPiRuntime(id)));
+    const exits = await Promise.all(ids.map((id) => this.teardownPiRuntime(id, mode)));
     this.sessions.clear();
-    this.send({ v: 1, kind: "closed", opId, exit: { code: 0, signal: null } });
+    this.send({ v: 1, kind: "closed", opId, exit: aggregateExits(exits) });
   }
 
-  private async teardownPiRuntime(sessionId: string): Promise<void> {
+  private async teardownPiRuntime(sessionId: string, mode: "graceful" | "force" = "graceful"): Promise<{ code: number | null; signal: string | null }> {
     const runtime = this.piRuntimes.get(sessionId);
-    if (!runtime) return;
+    if (!runtime) return { code: 0, signal: null };
     this.piRuntimes.delete(sessionId);
     for (const unsub of runtime.unsubs.splice(0)) {
       try {
@@ -884,14 +939,21 @@ export class PiBridgeProvider extends BridgeProvider {
         // Cleanup must not throw.
       }
     }
+    // Force skips the graceful EOF/SIGTERM graces and goes straight to the
+    // bounded force path; graceful uses the configured grace. Either way the
+    // observed child result is reported (never a fabricated clean exit).
+    const graceMs = mode === "force" ? 0 : this.piCloseGraceMs;
     try {
-      await runtime.conn.close(this.piCloseGraceMs);
+      const result = await runtime.conn.close(graceMs);
+      return { code: result.exitCode, signal: result.signal };
     } catch {
       // Teardown is best-effort; the host bounds kill stages regardless.
       try {
-        await runtime.conn.close(0);
+        const result = await runtime.conn.close(0);
+        return { code: result.exitCode, signal: result.signal };
       } catch {
         // Ignore — child already gone.
+        return { code: null, signal: null };
       }
     }
   }

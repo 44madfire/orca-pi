@@ -31,6 +31,8 @@ class FakePi implements PiProviderConnection {
   failStateWith: unknown = null;
   /** Artificial `close()` latency (ms) to prove `dispose()` awaits slow children. */
   closeDelayMs = 0;
+  /** Override the observed close result (force/signal paths). */
+  closeResult: PiRpcCloseResult | null = null;
   state: PiState = {
     model: { id: "glm-5.3-flash", provider: "opencode-go" } as PiState["model"],
     thinkingLevel: "low",
@@ -69,6 +71,7 @@ class FakePi implements PiProviderConnection {
     this.closes.push(graceMs);
     if (this.closeDelayMs > 0) await new Promise((r) => setTimeout(r, this.closeDelayMs));
     this._closed = true;
+    if (this.closeResult) return { ...this.closeResult };
     const info: PiRpcCloseResult = { exitCode: 0, signal: null, forced: graceMs === 0 };
     for (const h of [...this.exitHandlers]) {
       try {
@@ -1027,5 +1030,146 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     expect(fakes).toHaveLength(2);
     expect(fakes.every((f) => f.closes.length > 0)).toBe(true);
     expect(fakes.every((f) => f.isClosed)).toBe(true);
+  });
+});
+
+describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
+  it("rejects extension-command prompts without touching Pi (session stays idle)", async () => {
+    // Pi handles `/cmd` immediately with success but no turn lifecycle, which
+    // would strand this single-turn provider streaming forever. SNC1.4
+    // honestly rejects them (interactive prompts land in SNC1.6).
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "/rpc-ask" } });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_1", status: "rejected" });
+    expect(JSON.stringify(lastOfKind(out, "dispatch_ack"))).toContain("SNC1.6");
+    expect(fakes[0]?.prompts).toHaveLength(0);
+    // Never streamed, so still idle — the next plain-text turn runs normally.
+    send({ v: 1, kind: "cancel", opId: "cnl_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "cancelled")).toMatchObject({ settled: true });
+    send({ v: 1, kind: "dispatch", opId: "dsp_2", sessionId, message: { text: "plain hello" } });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_2", status: "accepted" });
+  });
+
+  it("does not abort the live turn for a stale targeted cancel", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "A" } });
+    await new Promise((r) => setTimeout(r, 20));
+    // A runs to completion under its own op.
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-done" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    // Sequential turn B starts streaming.
+    send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B" } });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_B", status: "accepted" });
+    // A delayed cancel naming settled A must not abort live B.
+    send({ v: 1, kind: "cancel", opId: "cnl_late", sessionId, targetOpId: "dsp_A" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "cancelled")).toMatchObject({ targetOpId: "dsp_A", settled: false });
+    expect(fakes[0]?.aborts).toBe(0);
+    // B still streams and settles normally under its own op.
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-done" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sessionEvents(out, "dsp_B").filter((e) => e.event.type === "settled")).toHaveLength(1);
+  });
+
+  it("propagates force mode and reports the observed Pi exit (no fabricated success)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    // Force close skips the graceful EOF/SIGTERM graces and reports Pi's
+    // actual signaled exit instead of a hard-coded clean result.
+    if (fakes[0]) fakes[0].closeResult = { exitCode: null, signal: "SIGKILL", forced: true };
+    send({ v: 1, kind: "close", opId: "cls_force", mode: "force", sessionId });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fakes[0]?.closes).toEqual([0]);
+    expect(lastOfKind(out, "closed")).toMatchObject({ exit: { code: null, signal: "SIGKILL" } });
+  });
+
+  it("advertises only the capabilities SNC1.4 honestly implements", async () => {
+    // Model/thinking controls are SNC1.6 and history/branch/resume is SNC1.7:
+    // `options`/`resume` must stay false so Orca never exposes controls or
+    // resume paths that silently diverge from actual Pi child state.
+    const provider = new PiBridgeProvider({ createConnection: (opts) => new FakePi(opts) });
+    const { out, hello } = drive(provider);
+    hello();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(lastOfKind(out, "hello_ok")).toMatchObject({
+      provider: { id: "pi" },
+      capabilities: { textStreaming: true, cancel: true, options: false, resume: false },
+    });
+  });
+
+  it("keeps user-home paths and token-shaped values out of failure diagnostics", async () => {
+    const probingPrompt = "ignore this prompt body";
+    const failing = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fake.failStartWith = Object.assign(
+          new Error(`failed to spawn C:\\Users\\someone\\pi.exe with sk-proj-abcdefghijklmnopqr for ${probingPrompt}`),
+          { code: "spawn-failed", ambiguous: false },
+        );
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(failing);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 30));
+    const err = lastOfKind(out, "error") as unknown as { error: { code: string; message: string } };
+    expect(err.error.code).toBe("PI_STARTUP_FAILED");
+    expect(err.error.message).not.toContain("sk-proj-abcdefghijklmnopqr");
+    expect(err.error.message).not.toContain("someone");
+    expect(err.error.message).not.toContain(probingPrompt);
+    // Pi free-text turn failures collapse to the stable generic message.
+    const mapped = mapPiRecordToBridgeEvents({
+      type: "turn_end",
+      message: { role: "assistant", stopReason: "error" },
+      errorMessage: "boom sk-proj-abcdefghijklmnopqr near /home/someone/x",
+    });
+    expect(mapped).toEqual([{ type: "turn_end", stopReason: "error", errorMessage: "provider dispatch failed" }]);
+    expect(JSON.stringify(mapped)).not.toContain("sk-proj-abcdefghijklmnopqr");
   });
 });

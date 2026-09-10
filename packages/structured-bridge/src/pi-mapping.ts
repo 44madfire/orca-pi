@@ -199,7 +199,10 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
             ? (inner["errorMessage"] as string)
             : undefined;
       if (stop === "aborted") return [{ type: "turn_end", stopReason: "aborted", ...(errorMessage ? { errorMessage } : {}) }];
-      if (stop === "error") return [{ type: "turn_end", stopReason: "error", ...(errorMessage ? { errorMessage } : {}) }];
+      // Secret hygiene (bridge-protocol §6): provider turn failures use a stable
+      // generic message — Pi free text can carry prompt/request/credential
+      // material that value redaction cannot reliably strip.
+      if (stop === "error") return [{ type: "turn_end", stopReason: "error", errorMessage: "provider dispatch failed" }];
       return [{ type: "turn_end", stopReason: "stop" }];
     }
     case "agent_settled": {

@@ -17,20 +17,26 @@ spawn-only never the bridge); TUI-only flags are rejected fail-closed via
 `toPiRpcProcessSpec`; `--mode rpc` is appended idempotently. No terminal
 keystroke injection anywhere on this path.
 
-- `hello` → `hello_ok{provider:{id:"pi"},capabilities:piBridgeCapabilities()}`
+- `hello` → `hello_ok{provider:{id:"pi"},capabilities}` with SNC1.4-truthful
+  flags (`options:false`, `resume:false`: model/thinking controls are SNC1.6,
+  history/branch/resume is SNC1.7, so Orca never exposes diverging controls)
 - `acquire{workspaceRoot,options?}` → spawn + `start()` + `get_state` →
   `acquired{metadata{sessionId,providerSessionId,workspaceRoot,model?,thinkingLevel?,messageCount,isStreaming:false}}`
-- `dispatch{text,images?,queue?}` → `validatePiDispatch` → Pi `prompt`
-  (with `streamingBehavior` for `steer`/`followUp`) →
-  `dispatch_ack{accepted|rejected|unknown}` + streamed `session_event`s
-- `cancel` → Pi `abort()` → `cancelled{settled}` + Pi `turn_end{aborted}`/`settled`
+- `dispatch{text,images?,queue?}` → `validatePiDispatch` (+ leading-`/`
+  extension-command rejection for SNC1.6) → idle Pi `prompt` →
+  `dispatch_ack{accepted|rejected|unknown}` + streamed `session_event`s.
+  Busy-session dispatches (including `steer`/`followUp`) are honestly
+  rejected — one turn at a time; Pi-owned queue fidelity is SNC1.5.
+- `cancel{targetOpId?}` → Pi `abort()` only when the target is the live turn
+  (omitted target means Esc-for-active); stale targets are honest no-ops →
+  `cancelled{settled}` + Pi `turn_end{aborted}`/`settled`
 - `answer_prompt` → Pi `extension_ui_response` (select/input/editor `{value}`,
   confirm `{confirmed}`, cancel `{cancelled:true}`)
-- `release`/`close` → bounded `PiRpcConnection.close()` per child, then
-  `released`/`closed`; provider `dispose()` (also awaited to completion on
-  SIGTERM/SIGINT/stdin-EOF — `close()` is already bounded, so exiting early
-  would cut off its SIGTERM/SIGKILL stages) closes every Pi child with
-  observed exit (no leaked processes/listeners).
+- `release`/`close{mode}` → bounded `PiRpcConnection.close()` per child
+  (`force` skips graceful graces via `close(0)`), then `released`/`closed`
+  carrying the observed Pi exit (first non-clean child wins; never fabricated).
+  Provider `dispose()` (also awaited to completion on SIGTERM/SIGINT/stdin-EOF)
+  closes every Pi child with observed exit (no leaked processes/listeners).
 
 ## 2. Delivery honesty
 
@@ -86,8 +92,11 @@ and queued-delivery boundaries).
 
 - Missing Pi binary → `PI_STARTUP_FAILED` (spawn-failed hint).
 - Early exit / bad args / auth / model → `PI_STARTUP_FAILED` /
-  `PI_STATE_FAILED` with bounded redacted diagnostics (no prompt text, no
-  credentials/paths).
+  `PI_STATE_FAILED` quoting only `PiRpcError.toSecretSafeString()` (safe by
+  construction: command name + id + redacted tail) — foreign error text is
+  never forwarded, so no prompt text, paths, or token-shaped values leak.
+  Pi free-text `turn_end{error}` collapses to the stable generic
+  `provider dispatch failed` per bridge §6.
 - TUI-only launch flags → `PI_TUI_FLAG` (fall back to normal Pi TUI).
 - Pi death mid-turn → shaped `turn_end{error}` + `settled` (UI unsticks);
   already-journaled turns survive so `unknown` reconciles without duplicates;
