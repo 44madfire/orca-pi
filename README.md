@@ -37,7 +37,7 @@ orca-pi/
 │   ├── core/               # version + doctor + manifest validator + profiles + launcher + supervised adapter + compact orchestration (no Electron)
 │   ├── cli/                # `orca-pi` executable (thin wrapper over core)
 │   ├── pi-rpc/             # SNC1.1 Pi RPC contract proofs (LF-only JSONL, fixtures, compatibility matrix)
-│   ├── structured-bridge/  # SNC1.3 hot-swappable external structured-session bridge (dev seam + mock + Pi mapping)
+│   ├── structured-bridge/  # SNC1.3 hot-swappable external structured-session bridge (dev seam + mock + Pi mapping) + SNC1.4 Pi-backed provider (pi --mode rpc text chat)
 │   └── orca-plugin/        # Orca manifest, panel/skill/command contributions
 ├── profiles/          # Pi agent profile schema docs + defaults + examples (OP1.2 / JEF-6 + OP1.6 / JEF-10)
 ├── prompts/           # Default scout/worker/reviewer role prompts (OP1.6 / JEF-10)

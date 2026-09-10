@@ -1,7 +1,7 @@
 {
   "name": "@orca-pi/structured-bridge",
   "version": "0.1.0",
-  "description": "SNC1.3: hot-swappable external structured-session bridge — versioned local IPC (Orca-side host + external provider + mock). Dev/test seam only; Orca owns journal/lease/outbox/rendering.",
+  "description": "SNC1.3 hot-swappable external structured-session bridge + SNC1.4 Pi-backed provider (pi --mode rpc via @orca-pi/pi-rpc). Dev/test seam only; Orca owns journal/lease/outbox/rendering.",
   "type": "commonjs",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -16,5 +16,7 @@
     "test": "vitest run",
     "lint": "eslint src test"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@orca-pi/pi-rpc": "0.1.0"
+  }
 }

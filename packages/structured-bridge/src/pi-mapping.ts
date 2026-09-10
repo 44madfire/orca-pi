@@ -1,5 +1,5 @@
 /**
- * Pi-specific bridge translation (orca-pi owned, SNC1.3).
+ * Pi-specific bridge translation (orca-pi owned, SNC1.3 + SNC1.4).
  *
  * The generic core (`protocol.ts`, `framing.ts`, `host.ts`, `provider.ts`)
  * is provider-neutral and safe to vendor into the Orca fork. Everything Pi
@@ -9,10 +9,12 @@
  * - Client-side validation Pi itself will not do (bogus thinking levels
  *   fall back to `minimal` without error; image support is per-model).
  * - Bridge dispatch → Pi RPC `prompt` mapping (shape only; SNC1.4 wires it
- *   to the production `PiRpcConnection` from SNC1.2 — today it targets the
- *   SNC1.1 `SpikeClient` semantics).
- * - Pi event → bridge `session_event` mapping notes (per
- *   `pi-rpc/docs/pi-rpc-contract.md` §7).
+ *   to the production `PiRpcConnection` from SNC1.2 via `pi-provider.ts`).
+ * - Pi event → bridge `session_event` mapping (per
+ *   `pi-rpc/docs/pi-rpc-contract.md` §7), covering both the legacy
+ *   SNC1.1 `SpikeClient` shapes (`update:{kind}`) and the real Pi
+ *   `--mode rpc` shapes (`assistantMessageEvent`, `method`-based
+ *   `extension_ui_request`, `turn_start`/`turn_end`/`agent_settled`).
  *
  * This module imports no Orca journal/session types and sends no
  * credentials — it only shapes opaque text/image/option payloads.
@@ -109,19 +111,31 @@ export function mapBridgeDispatchToPiPrompt(
 
 /**
  * Map one Pi RPC stdout record to zero or more bridge provider events.
- * Pure function over opaque payloads (used by SNC1.4; unit-tested here so
- * the mapping is pinned before the native adapter lands).
+ * Pure function over opaque payloads (used by SNC1.4 `pi-provider.ts`;
+ * unit-tested here so the mapping is pinned before the native adapter lands).
+ *
+ * Covers both the legacy SNC1.1 spike shapes (`update:{kind}`) and the real
+ * Pi `--mode rpc` shapes proven in `packages/pi-rpc/fixtures/*.jsonl`:
+ * `message_update.assistantMessageEvent` (`text_*`, `thinking_*`,
+ * `toolcall_*`), `turn_start`/`turn_end` (with `message.stopReason`), and
+ * `method`-based `extension_ui_request` dialogs.
  *
  * Returns `[]` for fire-and-forget records the bridge must ignore
- * (`extension_ui_request` with `setTitle`/`setStatus`/`notify`, unknown
+ * (`agent_start`/`agent_end`/`message_start`/`message_end` lifecycle chrome,
+ * `toolcall_delta` arg chunks, `extension_ui_request` with
+ * `setTitle`/`setStatus`/`setWidget`/`notify`, `queue_update`,
+ * `thinking_level_changed`, `session_info_changed`, `compaction_*`, unknown
  * future events) and for `response` envelopes (handled via correlation,
- * not streaming).
+ * not streaming). SNC1.4 streams basic text + turn lifecycle + cancel;
+ * richer thinking/tool/error translation lands in SNC1.5.
  */
 export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): BridgeProviderEvent[] {
   const type = record["type"] as string | undefined;
   switch (type) {
     case "message_update": {
-      const update = record["update"] as Record<string, unknown> | undefined;
+      // Real Pi nests the delta under `assistantMessageEvent`; the SNC1.1
+      // spike used `update:{kind}`. Support both (spike first for back-compat).
+      const update = (record["assistantMessageEvent"] ?? record["update"]) as Record<string, unknown> | undefined;
       const kind = update?.["kind"] ?? update?.["type"];
       if (kind === "text_start") return [{ type: "text_start", contentIndex: numeric(update?.["contentIndex"], 0) }];
       if (kind === "text_delta") return [{ type: "text_delta", delta: String(update?.["delta"] ?? update?.["text"] ?? ""), contentIndex: numeric(update?.["contentIndex"], 0) }];
@@ -129,6 +143,13 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
       if (kind === "thinking_start") return [{ type: "thinking_start", contentIndex: numeric(update?.["contentIndex"], 0) }];
       if (kind === "thinking_delta") return [{ type: "thinking_delta", delta: String(update?.["delta"] ?? ""), contentIndex: numeric(update?.["contentIndex"], 0) }];
       if (kind === "thinking_end") return [{ type: "thinking_end", contentIndex: numeric(update?.["contentIndex"], 0), thinking: typeof update?.["content"] === "string" ? (update?.["content"] as string) : undefined }];
+      // `toolcall_*` arg streaming is SNC1.5 scope: ignore deltas/ends here
+      // (execution identity comes via `tool_execution_*` below). Map the
+      // start so a tool call still surfaces as activity without duplicating
+      // the later `tool_execution_start` card in SNC1.4 basic text flow.
+      // To avoid double `tool_start` cards (one for `toolcall_start`, one
+      // for `tool_execution_start` with the same id), ignore the arg-phase
+      // start here — execution events carry args + identity authoritatively.
       return [];
     }
     case "text_start":
@@ -143,47 +164,92 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
       return [{ type: "thinking_delta", delta: String(record["delta"] ?? ""), contentIndex: numeric(record["contentIndex"], 0) }];
     case "thinking_end":
       return [{ type: "thinking_end", contentIndex: numeric(record["contentIndex"], 0), thinking: typeof record["content"] === "string" ? (record["content"] as string) : undefined }];
-    case "toolcall_start":
     case "tool_execution_start": {
       const id = String(record["toolCallId"] ?? record["id"] ?? "call_unknown");
       return [{ type: "tool_start", toolCallId: id, toolName: String(record["toolName"] ?? record["tool"] ?? "tool"), args: record["args"] }];
     }
-    case "tool_execution_update":
-      return [{ type: "tool_progress", toolCallId: String(record["toolCallId"] ?? "call_unknown"), partialResult: String(record["partialResult"] ?? "") }];
-    case "toolcall_end":
-    case "tool_execution_end":
-      return [{ type: "tool_end", toolCallId: String(record["toolCallId"] ?? "call_unknown"), result: String(record["result"] ?? ""), isError: Boolean(record["isError"]) }];
+    case "tool_execution_update": {
+      const partial = record["partialResult"];
+      // `partialResult` is accumulated opaque output: stringify objects so
+      // the bridge `tool_progress.partialResult: string` contract holds.
+      // SNC1.5 owns faithful tool rendering; SNC1.4 keeps text flowing.
+      const partialResult = typeof partial === "string" ? partial : safeStringify(partial);
+      return [{ type: "tool_progress", toolCallId: String(record["toolCallId"] ?? "call_unknown"), partialResult }];
+    }
+    case "tool_execution_end": {
+      const result = record["result"];
+      const resultText = typeof result === "string" ? result : safeStringify(result);
+      return [{ type: "tool_end", toolCallId: String(record["toolCallId"] ?? "call_unknown"), result: resultText, isError: Boolean(record["isError"]) }];
+    }
     case "turn_start":
-    case "agent_start":
       return [{ type: "turn_start" }];
-    case "turn_end":
+    case "turn_end": {
+      // Real Pi nests the verdict under `message.stopReason` (`stop` |
+      // `aborted` | tool-use flows); the outer record may also carry it.
+      // Preserve `aborted` so Esc-cancel renders correctly; everything else
+      // maps to `stop` for SNC1.4 basic text (SNC1.5 owns error shaping).
+      const outerStop = typeof record["stopReason"] === "string" ? (record["stopReason"] as string) : undefined;
+      const inner = record["message"] as Record<string, unknown> | undefined;
+      const innerStop = inner && typeof inner["stopReason"] === "string" ? (inner["stopReason"] as string) : undefined;
+      const stop = outerStop ?? innerStop ?? "stop";
+      const errorMessage =
+        typeof record["errorMessage"] === "string"
+          ? (record["errorMessage"] as string)
+          : inner && typeof inner["errorMessage"] === "string"
+            ? (inner["errorMessage"] as string)
+            : undefined;
+      if (stop === "aborted") return [{ type: "turn_end", stopReason: "aborted", ...(errorMessage ? { errorMessage } : {}) }];
+      // Secret hygiene (bridge-protocol §6): provider turn failures use a stable
+      // generic message — Pi free text can carry prompt/request/credential
+      // material that value redaction cannot reliably strip.
+      if (stop === "error") return [{ type: "turn_end", stopReason: "error", errorMessage: "provider dispatch failed" }];
       return [{ type: "turn_end", stopReason: "stop" }];
-    case "agent_end":
-      return [{ type: "turn_end", stopReason: "stop" }];
-    case "agent_settled":
-      return [{ type: "settled", willRetry: false }];
+    }
+    case "agent_settled": {
+      const willRetry = typeof record["willRetry"] === "boolean" ? (record["willRetry"] as boolean) : false;
+      return [{ type: "settled", willRetry }];
+    }
     case "extension_ui_request": {
-      const ui = record as { id?: unknown; request?: unknown; prompt?: unknown; kind?: unknown; title?: unknown; options?: unknown; message?: unknown };
+      const ui = record as {
+        id?: unknown;
+        method?: unknown;
+        request?: unknown;
+        prompt?: unknown;
+        kind?: unknown;
+        title?: unknown;
+        options?: unknown;
+        message?: unknown;
+        placeholder?: unknown;
+        prefill?: unknown;
+      };
+      // Real Pi uses `method`; the SNC1.1 spike used `kind`/`prompt.kind`.
       // Fire-and-forget chrome (spinner title, status, widgets, notify) is ignored.
-      const maybeKind = String((ui.prompt as { kind?: unknown } | undefined)?.kind ?? ui.kind ?? (ui.request as { kind?: unknown } | undefined)?.kind ?? "");
+      const rawMethod =
+        (typeof ui.method === "string" ? ui.method : undefined) ??
+        String((ui.prompt as { kind?: unknown } | undefined)?.kind ?? ui.kind ?? (ui.request as { kind?: unknown } | undefined)?.kind ?? "");
+      const maybeKind = rawMethod;
       if (["select", "confirm", "input", "editor"].includes(maybeKind)) {
         const requestId = String(ui.id ?? "");
         if (!requestId) return [];
+        // Dialog fields may live top-level (real Pi) or under prompt/request (spike).
+        const nested = ((ui.prompt ?? ui.request ?? {}) as { title?: unknown; options?: unknown; message?: unknown; placeholder?: unknown; prefill?: unknown }) ?? {};
+        const titleTop = typeof ui.title === "string" ? ui.title : undefined;
         if (maybeKind === "select") {
-          const prompt = (ui.prompt ?? ui.request ?? {}) as { title?: unknown; options?: unknown };
-          const options = Array.isArray(prompt.options) ? prompt.options.map(String) : [];
-          return [{ type: "prompt_request", requestId, prompt: { kind: "select", title: String(prompt.title ?? "Choose"), options } }];
+          const rawOptions = Array.isArray(nested.options) ? nested.options : Array.isArray(ui.options) ? ui.options : [];
+          const options = (rawOptions as unknown[]).map(String);
+          if (options.length === 0) return [];
+          return [{ type: "prompt_request", requestId, prompt: { kind: "select", title: String(nested.title ?? titleTop ?? "Choose"), options } }];
         }
         if (maybeKind === "confirm") {
-          const prompt = (ui.prompt ?? ui.request ?? {}) as { title?: unknown; message?: unknown };
-          return [{ type: "prompt_request", requestId, prompt: { kind: "confirm", title: String(prompt.title ?? "Confirm"), message: String(prompt.message ?? "") } }];
+          const message = typeof nested.message === "string" ? nested.message : typeof ui.message === "string" ? ui.message : "";
+          return [{ type: "prompt_request", requestId, prompt: { kind: "confirm", title: String(nested.title ?? titleTop ?? "Confirm"), message: String(message) } }];
         }
         if (maybeKind === "input") {
-          const prompt = (ui.prompt ?? ui.request ?? {}) as { title?: unknown; placeholder?: unknown };
-          return [{ type: "prompt_request", requestId, prompt: { kind: "input", title: String(prompt.title ?? "Input"), placeholder: typeof prompt.placeholder === "string" ? prompt.placeholder : undefined } }];
+          const placeholder = typeof nested.placeholder === "string" ? nested.placeholder : typeof ui.placeholder === "string" ? ui.placeholder : undefined;
+          return [{ type: "prompt_request", requestId, prompt: { kind: "input", title: String(nested.title ?? titleTop ?? "Input"), placeholder } }];
         }
-        const prompt = (ui.prompt ?? ui.request ?? {}) as { title?: unknown; prefill?: unknown };
-        return [{ type: "prompt_request", requestId, prompt: { kind: "editor", title: String(prompt.title ?? "Edit"), prefill: typeof prompt.prefill === "string" ? prompt.prefill : undefined } }];
+        const prefill = typeof nested.prefill === "string" ? nested.prefill : typeof ui.prefill === "string" ? ui.prefill : undefined;
+        return [{ type: "prompt_request", requestId, prompt: { kind: "editor", title: String(nested.title ?? titleTop ?? "Edit"), prefill } }];
       }
       return [];
     }
@@ -194,4 +260,16 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
 
 function numeric(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** Stringify opaque tool payloads without leaking unbounded bytes into the bridge. */
+function safeStringify(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  try {
+    const text = JSON.stringify(value);
+    return typeof text === "string" ? text : String(value);
+  } catch {
+    return String(value);
+  }
 }
