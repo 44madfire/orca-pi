@@ -60,16 +60,30 @@ let exiting = false;
 function shutdown(signal: string): void {
   if (exiting) return;
   exiting = true;
-  try {
-    detach();
-  } catch {
-    // Cleanup must not throw.
-  }
-  // Give the final `closed` line one tick to flush before exiting.
-  setTimeout(() => {
-    void signal;
-    process.exit(0);
-  }, 20);
+  // Signal/EOF fallback path (host force-close or pipe EOF without a bridge
+  // `close` handshake): boundedly close every Pi child with observed exit
+  // before leaving, so no `pi --mode rpc` process leaks. The normal path is
+  // the bridge `close` handshake (`onPiClose`); this covers the rest.
+  void (async () => {
+    try {
+      await Promise.race([
+        provider.dispose(),
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+    } catch {
+      // Teardown is best-effort; never block process exit.
+    }
+    try {
+      detach();
+    } catch {
+      // Cleanup must not throw.
+    }
+    // Give the final `closed` line one tick to flush before exiting.
+    setTimeout(() => {
+      void signal;
+      process.exit(0);
+    }, 20);
+  })();
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

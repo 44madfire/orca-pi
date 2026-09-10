@@ -11,9 +11,10 @@
 One `pi --mode rpc` child per bridge session (`cwd` = acquire
 `workspaceRoot`, the exact Orca-selected workspace). Transport-neutral
 profile configuration travels via `resolvePiSpec` (callers pass
-`buildPiLaunch()` output); TUI-only flags are rejected fail-closed via
-`toPiRpcProcessSpec`; `--mode rpc` is appended idempotently. No terminal
-keystroke injection anywhere on this path.
+`buildPiLaunch()` output; spec `env` merges into the spawn with explicit
+`piEnv`-wins precedence, spawn-only never the bridge); TUI-only flags are
+rejected fail-closed via `toPiRpcProcessSpec`; `--mode rpc` is appended
+idempotently. No terminal keystroke injection anywhere on this path.
 
 - `hello` → `hello_ok{provider:{id:"pi"},capabilities:piBridgeCapabilities()}`
 - `acquire{workspaceRoot,options?}` → spawn + `start()` + `get_state` →
@@ -25,17 +26,24 @@ keystroke injection anywhere on this path.
 - `answer_prompt` → Pi `extension_ui_response` (select/input/editor `{value}`,
   confirm `{confirmed}`, cancel `{cancelled:true}`)
 - `release`/`close` → bounded `PiRpcConnection.close()` per child, then
-  `released`/`closed`; provider SIGTERM/stdin-EOF closes every Pi child
+  `released`/`closed`; provider `dispose()` (also awaited on SIGTERM/SIGINT/
+  stdin-EOF with a 2s bound) closes every Pi child with observed exit
   (no leaked processes/listeners).
 
 ## 2. Delivery honesty
 
-- `accepted` only after Pi `prompt success:true` (Pi definitely owns it).
+- `accepted` only after Pi `prompt success:true` (Pi definitely owns it) —
+  including queued `steer`/`followUp`, submitted to Pi with the matching
+  `streamingBehavior` *before* acking and tracked in `piQueuedOps` for
+  post-settle promotion (never merely provider memory).
 - `rejected` only for definite refusal (`success:false`, empty text,
   unknown session, busy + `queue:reject`, Pi-exited reacquire hint).
-- `unknown` for ambiguity (timeout/exit/close after the write). The provider
-  sends `unknown` fast instead of waiting for the host deadline; callers
-  reconcile via `get_history` before retrying and never auto-resend.
+- `unknown` for ambiguity (timeout/exit/close after the write). Pending-op
+  state (`activeOpId`/`isStreaming`) is retained *before* the write, so a
+  landed-but-timed-out turn still attributes its events and journals user +
+  assistant for `get_history`. The provider sends `unknown` fast instead of
+  waiting for the host deadline; callers reconcile via `get_history` before
+  retrying and never auto-resend.
 
 ## 3. Streaming
 

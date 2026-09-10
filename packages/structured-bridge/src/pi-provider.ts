@@ -143,6 +143,13 @@ interface PiRuntime {
   activeText: string;
   /** Pi-side session id observed via `get_state` (for lease identity). */
   piSessionId?: string;
+  /**
+   * FIFO of Pi-owned queued `steer`/`followUp` opIds (accepted only after Pi
+   * `prompt{streamingBehavior}` succeeded). Promoted to `activeOpId` when the
+   * current turn settles, so later Pi turns attribute to the queued op — never
+   * merely resident in provider memory (SNC1.4 P1: accepted means Pi-owned).
+   */
+  piQueuedOps: string[];
 }
 
 function nowIso(): string {
@@ -285,11 +292,17 @@ export class PiBridgeProvider extends BridgeProvider {
       return;
     }
 
+    // Merge transport-neutral spec env with the explicit provider overlay.
+    // Precedence: explicit `piEnv` wins over `resolvePiSpec` env (dev override
+    // beats profile-derived config); both ride the spawn env only, never the
+    // bridge (see `pi-provider.md` §1). When neither is set, inherit.
+    const mergedEnv: NodeJS.ProcessEnv | undefined =
+      rpcSpec.env !== undefined || this.piEnv !== undefined ? { ...(rpcSpec.env ?? {}), ...(this.piEnv ?? {}) } : undefined;
     const conn = this.createConnection({
       piCommand: rpcSpec.command,
       piArgs: [...rpcSpec.args],
       ...(rpcSpec.cwd !== undefined ? { cwd: rpcSpec.cwd } : { cwd: msg.workspaceRoot }),
-      ...(this.piEnv !== undefined ? { env: this.piEnv } : {}),
+      ...(mergedEnv !== undefined ? { env: mergedEnv } : {}),
       ...(this.piSpawnFn !== undefined ? { spawnFn: this.piSpawnFn } : {}),
       ...(this.defaultTimeoutMs !== undefined ? { defaultTimeoutMs: this.defaultTimeoutMs } : {}),
       ...(this.startupTimeoutMs !== undefined ? { startupTimeoutMs: this.startupTimeoutMs } : {}),
@@ -353,7 +366,7 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompt: null,
       entryCounter: 0,
     });
-    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId };
+    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, piQueuedOps: [] };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
     if (session) this.attachPiStreaming(sessionId, session, runtime);
@@ -460,11 +473,25 @@ export class PiBridgeProvider extends BridgeProvider {
               session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
             }
             runtime.activeText = "";
-            this.finishTurn(session, activeOpId);
-            // `finishTurn` may have started a queued steer/followUp turn via
-            // `handleDispatch` (which sets a new activeOpId + isStreaming).
-            // When the queue is empty it clears streaming state here.
-            if (session.activeOpId === null) session.metadata.isStreaming = false;
+            // Pi-owned queued steer/followUp turns promote here: Pi already
+            // owns the next prompt (accepted only after Pi success), so just
+            // switch attribution without re-sending to Pi. Base `finishTurn`
+            // drains only the legacy local queue (empty on the Pi path).
+            const nextPiOp = runtime.piQueuedOps.shift();
+            if (nextPiOp !== undefined) {
+              session.activeOpId = nextPiOp;
+              session.metadata.isStreaming = true;
+              runtime.activeText = "";
+              // User history for the queued turn was journaled at Pi-accept
+              // time (see onPiDispatch busy branch), so later Pi text
+              // attributes to the queued op and settles it in turn.
+            } else {
+              this.finishTurn(session, activeOpId);
+              // `finishTurn` may have started a legacy queued turn via
+              // `handleDispatch` (which sets a new activeOpId + isStreaming).
+              // When both queues are empty it clears streaming state here.
+              if (session.activeOpId === null) session.metadata.isStreaming = false;
+            }
           }
           continue;
         }
@@ -495,9 +522,13 @@ export class PiBridgeProvider extends BridgeProvider {
 
   private onPiExit(sessionId: string, info: PiRpcCloseResult): void {
     const session = this.sessions.get(sessionId);
+    const runtime = this.piRuntimes.get(sessionId);
     if (!session) return;
     const activeOpId = session.activeOpId;
     session.metadata.isStreaming = false;
+    // Pi-owned queued turns cannot survive the child: drop them alongside the
+    // legacy local queue so a later reacquire starts clean.
+    runtime?.piQueuedOps.splice(0);
     if (activeOpId) {
       // Pi died mid-turn: the prompt outcome is ambiguous, but the UI must
       // not stay stuck streaming. Emit a shaped error turn + settled so Orca
@@ -541,11 +572,60 @@ export class PiBridgeProvider extends BridgeProvider {
         this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: "already-streaming (use steer/followUp or cancel)" });
         return;
       }
+      // Busy + steer/followUp: `accepted` means Pi definitely owns the
+      // prompt, never merely provider memory. Submit to Pi now with the
+      // corresponding `streamingBehavior` and wait for Pi's success before
+      // acking. Pi queues internally; the op is tracked in `piQueuedOps`
+      // for attribution when its turn runs (see settled promotion). A crash
+      // after this ack loses nothing Pi had not already accepted.
+      const queuedCmd = mapBridgeDispatchToPiPrompt(msg.opId, msg.message, msg.queue ?? "followUp");
+      try {
+        await runtime.conn.prompt(queuedCmd.message, {
+          ...(queuedCmd.images ? { images: queuedCmd.images } : {}),
+          ...(queuedCmd.streamingBehavior ? { streamingBehavior: queuedCmd.streamingBehavior } : {}),
+        });
+      } catch (error) {
+        const code = (error as { code?: unknown })?.code;
+        const ambiguous = (error as { ambiguous?: unknown })?.ambiguous;
+        if (code === "rejected" && ambiguous === false) {
+          const piError = (error as { piError?: unknown }).piError;
+          this.send({
+            v: 1,
+            kind: "dispatch_ack",
+            opId: msg.opId,
+            sessionId: msg.sessionId,
+            status: "rejected",
+            reason: sanitizeCode(typeof piError === "string" && piError !== "" ? piError : "pi-rejected-prompt"),
+          });
+          return;
+        }
+        this.send({
+          v: 1,
+          kind: "dispatch_ack",
+          opId: msg.opId,
+          sessionId: msg.sessionId,
+          status: "unknown",
+          reason: "pi-prompt-ambiguous (reconcile via history; do not auto-resend)",
+        });
+        return;
+      }
+      // Pi owns the queued prompt: journal the user turn now (so history
+      // already reflects it) and track it for post-settle promotion. Later
+      // Pi `turn_start`/deltas for this turn attribute to `msg.opId` once
+      // the current turn settles (see settled promotion in streaming).
+      this.appendHistory(session, { role: "user", text: msg.message.text });
+      session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+      runtime.piQueuedOps.push(msg.opId);
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
-      session.queue.push(msg);
       return;
     }
-    // Idle: Pi must definitely own the prompt before we report `accepted`.
+    // Idle: retain pending-op state BEFORE the write so an ambiguous outcome
+    // (write landed but the response was lost) still attributes later Pi
+    // events/history to this op. Definite refusal clears it below (Pi made no
+    // change); success and ambiguity keep it for streaming/reconciliation.
+    session.activeOpId = msg.opId;
+    session.metadata.isStreaming = true;
+    runtime.activeText = "";
     const piCmd = mapBridgeDispatchToPiPrompt(msg.opId, msg.message, msg.queue ?? "reject");
     try {
       await runtime.conn.prompt(piCmd.message, {
@@ -556,8 +636,14 @@ export class PiBridgeProvider extends BridgeProvider {
       const code = (error as { code?: unknown })?.code;
       const ambiguous = (error as { ambiguous?: unknown })?.ambiguous;
       // Definite refusal: Pi rejected without side effects (e.g. busy
-      // without streamingBehavior). Report `rejected` with Pi's reason.
+      // without streamingBehavior). Clear the pending state and report
+      // `rejected` with Pi's reason (no history entry: rejected turns leave
+      // no entries per the Pi contract).
       if (code === "rejected" && ambiguous === false) {
+        if (session.activeOpId === msg.opId) {
+          session.activeOpId = null;
+          session.metadata.isStreaming = false;
+        }
         const piError = (error as { piError?: unknown }).piError;
         this.send({
           v: 1,
@@ -570,10 +656,14 @@ export class PiBridgeProvider extends BridgeProvider {
         return;
       }
       // Ambiguous: timeout/exit/close after the write may or may not have
-      // landed. Report `unknown` fast (do not wait for the host deadline)
-      // and leave reconciliation to history. Emit a shaped error turn so the
-      // UI does not hang when Pi is still alive but silent; when Pi died the
-      // exit handler already settled the turn (guard via activeOpId below).
+      // landed. Keep the pending active turn (set above) so late Pi events
+      // attribute to `msg.opId`, journal the user turn optimistically so
+      // `get_history` can recover a landed prompt/result, and report
+      // `unknown` fast (do not wait for the host deadline). Callers must
+      // reconcile via history and never auto-resend. When Pi died the exit
+      // handler settles the turn; otherwise Pi's own `settled` completes it.
+      this.appendHistory(session, { role: "user", text: msg.message.text });
+      session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
       this.send({
         v: 1,
         kind: "dispatch_ack",
@@ -584,11 +674,9 @@ export class PiBridgeProvider extends BridgeProvider {
       });
       return;
     }
-    // Pi owns the prompt: mark streaming, journal the user turn, and let Pi
-    // events drive `turn_start`/deltas/`turn_end`/`settled`.
-    session.activeOpId = msg.opId;
-    session.metadata.isStreaming = true;
-    runtime.activeText = "";
+    // Pi owns the prompt: the pending active turn (set before the write)
+    // stays streaming; journal the user turn and let Pi events drive
+    // `turn_start`/deltas/`turn_end`/`settled`.
     this.appendHistory(session, { role: "user", text: msg.message.text });
     session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
     this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
@@ -740,6 +828,20 @@ export class PiBridgeProvider extends BridgeProvider {
         // Ignore — child already gone.
       }
     }
+  }
+
+  /**
+   * Bounded provider shutdown for signal/EOF paths (CLI `SIGTERM`/`SIGINT`/
+   * stdin EOF). Closes every Pi child with observed exit, detaches listeners,
+   * and clears session state without sending bridge records (stdio may already
+   * be closing). The bridge `close` handshake (`onPiClose`) remains the normal
+   * host-driven path; this is the fallback that guarantees no leaked `pi`
+   * children when the provider process itself is asked to exit.
+   */
+  async dispose(): Promise<void> {
+    const ids = [...this.piRuntimes.keys()];
+    await Promise.all(ids.map((id) => this.teardownPiRuntime(id)));
+    this.sessions.clear();
   }
 
   /** Best-effort session stats for diagnostics (never sent over the bridge). */

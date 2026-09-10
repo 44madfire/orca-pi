@@ -608,3 +608,143 @@ describe("BridgeHost + PiBridgeProvider structured outbox/send flow (SNC1.4 acce
     expect(fakes[0]?.closes.length).toBeGreaterThan(0);
   });
 });
+
+describe("PiBridgeProvider review fixes (PR #37)", () => {
+  it("recovers a landed ambiguous prompt via history without auto-resending", async () => {
+    // The write lands on Pi (turn streams) but the `prompt` response is lost
+    // (timeout, ambiguous:true). Bridge must still attribute the streamed
+    // turn to the dispatch op and journal user + assistant for `get_history`.
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        const originalPrompt = fake.prompt.bind(fake);
+        fake.prompt = async (message: string, promptOpts?: { images?: readonly unknown[]; streamingBehavior?: string }): Promise<void> => {
+          // Land the turn first (Pi accepted and streams), then lose the response.
+          fake.emit({ type: "turn_start" } as PiServerEvent);
+          fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "landed " } } as unknown as PiServerEvent);
+          fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "result" } } as unknown as PiServerEvent);
+          fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "landed result" } } as unknown as PiServerEvent);
+          await originalPrompt(message, promptOpts);
+          throw Object.assign(new Error("timed out"), {
+            code: "request-timeout",
+            command: "prompt",
+            ambiguous: true,
+            timeoutMs: 10,
+          });
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "ambiguous landing" } });
+    await new Promise((r) => setTimeout(r, 30));
+    // Ambiguous delivery is never auto-resent: the ack is `unknown` …
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_1", status: "unknown" });
+    // … but the landed turn still streams under the same op …
+    expect(sessionEvents(out, "dsp_1").some((e) => e.event.type === "text_delta")).toBe(true);
+    // … and once Pi settles, history recovers user + assistant without a resend.
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fakes[0]?.prompts).toHaveLength(1);
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ role: string; text?: string }> };
+    expect(history.entries.some((e) => e.role === "user" && e.text === "ambiguous landing")).toBe(true);
+    expect(history.entries.some((e) => e.role === "assistant" && e.text === "landed result")).toBe(true);
+  });
+
+  it("acks queued steer only after Pi owns it and attributes the later turn to the queued op", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "first" } });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_1", status: "accepted" });
+    // Steer while streaming: Pi must see it (with streamingBehavior) BEFORE accepted.
+    send({ v: 1, kind: "dispatch", opId: "dsp_2", sessionId, message: { text: "steered" }, queue: "steer" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_2", status: "accepted" });
+    expect(fakes[0]?.prompts.map((p) => p.message)).toEqual(["first", "steered"]);
+    const steerOpts = (fakes[0]?.prompts[1] as { opts?: { streamingBehavior?: string } } | undefined)?.opts;
+    expect(steerOpts?.streamingBehavior).toBe("steer");
+    // First turn settles; the Pi-owned queued turn promotes to active so its
+    // later events attribute to dsp_2, not dsp_1 (no provider-memory loss).
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "second-turn" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "second-turn" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sessionEvents(out, "dsp_2").some((e) => e.event.type === "turn_start")).toBe(true);
+    expect(
+      sessionEvents(out, "dsp_2")
+        .filter((e) => e.event.type === "text_delta")
+        .map((e) => String(e.event["delta"] ?? ""))
+        .join(""),
+    ).toContain("second-turn");
+    // No duplicate Pi submission for the queued turn (Pi owned it once).
+    expect(fakes[0]?.prompts.filter((p) => p.message === "steered")).toHaveLength(1);
+  });
+
+  it("merges resolvePiSpec env into the Pi spawn (explicit piEnv wins)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      piEnv: { SHARED: "override", EXTRA: "dev" },
+      resolvePiSpec: () => ({ command: "pi", args: [], env: { SHARED: "profile", PROFILE_ONLY: "yes" } }),
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "acquired")).toBeDefined();
+    expect(fakes[0]?.seenOpts.env).toMatchObject({ SHARED: "override", EXTRA: "dev", PROFILE_ONLY: "yes" });
+  });
+
+  it("dispose() closes every Pi child with observed exit (signal/EOF fallback)", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "acquire", opId: "acq_2", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(provider.piSessionCount).toBe(2);
+    await provider.dispose();
+    expect(provider.piSessionCount).toBe(0);
+    expect(fakes).toHaveLength(2);
+    expect(fakes.every((f) => f.closes.length > 0)).toBe(true);
+    expect(fakes.every((f) => f.isClosed)).toBe(true);
+  });
+});
