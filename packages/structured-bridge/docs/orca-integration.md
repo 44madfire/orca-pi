@@ -2,7 +2,7 @@
 
 > Status: the Orca-side seam is implemented **and hooked into the runtime**
 > on the writable fork `44madfire/orca` branch
-> `snc1.3-external-structured-bridge` (commit `25e66b2a`, based on upstream
+> `snc1.3-external-structured-bridge` (commit `ad8784810e`, based on upstream
 > `main@f2d5711b`; interim upstream drift verified additive-only).
 > Fork review unit: https://github.com/44madfire/orca/pull/1 (draft,
 > fork-internal; upstream PR to `stablyai/orca` follows in SNC1.8 after
@@ -35,7 +35,7 @@ Plus fork-side (provider-neutral, no Pi imports):
 ```text
 orca/.../external/external-structured-bridge-config.ts  # dev-only flag + ORCA_PI_BRIDGE_COMMAND
 orca/.../external/external-structured-session-adapter.ts # StructuredAgentSessionAdapter impl
-orca/.../external/external-structured-session-adapter.test.ts # 13 tests incl. live-process E2E
+orca/.../external/external-structured-session-adapter.test.ts # 18 tests incl. live-process E2E
 orca/.../external/README.md # fork-side dev setup + failure semantics
 ```
 
@@ -125,7 +125,7 @@ without Pi or Electron:
 ```sh
 # In a checkout of 44madfire/orca @ snc1.3-external-structured-bridge:
 vitest run src/main/native-chat/agent-session-wire/external
-# 13 tests: config gating, fail-closed acquire, accepted mock turn streamed
+# 18 tests: config gating, fail-closed acquire, accepted mock turn streamed
 # into journal-sink Native Chat blocks, unknown preservation, prompt
 # request/answer-once, option validation, teardown, plus a live-OS-process
 # BridgeHost + inline mock E2E (acquire → dispatch → streamed fake response
@@ -144,7 +144,7 @@ vitest run src/main/native-chat/agent-session-wire/external
 - [x] Explicit dev-only flag (`--enable-external-structured-bridge`) +
   `ORCA_PI_BRIDGE_COMMAND` path (no plugin-manifest widening), fail-closed
   fallback to the Pi TUI path.
-- [x] Runtime hookup (`25e66b2a`, rebased onto upstream `main@f2d5711b`):
+- [x] Runtime hookup (`ad8784810e`, rebased onto upstream `main@f2d5711b`):
   first-class `external` provider handle (+ `EXTERNAL_BRIDGE_DIR` pin,
   opaque journal mapping), optional router member, RPC attach schemas
   accept external, runtime installs the adapter only when dev-configured
@@ -155,9 +155,11 @@ vitest run src/main/native-chat/agent-session-wire/external
 - [x] Mock provider proves the adapter path headlessly (real `BridgeHost` +
   live OS process → real adapter session → streamed fake response into
   journal-sink Native Chat blocks → `settled`; restart starts empty;
-  teardown leaves no resident helper). Full Native Chat UI click-through
-  with the `orca-pi` mock provider remains the manual gate before closing
-  #13 (see §4).
+  teardown leaves no resident helper). Manual gate (Gates 0–6) passed against
+  the dev app with the mock provider: real session + streamed Native Chat
+  reply, restart independence, fallback matrix, clean teardown, no upstream
+  drift — fork `44madfire/orca@ad8784810e`, PR `44madfire/orca#1` (draft;
+  upstream follows in SNC1.8).
 - [ ] Open the upstream PR(s) to `stablyai/orca` (small provider-neutral
   seam) or carry the temporary dev branch.
 
