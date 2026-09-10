@@ -1,15 +1,17 @@
 # Orca Integration (SNC1.3 dev branch)
 
-> Status: the Orca-side seam is implemented on the writable fork
-> `44madfire/orca` branch `snc1.3-external-structured-bridge`
-> (commit `b4935c78`, parent `stablyai/orca`). That branch vendors the
-> three provider-neutral files below plus a thin
-> `ExternalStructuredSessionAdapter`, dev-only flag/config, journal/Native
-> Chat translation, and fork-side mock E2E (13 tests incl. a live-OS-process
-> acquire → dispatch → streamed fake response → settled proof). This package
-> remains the bridge protocol/host/provider testbed prerequisite for #13;
-> host-callback assertions in `test/host.test.ts` stay a "Native Chat
-> stand-in" — the *real* Orca structured session proof lives fork-side.
+> Status: the Orca-side seam is implemented **and hooked into the runtime**
+> on the writable fork `44madfire/orca` branch
+> `snc1.3-external-structured-bridge` (commit `25e66b2a`, based on upstream
+> `main@f2d5711b`; interim upstream drift verified additive-only).
+> Fork review unit: https://github.com/44madfire/orca/pull/1 (draft,
+> fork-internal; upstream PR to `stablyai/orca` follows in SNC1.8 after
+> Pi-backed proof). This package remains the bridge protocol/host/provider
+> testbed prerequisite for #13; host-callback assertions in
+> `test/host.test.ts` stay a "Native Chat stand-in" — the adapter-level
+> proof lives fork-side (18 tests incl. live-process mock E2E + router
+> routing), and the **manual UI gate** below is what actually puts pixels
+> on screen.
 
 How the Orca fork wires the generic seam without widening the
 public plugin surface. The canonical fork/branch is recorded above; until
@@ -142,6 +144,14 @@ vitest run src/main/native-chat/agent-session-wire/external
 - [x] Explicit dev-only flag (`--enable-external-structured-bridge`) +
   `ORCA_PI_BRIDGE_COMMAND` path (no plugin-manifest widening), fail-closed
   fallback to the Pi TUI path.
+- [x] Runtime hookup (`25e66b2a`, rebased onto upstream `main@f2d5711b`):
+  first-class `external` provider handle (+ `EXTERNAL_BRIDGE_DIR` pin,
+  opaque journal mapping), optional router member, RPC attach schemas
+  accept external, runtime installs the adapter only when dev-configured
+  (production codex/claude pair untouched; teardown joined). Entry point:
+  client-supplied-location `agentSession.ensure` with provider+agent
+  `external`. Worktree-intent create, tab pickers, and TUI handoff stay
+  out of scope (SNC1.4/SNC1.9).
 - [x] Mock provider proves the adapter path headlessly (real `BridgeHost` +
   live OS process → real adapter session → streamed fake response into
   journal-sink Native Chat blocks → `settled`; restart starts empty;
@@ -151,9 +161,7 @@ vitest run src/main/native-chat/agent-session-wire/external
 - [ ] Open the upstream PR(s) to `stablyai/orca` (small provider-neutral
   seam) or carry the temporary dev branch.
 
-Temporary dev mappings to replace in SNC1.8 before any upstream PR:
-codex-namespaced provider handle (`external:<bridgeSessionId>`),
-`legacy`/`external` journal identities, empty model catalog, text-only
+Remaining temps before any upstream PR: empty model catalog, text-only
 dispatch. Tracked in the fork `external/README.md`.
 
 ## 6. Upstream strategy
