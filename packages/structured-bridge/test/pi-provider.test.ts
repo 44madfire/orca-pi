@@ -666,7 +666,7 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     expect(history.entries.some((e) => e.role === "assistant" && e.text === "landed result")).toBe(true);
   });
 
-  it("acks queued steer only after Pi owns it and attributes the later turn to the queued op", async () => {
+  it("honestly rejects queued steer while busy without touching Pi (queue fidelity is SNC1.5)", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -683,34 +683,24 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "first" } });
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_1", status: "accepted" });
-    // Steer while streaming: Pi must see it (with streamingBehavior) BEFORE accepted.
+    // Steer while streaming: SNC1.4 honestly rejects without touching Pi.
+    // Proving Pi owns a future turn needs user-message/`queue_update` evidence
+    // plus retry/compaction boundaries owned by the SNC1.5 translator, so
+    // claiming `accepted` here would risk misattribution and fabricated history.
     send({ v: 1, kind: "dispatch", opId: "dsp_2", sessionId, message: { text: "steered" }, queue: "steer" });
     await new Promise((r) => setTimeout(r, 20));
-    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_2", status: "accepted" });
-    expect(fakes[0]?.prompts.map((p) => p.message)).toEqual(["first", "steered"]);
-    const steerOpts = (fakes[0]?.prompts[1] as { opts?: { streamingBehavior?: string } } | undefined)?.opts;
-    expect(steerOpts?.streamingBehavior).toBe("steer");
-    // Real Pi queues the steer before the final `agent_settled`: the first
-    // `turn_end` promotes the Pi-owned queued op, so the next `turn_start`
-    // attributes to dsp_2 (no intermediate `settled` — that would mean no
-    // continuation left per the Pi contract).
-    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
-    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_2", status: "rejected" });
+    expect(JSON.stringify(lastOfKind(out, "dispatch_ack"))).toContain("SNC1.5");
+    // Definite refusal: Pi never saw the prompt (safe to retry after idle).
+    expect(fakes[0]?.prompts.map((p) => p.message)).toEqual(["first"]);
+    // The active turn still streams and settles normally under its own op.
     fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
-    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "second-turn" } } as unknown as PiServerEvent);
-    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "second-turn" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "first-out" } } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
-    expect(sessionEvents(out, "dsp_2").some((e) => e.event.type === "turn_start")).toBe(true);
-    expect(
-      sessionEvents(out, "dsp_2")
-        .filter((e) => e.event.type === "text_delta")
-        .map((e) => String(e.event["delta"] ?? ""))
-        .join(""),
-    ).toContain("second-turn");
-    // No duplicate Pi submission for the queued turn (Pi owned it once).
-    expect(fakes[0]?.prompts.filter((p) => p.message === "steered")).toHaveLength(1);
+    expect(sessionEvents(out, "dsp_1").filter((e) => e.event.type === "settled")).toHaveLength(1);
+    expect(sessionEvents(out, "dsp_2")).toHaveLength(0);
   });
 
   it("merges resolvePiSpec env into the Pi spawn (explicit piEnv wins)", async () => {
@@ -834,7 +824,7 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     }
   });
 
-  it("gives every accepted dispatch exactly one settled (queued promotion completes the predecessor)", async () => {
+  it("settles the accepted turn exactly once while the queued dispatch stays rejected", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -852,19 +842,20 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     await new Promise((r) => setTimeout(r, 20));
     send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B" }, queue: "steer" });
     await new Promise((r) => setTimeout(r, 20));
-    // A completes; promotion synthesizes A's settled before B starts.
-    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
-    await new Promise((r) => setTimeout(r, 20));
+    // Queued delivery while busy is honestly rejected (SNC1.5 owns the queue).
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_B", status: "rejected" });
+    // The accepted turn still completes exactly once under its own op.
     fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
-    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-done" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-done" } } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
     expect(sessionEvents(out, "dsp_A").filter((e) => e.event.type === "settled")).toHaveLength(1);
-    expect(sessionEvents(out, "dsp_B").filter((e) => e.event.type === "settled")).toHaveLength(1);
+    // The rejected dispatch never owns a turn, so it never settles.
+    expect(sessionEvents(out, "dsp_B")).toHaveLength(0);
   });
 
-  it("recovers an ambiguous queued steer via later turn evidence (never auto-resent)", async () => {
+  it("never sends queued steers to Pi while busy (no ambiguous queued delivery possible)", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -880,39 +871,29 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
     send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "A" } });
     await new Promise((r) => setTimeout(r, 20));
-    // Make the queued steer land-but-timeout: Pi queues internally, response lost.
-    const realPrompt = fakes[0]?.prompt.bind(fakes[0]);
-    if (fakes[0] && realPrompt) {
-      fakes[0].prompt = async (message: string, promptOpts?: { streamingBehavior?: string }): Promise<void> => {
-        if (message === "B-ambiguous") {
-          await realPrompt(message, promptOpts);
-          throw Object.assign(new Error("timed out"), { code: "request-timeout", ambiguous: true });
-        }
-        return realPrompt(message, promptOpts);
-      };
-    }
+    // Queued steers never reach Pi while busy, so no ambiguous queued write
+    // can exist: the rejection is definite ( Pi never saw it) and history
+    // stays clean for the unknown-free path. Ordered ambiguous-queue tracking
+    // belongs to the SNC1.5 evidence-based queue.
     send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B-ambiguous" }, queue: "steer" });
     await new Promise((r) => setTimeout(r, 30));
-    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_B", status: "unknown" });
-    // A completes; B's later turn (landed despite the timeout) promotes the
-    // ambiguous candidate and journals in order — no resend needed.
-    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
-    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_B", status: "rejected" });
+    expect(fakes[0]?.prompts.filter((p) => p.message === "B-ambiguous")).toHaveLength(0);
+    // The active turn still completes under its own op with no cross-wiring.
     fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
-    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-landed" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-done" } } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
-    expect(sessionEvents(out, "dsp_B").some((e) => e.event.type === "turn_start")).toBe(true);
+    expect(sessionEvents(out, "dsp_A").filter((e) => e.event.type === "settled")).toHaveLength(1);
+    expect(sessionEvents(out, "dsp_B")).toHaveLength(0);
     send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
     await new Promise((r) => setTimeout(r, 20));
     const history = lastOfKind(out, "history") as unknown as { entries: Array<{ role: string; text?: string }> };
-    expect(history.entries.some((e) => e.role === "user" && e.text === "B-ambiguous")).toBe(true);
-    expect(history.entries.some((e) => e.role === "assistant" && e.text === "b-landed")).toBe(true);
-    expect(fakes[0]?.prompts.filter((p) => p.message === "B-ambiguous")).toHaveLength(1);
+    expect(history.entries.some((e) => e.text === "B-ambiguous")).toBe(false);
   });
 
-  it("does not promote a queued followUp at a tool-use turn_end (same-prompt continuation wins)", async () => {
+  it("keeps tool-loop continuations on the active op when followUp is rejected while busy", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -930,24 +911,22 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     await new Promise((r) => setTimeout(r, 20));
     send({ v: 1, kind: "dispatch", opId: "dsp_F", sessionId, message: { text: "followup" }, queue: "followUp" });
     await new Promise((r) => setTimeout(r, 20));
-    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_F", status: "accepted" });
-    // Tool loop: first turn ends with toolUse (continuation of A, not delivery
-    // of F). The next turn still belongs to A.
+    // FollowUp while busy is honestly rejected: no Pi-owned queue exists, so
+    // there is nothing to promote at any turn boundary (tool or otherwise).
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_F", status: "rejected" });
+    expect(fakes[0]?.prompts.map((p) => p.message)).toEqual(["tool task"]);
+    // Tool loop: both turns belong to A (toolUse continuation, then final).
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "toolUse" }, toolResults: [{ role: "toolResult" }] } as unknown as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
     fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
     fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-continued" } } as unknown as PiServerEvent);
-    // No promotion at the tool boundary: continuation still attributes to A.
-    expect(sessionEvents(out, "dsp_F").some((e) => e.event.type === "turn_start")).toBe(false);
-    // Final stop turn promotes F; F's turn then attributes correctly.
-    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
-    await new Promise((r) => setTimeout(r, 20));
-    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
-    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "f-done" } } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
-    expect(sessionEvents(out, "dsp_F").some((e) => e.event.type === "turn_start")).toBe(true);
+    // Continuation attributed to A; the rejected followUp never owns a turn.
+    expect(sessionEvents(out, "dsp_A").filter((e) => e.event.type === "turn_start")).toHaveLength(1);
+    expect(sessionEvents(out, "dsp_F")).toHaveLength(0);
+    expect(sessionEvents(out, "dsp_A").filter((e) => e.event.type === "settled")).toHaveLength(1);
   });
 
   it("preserves a landed ambiguous user through exit-before-turn_end (no duplicate retry)", async () => {
@@ -983,7 +962,7 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     expect(history.entries.some((e) => e.role === "user" && e.text === "started then died")).toBe(true);
   });
 
-  it("journals queued users in transcript order (A-user, A-assistant, B-user, B-assistant)", async () => {
+  it("keeps transcript order across sequential turns (A-user, A-assistant, B-user, B-assistant)", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -999,11 +978,19 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
     send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "A" } });
     await new Promise((r) => setTimeout(r, 20));
+    // Queued while busy: honestly rejected (SNC1.5 owns the queue), so the
+    // second turn runs as a fresh idle dispatch after the first settles —
+    // transcript order falls out naturally with no promotion bookkeeping.
     send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B" }, queue: "steer" });
     await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_B", status: "rejected" });
     fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-out" } } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "dispatch", opId: "dsp_B2", sessionId, message: { text: "B" } });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_B2", status: "accepted" });
     fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
     fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-out" } } as unknown as PiServerEvent);
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);

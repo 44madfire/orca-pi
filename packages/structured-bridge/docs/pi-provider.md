@@ -34,28 +34,30 @@ keystroke injection anywhere on this path.
 
 ## 2. Delivery honesty
 
-- `accepted` only after Pi `prompt success:true` (Pi definitely owns it) —
-  including queued `steer`/`followUp`, submitted to Pi with the matching
-  `streamingBehavior` *before* acking and tracked with mode/text for per-turn
-  promotion. Completed non-tool `turn_end`s promote (synthesizing the finished
-  op's `settled` first, so every accepted op gets exactly one completion);
-  tool-continuation `turn_end`s (`toolUse`/non-empty results, same prompt)
-  never promote queued follow-ups. `agent_settled` means no continuation left
-  and never promotes. Ambiguous queued writes track as candidates until turn
-  evidence resolves them (promoted on their turn, dropped unjournaled on final
-  `settled`).
-- `rejected` only for definite refusal (`success:false`, empty text,
-  unknown session, busy + `queue:reject`, Pi-exited reacquire hint).
-- `unknown` for ambiguity (timeout/exit/close after the write). Pending-op
-  state (`activeOpId`/`isStreaming` + unjournaled `pendingUserText`) is
-  retained *before* the write; `turn_start` proves receipt (journaling the
-  pending user immediately, so exit-before-`turn_end` still leaves history
-  evidence), then `turn_end` journals user→assistant in order. Idle
-  reconciliation (`get_state`) clears unlanded pending turns (history stays
-  clean); fully landed turns that settle before the timeout journal once (no
-  duplication). Queued users journal at delivery (promotion), preserving
-  A-user, A-assistant, B-user, … order. The provider sends `unknown` fast;
-  callers reconcile via history and never auto-resend.
+- `accepted` only after Pi `prompt success:true` on an idle session (Pi
+  definitely owns the single active turn). One turn at a time: there is no
+  Pi-owned queue in SNC1.4, so every accepted op completes with Pi's own
+  `turn_end` + authoritative `agent_settled` under its own op — no synthesized
+  completions, no cross-op attribution.
+- `rejected` only for definite refusal (`success:false`, empty text, unknown
+  session, Pi-exited reacquire hint, and any dispatch — including
+  `steer`/`followUp` — while a turn streams). The busy rejection is definite:
+  Pi never saw the prompt, so it is safe to retry after idle or cancel.
+  Queued Pi-owned delivery needs user-message/`queue_update` evidence plus
+  retry/compaction boundaries owned by the SNC1.5 lifecycle translator, so
+  SNC1.4 declines the queue rather than guessing ownership from turn
+  boundaries (which misattributes tool continuations/retries and fabricates
+  history).
+- `unknown` for ambiguity (timeout/exit/close after the write on an idle
+  session). Pending-op state (`activeOpId`/`isStreaming` + unjournaled
+  `pendingUserText`) is retained *before* the write; `turn_start` proves
+  receipt (journaling the pending user immediately, so exit-before-`turn_end`
+  still leaves history evidence), then `turn_end` journals user→assistant in
+  order. Idle reconciliation (`get_state`) clears unlanded pending turns
+  (history stays clean); fully landed turns that settle before the timeout
+  journal once (no duplication). Sequential idle turns journal naturally in
+  transcript order. The provider sends `unknown` fast; callers reconcile via
+  history and never auto-resend.
 
 ## 3. Streaming
 
@@ -66,18 +68,19 @@ keystroke injection anywhere on this path.
 Pi turn_start                    → turn_start
 Pi message_update text_start/delta/end → text_start/delta/end
 Pi turn_end{stop/aborted}        → turn_end{stop/aborted}
-Pi agent_settled                 → settled (+ journal + finishTurn/queue drain)
+Pi agent_settled                 → settled (+ journal + finishTurn)
 Pi extension_ui_request dialog   → prompt_request (pendingPrompt for answer)
 Pi tool_execution_*              → tool_start/progress/end (SNC1.5 owns faithful rendering)
 agent_start/agent_end/message_start/end, toolcall deltas,
 notify/setTitle/setStatus, queue_update → ignored ([])
 ```
 
-`isStreaming` follows the active turn; `cancelled.settled` reports actual
+`isStreaming` follows the single active turn; `cancelled.settled` reports actual
 state (`true` only when idle). Assistant text accumulates from authoritative
 `text_end.text` into `get_history` (user + assistant) for `unknown`
-reconciliation. Multi-turn tool flows settle once per `agent_settled`
-(SNC1.5 owns per-turn journal identities).
+reconciliation. Multi-turn tool flows journal per `turn_end` under the same op
+and complete once per `agent_settled` (SNC1.5 owns per-turn journal identities
+and queued-delivery boundaries).
 
 ## 4. Failures (secret-safe, actionable)
 
@@ -87,8 +90,9 @@ reconciliation. Multi-turn tool flows settle once per `agent_settled`
   credentials/paths).
 - TUI-only launch flags → `PI_TUI_FLAG` (fall back to normal Pi TUI).
 - Pi death mid-turn → shaped `turn_end{error}` + `settled` (UI unsticks);
-  queued steer/followUp dropped; next dispatch reports
-  `rejected: pi-exited (reacquire)` until explicit reacquire (resume is SNC1.7).
+  already-journaled turns survive so `unknown` reconciles without duplicates;
+  next dispatch reports `rejected: pi-exited (reacquire)` until explicit
+  reacquire (resume is SNC1.7).
 - Malformed bridge lines → `BAD_MESSAGE`/`PARSE_ERROR` (never crash).
 
 ## 5. Run it

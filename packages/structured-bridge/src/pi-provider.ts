@@ -33,13 +33,19 @@
  * - no terminal keystroke injection anywhere on this path.
  *
  * Delivery semantics: `accepted` only when Pi definitely owns the prompt
- * (`prompt success:true`), `rejected` only for definite provider refusal
- * (`success:false`, empty text, unknown session, busy + `queue:reject`),
- * `unknown` for ambiguous transport/delivery outcomes (timeout, exit,
- * malformed ack). Callers must reconcile `unknown` via history before
- * retrying; the provider never auto-resends.
+ * (`prompt success:true` on an idle session), `rejected` only for definite
+ * provider refusal (`success:false`, empty text, unknown session, busy turn
+ * including `steer`/`followUp` while streaming), `unknown` for ambiguous
+ * transport/delivery outcomes (timeout, exit, malformed ack). Callers must
+ * reconcile `unknown` via history before retrying; the provider never
+ * auto-resends.
  *
- * Scope: SNC1.4 is basic text chat. Thinking/tool/error/lifecycle
+ * Scope: SNC1.4 is basic text chat, one turn at a time. Queued delivery while
+ * busy (`steer`/`followUp` accepted via Pi-owned queue) is honestly rejected
+ * here and deferred to SNC1.5: proving Pi owns a future turn needs
+ * user-message/`queue_update` evidence plus retry/compaction boundaries that
+ * belong to the lifecycle translator — guessing from turn boundaries
+ * misattributes turns and fabricates history. Thinking/tool/error/lifecycle
  * translation beyond text + turn + cancel is SNC1.5; model/thinking
  * controls, prompts, images are SNC1.6; history/branch/resume is SNC1.7.
  * `set_options` stores options and acks (Pi apply lands in SNC1.6);
@@ -144,28 +150,17 @@ interface PiRuntime {
   activeText: string;
   /** Pi-side session id observed via `get_state` (for lease identity). */
   piSessionId?: string;
+  // SNC1.4 basic text runs one turn at a time: while a turn streams, queued
+  // `steer`/`followUp` dispatches are honestly rejected (never
+  // accepted-before-owned). Pi-owned queue fidelity — mode-specific delivery,
+  // user-message and `queue_update` evidence, retry/compaction boundaries,
+  // immediate-command classification, ordered ambiguous candidates — needs the
+  // SNC1.5 lifecycle translator, so it is deferred there (see `onPiDispatch`
+  // busy branch) rather than guessed from turn boundaries here.
   /**
-   * FIFO of Pi-owned queued turns (accepted only after Pi
-   * `prompt{streamingBehavior}` succeeded). Each entry preserves its queue
-   * mode and text so promotion respects delivery boundaries and history stays
-   * in transcript order (queued users journal at delivery, not at accept).
-   * Promoted at the per-turn boundary (`turn_end` for completed non-tool
-   * turns); `agent_settled` means Pi has no continuation left and never
-   * promotes (see streaming). Never merely provider memory: accepted means
-   * Pi-owned (SNC1.4).
-   */
-  piQueuedOps: Array<{ opId: string; queue: "steer" | "followUp"; text: string }>;
-  /**
-   * Ambiguous queued candidate (`steer`/`followUp` write may have landed but
-   * its response was lost). Tracked until Pi turn/queue evidence resolves it:
-   * a later turn for its text promotes it (journaled then), while a final
-   * `settled` with no such turn drops it unjournaled. Never auto-resent.
-   */
-  ambiguousQueued: { opId: string; queue: "steer" | "followUp"; text: string } | null;
-  /**
-   * Optimistic user text for an ambiguous `prompt` (write may have landed but
-   * the response was lost). NOT journaled yet: `turn_end` journals it first
-   * (user→assistant order) only when Pi actually streams the turn, so
+   * Optimistic user text for an ambiguous idle `prompt` (write may have landed
+   * but the response was lost). NOT journaled yet: `turn_start` (receipt proof)
+   * or `turn_end` journals it first, preserving user-before-assistant order, so
    * `get_history` never fabricates a user entry Pi never received. Cleared on
    * definite refusal, successful journaling, or idle reconciliation.
    */
@@ -387,7 +382,7 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompt: null,
       entryCounter: 0,
     });
-    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, piQueuedOps: [], ambiguousQueued: null, pendingUserText: null };
+    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, pendingUserText: null };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
     if (session) this.attachPiStreaming(sessionId, session, runtime);
@@ -446,21 +441,17 @@ export class PiBridgeProvider extends BridgeProvider {
   }
 
   // -- streaming: Pi events -> bridge session_event --------------------------
-
-  /** True when a raw Pi `turn_end` continues the same prompt (tool loop), not a queued delivery. */
-  private isToolContinuationTurn(record: Record<string, unknown>): boolean {
-    if (record["type"] !== "turn_end") return false;
-    const message = record["message"] as Record<string, unknown> | undefined;
-    if (message && message["stopReason"] === "toolUse") return true;
-    const toolResults = record["toolResults"];
-    if (Array.isArray(toolResults) && toolResults.length > 0) return true;
-    return false;
-  }
+  //
+  // SNC1.4 runs one turn at a time (queued delivery while busy is honestly
+  // rejected; see `onPiDispatch`). Attribution therefore never guesses across
+  // queued ops from turn boundaries: every streamed event carries the single
+  // active dispatch op, `turn_end` journals its turn, and the authoritative Pi
+  // `agent_settled` completes it. Mode-specific queued delivery, user-message
+  // and `queue_update` evidence, and retry/compaction boundaries belong to the
+  // SNC1.5 lifecycle translator.
 
   private attachPiStreaming(sessionId: string, session: ProviderSession, runtime: PiRuntime): void {
     const onEvent = (event: PiServerEvent): void => {
-      const raw = event as unknown as Record<string, unknown>;
-      const rawIsToolContinuation = this.isToolContinuationTurn(raw);
       const activeOpId = session.activeOpId;
       // No active turn: only forward stateless chrome that Orca can use
       // without a turn (currently none — queue_update/compaction are SNC1.5+).
@@ -496,28 +487,11 @@ export class PiBridgeProvider extends BridgeProvider {
           // started the turn, so journal the pending user now (before any
           // assistant text) so a later exit-before-`turn_end` still leaves
           // history evidence that prevents a duplicate retry.
-          let currentOp = session.activeOpId ?? activeOpId;
+          const currentOp = session.activeOpId ?? activeOpId;
           if (currentOp && runtime.pendingUserText !== null) {
             this.appendHistory(session, { role: "user", text: runtime.pendingUserText });
             runtime.pendingUserText = null;
             session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
-          }
-          // Ambiguous queued delivery resolved by turn evidence: a new turn
-          // after the previous completed turn (with no confirmed queued op
-          // promoted) must be the ambiguous queued message's turn (basic
-          // text has no multi-turn continuation without tools; tool
-          // continuations never promote ambiguous follow-ups — see `turn_end`
-          // guard). Promote now so this turn attributes to the queued op.
-          if (runtime.ambiguousQueued && runtime.piQueuedOps.length === 0) {
-            const amb = runtime.ambiguousQueued;
-            runtime.ambiguousQueued = null;
-            this.appendHistory(session, { role: "user", text: amb.text });
-            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
-            session.activeOpId = amb.opId;
-            session.metadata.isStreaming = true;
-            runtime.activeText = "";
-            runtime.pendingUserText = null;
-            currentOp = amb.opId;
           }
           const opForEvent = session.activeOpId ?? currentOp;
           if (!opForEvent) continue;
@@ -546,14 +520,9 @@ export class PiBridgeProvider extends BridgeProvider {
             }
             session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
             runtime.activeText = "";
-            // `agent_settled` means Pi has no queued continuation left: drop
-            // confirmed queued ops that never ran and any unresolved ambiguous
-            // queued candidate (it never became current) rather than promoting
-            // a turn Pi already finished past.
-            runtime.piQueuedOps.splice(0);
-            runtime.ambiguousQueued = null;
-            // Only finish when the settled op is still active (a synthesized
-            // per-turn `settled` below already cleared promoted predecessors).
+            // Single-turn honesty: the settled op is still active (SNC1.4 never
+            // transfers ownership mid-agent; queued delivery while busy is
+            // rejected, so there is nothing to promote).
             if (session.activeOpId === currentOp) {
               this.finishTurn(session, currentOp);
               if (session.activeOpId === null) session.metadata.isStreaming = false;
@@ -583,30 +552,10 @@ export class PiBridgeProvider extends BridgeProvider {
             }
             session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
             runtime.activeText = "";
-            // Tool-loop continuation (same prompt, more LLM calls to come)
-            // must NOT promote queued follow-ups: the next turn still belongs
-            // to the current prompt. Only completed non-tool turns promote.
-            // `steer` (before next LLM) and single-turn text promote here;
-            // `followUp` during a tool loop waits for the final stop turn.
-            if (!rawIsToolContinuation) {
-              const nextPiOp = runtime.piQueuedOps.shift();
-              if (nextPiOp !== undefined) {
-                // Every accepted dispatch gets exactly one `settled`: complete
-                // the finished op now before transferring ownership, since the
-                // final Pi `agent_settled` will arrive under the new op.
-                this.send({ v: 1, kind: "session_event", sessionId, opId: currentOp, event: { type: "settled", willRetry: false } });
-                // Deferred queued-user ordering: journal the queued user at
-                // delivery (now), after the completed turn's assistant, so
-                // history stays A-user, A-assistant, B-user, … (never B-user
-                // before A-assistant).
-                this.appendHistory(session, { role: "user", text: nextPiOp.text });
-                session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
-                session.activeOpId = nextPiOp.opId;
-                session.metadata.isStreaming = true;
-                runtime.activeText = "";
-                runtime.pendingUserText = null;
-              }
-            }
+            // No promotion: SNC1.4 holds the single active turn until Pi's
+            // authoritative `agent_settled` completes it (see above). Queued
+            // delivery while busy is rejected, so multi-turn tool continuations
+            // always belong to the current prompt and attribute to it.
           }
           continue;
         }
@@ -634,12 +583,10 @@ export class PiBridgeProvider extends BridgeProvider {
     if (!session) return;
     const activeOpId = session.activeOpId;
     session.metadata.isStreaming = false;
-    // Pi-owned queued turns cannot survive the child: drop them alongside the
-    // legacy local queue so a later reacquire starts clean. Pending ambiguous
-    // users are dropped unjournaled (Pi never confirmed them). 
+    // Pending ambiguous users are dropped unjournaled when Pi never proved
+    // receipt (no `turn_start` arrived to journal them); already-journaled
+    // turns survive in history so `unknown` reconciles without duplicates.
     if (runtime) {
-      runtime.piQueuedOps.splice(0);
-      runtime.ambiguousQueued = null;
       runtime.pendingUserText = null;
       runtime.activeText = "";
     }
@@ -682,60 +629,24 @@ export class PiBridgeProvider extends BridgeProvider {
       return;
     }
     if (session.activeOpId) {
-      if ((msg.queue ?? "reject") === "reject") {
-        this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: "already-streaming (use steer/followUp or cancel)" });
-        return;
-      }
-      // Busy + steer/followUp: `accepted` means Pi definitely owns the
-      // prompt, never merely provider memory. Submit to Pi now with the
-      // corresponding `streamingBehavior` and wait for Pi's success before
-      // acking. Pi queues internally; the op is tracked with its mode/text
-      // for per-turn promotion that respects steer/followUp and tool-loop
-      // boundaries (see `turn_end`). History journals the queued user at
-      // delivery (promotion), never at accept, so order stays A-user,
-      // A-assistant, B-user, … A crash after this ack loses nothing Pi had
-      // not already accepted.
-      const queuedCmd = mapBridgeDispatchToPiPrompt(msg.opId, msg.message, msg.queue ?? "followUp");
-      try {
-        await runtime.conn.prompt(queuedCmd.message, {
-          ...(queuedCmd.images ? { images: queuedCmd.images } : {}),
-          ...(queuedCmd.streamingBehavior ? { streamingBehavior: queuedCmd.streamingBehavior } : {}),
-        });
-      } catch (error) {
-        const code = (error as { code?: unknown })?.code;
-        const ambiguous = (error as { ambiguous?: unknown })?.ambiguous;
-        if (code === "rejected" && ambiguous === false) {
-          const piError = (error as { piError?: unknown }).piError;
-          this.send({
-            v: 1,
-            kind: "dispatch_ack",
-            opId: msg.opId,
-            sessionId: msg.sessionId,
-            status: "rejected",
-            reason: sanitizeCode(typeof piError === "string" && piError !== "" ? piError : "pi-rejected-prompt"),
-          });
-          return;
-        }
-        // Ambiguous queued write (may have landed but the response was lost):
-        // track it until Pi turn evidence resolves it. A later turn for its
-        // text promotes it (journaled then, in order); a final `settled`
-        // with no such turn drops it unjournaled. Never auto-resent.
-        runtime.ambiguousQueued = { opId: msg.opId, queue: (msg.queue ?? "followUp") as "steer" | "followUp", text: msg.message.text };
-        this.send({
-          v: 1,
-          kind: "dispatch_ack",
-          opId: msg.opId,
-          sessionId: msg.sessionId,
-          status: "unknown",
-          reason: "pi-prompt-ambiguous (reconcile via history; do not auto-resend)",
-        });
-        return;
-      }
-      // Pi owns the queued prompt: track it (with mode/text) for per-turn
-      // promotion. The user journals at delivery (promotion), not here, so
-      // history stays in transcript order (see `turn_end`).
-      runtime.piQueuedOps.push({ opId: msg.opId, queue: (msg.queue ?? "followUp") as "steer" | "followUp", text: msg.message.text });
-      this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
+      // SNC1.4 single-turn honesty: while a turn streams, every new dispatch
+      // — including `steer`/`followUp` — is honestly rejected without touching
+      // Pi (definite refusal: Pi never saw it, safe to retry after idle or
+      // cancel). Accepting a queued prompt would require proving Pi owns its
+      // future turn across steer/followUp modes, tool-loop continuations,
+      // retry/compaction, immediate-command handling, and ambiguous-queue
+      // ordering — all of which need user-message/`queue_update` evidence and
+      // retry/compaction boundaries owned by the SNC1.5 lifecycle translator.
+      // Guessing ownership from turn boundaries misattributes turns and
+      // fabricates history, so SNC1.4 declines the queue and SNC1.5 lands it.
+      this.send({
+        v: 1,
+        kind: "dispatch_ack",
+        opId: msg.opId,
+        sessionId: msg.sessionId,
+        status: "rejected",
+        reason: "already-streaming (queued steer/followUp needs SNC1.5 lifecycle evidence; wait for idle or cancel)",
+      });
       return;
     }
     // Idle: retain pending-op state BEFORE the write so an ambiguous outcome
@@ -832,7 +743,12 @@ export class PiBridgeProvider extends BridgeProvider {
     this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
   }
 
-  /** Queued steer/followUp turns (already acked): run against Pi, settling honestly. */
+  /**
+   * Defensive fallback for legacy base-class queue drains. The SNC1.4 Pi path
+   * never enqueues (busy dispatches are rejected before touching Pi), so this
+   * runs only if a subclass ever queues: execute once against Pi and settle
+   * honestly without a second ack.
+   */
   protected override async handleDispatch(session: ProviderSession, msg: DispatchRequest): Promise<void> {
     // Resolve the live session entry (the passed reference may be stale
     // after a provider restart in tests using the base harness).
