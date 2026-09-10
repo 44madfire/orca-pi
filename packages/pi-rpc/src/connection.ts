@@ -107,6 +107,16 @@ export interface PiRpcCloseResult {
   readonly forced: boolean;
 }
 
+export interface PiRpcCloseOptions {
+  /**
+   * Kill-first force semantics: SIGKILL immediately (no stdin EOF, no
+   * SIGTERM), then a NON-ZERO bounded observation window for the OS `exit`.
+   * Unobserved stays `{null, null}` (unknown). Callers must pass a real
+   * grace — `close(0, { force: true })` still cannot observe a real child.
+   */
+  readonly force?: boolean;
+}
+
 export type PiRpcEventHandler<T = unknown> = (payload: T) => void;
 
 interface PendingEntry {
@@ -1298,8 +1308,15 @@ export class PiRpcConnection {
    * and never leaves a duplicate owner. Idempotent — repeat calls return the
    * same result. Safe to call when idle (no pending) or active (pending
    * rejected as ambiguous).
+   *
+   * Pass `{ force: true }` for kill-first force semantics (bridge
+   * `close{force}`): SIGKILL immediately with no stdin EOF and no SIGTERM,
+   * then a NON-ZERO bounded observation window for the OS `exit`. Unobserved
+   * stays `{null, null}` (unknown) — never the graceful all-missed synthesis.
+   * `close(0)` without force cannot observe a real child (all three races are
+   * zero-length), so force callers must pass a real grace.
    */
-  async close(graceMs = CLOSE_TERM_GRACE_MS): Promise<PiRpcCloseResult> {
+  async close(graceMs = CLOSE_TERM_GRACE_MS, opts: PiRpcCloseOptions = {}): Promise<PiRpcCloseResult> {
     if (this.closed && this.exitInfo) return this.exitInfo;
     const proc = this.proc;
     if (!proc) {
@@ -1335,15 +1352,29 @@ export class PiRpcConnection {
         }),
       ]);
 
+    const stopWaiting = (): void => {
+      this.closeWaiter = null;
+    };
+
+    if (opts.force) {
+      // Kill-first: SIGKILL immediately (no EOF, no SIGTERM), then observe.
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Already exited; observation below reports whatever landed.
+      }
+      const seen = await waitExit(Math.max(graceMs, 1));
+      stopWaiting();
+      if (seen !== null) return this.finishClose(seen.exitCode, seen.signal, true);
+      // Genuinely unobserved: preserve unknown, never fabricate clean/signal.
+      return this.finishClose(null, null, true);
+    }
+
     try {
       proc.stdin?.end();
     } catch {
       // Already closed; fall through to SIGTERM below.
     }
-
-    const stopWaiting = (): void => {
-      this.closeWaiter = null;
-    };
 
     let seen = await waitExit(graceMs);
     let forced = false;

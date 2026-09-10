@@ -19,6 +19,7 @@ import { serializeBridgeLine } from "../src/framing.js";
 import {
   PiRpcConnection,
   serializeJsonLine,
+  type PiRpcCloseOptions,
   type PiRpcConnectionOptions,
   type PiRpcCloseResult,
   type PiRpcSpawnFn,
@@ -34,6 +35,7 @@ class FakePi implements PiProviderConnection {
   readonly uiResponses: Array<unknown> = [];
   aborts = 0;
   closes: number[] = [];
+  closeForces: Array<boolean | undefined> = [];
   started = false;
   failStartWith: unknown = null;
   failPromptWith: unknown = null;
@@ -76,8 +78,9 @@ class FakePi implements PiProviderConnection {
     this.aborts += 1;
   }
 
-  async close(graceMs = 2000): Promise<PiRpcCloseResult> {
+  async close(graceMs = 2000, opts?: PiRpcCloseOptions): Promise<PiRpcCloseResult> {
     this.closes.push(graceMs);
+    this.closeForces.push(opts?.force);
     if (this.closeDelayMs > 0) await new Promise((r) => setTimeout(r, this.closeDelayMs));
     this._closed = true;
     if (this.closeResult) return { ...this.closeResult };
@@ -1120,6 +1123,7 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     // — past every zero-length race, so only a non-zero observation window
     // reports the true signaled exit.
     const kills: Array<string | undefined> = [];
+    let stdinEnded = false;
     const spawnFn = (() => {
       const proc = new EventEmitter() as EventEmitter & {
         stdin: EventEmitter & { write: (s: string) => boolean; end: () => void };
@@ -1162,7 +1166,8 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
         return true;
       };
       stdin.end = (): void => {
-        // Ignores EOF (stuck child).
+        // Ignores EOF (stuck child), but records the attempt.
+        stdinEnded = true;
       };
       proc.stdin = stdin;
       proc.stdout = stdout;
@@ -1192,8 +1197,10 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     expect(acquired.sessionId).toBeTruthy();
     send({ v: 1, kind: "close", opId: "cls_force", mode: "force", sessionId: acquired.sessionId });
     await new Promise((r) => setTimeout(r, 1200));
-    // The stuck child was SIGKILLed and its real signaled exit observed.
-    expect(kills).toContain("SIGKILL");
+    // Kill-first force: stdin EOF skipped, SIGTERM skipped, SIGKILL sent
+    // immediately, and the real signaled exit observed (not synthesized).
+    expect(stdinEnded).toBe(false);
+    expect(kills).toEqual(["SIGKILL"]);
     expect(lastOfKind(out, "closed")).toMatchObject({ exit: { code: null, signal: "SIGKILL" } });
   });
 
@@ -1262,6 +1269,21 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     });
     expect(mapped).toEqual([{ type: "turn_end", stopReason: "error", errorMessage: "provider dispatch failed" }]);
     expect(JSON.stringify(mapped)).not.toContain("sk-proj-abcdefghijklmnopqr");
+  });
+
+  it("reports TUI-only flags without echoing embedded paths or values", async () => {
+    const provider = new PiBridgeProvider({
+      resolvePiSpec: () => ({ command: "pi", args: ["--resume=/mnt/worktrees/private/session.json"] }),
+      createConnection: (opts) => new FakePi(opts),
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const err = lastOfKind(out, "error") as unknown as { error: { code: string; message: string } };
+    expect(err.error.code).toBe("PI_TUI_FLAG");
+    expect(err.error.message).not.toContain("/mnt/worktrees");
+    expect(out.some((m) => m.kind === "acquired")).toBe(false);
   });
 
   it("summarizes resolver failures by code without paths or secret-shaped values", async () => {

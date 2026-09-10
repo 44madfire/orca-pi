@@ -59,6 +59,7 @@ import {
   resolvePiRpcEnv,
   toPiRpcProcessSpec,
   type PiImageAttachment,
+  type PiRpcCloseOptions,
   type PiRpcConnectionOptions,
   type PiRpcCloseResult,
   type PiRpcSpawnFn,
@@ -98,7 +99,7 @@ export interface PiProviderConnection {
     },
   ): Promise<void>;
   abort(opts?: { timeoutMs?: number }): Promise<void>;
-  close(graceMs?: number): Promise<PiRpcCloseResult>;
+  close(graceMs?: number, opts?: PiRpcCloseOptions): Promise<PiRpcCloseResult>;
   onEvent(handler: (event: PiServerEvent) => void): () => void;
   onExit(handler: (info: PiRpcCloseResult) => void): () => void;
   getState(): Promise<PiState>;
@@ -182,8 +183,6 @@ function sanitizeCode(text: string): string {
 }
 
 const DEFAULT_CLOSE_GRACE_MS = 2000;
-/** Per-stage bound for forced teardown: prompt killing with real observation windows. */
-const FORCE_CLOSE_GRACE_MS = 250;
 
 /** Aggregate observed child exits: first signaled/non-zero result wins, then
  * unobserved `{null,null}` (unknown is preserved, never laundered to clean),
@@ -319,14 +318,17 @@ export class PiBridgeProvider extends BridgeProvider {
     let rpcSpec: { command: string; args: readonly string[]; cwd?: string; env?: Readonly<Record<string, string>> };
     try {
       rpcSpec = toPiRpcProcessSpec(withCwd);
-    } catch (error) {
+    } catch {
+      // Stable summary only: the transport quotes the offending argv element,
+      // which can embed absolute paths or arbitrary values that pattern
+      // redaction cannot make safe. Details stay provider-side.
       this.send({
         v: BRIDGE_PROTOCOL_VERSION,
         kind: "error",
         opId: msg.opId,
         error: {
           code: "PI_TUI_FLAG",
-          message: sanitizeCode(`Pi launch rejects TUI-only flags: ${error instanceof Error ? error.message : String(error)}`),
+          message: "Pi launch rejects TUI-only flags. Use the typed RPC commands (e.g. switch_session) instead of CLI pickers/themes.",
         },
       });
       return;
@@ -958,21 +960,26 @@ export class PiBridgeProvider extends BridgeProvider {
         // Cleanup must not throw.
       }
     }
-    // Both modes run the transport's bounded EOF→SIGTERM→SIGKILL stage machine
-    // with NON-ZERO observation windows and report what was actually observed.
-    // `close(0)` cannot observe a real child (all three races are zero-length,
-    // so the result is synthesized before the process reports back); force
-    // therefore uses a short (not zero) per-stage bound for prompt killing
-    // while still observing, graceful uses the configured grace. A skip-EOF
-    // kill-first primitive would belong to future pi-rpc hardening if needed.
-    const graceMs = mode === "force" ? Math.min(this.piCloseGraceMs, FORCE_CLOSE_GRACE_MS) : this.piCloseGraceMs;
+    // Graceful runs the transport's bounded EOF→SIGTERM→SIGKILL machine with
+    // the configured grace. Force is kill-first (no EOF, no SIGTERM): SIGKILL
+    // immediately, then a NON-ZERO bounded observation window for the OS exit.
+    // `close(0)` cannot observe a real child (all races zero-length), so force
+    // callers pass a real grace. Observed results are reported as-is; anything
+    // still unobserved stays `{null,null}` (unknown), never fabricated clean.
+    const graceMs = this.piCloseGraceMs;
     try {
-      const result = await runtime.conn.close(graceMs);
+      const result =
+        mode === "force"
+          ? await runtime.conn.close(graceMs, { force: true })
+          : await runtime.conn.close(graceMs);
       return { code: result.exitCode, signal: result.signal };
     } catch {
       // Teardown is best-effort; the host bounds kill stages regardless.
       try {
-        const result = await runtime.conn.close(graceMs);
+        const result =
+          mode === "force"
+            ? await runtime.conn.close(graceMs, { force: true })
+            : await runtime.conn.close(graceMs);
         return { code: result.exitCode, signal: result.signal };
       } catch {
         // Ignore — child already gone (genuinely unobserved).

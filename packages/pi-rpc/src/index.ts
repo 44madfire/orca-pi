@@ -38,6 +38,7 @@ export {
 } from "./baseline.js";
 export {
   PiRpcConnection,
+  type PiRpcCloseOptions,
   type PiRpcCloseResult,
   type PiRpcConnectionOptions,
   type PiRpcEventHandler,

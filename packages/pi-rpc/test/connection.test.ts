@@ -414,6 +414,41 @@ describe("PiRpcConnection transport", () => {
     await expect(conn.close()).resolves.toEqual(result);
   });
 
+  it("close with force kills first (no EOF/SIGTERM) and observes the exit", async () => {
+    const fake = createFakeProc();
+    // Stuck child: ignore EOF; die (SIGKILL) on the next tick after the kill.
+    (fake.proc.stdin.end as ReturnType<typeof vi.fn>).mockImplementation(() => undefined);
+    const kills: Array<string | undefined> = [];
+    (fake.proc.kill as ReturnType<typeof vi.fn>).mockImplementation((signal?: string) => {
+      kills.push(signal);
+      if (signal === "SIGKILL") {
+        setTimeout(() => fake.emitExit(null, "SIGKILL"), 0);
+      }
+      return true;
+    });
+    const conn = await startedConnection(fake);
+    const result = await conn.close(500, { force: true });
+    expect(result.forced).toBe(true);
+    expect(fake.proc.stdin.end).not.toHaveBeenCalled();
+    expect(kills).toEqual(["SIGKILL"]);
+    expect(result.exitCode).toBeNull();
+    expect(result.signal).toBe("SIGKILL");
+    expect(conn.isClosed).toBe(true);
+  });
+
+  it("close with force preserves unobserved exits as unknown (never fabricated)", async () => {
+    const fake = createFakeProc();
+    // Unkillable child: ignore EOF and every signal, never exit.
+    (fake.proc.stdin.end as ReturnType<typeof vi.fn>).mockImplementation(() => undefined);
+    (fake.proc.kill as ReturnType<typeof vi.fn>).mockImplementation(() => true);
+    const conn = await startedConnection(fake);
+    const result = await conn.close(30, { force: true });
+    expect(result.forced).toBe(true);
+    expect(result.exitCode).toBeNull();
+    expect(result.signal).toBeNull();
+    expect(conn.isClosed).toBe(true);
+  });
+
   it("close on an active session rejects pending as ambiguous and cleans up", async () => {
     const fake = createFakeProc();
     // Never auto-exit: override stdin.end to hang so close must force-kill.
