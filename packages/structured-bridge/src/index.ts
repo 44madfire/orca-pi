@@ -1,9 +1,11 @@
 /**
- * `@orca-pi/structured-bridge` barrel (SNC1.3).
+ * `@orca-pi/structured-bridge` barrel (SNC1.3 + SNC1.4).
  *
  * Hot-swappable external structured-session bridge: versioned local IPC
  * (Orca-side host + external provider + mock) plus Pi-specific translation
- * kept strictly separate from the provider-neutral core.
+ * (`pi-mapping.ts`) and the SNC1.4 Pi-backed provider (`pi-provider.ts`)
+ * kept strictly separate from the provider-neutral core (the Orca fork
+ * vendors only `framing.ts` + `protocol.ts` + `host.ts`).
  */
 export {
   attachBridgeReader,
@@ -61,7 +63,20 @@ export {
   type SessionEventEnvelope,
   type SpawnFn,
 } from "./host.js";
-export { BridgeProvider, MockExternalProvider, type BridgeProviderOptions, type MockProviderOptions } from "./provider.js";
+export {
+  BridgeProvider,
+  MockExternalProvider,
+  type BridgeProviderOptions,
+  type MockProviderOptions,
+  type ProviderSession,
+} from "./provider.js";
+export {
+  PiBridgeProvider,
+  type PiBridgeProviderOptions,
+  type PiConnectionFactory,
+  type PiProviderConnection,
+  type PiSpecResolver,
+} from "./pi-provider.js";
 export {
   mapBridgeDispatchToPiPrompt,
   mapPiRecordToBridgeEvents,

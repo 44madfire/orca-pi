@@ -39,8 +39,12 @@ orca/.../external/external-structured-session-adapter.test.ts # 18 tests incl. l
 orca/.../external/README.md # fork-side dev setup + failure semantics
 ```
 
-`provider.ts` + `mock-provider-cli.js` + `pi-mapping.ts` stay in
-`orca-pi` (provider side). Orca core must never import Pi assumptions.
+`provider.ts` + `mock-provider-cli.js` + `pi-mapping.ts` + `pi-provider.ts` +
+`pi-provider-cli.js` stay in `orca-pi` (provider side). Orca core must never
+import Pi assumptions. The Pi-backed entry is
+`node …/structured-bridge/dist/pi-provider-cli.js` (SNC1.4, one
+`pi --mode rpc` child per session, `cwd` = acquire `workspaceRoot`); see
+`pi-provider.md` for the first real-Pi structured chat contract.
 
 Wrap the host in a thin `ExternalStructuredSessionAdapter` that implements
 Orca's current `StructuredAgentSessionAdapter` contract by delegating to

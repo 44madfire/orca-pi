@@ -232,19 +232,31 @@ The mock provider (`MockExternalProvider`, `mock-provider-cli.js`) honors:
   event to follow.
 - New instance = empty sessions (restart-independence proof).
 
-## 10. Pi mapping (orca-pi owned, not Orca core)
+## 10. Pi mapping + Pi provider (orca-pi owned, not Orca core)
 
-`src/pi-mapping.ts` pins the SNC1.1 contract before SNC1.4 wires the
-production `PiRpcConnection`:
+`src/pi-mapping.ts` pins the SNC1.1 contract and SNC1.4 wires it to the
+production `PiRpcConnection` via `src/pi-provider.ts` (+ `pi-provider-cli.js`;
+see `pi-provider.md`). The provider never enters the Orca fork (only
+`framing.ts` + `protocol.ts` + `host.ts` are vendored):
 
 - `piBridgeCapabilities(model?)` — images gated on model hints.
 - `validatePiDispatch()` — rejects empty text, unknown thinking levels,
   malformed/unsupported images (Pi would silently coerce or fail late).
 - `mapBridgeDispatchToPiPrompt()` — bridge `queue` → Pi
   `streamingBehavior`; images preserved opaquely.
-- `mapPiRecordToBridgeEvents()` — Pi `message_update`/`tool_*`/
-  `agent_*`/`extension_ui_request` → bridge events; fire-and-forget UI
-  and `response` envelopes map to `[]` (never streamed).
+- `mapPiRecordToBridgeEvents()` — Pi `message_update.assistantMessageEvent`
+  (`text_*`/`thinking_*`) + `tool_execution_*` + `turn_start`/`turn_end`/
+  `agent_settled` + `method`-based `extension_ui_request` → bridge events;
+  `agent_start`/`agent_end`/`message_start`/`message_end`, `toolcall` arg
+  deltas, `notify`/`setTitle`/`setStatus`, `queue_update`, and `response`
+  envelopes map to `[]` (never streamed). `turn_end{aborted}` is preserved
+  for Esc-cancel; opaque tool payloads are stringified (SNC1.5 owns faithful
+  tool rendering).
+- `PiBridgeProvider` (`pi-provider.ts`) — one `pi --mode rpc` child per
+  session (`cwd` = acquire `workspaceRoot`), `resolvePiSpec` +
+  `toPiRpcProcessSpec` for transport-neutral profile config, honest
+  `accepted`/`rejected`/`unknown` dispatch, `abort()` cancel, bounded
+  teardown, and secret-safe startup failures (see `pi-provider.md`).
 
 ## 11. Versioning
 

@@ -35,7 +35,7 @@ export interface BridgeProviderOptions {
   capabilities: BridgeCapabilities;
 }
 
-interface ProviderSession {
+export interface ProviderSession {
   metadata: BridgeSessionMetadata;
   history: BridgeHistoryEntry[];
   options: BridgeSessionOptions;
