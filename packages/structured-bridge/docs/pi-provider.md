@@ -33,8 +33,11 @@ keystroke injection anywhere on this path.
 - `answer_prompt` → Pi `extension_ui_response` (select/input/editor `{value}`,
   confirm `{confirmed}`, cancel `{cancelled:true}`)
 - `release`/`close{mode}` → bounded `PiRpcConnection.close()` per child
-  (`force` skips graceful graces via `close(0)`), then `released`/`closed`
-  carrying the observed Pi exit (first non-clean child wins; never fabricated).
+  (graceful uses the configured grace; `force` uses a short 250ms/stage bound
+  for prompt killing — both non-zero so exits are observed, never synthesized;
+  `close(0)` cannot observe a real child), then `released`/`closed` carrying
+  the observed Pi exit (first signaled/non-zero wins, unobserved stays
+  `{null,null}`, never laundered clean).
   Provider `dispose()` (also awaited to completion on SIGTERM/SIGINT/stdin-EOF)
   closes every Pi child with observed exit (no leaked processes/listeners).
 

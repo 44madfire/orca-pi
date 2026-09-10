@@ -16,7 +16,16 @@ import { BridgeHost, type SessionEventEnvelope } from "../src/host.js";
 import { mapPiRecordToBridgeEvents } from "../src/pi-mapping.js";
 import type { ProviderToHostMessage } from "../src/protocol.js";
 import { serializeBridgeLine } from "../src/framing.js";
-import type { PiRpcConnectionOptions, PiRpcCloseResult, PiServerEvent, PiState } from "@orca-pi/pi-rpc";
+import {
+  PiRpcConnection,
+  serializeJsonLine,
+  type PiRpcConnectionOptions,
+  type PiRpcCloseResult,
+  type PiRpcSpawnFn,
+  type PiServerEvent,
+  type PiState,
+} from "@orca-pi/pi-rpc";
+import type { ChildProcess } from "node:child_process";
 
 /** Deterministic fake Pi: scripted prompt/abort/close behavior + manual event injection. */
 class FakePi implements PiProviderConnection {
@@ -1105,7 +1114,90 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     expect(sessionEvents(out, "dsp_B").filter((e) => e.event.type === "settled")).toHaveLength(1);
   });
 
-  it("propagates force mode and reports the observed Pi exit (no fabricated success)", async () => {
+  it("force close observes the real Pi exit through a real PiRpcConnection (no synthesis)", async () => {
+    // Integration-style: a real `PiRpcConnection` over a fake child that
+    // ignores stdin EOF + SIGTERM and only dies (SIGKILL) 60ms after the kill
+    // — past every zero-length race, so only a non-zero observation window
+    // reports the true signaled exit.
+    const kills: Array<string | undefined> = [];
+    const spawnFn = (() => {
+      const proc = new EventEmitter() as EventEmitter & {
+        stdin: EventEmitter & { write: (s: string) => boolean; end: () => void };
+        stdout: EventEmitter & { destroy: () => void };
+        stderr: EventEmitter & { destroy: () => void };
+        kill: (signal?: string) => boolean;
+        exitCode: number | null;
+        signalCode: string | null | undefined;
+      };
+      const stdout = new EventEmitter() as EventEmitter & { destroy: () => void };
+      stdout.destroy = () => undefined;
+      const stderr = new EventEmitter() as EventEmitter & { destroy: () => void };
+      stderr.destroy = () => undefined;
+      const stdin = new EventEmitter() as EventEmitter & { write: (s: string) => boolean; end: () => void };
+      stdin.write = (s: string): boolean => {
+        for (const line of s.split("\n")) {
+          if (line.trim() === "") continue;
+          let payload: { id?: string; type?: string } = {};
+          try {
+            payload = JSON.parse(line) as { id?: string; type?: string };
+          } catch {
+            continue;
+          }
+          if (payload.type === "get_state") {
+            stdout.emit(
+              "data",
+              Buffer.from(
+                serializeJsonLine({
+                  id: payload.id,
+                  type: "response",
+                  command: "get_state",
+                  success: true,
+                  data: { sessionId: "pi_force", isStreaming: false, messageCount: 0 },
+                }),
+                "utf8",
+              ),
+            );
+          }
+        }
+        return true;
+      };
+      stdin.end = (): void => {
+        // Ignores EOF (stuck child).
+      };
+      proc.stdin = stdin;
+      proc.stdout = stdout;
+      proc.stderr = stderr;
+      proc.exitCode = null;
+      proc.signalCode = undefined;
+      proc.kill = (signal?: string): boolean => {
+        kills.push(signal);
+        if (signal === "SIGKILL") {
+          setTimeout(() => {
+            proc.emit("exit", null, "SIGKILL");
+          }, 60);
+        }
+        return true;
+      };
+      return proc as unknown as ChildProcess;
+    }) as unknown as PiRpcSpawnFn;
+    const provider = new PiBridgeProvider({
+      closeGraceMs: 500,
+      createConnection: (opts) => new PiRpcConnection({ ...opts, spawnFn, startupProbe: false }) as unknown as PiProviderConnection,
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 200));
+    const acquired = lastOfKind(out, "acquired") as unknown as { sessionId: string };
+    expect(acquired.sessionId).toBeTruthy();
+    send({ v: 1, kind: "close", opId: "cls_force", mode: "force", sessionId: acquired.sessionId });
+    await new Promise((r) => setTimeout(r, 1200));
+    // The stuck child was SIGKILLed and its real signaled exit observed.
+    expect(kills).toContain("SIGKILL");
+    expect(lastOfKind(out, "closed")).toMatchObject({ exit: { code: null, signal: "SIGKILL" } });
+  });
+
+  it("preserves unobserved exits as unknown instead of laundering them clean", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -1118,14 +1210,13 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     hello();
     send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
     await new Promise((r) => setTimeout(r, 20));
-    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
-    // Force close skips the graceful EOF/SIGTERM graces and reports Pi's
-    // actual signaled exit instead of a hard-coded clean result.
-    if (fakes[0]) fakes[0].closeResult = { exitCode: null, signal: "SIGKILL", forced: true };
-    send({ v: 1, kind: "close", opId: "cls_force", mode: "force", sessionId });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(fakes[0]?.closes).toEqual([0]);
-    expect(lastOfKind(out, "closed")).toMatchObject({ exit: { code: null, signal: "SIGKILL" } });
+    send({ v: 1, kind: "acquire", opId: "acq_2", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    // One child exits cleanly, the other vanishes genuinely unobserved.
+    if (fakes[1]) fakes[1].closeResult = { exitCode: null, signal: null, forced: true };
+    send({ v: 1, kind: "close", opId: "cls_all", mode: "graceful" });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(lastOfKind(out, "closed")).toMatchObject({ exit: { code: null, signal: null } });
   });
 
   it("advertises only the capabilities SNC1.4 honestly implements", async () => {
@@ -1171,5 +1262,30 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     });
     expect(mapped).toEqual([{ type: "turn_end", stopReason: "error", errorMessage: "provider dispatch failed" }]);
     expect(JSON.stringify(mapped)).not.toContain("sk-proj-abcdefghijklmnopqr");
+  });
+
+  it("summarizes resolver failures by code without paths or secret-shaped values", async () => {
+    // `PiLaunchError` intentionally carries resolved absolute paths plus foreign
+    // filesystem text that no pattern list can make safe — the bridge carries
+    // only the machine-readable code plus generic guidance.
+    const secretish = "hunter2-unrecognized-secret-value";
+    const provider = new PiBridgeProvider({
+      resolvePiSpec: () => {
+        throw Object.assign(new Error(`read D:\\work\\secret\\prompt.md: ${secretish}`), {
+          code: "prompt-materialization-failed",
+        });
+      },
+      createConnection: (opts) => new FakePi(opts),
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const err = lastOfKind(out, "error") as unknown as { error: { code: string; message: string } };
+    expect(err.error.code).toBe("PI_SPEC_FAILED");
+    expect(err.error.message).toContain("prompt-materialization-failed");
+    expect(err.error.message).not.toContain("D:\\work");
+    expect(err.error.message).not.toContain(secretish);
+    expect(out.some((m) => m.kind === "acquired")).toBe(false);
   });
 });

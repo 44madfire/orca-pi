@@ -182,12 +182,19 @@ function sanitizeCode(text: string): string {
 }
 
 const DEFAULT_CLOSE_GRACE_MS = 2000;
+/** Per-stage bound for forced teardown: prompt killing with real observation windows. */
+const FORCE_CLOSE_GRACE_MS = 250;
 
-/** Aggregate observed child exits: first non-clean result wins, else clean. */
+/** Aggregate observed child exits: first signaled/non-zero result wins, then
+ * unobserved `{null,null}` (unknown is preserved, never laundered to clean),
+ * else clean. */
 function aggregateExits(exits: Array<{ code: number | null; signal: string | null }>): { code: number | null; signal: string | null } {
+  let sawUnknown = false;
   for (const exit of exits) {
     if (exit.signal !== null || (exit.code !== null && exit.code !== 0)) return { code: exit.code, signal: exit.signal };
+    if (exit.code === null && exit.signal === null) sawUnknown = true;
   }
+  if (sawUnknown) return { code: null, signal: null };
   return { code: 0, signal: null };
 }
 
@@ -302,7 +309,7 @@ export class PiBridgeProvider extends BridgeProvider {
         v: BRIDGE_PROTOCOL_VERSION,
         kind: "error",
         opId: msg.opId,
-        error: { code: "PI_SPEC_FAILED", message: sanitizeCode(`Pi spec resolution failed: ${error instanceof Error ? error.message : String(error)}`) },
+        error: { code: "PI_SPEC_FAILED", message: this.safeSpecError(error) },
       });
       return;
     }
@@ -440,6 +447,18 @@ export class PiBridgeProvider extends BridgeProvider {
       }
     }
     return null;
+  }
+
+  /** Stable summary for resolver failures: machine-readable code plus generic
+   * guidance, never the exception text (`PiLaunchError` intentionally carries
+   * resolved absolute paths and foreign filesystem messages that pattern
+   * redaction cannot make safe). Details stay provider-side. */
+  private safeSpecError(error: unknown): string {
+    const code = (error as { code?: unknown })?.code;
+    if (typeof code === "string" && code !== "") {
+      return sanitizeCode(`Pi spec resolution failed (${code}). Check profile paths and retry.`);
+    }
+    return sanitizeCode("Pi spec resolution failed. Check profile configuration and retry.");
   }
 
   private classifyStartupError(error: unknown): string {
@@ -939,20 +958,24 @@ export class PiBridgeProvider extends BridgeProvider {
         // Cleanup must not throw.
       }
     }
-    // Force skips the graceful EOF/SIGTERM graces and goes straight to the
-    // bounded force path; graceful uses the configured grace. Either way the
-    // observed child result is reported (never a fabricated clean exit).
-    const graceMs = mode === "force" ? 0 : this.piCloseGraceMs;
+    // Both modes run the transport's bounded EOF→SIGTERM→SIGKILL stage machine
+    // with NON-ZERO observation windows and report what was actually observed.
+    // `close(0)` cannot observe a real child (all three races are zero-length,
+    // so the result is synthesized before the process reports back); force
+    // therefore uses a short (not zero) per-stage bound for prompt killing
+    // while still observing, graceful uses the configured grace. A skip-EOF
+    // kill-first primitive would belong to future pi-rpc hardening if needed.
+    const graceMs = mode === "force" ? Math.min(this.piCloseGraceMs, FORCE_CLOSE_GRACE_MS) : this.piCloseGraceMs;
     try {
       const result = await runtime.conn.close(graceMs);
       return { code: result.exitCode, signal: result.signal };
     } catch {
       // Teardown is best-effort; the host bounds kill stages regardless.
       try {
-        const result = await runtime.conn.close(0);
+        const result = await runtime.conn.close(graceMs);
         return { code: result.exitCode, signal: result.signal };
       } catch {
-        // Ignore — child already gone.
+        // Ignore — child already gone (genuinely unobserved).
         return { code: null, signal: null };
       }
     }
