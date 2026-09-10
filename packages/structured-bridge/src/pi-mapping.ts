@@ -1,5 +1,5 @@
 /**
- * Pi-specific bridge translation (orca-pi owned, SNC1.3 + SNC1.4).
+ * Pi-specific bridge translation (orca-pi owned, SNC1.3 + SNC1.4 + SNC1.5).
  *
  * The generic core (`protocol.ts`, `framing.ts`, `host.ts`, `provider.ts`)
  * is provider-neutral and safe to vendor into the Orca fork. Everything Pi
@@ -111,8 +111,9 @@ export function mapBridgeDispatchToPiPrompt(
 
 /**
  * Map one Pi RPC stdout record to zero or more bridge provider events.
- * Pure function over opaque payloads (used by SNC1.4 `pi-provider.ts`;
- * unit-tested here so the mapping is pinned before the native adapter lands).
+ * Pure function over opaque payloads (used by SNC1.4 `pi-provider.ts` and the
+ * SNC1.5 `pi-translator.ts`; unit-tested here so the mapping is pinned before
+ * the native adapter lands).
  *
  * Covers both the legacy SNC1.1 spike shapes (`update:{kind}`) and the real
  * Pi `--mode rpc` shapes proven in `packages/pi-rpc/fixtures/*.jsonl`:
@@ -120,14 +121,34 @@ export function mapBridgeDispatchToPiPrompt(
  * `toolcall_*`), `turn_start`/`turn_end` (with `message.stopReason`), and
  * `method`-based `extension_ui_request` dialogs.
  *
+ * SNC1.5 semantics (per #15):
+ * - text/thinking carry stable `contentIndex` identities so deltas coalesce;
+ *   finals (`text_end.text`/`thinking_end.thinking`) are authoritative and
+ *   reconcile (never duplicate deltas) — see `pi-translator.ts`.
+ * - tool identity is stable `toolCallId`: `toolcall_start` (provisional) and
+ *   `toolcall_end` (with full args) both map to `tool_start` with the same id
+ *   so Orca shows one row per id; `tool_execution_start` (authoritative args)
+ *   reconciles via the translator's same-id dedupe (no duplicate cards).
+ *   `toolcall_delta` arg chunks never become `tool_progress` (args are not
+ *   output); `tool_execution_update.partialResult` is cumulative (replace
+ *   display, never append) and `tool_execution_end` reconciles with `isError`
+ *   preserved faithfully.
+ * - tool stdout never becomes assistant prose: tool events never map to
+ *   `text_*`, and history separation lives in the translator.
+ * - turn/agent lifecycle drives working/settled: `turn_start` (receipt),
+ *   `turn_end` (`aborted` preserved, `toolUse` → `stop` since the bridge has
+ *   no toolUse verdict — multi-turn continuations stay on the same op until
+ *   `agent_settled`), `agent_settled` → `settled` (with `willRetry`).
+ *
  * Returns `[]` for fire-and-forget records the bridge must ignore
  * (`agent_start`/`agent_end`/`message_start`/`message_end` lifecycle chrome,
  * `toolcall_delta` arg chunks, `extension_ui_request` with
  * `setTitle`/`setStatus`/`setWidget`/`notify`, `queue_update`,
- * `thinking_level_changed`, `session_info_changed`, `compaction_*`, unknown
- * future events) and for `response` envelopes (handled via correlation,
- * not streaming). SNC1.4 streams basic text + turn lifecycle + cancel;
- * richer thinking/tool/error translation lands in SNC1.5.
+ * `thinking_level_changed`, `session_info_changed`, `compaction_*`,
+ * `bash_execution_update` out-of-band direct-bash deltas, unknown future
+ * events) and for `response` envelopes (handled via correlation, not
+ * streaming). Ignored records change no translator state and never terminate
+ * a session (bounded forward-compatibility).
  */
 export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): BridgeProviderEvent[] {
   const type = record["type"] as string | undefined;
@@ -143,13 +164,27 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
       if (kind === "thinking_start") return [{ type: "thinking_start", contentIndex: numeric(update?.["contentIndex"], 0) }];
       if (kind === "thinking_delta") return [{ type: "thinking_delta", delta: String(update?.["delta"] ?? ""), contentIndex: numeric(update?.["contentIndex"], 0) }];
       if (kind === "thinking_end") return [{ type: "thinking_end", contentIndex: numeric(update?.["contentIndex"], 0), thinking: typeof update?.["content"] === "string" ? (update?.["content"] as string) : undefined }];
-      // `toolcall_*` arg streaming is SNC1.5 scope: ignore deltas/ends here
-      // (execution identity comes via `tool_execution_*` below). Map the
-      // start so a tool call still surfaces as activity without duplicating
-      // the later `tool_execution_start` card in SNC1.4 basic text flow.
-      // To avoid double `tool_start` cards (one for `toolcall_start`, one
-      // for `tool_execution_start` with the same id), ignore the arg-phase
-      // start here — execution events carry args + identity authoritatively.
+      // SNC1.5 tool-call identity: arg-phase start (provisional, often without
+      // args) and end (with full `toolCall` args) both surface as `tool_start`
+      // with the stable id. The translator dedupes same-id re-announces (e.g.
+      // `toolcall_end` then `tool_execution_start`) so Orca shows one row per
+      // id that reconciles (never duplicates). Deltas are arg JSON chunks —
+      // never output — so they map to `[]` (never `tool_progress`).
+      if (kind === "toolcall_start") {
+        const id = String(update?.["id"] ?? (update?.["toolCall"] as Record<string, unknown> | undefined)?.["id"] ?? "call_unknown");
+        const toolName = String(update?.["toolName"] ?? (update?.["toolCall"] as Record<string, unknown> | undefined)?.["name"] ?? "tool");
+        const toolCall = update?.["toolCall"] as Record<string, unknown> | undefined;
+        const args = toolCall?.["arguments"];
+        return [{ type: "tool_start", toolCallId: id, toolName, ...(args !== undefined ? { args } : {}) }];
+      }
+      if (kind === "toolcall_delta") return [];
+      if (kind === "toolcall_end") {
+        const toolCall = update?.["toolCall"] as Record<string, unknown> | undefined;
+        const id = String(toolCall?.["id"] ?? update?.["id"] ?? "call_unknown");
+        const toolName = String(toolCall?.["name"] ?? update?.["toolName"] ?? "tool");
+        const args = toolCall?.["arguments"];
+        return [{ type: "tool_start", toolCallId: id, toolName, ...(args !== undefined ? { args } : {}) }];
+      }
       return [];
     }
     case "text_start":
@@ -170,9 +205,10 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
     }
     case "tool_execution_update": {
       const partial = record["partialResult"];
-      // `partialResult` is accumulated opaque output: stringify objects so
-      // the bridge `tool_progress.partialResult: string` contract holds.
-      // SNC1.5 owns faithful tool rendering; SNC1.4 keeps text flowing.
+      // SNC1.5 cumulative semantics: `partialResult` is accumulated output —
+      // it REPLACES display (never appends). Stringify objects so the bridge
+      // `tool_progress.partialResult: string` contract holds; tool stdout stays
+      // in the tool channel (never assistant prose) via the translator.
       const partialResult = typeof partial === "string" ? partial : safeStringify(partial);
       return [{ type: "tool_progress", toolCallId: String(record["toolCallId"] ?? "call_unknown"), partialResult }];
     }
@@ -185,9 +221,15 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
       return [{ type: "turn_start" }];
     case "turn_end": {
       // Real Pi nests the verdict under `message.stopReason` (`stop` |
-      // `aborted` | tool-use flows); the outer record may also carry it.
-      // Preserve `aborted` so Esc-cancel renders correctly; everything else
-      // maps to `stop` for SNC1.4 basic text (SNC1.5 owns error shaping).
+      // `aborted` | `toolUse` tool continuations | `error`); the outer record
+      // may also carry it. SNC1.5 lifecycle:
+      // - `aborted` preserved so Esc-cancel renders correctly (with Pi's
+      //   message when present — abort text is a stable provider string, not
+      //   free-form prompt material);
+      // - `toolUse` → `stop` (the bridge has no toolUse verdict; multi-turn
+      //   tool continuations stay on the same op until `agent_settled` — the
+      //   translator/provider never settle on `turn_end` alone);
+      // - `error` → shaped generic per bridge §6 (never Pi free text).
       const outerStop = typeof record["stopReason"] === "string" ? (record["stopReason"] as string) : undefined;
       const inner = record["message"] as Record<string, unknown> | undefined;
       const innerStop = inner && typeof inner["stopReason"] === "string" ? (inner["stopReason"] as string) : undefined;
@@ -203,6 +245,8 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
       // generic message — Pi free text can carry prompt/request/credential
       // material that value redaction cannot reliably strip.
       if (stop === "error") return [{ type: "turn_end", stopReason: "error", errorMessage: "provider dispatch failed" }];
+      // `toolUse`, `stop`, and any unknown verdict all complete the turn
+      // boundary without settling the agent (settlement owns `settled`).
       return [{ type: "turn_end", stopReason: "stop" }];
     }
     case "agent_settled": {
@@ -253,7 +297,41 @@ export function mapPiRecordToBridgeEvents(record: Record<string, unknown>): Brid
       }
       return [];
     }
+    // SNC1.5 bounded chrome: out-of-band direct-`bash` deltas (correlate by
+    // command `id`, not `toolCallId`; turn tools use `tool_execution_*` above),
+    // queue/compaction/retry/session-chrome, and agent/message envelopes are
+    // never turn content — ignored without state change, never terminating.
+    case "bash_execution_update":
+    case "queue_update":
+    case "compaction_start":
+    case "compaction_end":
+    case "thinking_level_changed":
+    case "session_info_changed":
+    case "agent_start":
+    case "agent_end":
+    case "message_start":
+    case "message_end":
+    case "response":
+      return [];
+    // Top-level legacy toolcall shapes (spike back-compat; real Pi nests them
+    // under `message_update` handled above). Same stable-id semantics.
+    case "toolcall_start": {
+      const id = String(record["id"] ?? (record["toolCall"] as Record<string, unknown> | undefined)?.["id"] ?? "call_unknown");
+      return [{ type: "tool_start", toolCallId: id, toolName: String(record["toolName"] ?? "tool") }];
+    }
+    case "toolcall_delta":
+      return [];
+    case "toolcall_end": {
+      const toolCall = record["toolCall"] as Record<string, unknown> | undefined;
+      const id = String(toolCall?.["id"] ?? record["id"] ?? "call_unknown");
+      const toolName = String(toolCall?.["name"] ?? record["toolName"] ?? "tool");
+      const args = toolCall?.["arguments"];
+      return [{ type: "tool_start", toolCallId: id, toolName, ...(args !== undefined ? { args } : {}) }];
+    }
     default:
+      // Unknown future Pi kinds: bounded ignore (forward-compat). The
+      // translator changes no state for `[]`, so suppressed chrome can never
+      // settle/error a turn or terminate a session.
       return [];
   }
 }

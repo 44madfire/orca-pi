@@ -86,3 +86,9 @@ export {
   type PiDispatchValidation,
   type PiPromptCommand,
 } from "./pi-mapping.js";
+export {
+  PiTranslator,
+  type BridgeTranslatorEvent,
+  type TranslatorJournalEntry,
+  type TranslatorToolState,
+} from "./pi-translator.js";
