@@ -11,10 +11,11 @@
 One `pi --mode rpc` child per bridge session (`cwd` = acquire
 `workspaceRoot`, the exact Orca-selected workspace). Transport-neutral
 profile configuration travels via `resolvePiSpec` (callers pass
-`buildPiLaunch()` output; spec `env` merges into the spawn with explicit
-`piEnv`-wins precedence, spawn-only never the bridge); TUI-only flags are
-rejected fail-closed via `toPiRpcProcessSpec`; `--mode rpc` is appended
-idempotently. No terminal keystroke injection anywhere on this path.
+`buildPiLaunch()` output; overlays merge via `resolvePiRpcEnv(overlay,
+process.env)` so ambient PATH/auth/config survives, `piEnv` wins on conflict,
+spawn-only never the bridge); TUI-only flags are rejected fail-closed via
+`toPiRpcProcessSpec`; `--mode rpc` is appended idempotently. No terminal
+keystroke injection anywhere on this path.
 
 - `hello` → `hello_ok{provider:{id:"pi"},capabilities:piBridgeCapabilities()}`
 - `acquire{workspaceRoot,options?}` → spawn + `start()` + `get_state` →
@@ -26,24 +27,29 @@ idempotently. No terminal keystroke injection anywhere on this path.
 - `answer_prompt` → Pi `extension_ui_response` (select/input/editor `{value}`,
   confirm `{confirmed}`, cancel `{cancelled:true}`)
 - `release`/`close` → bounded `PiRpcConnection.close()` per child, then
-  `released`/`closed`; provider `dispose()` (also awaited on SIGTERM/SIGINT/
-  stdin-EOF with a 2s bound) closes every Pi child with observed exit
-  (no leaked processes/listeners).
+  `released`/`closed`; provider `dispose()` (also awaited to completion on
+  SIGTERM/SIGINT/stdin-EOF — `close()` is already bounded, so exiting early
+  would cut off its SIGTERM/SIGKILL stages) closes every Pi child with
+  observed exit (no leaked processes/listeners).
 
 ## 2. Delivery honesty
 
 - `accepted` only after Pi `prompt success:true` (Pi definitely owns it) —
   including queued `steer`/`followUp`, submitted to Pi with the matching
   `streamingBehavior` *before* acking and tracked in `piQueuedOps` for
-  post-settle promotion (never merely provider memory).
+  per-turn promotion (promoted on the completed `turn_end`, so the next
+  `turn_start` carries the queued op; `agent_settled` means no continuation
+  left and never promotes).
 - `rejected` only for definite refusal (`success:false`, empty text,
   unknown session, busy + `queue:reject`, Pi-exited reacquire hint).
 - `unknown` for ambiguity (timeout/exit/close after the write). Pending-op
-  state (`activeOpId`/`isStreaming`) is retained *before* the write, so a
-  landed-but-timed-out turn still attributes its events and journals user +
-  assistant for `get_history`. The provider sends `unknown` fast instead of
-  waiting for the host deadline; callers reconcile via `get_history` before
-  retrying and never auto-resend.
+  state (`activeOpId`/`isStreaming` + unjournaled `pendingUserText`) is
+  retained *before* the write; `turn_end` journals pending-user→assistant in
+  order, so a landed-but-timed-out turn still recovers via `get_history`
+  without fabricating turns Pi never received. Idle reconciliation (`get_state`)
+  clears unlanded pending turns (history stays clean). Fully landed turns that
+  settle before the timeout journal once (no duplication). The provider sends
+  `unknown` fast; callers reconcile via history and never auto-resend.
 
 ## 3. Streaming
 

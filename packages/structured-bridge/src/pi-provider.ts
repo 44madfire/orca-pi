@@ -49,6 +49,7 @@
 
 import {
   PiRpcConnection,
+  resolvePiRpcEnv,
   toPiRpcProcessSpec,
   type PiImageAttachment,
   type PiRpcConnectionOptions,
@@ -145,11 +146,21 @@ interface PiRuntime {
   piSessionId?: string;
   /**
    * FIFO of Pi-owned queued `steer`/`followUp` opIds (accepted only after Pi
-   * `prompt{streamingBehavior}` succeeded). Promoted to `activeOpId` when the
-   * current turn settles, so later Pi turns attribute to the queued op — never
-   * merely resident in provider memory (SNC1.4 P1: accepted means Pi-owned).
+   * `prompt{streamingBehavior}` succeeded). Promoted at the per-turn boundary
+   * (see `turn_end` handling): the next `turn_start` after a completed turn
+   * attributes to the queued op — never merely resident in provider memory
+   * (SNC1.4 P1: accepted means Pi-owned). `agent_settled` means Pi has no
+   * queued continuation left, so promotion must not wait for it.
    */
   piQueuedOps: string[];
+  /**
+   * Optimistic user text for an ambiguous `prompt` (write may have landed but
+   * the response was lost). NOT journaled yet: `turn_end` journals it first
+   * (user→assistant order) only when Pi actually streams the turn, so
+   * `get_history` never fabricates a user entry Pi never received. Cleared on
+   * definite refusal, successful journaling, or idle reconciliation.
+   */
+  pendingUserText: string | null;
 }
 
 function nowIso(): string {
@@ -292,12 +303,13 @@ export class PiBridgeProvider extends BridgeProvider {
       return;
     }
 
-    // Merge transport-neutral spec env with the explicit provider overlay.
-    // Precedence: explicit `piEnv` wins over `resolvePiSpec` env (dev override
-    // beats profile-derived config); both ride the spawn env only, never the
-    // bridge (see `pi-provider.md` §1). When neither is set, inherit.
-    const mergedEnv: NodeJS.ProcessEnv | undefined =
-      rpcSpec.env !== undefined || this.piEnv !== undefined ? { ...(rpcSpec.env ?? {}), ...(this.piEnv ?? {}) } : undefined;
+    // Merge transport-neutral spec env with the explicit provider overlay
+    // through the Pi RPC helper so ambient auth/config/PATH survives.
+    // `spec.env` is an overlay (default `{}` from `buildPiLaunch`, never a
+    // complete environment); `piEnv` wins on conflict (dev override beats
+    // profile-derived config). Both ride the spawn env only, never the bridge.
+    const overlay: Record<string, string | undefined> = { ...(rpcSpec.env ?? {}), ...(this.piEnv ?? {}) };
+    const mergedEnv: NodeJS.ProcessEnv = resolvePiRpcEnv(overlay, process.env);
     const conn = this.createConnection({
       piCommand: rpcSpec.command,
       piArgs: [...rpcSpec.args],
@@ -366,7 +378,7 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompt: null,
       entryCounter: 0,
     });
-    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, piQueuedOps: [] };
+    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, piQueuedOps: [], pendingUserText: null };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
     if (session) this.attachPiStreaming(sessionId, session, runtime);
@@ -466,32 +478,26 @@ export class PiBridgeProvider extends BridgeProvider {
             event: bridgeEvent,
           });
           if (activeOpId) {
-            // Journal the completed assistant turn once (text may be empty
-            // for tool-only turns; SNC1.5 owns faithful tool journaling).
+            // Fallback journaling for turns that settle without a `turn_end`
+            // (robustness; the normal path journals per turn below). Pending
+            // ambiguous users journal first so order stays user→assistant.
+            if (runtime.pendingUserText !== null) {
+              this.appendHistory(session, { role: "user", text: runtime.pendingUserText });
+              runtime.pendingUserText = null;
+            }
             if (runtime.activeText !== "") {
               this.appendHistory(session, { role: "assistant", text: runtime.activeText });
               session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+            } else {
+              session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
             }
             runtime.activeText = "";
-            // Pi-owned queued steer/followUp turns promote here: Pi already
-            // owns the next prompt (accepted only after Pi success), so just
-            // switch attribution without re-sending to Pi. Base `finishTurn`
-            // drains only the legacy local queue (empty on the Pi path).
-            const nextPiOp = runtime.piQueuedOps.shift();
-            if (nextPiOp !== undefined) {
-              session.activeOpId = nextPiOp;
-              session.metadata.isStreaming = true;
-              runtime.activeText = "";
-              // User history for the queued turn was journaled at Pi-accept
-              // time (see onPiDispatch busy branch), so later Pi text
-              // attributes to the queued op and settles it in turn.
-            } else {
-              this.finishTurn(session, activeOpId);
-              // `finishTurn` may have started a legacy queued turn via
-              // `handleDispatch` (which sets a new activeOpId + isStreaming).
-              // When both queues are empty it clears streaming state here.
-              if (session.activeOpId === null) session.metadata.isStreaming = false;
-            }
+            // `agent_settled` means Pi has no queued continuation left: any
+            // still-tracked Pi-owned ops never ran, so drop them rather than
+            // promoting a turn Pi already finished past.
+            runtime.piQueuedOps.splice(0);
+            this.finishTurn(session, activeOpId);
+            if (session.activeOpId === null) session.metadata.isStreaming = false;
           }
           continue;
         }
@@ -503,6 +509,34 @@ export class PiBridgeProvider extends BridgeProvider {
             ...(activeOpId ? { opId: activeOpId } : {}),
             event: bridgeEvent,
           });
+          if (activeOpId) {
+            // Per-turn boundary: journal this turn (pending ambiguous user
+            // first, then assistant) so later turns attribute correctly.
+            // Tool-only turns journal nothing (SNC1.5 owns tool journaling).
+            if (runtime.pendingUserText !== null) {
+              this.appendHistory(session, { role: "user", text: runtime.pendingUserText });
+              runtime.pendingUserText = null;
+            }
+            if (runtime.activeText !== "") {
+              this.appendHistory(session, { role: "assistant", text: runtime.activeText });
+            }
+            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+            runtime.activeText = "";
+            // Promote the next Pi-owned queued turn (if any) so its upcoming
+            // `turn_start`/deltas attribute to the queued op, not the
+            // completed one. `agent_settled` (final, no continuation left)
+            // never promotes — see above.
+            const nextPiOp = runtime.piQueuedOps.shift();
+            if (nextPiOp !== undefined) {
+              session.activeOpId = nextPiOp;
+              session.metadata.isStreaming = true;
+              runtime.activeText = "";
+              runtime.pendingUserText = null;
+              // Queued user history was journaled at Pi-accept time, so the
+              // promoted turn only needs its assistant journaled at its own
+              // `turn_end` below.
+            }
+          }
           continue;
         }
         // turn_start/text_*/thinking_*/tool_*: stream with the active turn id.
@@ -527,8 +561,13 @@ export class PiBridgeProvider extends BridgeProvider {
     const activeOpId = session.activeOpId;
     session.metadata.isStreaming = false;
     // Pi-owned queued turns cannot survive the child: drop them alongside the
-    // legacy local queue so a later reacquire starts clean.
-    runtime?.piQueuedOps.splice(0);
+    // legacy local queue so a later reacquire starts clean. Pending ambiguous
+    // users are dropped unjournaled (Pi never confirmed them). 
+    if (runtime) {
+      runtime.piQueuedOps.splice(0);
+      runtime.pendingUserText = null;
+      runtime.activeText = "";
+    }
     if (activeOpId) {
       // Pi died mid-turn: the prompt outcome is ambiguous, but the UI must
       // not stay stuck streaming. Emit a shaped error turn + settled so Orca
@@ -576,7 +615,8 @@ export class PiBridgeProvider extends BridgeProvider {
       // prompt, never merely provider memory. Submit to Pi now with the
       // corresponding `streamingBehavior` and wait for Pi's success before
       // acking. Pi queues internally; the op is tracked in `piQueuedOps`
-      // for attribution when its turn runs (see settled promotion). A crash
+      // for attribution at the per-turn boundary (promoted on the completed
+      // `turn_end`, so the next `turn_start` carries the queued op). A crash
       // after this ack loses nothing Pi had not already accepted.
       const queuedCmd = mapBridgeDispatchToPiPrompt(msg.opId, msg.message, msg.queue ?? "followUp");
       try {
@@ -609,10 +649,10 @@ export class PiBridgeProvider extends BridgeProvider {
         });
         return;
       }
-      // Pi owns the queued prompt: journal the user turn now (so history
-      // already reflects it) and track it for post-settle promotion. Later
-      // Pi `turn_start`/deltas for this turn attribute to `msg.opId` once
-      // the current turn settles (see settled promotion in streaming).
+      // Pi owns the queued prompt: journal the user turn now (confirmed) and
+      // track it for per-turn promotion. Later Pi `turn_start`/deltas for
+      // this turn attribute to `msg.opId` once the current turn ends (see
+      // `turn_end` promotion in streaming).
       this.appendHistory(session, { role: "user", text: msg.message.text });
       session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
       runtime.piQueuedOps.push(msg.opId);
@@ -621,11 +661,15 @@ export class PiBridgeProvider extends BridgeProvider {
     }
     // Idle: retain pending-op state BEFORE the write so an ambiguous outcome
     // (write landed but the response was lost) still attributes later Pi
-    // events/history to this op. Definite refusal clears it below (Pi made no
-    // change); success and ambiguity keep it for streaming/reconciliation.
+    // events to this op. The user text stays pending (NOT journaled) until Pi
+    // actually streams the turn (`turn_end` journals user→assistant in order),
+    // so `get_history` never fabricates a turn Pi never received. Definite
+    // refusal clears everything below (Pi made no change); success journals
+    // immediately; ambiguity reconciles against Pi state before deciding.
     session.activeOpId = msg.opId;
     session.metadata.isStreaming = true;
     runtime.activeText = "";
+    runtime.pendingUserText = msg.message.text;
     const piCmd = mapBridgeDispatchToPiPrompt(msg.opId, msg.message, msg.queue ?? "reject");
     try {
       await runtime.conn.prompt(piCmd.message, {
@@ -644,6 +688,7 @@ export class PiBridgeProvider extends BridgeProvider {
           session.activeOpId = null;
           session.metadata.isStreaming = false;
         }
+        runtime.pendingUserText = null;
         const piError = (error as { piError?: unknown }).piError;
         this.send({
           v: 1,
@@ -656,14 +701,33 @@ export class PiBridgeProvider extends BridgeProvider {
         return;
       }
       // Ambiguous: timeout/exit/close after the write may or may not have
-      // landed. Keep the pending active turn (set above) so late Pi events
-      // attribute to `msg.opId`, journal the user turn optimistically so
-      // `get_history` can recover a landed prompt/result, and report
-      // `unknown` fast (do not wait for the host deadline). Callers must
-      // reconcile via history and never auto-resend. When Pi died the exit
-      // handler settles the turn; otherwise Pi's own `settled` completes it.
-      this.appendHistory(session, { role: "user", text: msg.message.text });
-      session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+      // landed. Do NOT journal yet. Reconcile against Pi's authoritative
+      // state: when Pi is idle it never received the prompt, so clear the
+      // pending turn (history stays clean, session idle, safe for the caller
+      // to retry as fresh work after reconciling). When Pi is streaming (or
+      // state is unreadable) keep the pending turn so late Pi events
+      // attribute to `msg.opId` and `turn_end` journals user→assistant in
+      // order. Report `unknown` fast; callers reconcile via history and never
+      // auto-resend. A turn that already settled during the write (complete
+      // landed turn before the timeout) already cleared `activeOpId` via its
+      // own `turn_end`/`settled`, so only still-pending ops reconcile here.
+      if (session.activeOpId === msg.opId) {
+        let piStreaming: boolean | null = null;
+        try {
+          const state = await runtime.conn.getState();
+          piStreaming = state.isStreaming === true;
+        } catch {
+          piStreaming = null;
+        }
+        if (piStreaming === false) {
+          session.activeOpId = null;
+          session.metadata.isStreaming = false;
+          runtime.pendingUserText = null;
+          runtime.activeText = "";
+        }
+      } else {
+        runtime.pendingUserText = null;
+      }
       this.send({
         v: 1,
         kind: "dispatch_ack",
@@ -674,11 +738,18 @@ export class PiBridgeProvider extends BridgeProvider {
       });
       return;
     }
-    // Pi owns the prompt: the pending active turn (set before the write)
-    // stays streaming; journal the user turn and let Pi events drive
-    // `turn_start`/deltas/`turn_end`/`settled`.
-    this.appendHistory(session, { role: "user", text: msg.message.text });
-    session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+    // Pi owns the prompt: journal the user turn now (confirmed) and let Pi
+    // events drive `turn_start`/deltas/`turn_end`/`settled`. Clear the
+    // pending marker so `turn_end` does not journal it a second time. When
+    // the turn already settled during the write, `activeOpId` was cleared by
+    // its own `settled` (which journaled user+assistant) — skip the duplicate.
+    if (session.activeOpId === msg.opId && runtime.pendingUserText !== null) {
+      this.appendHistory(session, { role: "user", text: msg.message.text });
+      session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+      runtime.pendingUserText = null;
+    } else {
+      runtime.pendingUserText = null;
+    }
     this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
   }
 

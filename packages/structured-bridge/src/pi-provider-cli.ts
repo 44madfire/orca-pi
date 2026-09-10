@@ -66,10 +66,11 @@ function shutdown(signal: string): void {
   // the bridge `close` handshake (`onPiClose`); this covers the rest.
   void (async () => {
     try {
-      await Promise.race([
-        provider.dispose(),
-        new Promise((resolve) => setTimeout(resolve, 2000)),
-      ]);
+      // `dispose()` is bounded by `PiRpcConnection.close()` (EOF grace →
+      // SIGTERM grace → SIGKILL grace → synthetic finish, never hangs), so
+      // await it to completion: exiting early would cut off the force-kill
+      // stages and leak the child when it ignores EOF.
+      await provider.dispose();
     } catch {
       // Teardown is best-effort; never block process exit.
     }

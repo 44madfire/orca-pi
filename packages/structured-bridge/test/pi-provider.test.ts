@@ -29,6 +29,8 @@ class FakePi implements PiProviderConnection {
   failStartWith: unknown = null;
   failPromptWith: unknown = null;
   failStateWith: unknown = null;
+  /** Artificial `close()` latency (ms) to prove `dispose()` awaits slow children. */
+  closeDelayMs = 0;
   state: PiState = {
     model: { id: "glm-5.3-flash", provider: "opencode-go" } as PiState["model"],
     thinkingLevel: "low",
@@ -65,6 +67,7 @@ class FakePi implements PiProviderConnection {
 
   async close(graceMs = 2000): Promise<PiRpcCloseResult> {
     this.closes.push(graceMs);
+    if (this.closeDelayMs > 0) await new Promise((r) => setTimeout(r, this.closeDelayMs));
     this._closed = true;
     const info: PiRpcCloseResult = { exitCode: 0, signal: null, forced: graceMs === 0 };
     for (const h of [...this.exitHandlers]) {
@@ -621,7 +624,10 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
         fakes.push(fake);
         const originalPrompt = fake.prompt.bind(fake);
         fake.prompt = async (message: string, promptOpts?: { images?: readonly unknown[]; streamingBehavior?: string }): Promise<void> => {
-          // Land the turn first (Pi accepted and streams), then lose the response.
+          // Land the turn first (Pi accepted and streams; authoritative state
+          // reports streaming so ambiguity reconciliation keeps the pending
+          // turn), then lose the response.
+          fake.state.isStreaming = true;
           fake.emit({ type: "turn_start" } as PiServerEvent);
           fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "landed " } } as unknown as PiServerEvent);
           fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "result" } } as unknown as PiServerEvent);
@@ -684,10 +690,11 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     expect(fakes[0]?.prompts.map((p) => p.message)).toEqual(["first", "steered"]);
     const steerOpts = (fakes[0]?.prompts[1] as { opts?: { streamingBehavior?: string } } | undefined)?.opts;
     expect(steerOpts?.streamingBehavior).toBe("steer");
-    // First turn settles; the Pi-owned queued turn promotes to active so its
-    // later events attribute to dsp_2, not dsp_1 (no provider-memory loss).
+    // Real Pi queues the steer before the final `agent_settled`: the first
+    // `turn_end` promotes the Pi-owned queued op, so the next `turn_start`
+    // attributes to dsp_2 (no intermediate `settled` — that would mean no
+    // continuation left per the Pi contract).
     fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
-    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
     fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
     fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "second-turn" } } as unknown as PiServerEvent);
@@ -725,11 +732,116 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
     expect(fakes[0]?.seenOpts.env).toMatchObject({ SHARED: "override", EXTRA: "dev", PROFILE_ONLY: "yes" });
   });
 
+  it("leaves no fabricated history and no stuck turn when an ambiguous prompt never landed", async () => {
+    // Timeout with no Pi events: Pi never received the write, so history stays
+    // clean and authoritative idle state clears the pending turn (safe to
+    // retry as fresh work after reconciling the empty history + unknown ack).
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fake.state.isStreaming = false;
+        fakes.push(fake);
+        fake.failPromptWith = Object.assign(new Error("timed out"), {
+          code: "request-timeout",
+          command: "prompt",
+          ambiguous: true,
+          timeoutMs: 10,
+        });
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "never landed" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ status: "unknown" });
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ text?: string }> };
+    expect(history.entries.some((e) => e.text === "never landed")).toBe(false);
+    // Idle reconciliation cleared the pending turn: cancel reports settled.
+    send({ v: 1, kind: "cancel", opId: "cnl_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "cancelled")).toMatchObject({ settled: true });
+  });
+
+  it("recovers a fully landed turn that settles before the prompt timeout without duplication", async () => {
+    const fakes: FakePi[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi(opts);
+        fakes.push(fake);
+        const originalPrompt = fake.prompt.bind(fake);
+        fake.prompt = async (message: string, promptOpts?: { images?: readonly unknown[]; streamingBehavior?: string }): Promise<void> => {
+          // Pi runs the complete turn synchronously, then the response is lost.
+          fake.state.isStreaming = true;
+          fake.emit({ type: "turn_start" } as PiServerEvent);
+          fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "done early" } } as unknown as PiServerEvent);
+          fake.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+          fake.emit({ type: "agent_settled" } as PiServerEvent);
+          fake.state.isStreaming = false;
+          await originalPrompt(message, promptOpts);
+          throw Object.assign(new Error("timed out"), { code: "request-timeout", command: "prompt", ambiguous: true, timeoutMs: 10 });
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 20));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "early settle" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ status: "unknown" });
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ role: string; text?: string }> };
+    expect(history.entries.filter((e) => e.role === "user" && e.text === "early settle")).toHaveLength(1);
+    expect(history.entries.filter((e) => e.role === "assistant" && e.text === "done early")).toHaveLength(1);
+    send({ v: 1, kind: "cancel", opId: "cnl_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "cancelled")).toMatchObject({ settled: true });
+  });
+
+  it("preserves ambient environment when the profile spec env is empty (overlay, not replacement)", async () => {
+    const sentinelKey = "__SNC14_AMBIENT_SENTINEL__";
+    const previous = process.env[sentinelKey];
+    process.env[sentinelKey] = "keep-me";
+    try {
+      const fakes: FakePi[] = [];
+      const provider = new PiBridgeProvider({
+        resolvePiSpec: () => ({ command: "pi", args: [], env: {} }),
+        createConnection: (opts) => {
+          const fake = new FakePi(opts);
+          fakes.push(fake);
+          return fake;
+        },
+      });
+      const { out, send, hello } = drive(provider);
+      hello();
+      send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(lastOfKind(out, "acquired")).toBeDefined();
+      expect((fakes[0]?.seenOpts.env as Record<string, string | undefined> | undefined)?.[sentinelKey]).toBe("keep-me");
+    } finally {
+      if (previous === undefined) delete process.env[sentinelKey];
+      else process.env[sentinelKey] = previous;
+    }
+  });
+
   it("dispose() closes every Pi child with observed exit (signal/EOF fallback)", async () => {
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
         const fake = new FakePi(opts);
+        // Slow children prove `dispose()` (and thus the CLI signal path)
+        // awaits completion instead of racing out early and leaking.
+        fake.closeDelayMs = 120;
         fakes.push(fake);
         return fake;
       },
