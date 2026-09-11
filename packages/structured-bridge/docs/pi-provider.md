@@ -1,11 +1,13 @@
-# Pi Provider — Real Pi Structured Chat (SNC1.4 + SNC1.5)
+# Pi Provider — Real Pi Structured Chat (SNC1.4 + SNC1.5 + SNC1.6)
 
 > Status: SNC1.4 basic text chat plus SNC1.5 thinking/tools/errors/lifecycle
-> translation, implemented in `packages/structured-bridge/src/pi-provider.ts`
+> translation plus SNC1.6 model/thinking controls, interactive prompts, and
+> structured images, implemented in `packages/structured-bridge/src/pi-provider.ts`
 > (+ `pi-provider-cli.js`) with fixture-driven mapping in `pi-mapping.ts` and
 > the pure, fixture-testable turn translator in `src/pi-translator.ts`
-> (`test/pi-translator.test.ts` replays real SNC1.1 fixtures with no Orca/Pi).
-> Proves #14 and #15 without touching Orca core: the fork vendors only
+> (`test/pi-translator.test.ts` replays real SNC1.1 fixtures with no Orca/Pi;
+> `test/pi-provider-snc16.test.ts` pins SNC1.6 with a fake Pi option RPC).
+> Proves #14, #15, and #16 without touching Orca core: the fork vendors only
 > `framing.ts` + `protocol.ts` + `host.ts`; `pi-provider.ts` (+ `pi-mapping.ts`
 > + `pi-translator.ts`) stays in `orca-pi` like `provider.ts` +
 > `mock-provider-cli.js`.
@@ -21,21 +23,47 @@ spawn-only never the bridge); TUI-only flags are rejected fail-closed via
 `toPiRpcProcessSpec`; `--mode rpc` is appended idempotently. No terminal
 keystroke injection anywhere on this path.
 
-- `hello` → `hello_ok{provider:{id:"pi"},capabilities}` with SNC1.4-truthful
-  flags (`options:false`, `resume:false`: model/thinking controls are SNC1.6,
-  history/branch/resume is SNC1.7, so Orca never exposes diverging controls)
-- `acquire{workspaceRoot,options?}` → spawn + `start()` + `get_state` →
+- `hello` → `hello_ok{provider:{id:"pi"},capabilities}` with SNC1.6-truthful
+  flags (`options:true` — model/thinking/prompt/image controls are live —
+  `resume:false`: history/branch/resume is SNC1.7, so Orca never exposes
+  diverging resume paths)
+- `acquire{workspaceRoot,options?}` → spawn + `start()` + `get_state` + live
+  `applyPiOptions(model/thinking/autoCompaction)` →
   `acquired{metadata{sessionId,providerSessionId,workspaceRoot,model?,thinkingLevel?,messageCount,isStreaming:false}}`
-- `dispatch{text,images?,queue?}` → `validatePiDispatch` (+ leading-`/`
-  extension-command rejection for SNC1.6) → idle Pi `prompt` →
+  with provider-confirmed values (bad refs fail closed with
+  `UNKNOWN_MODEL` / `AMBIGUOUS_MODEL` / `UNKNOWN_THINKING_LEVEL`, no leaked
+  child, Orca stays on TUI)
+- `dispatch{text,images?,queue?}` → `validatePiDispatch` + live image gating
+  (hint floor + cached-catalog `model-rejects-images`) → idle Pi `prompt` →
   `dispatch_ack{accepted|rejected|unknown}` + streamed `session_event`s.
   Busy-session dispatches (including `steer`/`followUp`) are honestly
-  rejected — one turn at a time; Pi-owned queue fidelity is SNC1.5.
-- `cancel{targetOpId?}` → Pi `abort()` only when the target is the live turn
-  (omitted target means Esc-for-active); stale targets are honest no-ops →
+  rejected — one turn at a time; Pi-owned queue fidelity stays deferred.
+  Idle `/` extension commands run immediately without a turn (no history
+  entries, per the Pi contract); busy `/` stays honestly rejected to avoid
+  concurrent attribution without queue evidence; `/` with images is
+  rejected (`extension-command-images-unsupported`).
+- `set_options{model?,thinkingLevel?,queueMode?,autoCompaction?}` → live Pi
+  `get_available_models` / `set_model`, `get_available_thinking_levels` /
+  `set_thinking_level`, `set_auto_compaction` with exact-match semantics
+  (no fuzzy/wildcard) → `options_updated` with provider-confirmed values
+  (Orca-normal persistence: `session.options` + `metadata` hold confirmed
+  state; `acquire` restores the same way). Failures return shaped `error`
+  (`UNKNOWN_MODEL` / `AMBIGUOUS_MODEL` / `UNKNOWN_THINKING_LEVEL` /
+  `PI_OPTION_FAILED` / `PI_OPTION_UNSUPPORTED`), never a diverging ack.
+- `get_session` → best-effort `get_state` refresh (provider-confirmed
+  model/thinking/counts/streaming) + cached lease fallback (never fails on
+  transient state reads). `thinking_level_changed` Pi events also update
+  the lease live.
+- `cancel{targetOpId?}` → retire that op's pending dialogs (SNC1.6 provider-
+  cancellation retirement) + Pi `abort()` only when the target is the live
+  turn (omitted target means Esc-for-active); stale targets are honest
+  no-ops (never abort live turns, never touch live prompts) →
   `cancelled{settled}` + Pi `turn_end{aborted}`/`settled`
-- `answer_prompt` → Pi `extension_ui_response` (select/input/editor `{value}`,
-  confirm `{confirmed}`, cancel `{cancelled:true}`)
+- `answer_prompt` → exactly-once Pi `extension_ui_response` (select/input/
+  editor `{value}`, confirm `{confirmed}`, cancel `{cancelled:true}`) with
+  stable `requestId` identity; duplicates / unknown / retired ids refuse
+  with `UNKNOWN_REQUEST` (never re-sent, never broadcast); benign `ANSWERED`
+  ack resolves the host without echoing values
 - `release`/`close{mode}` → bounded `PiRpcConnection.close()` per child
   (graceful: EOF→SIGTERM→SIGKILL with the configured grace; `force`: kill-first
   `close(grace, { force: true })` — SIGKILL immediately with no EOF/SIGTERM,
@@ -89,11 +117,12 @@ Pi tool_execution_start                       → tool_start (dedupe same id →
 Pi tool_execution_update (cumulative)         → tool_progress (replace display)
 Pi tool_execution_end (+isError)              → tool_end (reconciles, isError faithful)
 Pi turn_end{stop/aborted/toolUse}             → turn_end{stop/aborted} (toolUse→stop; journals user→tools→assistant)
-Pi agent_settled{willRetry}                   → settled (drains remainder, clears ALL transient)
-Pi extension_ui_request dialog                → prompt_request (pendingPrompt for answer)
+Pi agent_settled{willRetry}                   → settled (drains remainder, clears ALL transient + retires op prompts)
+Pi extension_ui_request dialog                → prompt_request (stable requestId, multi-dialog map, exactly-once)
+Pi thinking_level_changed{level}              → lease update (no bridge event; get_session reports confirmed)
 agent_start/agent_end/message_start/end, toolcall_delta,
-bash_execution_update, queue_update, compaction_*, thinking_level_changed,
-session_info_changed, notify/setTitle/setStatus, responses, unknown → [] (bounded)
+bash_execution_update, queue_update, compaction_*, session_info_changed,
+notify/setTitle/setStatus, responses, unknown → [] (bounded)
 ```
 
 `isStreaming` follows the single active turn (lifecycle-driven, not terminal
@@ -153,10 +182,16 @@ Missing/incompatible bridge still falls back to the ordinary Pi TUI path
 
 SNC1.4 was basic text chat; SNC1.5 lands faithful thinking/tool/error/
 lifecycle translation (this doc §3 + `pi-translator.ts` + fixture replay).
-Queued `steer`/`followUp` while busy stays honestly rejected (Pi-owned queue
-fidelity needs `queue_update`/retry/compaction evidence beyond turn
-boundaries — still deferred, not guessed). Model/thinking controls, prompts,
-images are SNC1.6; history/branch/resume is SNC1.7 (which will reconstruct
-from Pi `get_entries`/`get_tree` instead of the live-turn journal used here).
-`set_options` stores + acks; `get_history`/`get_session` serve live-turn
-state (now user + tools + assistant).
+SNC1.6 lands model/thinking controls, interactive prompts, and structured
+images (this doc §§1–4 + `test/pi-provider-snc16.test.ts`): Orca's existing
+shared Native Chat option/prompt/image controls drive Pi with no renderer
+fork (capabilities `options:true`); unsupported images / unknown models /
+thinking fail closed with actionable codes; prompts are exactly-once with
+stable identity and acquisition-fenced retirement. Queued `steer`/`followUp`
+while busy stays honestly rejected (Pi-owned queue fidelity needs
+`queue_update`/retry/compaction evidence beyond turn boundaries — still
+deferred, not guessed). History/branch/resume is SNC1.7 (which will
+reconstruct from Pi `get_entries`/`get_tree` instead of the live-turn journal
+used here). `get_history` serves live-turn state (user + tools + assistant,
+text only — image bytes never journaled); `get_session` serves
+provider-confirmed lease state.
