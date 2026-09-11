@@ -1,9 +1,10 @@
 /**
- * `@orca-pi/structured-bridge` barrel (SNC1.3 + SNC1.4).
+ * `@orca-pi/structured-bridge` barrel (SNC1.3 + SNC1.4 + SNC1.5 + SNC1.6).
  *
  * Hot-swappable external structured-session bridge: versioned local IPC
  * (Orca-side host + external provider + mock) plus Pi-specific translation
- * (`pi-mapping.ts`) and the SNC1.4 Pi-backed provider (`pi-provider.ts`)
+ * (`pi-mapping.ts`), the SNC1.4 Pi-backed provider + SNC1.5 translator +
+ * SNC1.6 model/thinking/prompt/image controls (`pi-provider.ts`)
  * kept strictly separate from the provider-neutral core (the Orca fork
  * vendors only `framing.ts` + `protocol.ts` + `host.ts`).
  */

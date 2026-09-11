@@ -1,5 +1,5 @@
 /**
- * Pi-backed external provider (SNC1.4 + SNC1.5, orca-pi owned).
+ * Pi-backed external provider (SNC1.4 + SNC1.5 + SNC1.6, orca-pi owned).
  *
  * Combines the production SNC1.2 `PiRpcConnection` transport with the SNC1.3
  * external structured-session bridge to run the first real Pi structured
@@ -7,7 +7,7 @@
  * the fork vendors only `framing.ts` + `protocol.ts` + `host.ts`
  * (provider-neutral). Everything Pi stays here plus `pi-mapping.ts`.
  *
- * Capabilities (per #14):
+ * Capabilities (per #14 + #15 + #16):
  * - spawn/acquire `pi --mode rpc` in the exact Orca-selected workspace/cwd;
  * - apply compatible transport-neutral resolved Pi profile configuration
  *   (callers pass a `buildPiLaunch()` spec via `resolvePiSpec`; TUI-only
@@ -17,11 +17,23 @@
  *   lease (`hello_ok{provider:{id:"pi"}}` + `acquired{metadata}` with
  *   `providerSessionId` from Pi `get_state`, `workspaceRoot`, model,
  *   thinking, counts, `isStreaming`, `createdAt`);
- * - dispatch one text message through Pi RPC (`prompt` accept = `accepted`,
- *   definite `success:false` = `rejected`, transport ambiguity = `unknown`;
- *   never auto-resend `unknown`);
+ * - dispatch text + structured images through Pi RPC (`prompt` accept =
+ *   `accepted`, definite `success:false` = `rejected`, transport ambiguity =
+ *   `unknown`; never auto-resend `unknown`);
  * - stream assistant text into the normal Orca structured journal/UI via
  *   `session_event` (`turn_start`/`text_*`/`turn_end`/`settled`);
+ * - SNC1.6 model/thinking controls via live Pi RPC (`get_available_models` /
+ *   `set_model`, `get_available_thinking_levels` / `set_thinking_level`,
+ *   `set_auto_compaction`) with provider-confirmed metadata; Orca's normal
+ *   `set_options` / `get_session` persistence semantics; exact-match model
+ *   refs only (`provider/modelId` or unique bare `modelId` — no fuzzy /
+ *   wildcard beyond the Pi RPC contract);
+ * - SNC1.6 interactive prompts: Pi `extension_ui_request` dialogs (select /
+ *   confirm / input / editor) → bridge `prompt_request` with stable
+ *   `requestId` identity, exactly-once `answer_prompt` → Pi
+ *   `extension_ui_response`, stale/late refusal (`UNKNOWN_REQUEST`), prompt
+ *   retirement on turn settle / cancel / Pi exit / release, bounded ignore
+ *   of fire-and-forget / unknown UI kinds (never block, never terminate);
  * - report turn start/settlement/idle accurately (`isStreaming` follows the
  *   active turn; `cancelled.settled` reports actual state);
  * - cancel an active turn using Pi RPC (`abort`);
@@ -33,9 +45,11 @@
  * - no terminal keystroke injection anywhere on this path.
  *
  * Delivery semantics: `accepted` only when Pi definitely owns the prompt
- * (`prompt success:true` on an idle session), `rejected` only for definite
+ * (`prompt success:true` on an idle session, or immediate `/` extension
+ * commands that Pi handles without a turn), `rejected` only for definite
  * provider refusal (`success:false`, empty text, unknown session, busy turn
- * including `steer`/`followUp` while streaming), `unknown` for ambiguous
+ * including `steer`/`followUp` while streaming, model-rejects-images,
+ * unknown/ambiguous model/thinking refs), `unknown` for ambiguous
  * transport/delivery outcomes (timeout, exit, malformed ack). Callers must
  * reconcile `unknown` via history before retrying; the provider never
  * auto-resends.
@@ -50,10 +64,14 @@
  * `contentIndex`/`toolCallId` identities, cumulative-vs-delta semantics, tool
  * journaling with assistant/tool separation, abort fidelity, secret-safe error
  * shaping, and bounded unknown handling with no retained transient on settle.
- * Model/thinking controls, prompts, images are SNC1.6; history/branch/resume
- * is SNC1.7. `set_options` stores options and acks (Pi apply lands in SNC1.6);
- * `get_history`/`get_session` serve the live-turn journal (Pi tree
- * reconstruction lands in SNC1.7).
+ * SNC1.6 owns model/thinking controls, interactive prompts, and structured
+ * images (this file + `pi-mapping.ts`); history/branch/resume is SNC1.7.
+ * `set_options` applies live to Pi and acks provider-confirmed values;
+ * `get_history` serves the live-turn journal (Pi tree reconstruction lands in
+ * SNC1.7); `get_session` refreshes provider-confirmed model/thinking
+ * best-effort. Immediate `/` extension commands run without a turn (no
+ * journal entries, per the Pi contract) and stay honestly rejected while busy
+ * to avoid concurrent attribution without queue evidence.
  */
 
 import {
@@ -62,6 +80,7 @@ import {
   resolvePiRpcEnv,
   toPiRpcProcessSpec,
   type PiImageAttachment,
+  type PiModel,
   type PiRpcCloseOptions,
   type PiRpcConnectionOptions,
   type PiRpcCloseResult,
@@ -76,11 +95,14 @@ import {
   BRIDGE_PROTOCOL_VERSION,
   redactSecretsFromText,
   type AcquireRequest,
+  type AnswerPromptRequest,
   type BridgeCapabilities,
   type BridgeSessionMetadata,
   type BridgeSessionOptions,
   type DispatchRequest,
+  type GetSessionRequest,
   type HostToProviderMessage,
+  type SetOptionsRequest,
 } from "./protocol.js";
 import { BridgeProvider, type ProviderSession } from "./provider.js";
 import {
@@ -91,7 +113,14 @@ import {
 } from "./pi-mapping.js";
 import { PiTranslator } from "./pi-translator.js";
 
-/** Minimal Pi connection surface used by the bridge (real `PiRpcConnection` satisfies it). */
+/** Minimal Pi connection surface used by the bridge (real `PiRpcConnection` satisfies it).
+ *
+ * SNC1.6 model/thinking controls need the live Pi option RPCs. They are
+ * optional here so minimal test fakes (SNC1.4 text-only) keep working: when
+ * absent, `set_options` for model/thinking/autoCompaction fails closed with
+ * an actionable `PI_OPTION_UNSUPPORTED` error instead of silently diverging.
+ * Production `PiRpcConnection` always implements them.
+ */
 export interface PiProviderConnection {
   start(): Promise<void>;
   prompt(
@@ -108,6 +137,11 @@ export interface PiProviderConnection {
   onExit(handler: (info: PiRpcCloseResult) => void): () => void;
   getState(): Promise<PiState>;
   respondToExtensionUi(response: { type: "extension_ui_response"; id: string; value?: unknown; confirmed?: boolean; cancelled?: boolean }): void;
+  getAvailableModels?(): Promise<{ models: PiModel[] }>;
+  setModel?(provider: string, modelId: string): Promise<PiModel>;
+  getAvailableThinkingLevels?(): Promise<{ levels: string[] }>;
+  setThinkingLevel?(level: string): Promise<void>;
+  setAutoCompaction?(enabled: boolean): Promise<void>;
   readonly isClosed: boolean;
 }
 
@@ -157,6 +191,21 @@ interface PiRuntime {
   translator: PiTranslator;
   /** Pi-side session id observed via `get_state` (for lease identity). */
   piSessionId?: string;
+  /**
+   * SNC1.6 interactive prompts: stable `requestId` → originating dispatch
+   * `opId` for every unanswered Pi dialog in this session. Exactly-once:
+   * the first `answer_prompt` for a `requestId` forwards one Pi
+   * `extension_ui_response` and deletes the entry; later answers for the
+   * same id are stale/late refusals (`UNKNOWN_REQUEST`, never re-sent).
+   * Retired on turn settle / cancel / Pi exit / release / close, so prompt
+   * state never leaks across turns or acquisition fences. The base
+   * `session.pendingPrompt` single slot is kept in sync (latest only) for
+   * back-compat, but this map is authoritative for answers (multi-dialog
+   * support; the single slot would overwrite overlapping dialogs).
+   */
+  pendingPrompts: Map<string, string>;
+  /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
+  cachedModels?: PiModel[];
   // Single-turn honesty: while a turn streams, queued `steer`/`followUp`
   // dispatches are honestly rejected (never accepted-before-owned). Pi-owned
   // queue fidelity would need user-message/`queue_update` evidence plus
@@ -225,15 +274,17 @@ export class PiBridgeProvider extends BridgeProvider {
   private readonly resolvePiSpec?: PiSpecResolver;
 
   constructor(opts: PiBridgeProviderOptions = {}) {
-    // SNC1.4 truthfulness: model/thinking controls are SNC1.6 and
-    // history/branch/resume is SNC1.7, so `options`/`resume` stay false until
-    // those translators land — otherwise Orca would expose controls and resume
-    // paths that silently diverge from actual Pi child state.
-    const snc14Capabilities: BridgeCapabilities = { ...piBridgeCapabilities(), options: false, resume: false };
+    // SNC1.6 truthfulness: model/thinking/image/prompt controls are live
+    // (see `onPiSetOptions` / `onPiAnswerPrompt` / image-aware dispatch),
+    // so `options` is true and Orca may expose its shared Native Chat option
+    // controls with no renderer fork. History/branch/resume stays false until
+    // SNC1.7 reconstructs from Pi `get_entries`/`get_tree` — otherwise Orca
+    // would expose resume paths that silently diverge from Pi child state.
+    const snc16Capabilities: BridgeCapabilities = { ...piBridgeCapabilities(), options: true, resume: false };
     super({
       providerId: opts.providerId ?? "pi",
       providerVersion: opts.providerVersion ?? "0.1.0",
-      capabilities: opts.capabilities ?? snc14Capabilities,
+      capabilities: opts.capabilities ?? snc16Capabilities,
     });
     this.piCommand = opts.piCommand ?? "pi";
     this.piArgs = opts.piArgs ?? [];
@@ -269,6 +320,15 @@ export class PiBridgeProvider extends BridgeProvider {
         return;
       case "cancel":
         this.onPiCancel(msg.opId, msg.sessionId, msg.targetOpId);
+        return;
+      case "set_options":
+        await this.onPiSetOptions(msg);
+        return;
+      case "get_session":
+        await this.onPiGetSession(msg);
+        return;
+      case "answer_prompt":
+        this.onPiAnswerPrompt(msg);
         return;
       case "close":
         await this.onPiClose(msg.opId, msg.sessionId, msg.mode);
@@ -424,7 +484,15 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompt: null,
       entryCounter: 0,
     });
-    const runtime: PiRuntime = { conn, unsubs: [], translator: new PiTranslator(), activeText: "", piSessionId, pendingUserText: null };
+    const runtime: PiRuntime = {
+      conn,
+      unsubs: [],
+      translator: new PiTranslator(),
+      activeText: "",
+      piSessionId,
+      pendingUserText: null,
+      pendingPrompts: new Map<string, string>(),
+    };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
     if (session) this.attachPiStreaming(sessionId, session, runtime);
@@ -438,7 +506,35 @@ export class PiBridgeProvider extends BridgeProvider {
       // Minimal fakes may omit onExit; unexpected death then surfaces as
       // ambiguous prompt/cancel failures (still honest `unknown`).
     }
-    this.send({ v: 1, kind: "acquired", opId: msg.opId, sessionId, resumed: false, metadata: { ...metadata } });
+    // SNC1.6: apply acquire-time model/thinking/autoCompaction live so the
+    // acquired lease carries provider-confirmed values (launch `--model` /
+    // `--thinking` args are best-effort hints; Pi RPC is authoritative).
+    // Failures here are actionable (bad model/thinking ref) — close the
+    // child and report `error` fail-closed so Orca stays on TUI rather than
+    // exposing diverging controls. `queueMode` needs no Pi call (host-side).
+    if (msg.options && (msg.options.model !== undefined || msg.options.thinkingLevel !== undefined || msg.options.autoCompaction !== undefined)) {
+      const applied = await this.applyPiOptions(sessionId, msg.options);
+      if (!applied.ok) {
+        await this.teardownPiRuntime(sessionId).catch(() => undefined);
+        this.sessions.delete(sessionId);
+        this.send({
+          v: BRIDGE_PROTOCOL_VERSION,
+          kind: "error",
+          opId: msg.opId,
+          error: { code: applied.code, message: applied.message },
+        });
+        return;
+      }
+    }
+    const confirmed = this.sessions.get(sessionId);
+    this.send({
+      v: 1,
+      kind: "acquired",
+      opId: msg.opId,
+      sessionId,
+      resumed: false,
+      metadata: { ...(confirmed ? confirmed.metadata : metadata) },
+    });
   }
 
   /** Extra `--model`/`--thinking` from acquire options (launch-time only). */
@@ -447,6 +543,239 @@ export class PiBridgeProvider extends BridgeProvider {
     if (options?.model && !this.piArgs.includes("--model")) extra.push("--model", options.model);
     if (options?.thinkingLevel && !this.piArgs.includes("--thinking")) extra.push("--thinking", options.thinkingLevel);
     return extra;
+  }
+
+  // -- SNC1.6 model/thinking controls (live Pi RPC, provider-confirmed) -----
+  //
+  // Orca's shared Native Chat option controls drive `set_options` /
+  // `get_session` with Orca-normal persistence semantics: `set_options`
+  // persists into `session.options` and `session.metadata` (provider-
+  // confirmed), `get_session` reports the confirmed lease, and `acquire`
+  // with options restores them live before `acquired`. No fuzzy/wildcard
+  // beyond the Pi RPC contract: model refs are exact `provider/modelId` or
+  // exact unique bare `modelId`; thinking levels must exactly match Pi's
+  // live `get_available_thinking_levels` (Pi itself is lenient and would
+  // silently fall back to `minimal` — the bridge fails closed instead).
+
+  /**
+   * Resolve a bridge `model` string to an exact Pi `provider` + `modelId`.
+   * No fuzzy, prefix, or wildcard matching: `provider/modelId` must match
+   * both fields exactly; a bare `modelId` must match exactly one catalog
+   * entry (ambiguous bare ids must use the `provider/modelId` form).
+   */
+  private resolveModelRef(
+    requested: string,
+    models: readonly PiModel[],
+  ): { ok: true; provider: string; modelId: string; matched: PiModel } | { ok: false; code: string; message: string } {
+    const trimmed = requested.trim();
+    if (trimmed === "") {
+      return { ok: false, code: "UNKNOWN_MODEL", message: "unknown model: empty model ref (use provider/modelId or exact model id)" };
+    }
+    const slash = trimmed.indexOf("/");
+    if (slash >= 0) {
+      const providerPart = trimmed.slice(0, slash);
+      const idPart = trimmed.slice(slash + 1);
+      if (providerPart === "" || idPart === "") {
+        return { ok: false, code: "UNKNOWN_MODEL", message: sanitizeCode(`unknown model: ${trimmed} (use provider/modelId or exact model id)`) };
+      }
+      const matched = models.find((m) => m.provider === providerPart && m.id === idPart);
+      if (!matched) {
+        return { ok: false, code: "UNKNOWN_MODEL", message: sanitizeCode(`unknown model: ${trimmed} (no exact provider/modelId match)`) };
+      }
+      return { ok: true, provider: matched.provider, modelId: matched.id, matched };
+    }
+    const hits = models.filter((m) => m.id === trimmed);
+    if (hits.length === 0) {
+      return { ok: false, code: "UNKNOWN_MODEL", message: sanitizeCode(`unknown model: ${trimmed} (no exact model id match)`) };
+    }
+    if (hits.length > 1) {
+      const providers = hits.map((m) => m.provider).join(", ");
+      return {
+        ok: false,
+        code: "AMBIGUOUS_MODEL",
+        message: sanitizeCode(`ambiguous model: ${trimmed} matches ${hits.length} providers (${providers}); use provider/modelId`),
+      };
+    }
+    const only = hits[0] as PiModel;
+    return { ok: true, provider: only.provider, modelId: only.id, matched: only };
+  }
+
+  /** Live image-support check for the confirmed model (provider-confirmed where cached). */
+  private modelSupportsImages(modelId: string | undefined, cached: readonly PiModel[] | undefined): boolean | null {
+    if (!modelId) return null;
+    const entry = cached?.find((m) => m.id === modelId);
+    if (!entry) return null;
+    const input = (entry as { input?: unknown }).input;
+    if (!Array.isArray(input)) return null;
+    return input.includes("image");
+  }
+
+  /**
+   * Apply bridge options live to one Pi child. Updates `session.options` +
+   * `session.metadata` only with provider-confirmed values (Pi RPC results
+   * / live level lists / `get_state` refresh). Returns `{ok:true}` when every
+   * requested field applied, else `{ok:false, code, message}` fail-closed
+   * (succeeded fields stay applied — Pi mutations are not transactional —
+   * but the caller reports `error`, never a diverging `options_updated`).
+   */
+  private async applyPiOptions(
+    sessionId: string,
+    options: BridgeSessionOptions,
+  ): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+    const session = this.sessions.get(sessionId);
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!session || !runtime) {
+      return { ok: false, code: "UNKNOWN_SESSION", message: "unknown session" };
+    }
+    if (runtime.conn.isClosed) {
+      return { ok: false, code: "PI_EXITED", message: "pi-exited (reacquire the session)" };
+    }
+    // Model: exact-ref resolution via live catalog, then Pi `set_model`.
+    // Provider-confirmed `Model.id` becomes both `metadata.model` and the
+    // persisted `options.model` (so Orca restores the confirmed id, not a
+    // `provider/id` alias the next catalog may resolve differently).
+    if (options.model !== undefined) {
+      const conn = runtime.conn;
+      if (typeof conn.getAvailableModels !== "function" || typeof conn.setModel !== "function") {
+        return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support model operations" };
+      }
+      let models: PiModel[];
+      try {
+        const listed = await conn.getAvailableModels();
+        models = [...listed.models];
+        runtime.cachedModels = models;
+      } catch (error) {
+        return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`model list failed: ${this.shortPiError(error)}`) };
+      }
+      const resolved = this.resolveModelRef(options.model, models);
+      if (!resolved.ok) return { ok: false, code: resolved.code, message: resolved.message };
+      try {
+        const confirmed = await conn.setModel(resolved.provider, resolved.modelId);
+        const confirmedId = typeof confirmed?.id === "string" && confirmed.id !== "" ? confirmed.id : resolved.modelId;
+        session.options.model = confirmedId;
+        session.metadata.model = confirmedId;
+        // Refresh cached catalog entry (confirmed model may carry new caps).
+        const idx = models.findIndex((m) => m.provider === resolved.provider && m.id === resolved.modelId);
+        if (idx >= 0) models[idx] = confirmed;
+        runtime.cachedModels = models;
+      } catch (error) {
+        const code = (error as { code?: unknown })?.code;
+        if (code === "rejected") {
+          const piError = (error as { piError?: unknown }).piError;
+          return {
+            ok: false,
+            code: "UNKNOWN_MODEL",
+            message: sanitizeCode(typeof piError === "string" && piError !== "" ? piError : `unknown model: ${options.model}`),
+          };
+        }
+        return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_model failed: ${this.shortPiError(error)}`) };
+      }
+    }
+    // Thinking: exact live-level validation first (Pi is lenient and would
+    // silently fall back — the bridge fails closed instead), then apply.
+    if (options.thinkingLevel !== undefined) {
+      const conn = runtime.conn;
+      if (typeof conn.getAvailableThinkingLevels !== "function" || typeof conn.setThinkingLevel !== "function") {
+        return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support thinking-level operations" };
+      }
+      let levels: string[];
+      try {
+        const listed = await conn.getAvailableThinkingLevels();
+        levels = [...listed.levels];
+      } catch (error) {
+        return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`thinking-level list failed: ${this.shortPiError(error)}`) };
+      }
+      if (!levels.includes(options.thinkingLevel)) {
+        return {
+          ok: false,
+          code: "UNKNOWN_THINKING_LEVEL",
+          message: sanitizeCode(`unknown thinking level: ${options.thinkingLevel} (available: ${levels.join(", ") || "none"})`),
+        };
+      }
+      try {
+        await conn.setThinkingLevel(options.thinkingLevel);
+      } catch (error) {
+        return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_thinking_level failed: ${this.shortPiError(error)}`) };
+      }
+      // Provider-confirmed: Pi emits `thinking_level_changed` (tracked live
+      // in `attachPiStreaming`); refresh via `get_state` so the lease never
+      // echoes an unconfirmed request when Pi silently coerces.
+      try {
+        const state = await conn.getState();
+        const confirmed = typeof state.thinkingLevel === "string" ? state.thinkingLevel : options.thinkingLevel;
+        session.options.thinkingLevel = confirmed;
+        session.metadata.thinkingLevel = confirmed;
+      } catch {
+        session.options.thinkingLevel = options.thinkingLevel;
+        session.metadata.thinkingLevel = options.thinkingLevel;
+      }
+    }
+    if (options.autoCompaction !== undefined) {
+      const conn = runtime.conn;
+      if (typeof conn.setAutoCompaction === "function") {
+        try {
+          await conn.setAutoCompaction(options.autoCompaction);
+        } catch (error) {
+          return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_auto_compaction failed: ${this.shortPiError(error)}`) };
+        }
+      }
+      // No live confirmation RPC for this flag: persist the requested value
+      // (Pi `set_auto_compaction` is idempotent `success:true`; failures
+      // above already failed closed). Note it mutates Pi global settings —
+      // callers should use isolated `PI_CODING_AGENT_DIR` in tests.
+      session.options.autoCompaction = options.autoCompaction;
+    }
+    if (options.queueMode !== undefined) {
+      // Host-side queue policy only (SNC1.4 single-turn honesty preserved:
+      // busy dispatches stay honestly rejected regardless of this flag).
+      session.options.queueMode = options.queueMode;
+    }
+    return { ok: true };
+  }
+
+  private async onPiSetOptions(msg: SetOptionsRequest): Promise<void> {
+    if (!this.requireHello(msg.opId)) return;
+    const session = this.sessions.get(msg.sessionId);
+    const runtime = this.piRuntimes.get(msg.sessionId);
+    if (!session || !runtime) {
+      this.send({ v: BRIDGE_PROTOCOL_VERSION, kind: "error", opId: msg.opId, sessionId: msg.sessionId, error: { code: "UNKNOWN_SESSION", message: "unknown session" } });
+      return;
+    }
+    const applied = await this.applyPiOptions(msg.sessionId, msg.options);
+    if (!applied.ok) {
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId: msg.opId,
+        sessionId: msg.sessionId,
+        error: { code: applied.code, message: applied.message },
+      });
+      return;
+    }
+    // Orca-normal persistence: `session.options` already holds confirmed
+    // values; `metadata` mirrors model/thinking for the lease. Echo the
+    // persisted bag so Orca restores exactly what Pi confirmed.
+    this.send({ v: BRIDGE_PROTOCOL_VERSION, kind: "options_updated", opId: msg.opId, sessionId: msg.sessionId, options: { ...session.options } });
+  }
+
+  private async onPiGetSession(msg: GetSessionRequest): Promise<void> {
+    if (!this.requireHello(msg.opId)) return;
+    const session = this.sessions.get(msg.sessionId);
+    const runtime = this.piRuntimes.get(msg.sessionId);
+    if (!session || !runtime) {
+      this.send({ v: BRIDGE_PROTOCOL_VERSION, kind: "error", opId: msg.opId, sessionId: msg.sessionId, error: { code: "UNKNOWN_SESSION", message: "unknown session" } });
+      return;
+    }
+    // Provider-confirmed lease where available: refresh model/thinking /
+    // counts / streaming from Pi `get_state` best-effort. Failures keep the
+    // cached lease (never fail `get_session` for a transient state read).
+    await this.refreshMetadataBestEffort(msg.sessionId);
+    const current = this.sessions.get(msg.sessionId);
+    if (!current) {
+      this.send({ v: BRIDGE_PROTOCOL_VERSION, kind: "error", opId: msg.opId, sessionId: msg.sessionId, error: { code: "UNKNOWN_SESSION", message: "unknown session" } });
+      return;
+    }
+    this.send({ v: BRIDGE_PROTOCOL_VERSION, kind: "session", opId: msg.opId, sessionId: msg.sessionId, metadata: { ...current.metadata } });
   }
 
   /** Secret-safe Pi failure summary: `PiRpcError` messages are safe by
@@ -556,6 +885,24 @@ export class PiBridgeProvider extends BridgeProvider {
 
   private attachPiStreaming(sessionId: string, session: ProviderSession, runtime: PiRuntime): void {
     const onEvent = (event: PiServerEvent): void => {
+      // SNC1.6 live option tracking: Pi emits `thinking_level_changed` on
+      // every `set_thinking_level` / `cycle_thinking_level` / `set_model`
+      // (proven in `models-thinking.jsonl`). Update the lease immediately so
+      // `get_session` reports provider-confirmed thinking even before its
+      // best-effort `get_state` refresh. Never a bridge `session_event`
+      // (the bridge has no option-changed event; Orca re-reads via
+      // `get_session` / `options_updated`). Bounded: unknown shapes ignored.
+      try {
+        const raw = event as unknown as Record<string, unknown>;
+        if (raw["type"] === "thinking_level_changed" && typeof raw["level"] === "string") {
+          session.metadata.thinkingLevel = raw["level"] as string;
+          if (session.options.thinkingLevel !== undefined) {
+            session.options.thinkingLevel = raw["level"] as string;
+          }
+        }
+      } catch {
+        // Live tracking is best-effort; translator mapping below still applies.
+      }
       const activeOpId = session.activeOpId;
       const hasActiveOp = (session.activeOpId ?? activeOpId) !== null;
       // No active turn: turn-scoped events must not mutate translator state
@@ -565,8 +912,10 @@ export class PiBridgeProvider extends BridgeProvider {
       // with no state change: forward only stateless dialogs (actionable via
       // requestId), drop everything else. Queue/compaction/retry/unknown
       // already map to `[]` (bounded) so they never reach here as changes.
-      // Dialogs arriving without an active turn are still actionable: emit
-      // them without an opId so Orca can answer via requestId.
+      // Dialogs arriving without an active turn are still actionable (e.g.
+      // immediate `/` extension commands, which never start a turn): track
+      // them in the SNC1.6 pending map (stable identity, exactly-once) and
+      // emit without an opId so Orca answers via `requestId`.
       if (!hasActiveOp) {
         let stateless: ReturnType<typeof mapPiRecordToBridgeEvents>;
         try {
@@ -576,6 +925,10 @@ export class PiBridgeProvider extends BridgeProvider {
         }
         for (const bridgeEvent of stateless) {
           if (bridgeEvent.type !== "prompt_request") continue;
+          // Stable identity: duplicate Pi ids while pending are ignored
+          // (never emit a second card for the same request).
+          if (runtime.pendingPrompts.has(bridgeEvent.requestId)) continue;
+          runtime.pendingPrompts.set(bridgeEvent.requestId, "");
           session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: "" };
           this.send({
             v: 1,
@@ -596,6 +949,11 @@ export class PiBridgeProvider extends BridgeProvider {
       for (const bridgeEvent of mapped) {
         if (bridgeEvent.type === "prompt_request") {
           const currentOp = session.activeOpId ?? activeOpId ?? "";
+          // SNC1.6 stable identity: ignore duplicate Pi ids while pending
+          // (one card per requestId; the first op wins). New ids are tracked
+          // for exactly-once answers + retirement (see `onPiAnswerPrompt`).
+          if (runtime.pendingPrompts.has(bridgeEvent.requestId)) continue;
+          runtime.pendingPrompts.set(bridgeEvent.requestId, currentOp);
           session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: currentOp };
           this.send({
             v: 1,
@@ -643,11 +1001,14 @@ export class PiBridgeProvider extends BridgeProvider {
             // settle-without-`turn_end` robustness) in user→tools→assistant
             // order, then clear ALL transient (requirement) plus per-op
             // cancel/pending-prompt state so settled turns retain nothing.
+            // SNC1.6: retire every pending dialog for this op (provider
+            // cancellation retirement — late answers after settle are stale
+            // refusals, never forwarded to Pi).
             const entries = runtime.translator.settle();
             this.journalTranslatorEntries(session, entries);
             this.syncRuntimeMirrors(runtime);
             session.cancelledOps.delete(currentOp);
-            if (session.pendingPrompt?.opId === currentOp) session.pendingPrompt = null;
+            this.retirePromptsForOp(session, runtime, currentOp);
             // Single-turn honesty: the settled op is still active (queued
             // delivery while busy is rejected, so there is nothing to
             // promote). Multi-turn tool continuations already attributed to
@@ -703,6 +1064,23 @@ export class PiBridgeProvider extends BridgeProvider {
     }
   }
 
+  /** Retire every pending dialog for one op (settle/cancel). Keeps the base
+   * single slot in sync (clears when it names the retired op) so legacy
+   * readers never see a stale prompt. Future answers for retired ids are
+   * stale refusals (`UNKNOWN_REQUEST`). */
+  private retirePromptsForOp(session: ProviderSession, runtime: PiRuntime, opId: string): void {
+    for (const [requestId, ownerOp] of [...runtime.pendingPrompts]) {
+      if (ownerOp === opId) runtime.pendingPrompts.delete(requestId);
+    }
+    if (session.pendingPrompt?.opId === opId) session.pendingPrompt = null;
+  }
+
+  /** Retire every pending dialog in a session (exit/release/close fence). */
+  private retireAllPrompts(session: ProviderSession, runtime: PiRuntime): void {
+    runtime.pendingPrompts.clear();
+    session.pendingPrompt = null;
+  }
+
   private onPiExit(sessionId: string, info: PiRpcCloseResult): void {
     const session = this.sessions.get(sessionId);
     const runtime = this.piRuntimes.get(sessionId);
@@ -714,15 +1092,16 @@ export class PiBridgeProvider extends BridgeProvider {
     // turns survive in history so `unknown` reconciles without duplicates.
     // SNC1.5: translator transient is cleared (no retained state) plus
     // per-op cancel/pending-prompt cleanup so exit leaves nothing behind.
+    // SNC1.6: retire ALL pending dialogs (acquisition fence — a later
+    // reacquire with the same sessionId must never answer a pre-exit
+    // dialog, and Pi can never answer it either).
     if (runtime) {
       runtime.translator.resetAll();
       runtime.pendingUserText = null;
       runtime.activeText = "";
+      this.retireAllPrompts(session, runtime);
       if (activeOpId) {
         session.cancelledOps.delete(activeOpId);
-        if (session.pendingPrompt?.opId === activeOpId) session.pendingPrompt = null;
-      } else if (!session.activeOpId) {
-        session.pendingPrompt = null;
       }
     }
     if (activeOpId) {
@@ -763,19 +1142,90 @@ export class PiBridgeProvider extends BridgeProvider {
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: validation.reason ?? "invalid-dispatch" });
       return;
     }
-    // SNC1.4 is basic text chat: leading-`/` extension commands are handled
-    // immediately by Pi (success without any turn lifecycle), which would
-    // leave this single-turn provider streaming forever. Reject them honestly
-    // instead of stranding the session; interactive prompts land in SNC1.6.
-    if (msg.message.text.trimStart().startsWith("/")) {
-      this.send({
-        v: 1,
-        kind: "dispatch_ack",
-        opId: msg.opId,
-        sessionId: msg.sessionId,
-        status: "rejected",
-        reason: "extension-command (interactive prompts land in SNC1.6; send plain text)",
-      });
+    // SNC1.6 live image gating where the catalog is cached: hint-based
+    // `validatePiDispatch` above stays the floor (Pi would fail late on
+    // text-only models), but when `acquire`/`set_options` already cached the
+    // live catalog, a text-only confirmed model rejects with the same
+    // actionable code instead of relying on hints alone. History never
+    // journals image bytes (user entries carry text only) — see below.
+    const imageCount = msg.message.images?.length ?? 0;
+    if (imageCount > 0) {
+      const liveSupports = this.modelSupportsImages(session.metadata.model, runtime.cachedModels);
+      if (liveSupports === false) {
+        this.send({
+          v: 1,
+          kind: "dispatch_ack",
+          opId: msg.opId,
+          sessionId: msg.sessionId,
+          status: "rejected",
+          reason: `model-rejects-images: ${session.metadata.model ?? "unknown-model"}`,
+        });
+        return;
+      }
+    }
+    const isImmediateCommand = msg.message.text.trimStart().startsWith("/");
+    // SNC1.6 immediate `/` extension commands: Pi handles them without a
+    // turn lifecycle (no `turn_start`/`turn_end`, no session entries per the
+    // Pi contract) and may emit dialogs before the `prompt` response. They
+    // run without taking the single active turn (no `activeOpId`, no
+    // translator user, no history entries — image bytes never journaled).
+    // While busy they stay honestly rejected (concurrent immediate + turn
+    // attribution would need queue evidence; Pi-owned queue stays deferred).
+    if (isImmediateCommand) {
+      if (imageCount > 0) {
+        this.send({
+          v: 1,
+          kind: "dispatch_ack",
+          opId: msg.opId,
+          sessionId: msg.sessionId,
+          status: "rejected",
+          reason: "extension-command-images-unsupported (send plain text for / commands)",
+        });
+        return;
+      }
+      if (session.activeOpId) {
+        this.send({
+          v: 1,
+          kind: "dispatch_ack",
+          opId: msg.opId,
+          sessionId: msg.sessionId,
+          status: "rejected",
+          reason: "already-streaming (immediate / commands need an idle session; wait for idle or cancel)",
+        });
+        return;
+      }
+      // Idle immediate: direct Pi `prompt` with no turn tracking. Dialogs
+      // arriving mid-call flow via the no-active-op stateless path above
+      // (tracked in `pendingPrompts` with `""` op, answerable via
+      // `requestId`). No translator state, no history entries.
+      try {
+        await runtime.conn.prompt(msg.message.text);
+      } catch (error) {
+        const code = (error as { code?: unknown })?.code;
+        const ambiguous = (error as { ambiguous?: unknown })?.ambiguous;
+        if (code === "rejected" && ambiguous === false) {
+          const piError = (error as { piError?: unknown }).piError;
+          this.send({
+            v: 1,
+            kind: "dispatch_ack",
+            opId: msg.opId,
+            sessionId: msg.sessionId,
+            status: "rejected",
+            reason: sanitizeCode(typeof piError === "string" && piError !== "" ? piError : "pi-rejected-prompt"),
+          });
+          return;
+        }
+        this.send({
+          v: 1,
+          kind: "dispatch_ack",
+          opId: msg.opId,
+          sessionId: msg.sessionId,
+          status: "unknown",
+          reason: "pi-prompt-ambiguous (reconcile via history; do not auto-resend)",
+        });
+        return;
+      }
+      this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
       return;
     }
     if (session.activeOpId) {
@@ -969,6 +1419,13 @@ export class PiBridgeProvider extends BridgeProvider {
     if (target !== "") session.cancelledOps.add(target);
     const settled = session.activeOpId === null;
     this.send({ v: 1, kind: "cancelled", opId, sessionId, targetOpId: target, settled });
+    // SNC1.6 provider-cancellation retirement: a cancel for the live turn
+    // retires its pending dialogs immediately (late answers after cancel are
+    // stale refusals). A stale cancel for a non-live op never touches live
+    // prompts or the live turn (fenced below).
+    if (target !== "" && (targetOpId === undefined || targetOpId === session.activeOpId)) {
+      this.retirePromptsForOp(session, runtime, target);
+    }
     // Fence the abort to the requested target: a stale cancel for a settled
     // op must never abort the currently streaming (unrelated) turn. An
     // omitted target means Esc-for-active (abort whatever streams, if anything).
@@ -992,13 +1449,89 @@ export class PiBridgeProvider extends BridgeProvider {
     });
   }
 
-  // -- dialogs: answer_prompt -> Pi extension_ui_response --------------------
+  // -- dialogs: answer_prompt -> Pi extension_ui_response (SNC1.6) ------------
+  //
+  // Stable identity: Pi `extension_ui_request.id` is preserved verbatim as
+  // bridge `prompt_request.requestId` (never synthesized). Exactly-once:
+  // the first `answer_prompt` for a `requestId` forwards one Pi
+  // `extension_ui_response` and deletes the map entry; later answers for the
+  // same id are stale/late refusals (`UNKNOWN_REQUEST`, never re-sent to
+  // Pi) — this is what lets Orca do a durable CAS and then answer once.
+  // Retirement: turn settle / cancel / Pi exit / release / close clear the
+  // map (acquisition fence — prompts never leak across sessions/turns).
+  // Bounded unsupported kinds: fire-and-forget / unknown Pi UI methods map
+  // to `[]` in `pi-mapping.ts` and never create entries, so they never block
+  // and can never be answered (any answer for their ids is UNKNOWN).
+
+  private onPiAnswerPrompt(msg: AnswerPromptRequest): void {
+    if (!this.requireHello(msg.opId)) return;
+    // Find the owning Pi session via the SNC1.6 pending map (multi-dialog).
+    // Fall back to the base single slot for providers that never populated
+    // the map (defense in depth; Pi always populates the map above).
+    let ownerId: string | null = null;
+    let ownerRuntime: PiRuntime | undefined;
+    for (const [sessionId, runtime] of this.piRuntimes) {
+      if (runtime.pendingPrompts.has(msg.requestId)) {
+        ownerId = sessionId;
+        ownerRuntime = runtime;
+        break;
+      }
+    }
+    if (!ownerRuntime) {
+      for (const [sessionId, candidate] of this.sessions) {
+        if (candidate.pendingPrompt?.requestId === msg.requestId) {
+          ownerId = sessionId;
+          ownerRuntime = this.piRuntimes.get(sessionId);
+          break;
+        }
+      }
+    }
+    if (!ownerId || !ownerRuntime) {
+      // Stale/late/unknown: never seen, already answered, or retired via
+      // settle/cancel/exit/release. Refuse without touching any Pi child —
+      // never broadcast to every child.
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId: msg.opId,
+        error: { code: "UNKNOWN_REQUEST", message: `unknown prompt request ${msg.requestId}` },
+      });
+      return;
+    }
+    const session = this.sessions.get(ownerId);
+    // Exactly-once: delete before forwarding so a racing duplicate cannot
+    // double-send to Pi even if `respondToExtensionUi` throws.
+    ownerRuntime.pendingPrompts.delete(msg.requestId);
+    if (session?.pendingPrompt?.requestId === msg.requestId) session.pendingPrompt = null;
+    try {
+      if (msg.cancelled) {
+        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: msg.requestId, cancelled: true });
+      } else if (typeof msg.value === "boolean") {
+        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: msg.requestId, confirmed: msg.value });
+      } else {
+        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: msg.requestId, value: msg.value });
+      }
+    } catch {
+      // Pi is gone; the turn will settle via exit handling. The answer is
+      // still consumed (exactly-once holds) so a retry after reacquire is
+      // a fresh `requestId`, never a duplicate send.
+    }
+    // Benign ack so the host `answerPrompt()` promise resolves (the turn
+    // continues via `session_event`; see `host.ts` benign-ANSWERED path).
+    // Never echoes the value (secret-safe: answers may carry free-form text).
+    this.send({
+      v: BRIDGE_PROTOCOL_VERSION,
+      kind: "error",
+      opId: msg.opId,
+      error: { code: "ANSWERED", message: "prompt answer recorded" },
+    });
+  }
 
   protected override onPromptAnswered(session: ProviderSession, requestId: string, value: unknown, cancelled: boolean): void {
-    // Base `onAnswer` found the owning session via `pendingPrompt` and passed
-    // it here before clearing. Resolve its sessionId by identity so the Pi
-    // `extension_ui_response` goes to the correct child (one Pi per bridge
-    // session; single active turn per session keeps this unambiguous).
+    // Legacy base-class path (single-slot `pendingPrompt`). Pi sessions are
+    // answered via `onPiAnswerPrompt` (map-based, exactly-once) and never
+    // reach here; keep this fallback fenced to the owning/single runtime so
+    // a stray base call can never broadcast to every Pi child.
     let ownerId: string | null = null;
     for (const [sessionId, candidate] of this.sessions) {
       if (candidate === session) {
@@ -1011,6 +1544,8 @@ export class PiBridgeProvider extends BridgeProvider {
     // session providers in tests); never broadcast to every child.
     const target = runtime ?? (this.piRuntimes.size === 1 ? [...this.piRuntimes.values()][0] : undefined);
     if (!target) return;
+    // Consume the map entry when present so base + map stay consistent.
+    target.pendingPrompts.delete(requestId);
     try {
       if (cancelled) {
         target.conn.respondToExtensionUi({ type: "extension_ui_response", id: requestId, cancelled: true });
