@@ -206,6 +206,15 @@ interface PiRuntime {
   pendingPrompts: Map<string, string>;
   /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
   cachedModels?: PiModel[];
+  /**
+   * SNC1.6 immediate `/` command in flight (no turn). While set, the first
+   * Pi dialog for this session acks `accepted` early (Pi definitely owns the
+   * command and waits for an answer) so the host dispatch deadline (10s)
+   * never fires while the user thinks. The `prompt` response itself arrives
+   * after the answer (per `extension-ui.jsonl`) and needs no second ack.
+   * Cleared on ack (accepted/rejected/unknown) or session teardown.
+   */
+  pendingImmediate: { opId: string; acked: boolean } | null;
   // Single-turn honesty: while a turn streams, queued `steer`/`followUp`
   // dispatches are honestly rejected (never accepted-before-owned). Pi-owned
   // queue fidelity would need user-message/`queue_update` evidence plus
@@ -461,7 +470,18 @@ export class PiBridgeProvider extends BridgeProvider {
     }
 
     const piSessionId = typeof state.sessionId === "string" && state.sessionId !== "" ? state.sessionId : sessionId;
-    const model = typeof state.model?.id === "string" ? state.model.id : msg.options?.model;
+    // SNC1.6: persist canonical qualified refs where the provider is known
+    // (duplicate bare ids like `gpt-5.6-luna` exist under two providers in
+    // the live catalog — a bare lease would not restore). `get_state` carries
+    // the full `Model{provider,id}`, so qualify when both are present.
+    const stateModel = state.model;
+    const qualifiedStateModel =
+      typeof stateModel?.id === "string" && stateModel.id !== "" && typeof stateModel?.provider === "string" && stateModel.provider !== ""
+        ? `${stateModel.provider}/${stateModel.id}`
+        : typeof stateModel?.id === "string"
+          ? stateModel.id
+          : undefined;
+    const model = qualifiedStateModel ?? msg.options?.model;
     const thinkingLevel = typeof state.thinkingLevel === "string" ? state.thinkingLevel : msg.options?.thinkingLevel;
     const messageCount = typeof state.messageCount === "number" ? state.messageCount : 0;
     const metadata: BridgeSessionMetadata = {
@@ -492,10 +512,31 @@ export class PiBridgeProvider extends BridgeProvider {
       piSessionId,
       pendingUserText: null,
       pendingPrompts: new Map<string, string>(),
+      pendingImmediate: null,
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
     if (session) this.attachPiStreaming(sessionId, session, runtime);
+    // SNC1.6: populate the live model catalog best-effort so image gating is
+    // authoritative (not hint-only) once available. Background (never blocks
+    // `acquired`): a catalog read must not delay the lease or hang acquire
+    // on minimal transports that never answer `get_available_models` (the
+    // force-close test fakes only `get_state`). Hint checks remain the floor
+    // until the cache lands; `set_model` refreshes it synchronously.
+    {
+      const listModels = conn.getAvailableModels?.bind(conn);
+      if (listModels) {
+        void (async () => {
+          try {
+            const listed = await listModels();
+            const live = this.piRuntimes.get(sessionId);
+            if (live) live.cachedModels = [...listed.models];
+          } catch {
+            // Best-effort: hint checks remain the floor.
+          }
+        })();
+      }
+    }
     // Observe Pi exit so an dead child never leaves a stuck streaming turn.
     const onExit = (info: PiRpcCloseResult): void => {
       this.onPiExit(sessionId, info);
@@ -600,10 +641,26 @@ export class PiBridgeProvider extends BridgeProvider {
     return { ok: true, provider: only.provider, modelId: only.id, matched: only };
   }
 
-  /** Live image-support check for the confirmed model (provider-confirmed where cached). */
-  private modelSupportsImages(modelId: string | undefined, cached: readonly PiModel[] | undefined): boolean | null {
-    if (!modelId) return null;
-    const entry = cached?.find((m) => m.id === modelId);
+  /**
+   * Live image-support check for the confirmed model (provider-confirmed
+   * where cached). Accepts both bare ids and canonical `provider/modelId`
+   * refs: qualified refs resolve to the exact provider entry (so duplicate
+   * ids with different capabilities disambiguate); bare ids fall back to the
+   * first matching entry (ambiguous bare ids should have been rejected at
+   * `set_options`/`acquire` time via `AMBIGUOUS_MODEL`). Returns `null` when
+   * the catalog has no entry (caller falls back to hint checks).
+   */
+  private modelSupportsImages(modelRef: string | undefined, cached: readonly PiModel[] | undefined): boolean | null {
+    if (!modelRef) return null;
+    const slash = modelRef.indexOf("/");
+    let entry: PiModel | undefined;
+    if (slash >= 0) {
+      const providerPart = modelRef.slice(0, slash);
+      const idPart = modelRef.slice(slash + 1);
+      entry = cached?.find((m) => m.provider === providerPart && m.id === idPart);
+    } else {
+      entry = cached?.find((m) => m.id === modelRef);
+    }
     if (!entry) return null;
     const input = (entry as { input?: unknown }).input;
     if (!Array.isArray(input)) return null;
@@ -631,9 +688,13 @@ export class PiBridgeProvider extends BridgeProvider {
       return { ok: false, code: "PI_EXITED", message: "pi-exited (reacquire the session)" };
     }
     // Model: exact-ref resolution via live catalog, then Pi `set_model`.
-    // Provider-confirmed `Model.id` becomes both `metadata.model` and the
-    // persisted `options.model` (so Orca restores the confirmed id, not a
-    // `provider/id` alias the next catalog may resolve differently).
+    // Provider-confirmed canonical `provider/modelId` is persisted in both
+    // `metadata.model` and `options.model` (so a later restore/acquire with
+    // duplicate bare ids — e.g. `gpt-5.6-luna` under `openai-codex` +
+    // `opencode-go` in the live catalog — resolves without `AMBIGUOUS_MODEL`,
+    // and image-capability lookup disambiguates by provider). Bare unique
+    // ids still resolve (exact unique match), but persistence is always
+    // qualified for restore safety.
     if (options.model !== undefined) {
       const conn = runtime.conn;
       if (typeof conn.getAvailableModels !== "function" || typeof conn.setModel !== "function") {
@@ -651,9 +712,15 @@ export class PiBridgeProvider extends BridgeProvider {
       if (!resolved.ok) return { ok: false, code: resolved.code, message: resolved.message };
       try {
         const confirmed = await conn.setModel(resolved.provider, resolved.modelId);
-        const confirmedId = typeof confirmed?.id === "string" && confirmed.id !== "" ? confirmed.id : resolved.modelId;
-        session.options.model = confirmedId;
-        session.metadata.model = confirmedId;
+        const confirmedProvider =
+          typeof (confirmed as PiModel)?.provider === "string" && (confirmed as PiModel).provider !== ""
+            ? (confirmed as PiModel).provider
+            : resolved.provider;
+        const confirmedId =
+          typeof confirmed?.id === "string" && confirmed.id !== "" ? confirmed.id : resolved.modelId;
+        const qualified = `${confirmedProvider}/${confirmedId}`;
+        session.options.model = qualified;
+        session.metadata.model = qualified;
         // Refresh cached catalog entry (confirmed model may carry new caps).
         const idx = models.findIndex((m) => m.provider === resolved.provider && m.id === resolved.modelId);
         if (idx >= 0) models[idx] = confirmed;
@@ -831,7 +898,14 @@ export class PiBridgeProvider extends BridgeProvider {
     try {
       const state = await runtime.conn.getState();
       if (typeof state.sessionId === "string" && state.sessionId !== "") session.metadata.providerSessionId = state.sessionId;
-      if (typeof state.model?.id === "string") session.metadata.model = state.model.id;
+      // Qualify when the provider is known (duplicate bare ids exist in the
+      // live catalog); bare fallback preserves pre-SNC1.6 leases.
+      if (typeof state.model?.id === "string" && state.model.id !== "") {
+        session.metadata.model =
+          typeof state.model?.provider === "string" && state.model.provider !== ""
+            ? `${state.model.provider}/${state.model.id}`
+            : state.model.id;
+      }
       if (typeof state.thinkingLevel === "string") session.metadata.thinkingLevel = state.thinkingLevel;
       if (typeof state.messageCount === "number") session.metadata.messageCount = state.messageCount;
       session.metadata.isStreaming = session.activeOpId !== null;
@@ -914,7 +988,11 @@ export class PiBridgeProvider extends BridgeProvider {
       // already map to `[]` (bounded) so they never reach here as changes.
       // Dialogs arriving without an active turn are still actionable (e.g.
       // immediate `/` extension commands, which never start a turn): track
-      // them in the SNC1.6 pending map (stable identity, exactly-once) and
+      // them in the SNC1.6 pending map (stable identity, exactly-once). When
+      // an immediate `/` dispatch is pending, the first dialog proves Pi owns
+      // the command — ack `accepted` early (before the `prompt` response,
+      // which per `extension-ui.jsonl` arrives only after the answer) so the
+      // host dispatch deadline never fires while the user thinks. Otherwise
       // emit without an opId so Orca answers via `requestId`.
       if (!hasActiveOp) {
         let stateless: ReturnType<typeof mapPiRecordToBridgeEvents>;
@@ -928,6 +1006,25 @@ export class PiBridgeProvider extends BridgeProvider {
           // Stable identity: duplicate Pi ids while pending are ignored
           // (never emit a second card for the same request).
           if (runtime.pendingPrompts.has(bridgeEvent.requestId)) continue;
+          const immediate = runtime.pendingImmediate;
+          if (immediate && !immediate.acked) {
+            // First dialog for the pending immediate command: Pi definitely
+            // owns it. Attribute the dialog to the immediate op and ack
+            // early; the `prompt` response (after the answer) needs no
+            // second ack.
+            runtime.pendingPrompts.set(bridgeEvent.requestId, immediate.opId);
+            session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: immediate.opId };
+            this.send({
+              v: 1,
+              kind: "session_event",
+              sessionId,
+              opId: immediate.opId,
+              event: bridgeEvent,
+            });
+            immediate.acked = true;
+            this.send({ v: 1, kind: "dispatch_ack", opId: immediate.opId, sessionId, status: "accepted" });
+            continue;
+          }
           runtime.pendingPrompts.set(bridgeEvent.requestId, "");
           session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: "" };
           this.send({
@@ -1079,6 +1176,7 @@ export class PiBridgeProvider extends BridgeProvider {
   private retireAllPrompts(session: ProviderSession, runtime: PiRuntime): void {
     runtime.pendingPrompts.clear();
     session.pendingPrompt = null;
+    runtime.pendingImmediate = null;
   }
 
   private onPiExit(sessionId: string, info: PiRpcCloseResult): void {
@@ -1137,31 +1235,38 @@ export class PiBridgeProvider extends BridgeProvider {
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: "pi-exited (reacquire the session)" });
       return;
     }
-    const validation = validatePiDispatch(msg.message, session.options, session.metadata.model);
+    // SNC1.6 image gating: the live Pi catalog is authoritative when cached
+    // (`acquire` populates it best-effort; `set_model` refreshes it). Hint
+    // checks in `validatePiDispatch` stay only as a fallback when capability
+    // metadata is unavailable — otherwise hint-miss image-capable models
+    // (e.g. `minimax-m3`, `qwen3.8-flash`, `kimi-k2.6` in the live catalog)
+    // would be wrongly rejected before the authoritative check runs.
+    // History never journals image bytes (user entries carry text only).
+    const imageCount = msg.message.images?.length ?? 0;
+    const liveSupports =
+      imageCount > 0 ? this.modelSupportsImages(session.metadata.model, runtime.cachedModels) : null;
+    if (liveSupports === false) {
+      this.send({
+        v: 1,
+        kind: "dispatch_ack",
+        opId: msg.opId,
+        sessionId: msg.sessionId,
+        status: "rejected",
+        reason: `model-rejects-images: ${session.metadata.model ?? "unknown-model"}`,
+      });
+      return;
+    }
+    // When the live catalog confirms image support, bypass the static hint
+    // (pass `model: undefined` so only text/thinking/mime are validated).
+    // When the catalog is silent (`null`) or there are no images, validate
+    // normally (hints remain the floor for uncached models).
+    const validation =
+      liveSupports === true
+        ? validatePiDispatch(msg.message, session.options, undefined)
+        : validatePiDispatch(msg.message, session.options, session.metadata.model);
     if (!validation.ok) {
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "rejected", reason: validation.reason ?? "invalid-dispatch" });
       return;
-    }
-    // SNC1.6 live image gating where the catalog is cached: hint-based
-    // `validatePiDispatch` above stays the floor (Pi would fail late on
-    // text-only models), but when `acquire`/`set_options` already cached the
-    // live catalog, a text-only confirmed model rejects with the same
-    // actionable code instead of relying on hints alone. History never
-    // journals image bytes (user entries carry text only) — see below.
-    const imageCount = msg.message.images?.length ?? 0;
-    if (imageCount > 0) {
-      const liveSupports = this.modelSupportsImages(session.metadata.model, runtime.cachedModels);
-      if (liveSupports === false) {
-        this.send({
-          v: 1,
-          kind: "dispatch_ack",
-          opId: msg.opId,
-          sessionId: msg.sessionId,
-          status: "rejected",
-          reason: `model-rejects-images: ${session.metadata.model ?? "unknown-model"}`,
-        });
-        return;
-      }
     }
     const isImmediateCommand = msg.message.text.trimStart().startsWith("/");
     // SNC1.6 immediate `/` extension commands: Pi handles them without a
@@ -1196,11 +1301,30 @@ export class PiBridgeProvider extends BridgeProvider {
       }
       // Idle immediate: direct Pi `prompt` with no turn tracking. Dialogs
       // arriving mid-call flow via the no-active-op stateless path above
-      // (tracked in `pendingPrompts` with `""` op, answerable via
-      // `requestId`). No translator state, no history entries.
+      // (tracked in `pendingPrompts`). No translator state, no history.
+      // SNC1.6 early-ownership ack: the real `extension-ui.jsonl` ordering is
+      // `prompt` → `extension_ui_request` → `extension_ui_response` →
+      // `prompt` response, so awaiting the `prompt` response before acking
+      // would hit the host dispatch deadline (10s) whenever the user takes
+      // >10s to answer. Instead the first dialog acks `accepted` early (see
+      // stateless path above — Pi definitely owns the command and waits for
+      // an answer); the trailing `prompt` response needs no second ack.
+      // No-dialog immediates ack on `prompt` success (fast, no user wait).
+      runtime.pendingImmediate = { opId: msg.opId, acked: false };
+      const clearImmediate = (): void => {
+        if (runtime.pendingImmediate?.opId === msg.opId) runtime.pendingImmediate = null;
+      };
       try {
         await runtime.conn.prompt(msg.message.text);
       } catch (error) {
+        if (runtime.pendingImmediate?.opId === msg.opId && runtime.pendingImmediate.acked) {
+          // Already accepted via the early dialog ack: Pi owned the command;
+          // the late transport failure needs no second ack (the turn
+          // continues via `session_event` prompts, never a stuck dispatch).
+          clearImmediate();
+          return;
+        }
+        clearImmediate();
         const code = (error as { code?: unknown })?.code;
         const ambiguous = (error as { ambiguous?: unknown })?.ambiguous;
         if (code === "rejected" && ambiguous === false) {
@@ -1225,6 +1349,12 @@ export class PiBridgeProvider extends BridgeProvider {
         });
         return;
       }
+      // `prompt` succeeded: ack unless the early dialog path already did.
+      if (runtime.pendingImmediate?.opId === msg.opId && runtime.pendingImmediate.acked) {
+        clearImmediate();
+        return;
+      }
+      clearImmediate();
       this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
       return;
     }

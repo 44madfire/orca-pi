@@ -44,6 +44,13 @@ class FakePi16 implements PiProviderConnection {
     { id: "text-only-model", provider: "opencode-go", input: ["text"] } as PiModel,
     { id: "shared-id", provider: "a", input: ["text"] } as PiModel,
     { id: "shared-id", provider: "b", input: ["text"] } as PiModel,
+    // Image-capable but hint-miss (no glm/gpt/claude/gemini/vision substring):
+    // proves the live catalog is authoritative over PI_IMAGE_CAPABLE_HINTS.
+    { id: "minimax-m3", provider: "opencode-go", input: ["text", "image"] } as PiModel,
+    // Duplicate bare id across providers (mirrors live gpt-5.6-luna case):
+    // persistence must stay qualified or restore goes AMBIGUOUS_MODEL.
+    { id: "gpt-5.6-luna", provider: "openai-codex", input: ["text", "image"] } as PiModel,
+    { id: "gpt-5.6-luna", provider: "opencode-go", input: ["text", "image"] } as PiModel,
   ];
   levels: string[] = ["low", "high", "max"];
   setModelCalls: Array<{ provider: string; modelId: string }> = [];
@@ -239,13 +246,13 @@ describe("SNC1.6 model/thinking controls (live Pi RPC, provider-confirmed)", () 
     send({ v: 1, kind: "set_options", opId: "opt_1", sessionId, options: { model: "text-only-model" } });
     await new Promise((r) => setTimeout(r, 30));
     const updated = lastOfKind(out, "options_updated") as unknown as { options: { model?: string } };
-    expect(updated.options.model).toBe("text-only-model");
+    expect(updated.options.model).toBe("opencode-go/text-only-model");
     expect(fakes[0]?.setModelCalls).toEqual([{ provider: "opencode-go", modelId: "text-only-model" }]);
     // Lease reports the confirmed model (Orca-normal persistence).
     send({ v: 1, kind: "get_session", opId: "ses_1", sessionId });
     await new Promise((r) => setTimeout(r, 30));
     const meta = (lastOfKind(out, "session") as unknown as { metadata: { model?: string } }).metadata;
-    expect(meta.model).toBe("text-only-model");
+    expect(meta.model).toBe("opencode-go/text-only-model");
   });
 
   it("sets model by exact provider/modelId and persists the confirmed id", async () => {
@@ -263,8 +270,8 @@ describe("SNC1.6 model/thinking controls (live Pi RPC, provider-confirmed)", () 
     send({ v: 1, kind: "set_options", opId: "opt_1", sessionId, options: { model: "opencode-go/glm-5.3-flash" } });
     await new Promise((r) => setTimeout(r, 30));
     const updated = lastOfKind(out, "options_updated") as unknown as { options: { model?: string } };
-    // Provider-confirmed bare id is persisted (not the provider/id alias).
-    expect(updated.options.model).toBe("glm-5.3-flash");
+    // Provider-confirmed canonical qualified ref is persisted (restore-safe for duplicate ids).
+    expect(updated.options.model).toBe("opencode-go/glm-5.3-flash");
     expect(fakes[0]?.setModelCalls).toEqual([{ provider: "opencode-go", modelId: "glm-5.3-flash" }]);
   });
 
@@ -376,7 +383,7 @@ describe("SNC1.6 model/thinking controls (live Pi RPC, provider-confirmed)", () 
     send({ v: 1, kind: "acquire", opId: "acq_good", workspaceRoot: "/tmp/ws", options: { model: "text-only-model", thinkingLevel: "high" } });
     await new Promise((r) => setTimeout(r, 40));
     const acquired = lastOfKind(out, "acquired") as unknown as { metadata: { model?: string; thinkingLevel?: string } };
-    expect(acquired.metadata.model).toBe("text-only-model");
+    expect(acquired.metadata.model).toBe("opencode-go/text-only-model");
     expect(acquired.metadata.thinkingLevel).toBe("high");
 
     // Bad model ref: no acquired, actionable error, no leaked child.
@@ -752,5 +759,121 @@ describe("SNC1.6 acquisition fences (no option/prompt leak across sessions)", ()
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "error")).toMatchObject({ opId: "ans_old", error: { code: "UNKNOWN_REQUEST" } });
     expect(fakes[0]?.uiResponses).toHaveLength(0);
+  });
+});
+
+describe("SNC1.6 ChatGPT review regressions (PR #39 P1s)", () => {
+  const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+  it("P1-1: live catalog authorizes hint-miss image models (minimax-m3)", async () => {
+    // `minimax-m3` carries input:[text,image] in the live catalog but matches
+    // none of PI_IMAGE_CAPABLE_HINTS — the old hint-first order wrongly
+    // rejected it before the authoritative check ran.
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionId = await acquireSession(provider, out, send);
+    send({ v: 1, kind: "set_options", opId: "opt_mm", sessionId, options: { model: "opencode-go/minimax-m3" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOfKind(out, "options_updated")).toBeDefined();
+    send({
+      v: 1,
+      kind: "dispatch",
+      opId: "dsp_mm_img",
+      sessionId,
+      message: { text: "see this?", images: [{ data: tinyPng, mimeType: "image/png" }] },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_mm_img", status: "accepted" });
+    expect(fakes[0]?.prompts.some((p) => p.message === "see this?")).toBe(true);
+  });
+
+  it("P1-2: qualified persistence restores duplicate ids (gpt-5.6-luna)", async () => {
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionId = await acquireSession(provider, out, send, "acq_1");
+    // Select the openai-codex copy via qualified ref; persistence stays qualified.
+    send({ v: 1, kind: "set_options", opId: "opt_dup", sessionId, options: { model: "openai-codex/gpt-5.6-luna" } });
+    await new Promise((r) => setTimeout(r, 30));
+    const updated = lastOfKind(out, "options_updated") as unknown as { options: { model?: string } };
+    expect(updated.options.model).toBe("openai-codex/gpt-5.6-luna");
+    // Release and reacquire with the persisted qualified ref: must not go AMBIGUOUS.
+    send({ v: 1, kind: "release", opId: "rel_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    send({ v: 1, kind: "acquire", opId: "acq_2", workspaceRoot: "/tmp/ws", options: { model: updated.options.model } });
+    await new Promise((r) => setTimeout(r, 40));
+    const reacquired = lastOfKind(out, "acquired") as unknown as { metadata: { model?: string } };
+    expect(reacquired.metadata.model).toBe("openai-codex/gpt-5.6-luna");
+    // Bare duplicate still fails closed (proves the qualified form was required).
+    send({ v: 1, kind: "set_options", opId: "opt_bare_dup", sessionId: reacquired.metadata.sessionId as unknown as string, options: { model: "gpt-5.6-luna" } });
+    await new Promise((r) => setTimeout(r, 30));
+    // The reacquired session id is the new bridge id; resolve it from the acquired record.
+    const newSessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "set_options", opId: "opt_bare_dup2", sessionId: newSessionId, options: { model: "gpt-5.6-luna" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(JSON.stringify(lastOfKind(out, "error"))).toContain("AMBIGUOUS_MODEL");
+  });
+
+  it("P1-3: immediate / commands ack on dialog before the delayed prompt response", async () => {
+    // Real fixture ordering: prompt → extension_ui_request → (user thinks) →
+    // extension_ui_response → prompt response. The fake prompt emits its dialog
+    // then waits for the answer before resolving, so a provider that awaited
+    // prompt-then-ack would hit the host dispatch deadline. SNC1.6 acks
+    // accepted on the first dialog (Pi definitely owns the command).
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        fakes.push(fake);
+        const origPrompt = fake.prompt.bind(fake);
+        let answerSeen = false;
+        const origRespond = fake.respondToExtensionUi.bind(fake);
+        fake.respondToExtensionUi = (res) => {
+          answerSeen = true;
+          origRespond(res);
+        };
+        fake.prompt = async (message: string, promptOpts?: { images?: readonly unknown[]; streamingBehavior?: string }): Promise<void> => {
+          if (!message.trimStart().startsWith("/")) return origPrompt(message, promptOpts);
+          // Immediate: emit dialog on next tick, then wait for the answer
+          // before resolving (mirrors extension-ui.jsonl: prompt response
+          // arrives only after extension_ui_response).
+          await new Promise((r) => setTimeout(r, 5));
+          fake.emit({ type: "extension_ui_request", id: "dlg_delayed", method: "select", title: "Pick", options: ["A", "B"] } as unknown as PiServerEvent);
+          for (let i = 0; i < 200 && !answerSeen; i++) await new Promise((r) => setTimeout(r, 10));
+          if (!answerSeen) throw Object.assign(new Error("never answered"), { code: "request-timeout", ambiguous: true });
+          await origPrompt(message, promptOpts);
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionId = await acquireSession(provider, out, send);
+    send({ v: 1, kind: "dispatch", opId: "dsp_imm", sessionId, message: { text: "/rpc-ask" } });
+    // Dialog arrives fast; the early ack must land before any answer.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_imm", status: "accepted" });
+    expect(sessionEvents(out, "dsp_imm").some((e) => e.event.type === "prompt_request")).toBe(true);
+    // Now answer (slow user is fine — ownership was already acked).
+    send({ v: 1, kind: "answer_prompt", opId: "ans_delayed", requestId: "dlg_delayed", value: "A", cancelled: false });
+    await new Promise((r) => setTimeout(r, 80));
+    expect(fakes[0]?.uiResponses).toContainEqual({ type: "extension_ui_response", id: "dlg_delayed", value: "A" });
+    // Exactly one ack, no duplicate after the delayed prompt response.
+    expect(out.filter((m) => m.kind === "dispatch_ack" && (m as { opId?: string }).opId === "dsp_imm")).toHaveLength(1);
   });
 });
