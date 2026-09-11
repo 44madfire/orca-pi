@@ -8,9 +8,12 @@
   never scrapes terminal output or YAML and never stores a second copy of
   profiles in settings/storage. window.__ORCA_PI_PROFILES__ injection is
   deprecated (legacy read-only fallback only) — the production path is the
-  typed bridge. Degraded hosts show explicit read-only CLI fallback with
-  user-triggered terminal.sendText descriptors (explicit terminalId, never
-  auto-sent, never parsed).
+  typed bridge. Degraded hosts show explicit read-only CLI fallback with a
+  real user-triggered terminal.sendText action (explicit terminalId from
+  workspace.readContext, never auto-sent, never parsed).
+  Required capabilities (honest consent — every one is called below):
+  workspace:read (fallback terminal target), terminal:send (explicit
+  user-triggered fallback only).
 -->
 <html lang="en">
   <head>
@@ -26,6 +29,8 @@
       #profiles-summary ul { margin: 0.5em 0; }
       .bridge-ok { border-left: 4px solid #2da44e; padding-left: 8px; }
       .bridge-degraded { border-left: 4px solid #d29922; padding-left: 8px; }
+      button { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid rgba(127,127,127,.5); background: transparent; cursor: pointer; }
+      button:disabled { opacity: .5; cursor: default; }
     </style>
   </head>
   <body>
@@ -56,13 +61,23 @@ orca-pi profile path</code></pre>
       <p class="muted">Targets Orca app 1.4.196+ (pluginApi 1, Host API v0 re-audited 2026-09-11). See docs/ORCA_PLUGIN_API.md.</p>
     </div>
     <script>
-      // Versioned bridge client: structured requests first, explicit
-      // degraded CLI fallback otherwise. Never fetch, spawn, or touch the
-      // filesystem. Never scrapes terminal output. Legacy
-      // window.__ORCA_PI_PROFILES__ is honored only as a deprecated
-      // read-only fallback and labeled as such.
+      // Versioned bridge client + real Host API fallback (UI1.2, round 7).
+      // Never fetch, spawn, or touch the filesystem. Never scrapes terminal
+      // output. Legacy window.__ORCA_PI_PROFILES__ is honored only as a
+      // deprecated read-only fallback and labeled as such. The degraded path
+      // performs real Host API calls (workspace.readContext, then ONE
+      // user-gesture terminal.sendText of an allowlisted read-only command)
+      // over the panel postMessage bridge — exercised by
+      // packages/orca-plugin/test/panel-actions.test.ts against this file.
       (function () {
         var PROTOCOL_VERSION = 1;
+        var PANEL_ACTION_REQUEST_TYPE = "orca-panel-action";
+        var PANEL_ACTION_RESULT_TYPE = "orca-panel-action-result";
+        var HOST_CALL_TIMEOUT_MS = 8000;
+        // Degraded fallback text for THIS panel. Read-only CLI only — the
+        // same allowlist as describeTerminalFallback() in bridge.ts (keep
+        // in sync; the panel-actions test cross-checks both directions).
+        var FALLBACK_CLI_TEXT = "orca-pi profile validate";
         var counter = 0;
         function newRequestId() {
           counter += 1;
@@ -75,6 +90,78 @@ orca-pi profile path</code></pre>
             .replace(/>/g, "&gt;")
             .replace(/"/g, "&quot;")
             .replace(/'/g, "&#39;");
+        }
+        // Call one Host API method over the panel postMessage bridge.
+        // Resolves with the raw result message; ignores unrelated traffic.
+        function hostAction(action, params) {
+          return new Promise(function (resolve) {
+            var requestId = "host-" + Date.now().toString(36) + "-" + (counter += 1) + "-" + Math.random().toString(36).slice(2, 10);
+            var settled = false;
+            function done(value) {
+              if (settled) return;
+              settled = true;
+              try { window.removeEventListener("message", onMessage); } catch (e) {}
+              resolve(value);
+            }
+            function onMessage(event) {
+              var data = event && event.data;
+              if (!data || data.type !== PANEL_ACTION_RESULT_TYPE) return;
+              if (data.requestId !== requestId) return;
+              done(data);
+            }
+            try { window.addEventListener("message", onMessage); } catch (e) { done({ ok: false, requestId: requestId, error: "cannot listen for host replies" }); return; }
+            setTimeout(function () { done({ ok: false, requestId: requestId, error: "host call timed out" }); }, HOST_CALL_TIMEOUT_MS);
+            try {
+              window.parent.postMessage({ type: PANEL_ACTION_REQUEST_TYPE, requestId: requestId, action: action, params: params }, "*");
+            } catch (e) {
+              done({ ok: false, requestId: requestId, error: "cannot reach the host bridge" });
+            }
+          });
+        }
+        // Explicit user-triggered fallback: read the focused worktree's
+        // terminal list, then type the allowlisted CLI text into the shown
+        // terminal. Every step is user-visible; output is never read back.
+        function offerTerminalFallback(into) {
+          var wrap = document.createElement("div");
+          var btn = document.createElement("button");
+          btn.textContent = "Run `" + FALLBACK_CLI_TEXT + "` in a visible terminal";
+          var note = document.createElement("p");
+          note.setAttribute("class", "muted");
+          note.textContent = "Explicit action only: reads your focused worktree's terminal list, then types one read-only command. Output is never read back into this panel.";
+          btn.addEventListener("click", function () {
+            btn.disabled = true;
+            note.textContent = "Reading focused worktree terminals (workspace.readContext)…";
+            hostAction("workspace.readContext").then(function (ctx) {
+              var value = ctx && ctx.ok ? ctx.value : null;
+              var terminals = (value && value.terminals) || [];
+              if (!terminals.length) {
+                note.textContent = "No visible terminal in the focused worktree — open one, then try again.";
+                btn.disabled = false;
+                return;
+              }
+              var terminalId = terminals[0].id;
+              note.textContent = "Typing into terminal " + terminalId + " (explicit target — never the active terminal)…";
+              hostAction("terminal.sendText", { terminalId: terminalId, text: FALLBACK_CLI_TEXT, enter: false }).then(function (sent) {
+                var accepted = sent && sent.ok && sent.value && sent.value.accepted;
+                if (accepted) {
+                  note.textContent = "Sent to terminal " + terminalId + ". Check the terminal for output — it is never read back here.";
+                } else {
+                  note.textContent = "Terminal send failed (" + esc((sent && (sent.error || (sent.value && sent.value.error))) || "unavailable") + "). Nothing was executed blindly.";
+                  btn.disabled = false;
+                }
+              });
+            });
+          });
+          wrap.appendChild(btn);
+          wrap.appendChild(note);
+          into.appendChild(wrap);
+        }
+        function showDegraded(msg) {
+          var state = document.getElementById("bridge-state");
+          if (state) {
+            state.innerHTML = '<div class="bridge-degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">' + esc(msg) + '</span></p></div>';
+            offerTerminalFallback(state);
+          }
         }
         function renderList(root, profiles, note) {
           if (!profiles || profiles.length === 0) {
@@ -106,9 +193,6 @@ orca-pi profile path</code></pre>
             var capReq = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId(), operation: "bridge.capabilities" };
             var capPending = bridge.request(capReq);
             if (capPending && typeof capPending.then === "function") {
-              var showDegraded = function (msg) {
-                if (state) state.innerHTML = '<div class="bridge-degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">' + esc(msg) + '</span></p></div>';
-              };
               capPending.then(function (capRes) {
                 try {
                   if (!capRes || capRes.requestId !== capReq.requestId) return;
@@ -151,7 +235,7 @@ orca-pi profile path</code></pre>
             }
           }
           // No structured seam on this host: explicit degraded state.
-          if (state) state.innerHTML = '<div class="bridge-degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">Structured bridge seam not present; live editing requires the bridge worker. Mutations stay disabled.</span></p></div>';
+          showDegraded("Structured bridge seam not present; live editing requires the bridge worker. Mutations stay disabled.");
           // Deprecated legacy injection: honor read-only, label clearly.
           var data = window.__ORCA_PI_PROFILES__;
           if (data && data.profiles) {

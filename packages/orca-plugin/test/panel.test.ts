@@ -136,7 +136,7 @@ describe("profiles panel: feature detection and fallback", () => {
     const support = detectPanelSupport({
       appVersion: "1.4.196",
       pluginApi: 1,
-      grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+      grantedCapabilities: ["workspace:read", "terminal:send"],
       seamAvailable: true,
     });
     expect(support.supported).toBe(true);
@@ -155,7 +155,7 @@ describe("profiles panel: feature detection and fallback", () => {
     const support = detectPanelSupport({
       appVersion: "1.4.196",
       pluginApi: 1,
-      grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+      grantedCapabilities: ["workspace:read", "terminal:send"],
     });
     expect(support.supported).toBe(true);
     expect(support.readOnlySummary).toBe(true);
@@ -182,7 +182,7 @@ describe("profiles panel: feature detection and fallback", () => {
     const noConsent = detectPanelSupport({
       appVersion: "1.4.196",
       pluginApi: 1,
-      grantedCapabilities: ["terminal:send", "notifications:show"],
+      grantedCapabilities: ["terminal:send"],
     });
     expect(noConsent.degraded).toBe(true);
     expect(noConsent.editing).toBe(false);
@@ -201,17 +201,19 @@ describe("profiles panel: feature detection and fallback", () => {
     const result = validatePluginManifest(manifest);
     expect(result.errors).toEqual([]);
     expect(result.ok).toBe(true);
-    // UI1.2 declares a worker main + only the capabilities actually used
-    // (workspace:read, terminal:send for degraded fallback, notifications:show).
-    // No storage/secrets/settings — no second profile store can diverge.
+    // UI1.2 declares a worker main + only the capabilities actually called
+    // (workspace:read for the fallback target, terminal:send for the
+    // explicit user-triggered fallback — both verified end-to-end by
+    // panel-actions.test.ts). No storage/secrets/settings/notifications.
     // `main` is the ESM Orca entry (default-exported activate(orca)).
     const typed = manifest as { main?: string; capabilities: { kind: string }[] };
     expect(typed.main).toBe("worker-entry.mjs");
     const kinds = typed.capabilities.map((cap) => cap.kind).sort();
-    expect(kinds).toEqual(["notifications:show", "terminal:send", "workspace:read"]);
+    expect(kinds).toEqual(["terminal:send", "workspace:read"]);
     expect(kinds).not.toContain("storage");
     expect(kinds).not.toContain("secrets");
     expect(kinds).not.toContain("settings:own");
+    expect(kinds).not.toContain("notifications:show");
   });
 
   it("ships both panel entries with bridge client + CLI fallback and no escape hatch", () => {

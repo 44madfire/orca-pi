@@ -157,11 +157,14 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
    + `worker.ts` core + `worker-entry.mjs` activation) so it binds behind
    the seam without a panel rewrite.
 4. **`terminal.sendText` degraded fallback** — clearly-labeled, explicit
-   user actions only. Allowed text is allowlisted to read-only
-   `orca-pi doctor | profiles list | profile show/inspect/validate/path/read`;
-   mutations are never offered this way. Requires an explicit `terminalId`
-   from `workspace.readContext` (never “active”), never auto-sent, never
-   parsed back into the UI. It is not the primary architecture.
+   user actions only, implemented for real in both panels (a fallback
+   button, tested end-to-end in `panel-actions.test.ts`). Allowed text is
+   allowlisted to read-only `orca-pi doctor | profiles list | profile
+   show/inspect/validate/path/read`; mutations are never offered this
+   way. The button handler calls `workspace.readContext` for an explicit
+   `terminalId` (never “active”), shows the target, then sends once —
+   never on load, never parsed back into the UI. It is not the primary
+   architecture.
 
 **Not solved** by storing a second copy of profiles in plugin
 `settings`/`storage` (divergence risk — forbidden and tested). Stock Orca
@@ -272,12 +275,15 @@ Fork-side injection contract (`window.__ORCA_PI_BRIDGE__`):
 ## Manifest / consent
 
 - File `packages/orca-plugin/orca-plugin.json` (`main:
-  "dist/worker.js"`, compiled from `src/worker.ts`): declares **only**
-  `workspace:read` (worktree context for explicit scoping),
-  `terminal:send` (degraded fallback, explicit user gesture only),
-  `notifications:show` (diagnostics surfacing). No `storage` / `secrets` /
-  `settings:own` / `events:subscribe` — the bridge uses no second store and
-  never touches the panel vault, so consent stays minimal and honest.
+  "worker-entry.mjs"`, the ESM Orca entry default-exporting
+  `activate(orca)`): declares **only** the capabilities the shipped
+  panels genuinely call — `workspace:read` (fallback terminal target via
+  `workspace.readContext`) and `terminal:send` (ONE explicit
+  user-gesture `terminal.sendText` of an allowlisted read-only command;
+  verified end-to-end by `panel-actions.test.ts` against the shipped
+  scripts). No `storage` / `secrets` / `settings:own` / `events:subscribe`
+  / `notifications:show` — nothing unused is declared, so consent stays
+  minimal and honest.
 - No unrestricted process/network/filesystem permissions. Worker
   filesystem access is scoped to the explicit `projectRoot` via core
   services (no shell strings, no `child_process`).
@@ -323,8 +329,9 @@ Fork-side injection contract (`window.__ORCA_PI_BRIDGE__`):
   Host API additions do not require rewriting the panel.
 - Read-only/degraded mode is kept for older Orca builds (`engines.orca
   >=1.4.0` still installs everywhere; pre-1.4 / non-v1 `pluginApi` /
-  missing `workspace:read` → `cli-only` + explicit `terminal.sendText`
-  descriptors).
+  missing `workspace:read` → `cli-only` + an explicit user-gesture
+  `terminal.sendText` fallback button, never auto-sent, output never
+  parsed back).
 - Windows + WSL: `normalizeProjectRoot` / `isAbsoluteProjectRoot` preserve
   `C:/`, UNC, and `\\wsl.localhost\…` prefixes (slash-normalized, no
   `process.cwd()` resolution); atomic writes use sibling-temp + rename;

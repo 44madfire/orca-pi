@@ -32,9 +32,6 @@
     },
     {
       "kind": "terminal:send"
-    },
-    {
-      "kind": "notifications:show"
     }
   ]
 }

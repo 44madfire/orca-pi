@@ -377,7 +377,7 @@ describe("bridge host: transport enforcement (seam path)", () => {
   const STRUCTURED = {
     appVersion: "1.4.199",
     pluginApi: 1,
-    grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+    grantedCapabilities: ["workspace:read", "terminal:send"],
     seamAvailable: true,
   };
 
@@ -506,7 +506,7 @@ describe("bridge worker: lifecycle and consent honesty", () => {
 
   it("uses stable requestIds end-to-end", async () => {
     const worker = createBridgeWorker(deps());
-    worker.onInit({ grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"], appVersion: "1.4.196", pluginApi: 1, seamAvailable: true });
+    worker.onInit({ grantedCapabilities: ["workspace:read", "terminal:send"], appVersion: "1.4.196", pluginApi: 1, seamAvailable: true });
     expect(worker.isBridgeSupported()).toBe(true);
     const res = await worker.handleRequest({ protocolVersion: 1, requestId: "stable-42", operation: "bridge.capabilities" });
     expect(res.requestId).toBe("stable-42");

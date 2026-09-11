@@ -57,7 +57,7 @@ describe("plugin entry contract", () => {
     try {
       const logs: string[] = [];
       await entry.default({
-        grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+        grantedCapabilities: ["workspace:read", "terminal:send"],
         appVersion: "1.4.199",
         pluginApi: 1,
         log: (message: string) => {

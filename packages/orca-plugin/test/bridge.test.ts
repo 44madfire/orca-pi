@@ -208,7 +208,7 @@ describe("bridge protocol: capability negotiation + degraded fallback", () => {
   const HOST = {
     appVersion: "1.4.196",
     pluginApi: 1,
-    grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+    grantedCapabilities: ["workspace:read", "terminal:send"],
     seamAvailable: true,
   };
 
@@ -266,7 +266,7 @@ describe("bridge protocol: capability negotiation + degraded fallback", () => {
   it("ignores unknown future capabilities (additive, no rewrite needed)", () => {
     const res = negotiateBridgeCapabilities({
       ...HOST,
-      grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show", "future:thing"],
+      grantedCapabilities: ["workspace:read", "terminal:send", "future:thing"],
     });
     expect(res.structured).toBe(true);
   });
@@ -274,7 +274,7 @@ describe("bridge protocol: capability negotiation + degraded fallback", () => {
   it("notes that storage/settings/secrets are intentionally unused (no second store)", () => {
     const res = negotiateBridgeCapabilities({
       ...HOST,
-      grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show", "storage", "settings:own", "secrets"],
+      grantedCapabilities: ["workspace:read", "terminal:send", "storage", "settings:own", "secrets"],
     });
     expect(res.reasons.join("\n")).toMatch(/no second profile store/);
   });
