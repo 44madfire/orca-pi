@@ -1045,11 +1045,13 @@ describe("PiBridgeProvider review fixes (PR #37)", () => {
   });
 });
 
-describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
-  it("rejects extension-command prompts without touching Pi (session stays idle)", async () => {
-    // Pi handles `/cmd` immediately with success but no turn lifecycle, which
-    // would strand this single-turn provider streaming forever. SNC1.4
-    // honestly rejects them (interactive prompts land in SNC1.6).
+describe("PiBridgeProvider acceptance hardening (PR #37 fifth review + SNC1.6)", () => {
+  it("runs immediate extension-command prompts without a turn (SNC1.6)", async () => {
+    // SNC1.6: Pi handles `/cmd` immediately with success but no turn
+    // lifecycle and no session entries (per the Pi contract). Idle `/`
+    // dispatches run directly against Pi without taking the single active
+    // turn (no translator user, no history); busy `/` stays honestly
+    // rejected to avoid concurrent attribution without queue evidence.
     const fakes: FakePi[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -1065,10 +1067,14 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
     send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "/rpc-ask" } });
     await new Promise((r) => setTimeout(r, 20));
-    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_1", status: "rejected" });
-    expect(JSON.stringify(lastOfKind(out, "dispatch_ack"))).toContain("SNC1.6");
-    expect(fakes[0]?.prompts).toHaveLength(0);
-    // Never streamed, so still idle — the next plain-text turn runs normally.
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_1", status: "accepted" });
+    expect(fakes[0]?.prompts.map((p) => p.message)).toEqual(["/rpc-ask"]);
+    // Immediate commands leave no session entries and no active turn, so the
+    // session stays idle and the next plain-text turn runs normally.
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ text?: string }> };
+    expect(history.entries.some((e) => e.text === "/rpc-ask")).toBe(false);
     send({ v: 1, kind: "cancel", opId: "cnl_1", sessionId });
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "cancelled")).toMatchObject({ settled: true });
@@ -1226,17 +1232,16 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review)", () => {
     expect(lastOfKind(out, "closed")).toMatchObject({ exit: { code: null, signal: null } });
   });
 
-  it("advertises only the capabilities SNC1.4 honestly implements", async () => {
-    // Model/thinking controls are SNC1.6 and history/branch/resume is SNC1.7:
-    // `options`/`resume` must stay false so Orca never exposes controls or
-    // resume paths that silently diverge from actual Pi child state.
+  it("advertises the capabilities SNC1.6 honestly implements", async () => {
+    // SNC1.6 model/thinking/prompt/image controls are live; history/branch/
+    // resume stays false until SNC1.7 reconstructs from Pi get_entries/tree.
     const provider = new PiBridgeProvider({ createConnection: (opts) => new FakePi(opts) });
     const { out, hello } = drive(provider);
     hello();
     await new Promise((r) => setTimeout(r, 10));
     expect(lastOfKind(out, "hello_ok")).toMatchObject({
       provider: { id: "pi" },
-      capabilities: { textStreaming: true, cancel: true, options: false, resume: false },
+      capabilities: { textStreaming: true, cancel: true, options: true, resume: false },
     });
   });
 
