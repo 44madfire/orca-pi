@@ -105,8 +105,7 @@ describe("seam adapter: host-provisioned scope and consent", () => {
     if (!res.ok) expect(res.error.code).toBe("internal");
   });
 
-  it("refuses a static grants snapshot: no supported config can forward revoked grants", () => {
-    // Consent must be re-readable per request, so grants have no static
+  it("refuses a static grants snapshot: no supported config can forward revoked grants", () => {    // Consent must be re-readable per request, so grants have no static
     // form at all — misconfiguration fails fast at creation, and every
     // construction below carries a live provider.
     expect(() =>
@@ -121,6 +120,17 @@ describe("seam adapter: host-provisioned scope and consent", () => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
     ).toThrow(/per-request provider/);
+  });
+
+  it("refuses a relative projectRoot: scope must never depend on sidecar cwd", () => {
+    // Reads (unlike writes) accept relative roots at the dispatcher, so a
+    // relative adapter root would make read scope cwd-dependent. The
+    // documented absolute-root contract is enforced at creation instead.
+    for (const root of ["relative/path", "../up", ".", ""]) {
+      expect(() => createSeamAdapter({ projectRoot: root, grantedCapabilities: () => [] })).toThrow(/absolute projectRoot/);
+    }
+    expect(() => createSeamAdapter({ projectRoot: "/repo/p", grantedCapabilities: () => [] })).not.toThrow();
+    expect(() => createSeamAdapter({ projectRoot: "C:\\repo\\p", grantedCapabilities: () => [] })).not.toThrow();
   });
 
   it("capabilities() reports what the seam transport will permit", async () => {

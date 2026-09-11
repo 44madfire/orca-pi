@@ -185,7 +185,9 @@ the fork implements).
 
 Adapter responsibilities (all tested):
 
-- Bind one adapter per harness-authorized worktree (absolute root).
+- Bind one adapter per harness-authorized worktree (absolute root —
+  validated at creation, since reads as well as writes resolve under it
+  and a relative root would make scope cwd-dependent).
 - Validate each panel request, but **stamp the host-owned `worktree`
   scope before full `BridgeRequest` validation**: panels cannot know
   filesystem paths, so a correct panel mutation omits `worktree`

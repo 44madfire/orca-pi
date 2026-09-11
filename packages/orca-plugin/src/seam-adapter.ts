@@ -34,6 +34,7 @@
 
 import {
   BRIDGE_PROTOCOL_VERSION,
+  isAbsoluteProjectRoot,
   parseBridgeRequest,
   validateBridgeResponse,
   type BridgeOperation,
@@ -134,6 +135,14 @@ function internalError(requestId: string, message: string): BridgeResponse {
 export function createSeamAdapter(options: SeamAdapterOptions): SeamAdapter {
   const bin = options.orcaPiBin ?? "orca-pi";
   const root = options.projectRoot;
+  // The adapter documents `projectRoot` as the absolute host-authorized
+  // root: reads as well as writes resolve under it, so a relative root
+  // would make the scope depend on the sidecar's working directory
+  // instead of an explicit worktree. Reject it here (fail fast) rather
+  // than letting relative scopes through to reads.
+  if (!isAbsoluteProjectRoot(root)) {
+    throw new Error(`createSeamAdapter requires an absolute projectRoot (POSIX, drive-letter, or UNC/WSL); got ${JSON.stringify(root)}.`);
+  }
   if (typeof options.grantedCapabilities !== "function") {
     throw new Error("createSeamAdapter requires grantedCapabilities as a per-request provider function — static grant snapshots would keep forwarding stale grants after revocation.");
   }
