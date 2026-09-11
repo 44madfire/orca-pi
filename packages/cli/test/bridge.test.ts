@@ -82,30 +82,36 @@ function parseOut(d: { __out: string[] }): unknown {
 }
 
 describe("orca-pi bridge sidecar", () => {
-  it("serves bridge.capabilities with the seam handshake proven by invocation", async () => {
+  it("serves bridge.capabilities with operator authority (permitted = full set)", async () => {
     const d = deps();
     const result = await run(
       ["bridge", "--request", JSON.stringify({ protocolVersion: 1, requestId: "s1", operation: "bridge.capabilities" }), "--json"],
       d,
     );
     expect(result.exitCode).toBe(0);
-    const response = parseOut(d) as { ok: boolean; requestId: string; result: { structured: boolean; fallback: string } };
+    const response = parseOut(d) as {
+      ok: boolean;
+      requestId: string;
+      result: { transport: { mode: string }; permittedOperations: string[] };
+    };
     expect(response.ok).toBe(true);
     expect(response.requestId).toBe("s1");
-    // Sidecar invocation proves the transport; host facts stay unknown
-    // unless passed, so render support gates fail-closed while the
-    // transport block records the sidecar path.
-    expect(response.result.structured).toBe(false);
-    expect(JSON.stringify(response.result)).toMatch(/sidecar/);
+    // Default CLI mode is local operator authority: the shell authorizes
+    // the call, so every operation is permitted here. Panels never use
+    // this mode — they go through `--transport seam`.
+    expect(response.result.transport.mode).toBe("operator");
+    expect(response.result.permittedOperations).toContain("profile.mutate");
   });
 
-  it("reports structured when the harness declares host facts (sidecar transport proven)", async () => {
+  it("reports structured when the harness declares host facts in seam mode", async () => {
     const d = deps();
     const result = await run(
       [
         "bridge",
         "--request",
         JSON.stringify({ protocolVersion: 1, requestId: "s2", operation: "bridge.capabilities" }),
+        "--transport",
+        "seam",
         "--host-app-version",
         "1.4.199",
         "--host-plugin-api",
@@ -117,11 +123,55 @@ describe("orca-pi bridge sidecar", () => {
       d,
     );
     expect(result.exitCode).toBe(0);
-    const response = parseOut(d) as { ok: boolean; result: { structured: boolean; fallback: string; supportedOperations: string[] } };
+    const response = parseOut(d) as { ok: boolean; result: { structured: boolean; fallback: string; supportedOperations: string[]; permittedOperations: string[] } };
     expect(response.ok).toBe(true);
     expect(response.result.structured).toBe(true);
     expect(response.result.fallback).toBe("structured");
     expect(response.result.supportedOperations).toContain("profile.mutate");
+    // Capabilities match what the transport will permit.
+    expect(response.result.permittedOperations).toContain("profile.mutate");
+  });
+
+  it("blocks reads and mutations in seam mode without host facts (fail-closed)", async () => {
+    const seam = ["--transport", "seam", "--project-root", "/repo/p"];
+    const list = await run(
+      ["bridge", "--request", JSON.stringify({ protocolVersion: 1, requestId: "g1", operation: "profiles.list" }), ...seam, "--json"],
+      deps(),
+    );
+    expect(list.exitCode).toBe(1);
+    const mutateDeps = deps();
+    const mutate = await run(
+      [
+        "bridge",
+        "--request",
+        JSON.stringify({
+          protocolVersion: 1,
+          requestId: "g2",
+          operation: "profile.mutate",
+          worktree: { projectRoot: "/repo/p" },
+          params: { action: "create", name: "blocked", scope: "project" },
+        }),
+        ...seam,
+        "--json",
+      ],
+      mutateDeps,
+    );
+    expect(mutate.exitCode).toBe(1);
+    const response = parseOut(mutateDeps) as { ok: boolean; error: { code: string } };
+    expect(response.ok).toBe(false);
+    // Consent is unverified (no grants declared) → auth/setup, and nothing
+    // was written.
+    expect(response.error.code).toBe("auth/setup");
+    expect([...mutateDeps.fs.files.keys()].some((k) => k.includes("blocked"))).toBe(false);
+  });
+
+  it("rejects unknown --transport values (exit 2)", async () => {
+    const d = deps();
+    const result = await run(
+      ["bridge", "--request", JSON.stringify({ protocolVersion: 1, requestId: "t1", operation: "bridge.capabilities" }), "--transport", "panel", "--json"],
+      d,
+    );
+    expect(result.exitCode).toBe(2);
   });
 
   it("returns live profile data (builtins with empty stores)", async () => {

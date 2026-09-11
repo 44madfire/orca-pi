@@ -119,12 +119,22 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
 2. **CLI sidecar (implemented, current transport).** `orca-pi bridge
    --request '<json|@file>'` executes one versioned `BridgeRequest` per
    call through `bridge-host.ts` and prints a versioned `BridgeResponse`
-   (see `packages/cli/src/commands/bridge.ts`). The invocation itself is
-   the seam handshake (`seamAvailable: true`); Orca host facts the sidecar
-   cannot observe stay unknown unless the harness declares them
-   (`--host-app-version` / `--host-plugin-api` / `--granted-capability`,
-   fail-closed when omitted). Panels reach the bridge where the seam
-   harness injects `window.__ORCA_PI_BRIDGE__.request`; the worker entry
+   (see `packages/cli/src/commands/bridge.ts`). Two authority modes
+   (explicit `--transport`):
+   - `operator` (default): a human invoking the CLI directly. The local
+     shell already authorizes the call, so the seam consent gate does not
+     apply — but root pinning to `--project-root` still does. Never use
+     this mode to forward untrusted panel requests.
+   - `seam`: the seam adapter forwarding a panel request. Host facts
+     (`--host-app-version` / `--host-plugin-api` /
+     `--granted-capability`) plus the invocation-as-handshake gate every
+     structured operation exactly like the panel path; unknown facts
+     degrade fail-closed. `bridge.capabilities` reports
+     `permittedOperations` — what the chosen transport will actually
+     permit — alongside the panel-oriented `structured` signal (the two
+     always agree on `"seam"`).
+   Panels reach the bridge where the seam harness injects
+   `window.__ORCA_PI_BRIDGE__.request` (contract below); the worker entry
    (`worker-entry.mjs`) stays degraded until the harness signals
    `ORCA_PI_BRIDGE_SEAM=1` / `seamAvailable`.
 3. **Narrow Orca core seam / scoped execution capability** — the
@@ -158,6 +168,40 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
 without the seam harness stays explicitly degraded/read-only; no
 "structured available" claim is made there (negotiation is seam-gated
 and fail-closed — see below).
+
+## Seam adapter + fork-side injection contract
+
+The harness-side adapter lives in this repo
+(`packages/orca-plugin/src/seam-adapter.ts`, `createSeamAdapter`); the
+`window.__ORCA_PI_BRIDGE__` injection lives in the Orca fork's panel host
+(this repo cannot modify Orca's panel loader — the contract below is what
+the fork implements).
+
+Adapter responsibilities (all tested):
+
+- Bind one adapter per harness-authorized worktree (absolute root).
+- Validate each panel request (`parseBridgeRequest`) before spawning.
+- **Stamp** `worktree.projectRoot` from the harness root, overwriting any
+  panel-supplied scope wholesale — panels never select the filesystem
+  scope (`workspace.readContext` carries no path).
+- Forward host facts and invoke `orca-pi bridge --transport seam
+  --request … --project-root <root> --host-app-version …
+  --host-plugin-api … --granted-capability … --json`, so missing consent
+  blocks reads and mutations at the dispatcher (`auth/setup`).
+- Verify the sidecar response (JSON shape + `requestId` echo); transport
+  failures degrade to `internal` without trusting output.
+
+Fork-side injection contract (`window.__ORCA_PI_BRIDGE__`):
+
+- Shape: `{ request(req: BridgeRequest): Promise<BridgeResponse> }`.
+- Installed only inside approved plugin panels (never ambient pages),
+  before panel scripts run, bound to the panel's worktree session.
+- `request` forwards through the adapter above (never directly to the
+  dispatcher, never with panel-chosen roots or grants).
+- Panels confirm `bridge.capabilities` reports `structured: true` (and the
+  op in `supportedOperations`) before any data call; otherwise they stay
+  on the explicit CLI fallback. The dispatcher re-checks everything
+  regardless — the panel check is UX, the host gate is security.
 
 ## Bridge contract (owned by Orca-Pi)
 
@@ -250,6 +294,13 @@ and fail-closed — see below).
   carry `redacted: true`).
 - Project-profile mutations are scoped to the current/explicit
   worktree/project root; delayed requests carry the submission-time scope.
+  Panel-supplied roots are never trusted: the seam adapter stamps the
+  harness-authorized root over them, and the dispatcher pins request roots
+  to the transport-authorized root (`untrusted-scope` rejection).
+- Authority modes are separated: the CLI's default `operator` transport is
+  local-shell authority (never for forwarded panel requests); the seam
+  adapter always uses `--transport seam` with host-reported facts so
+  missing consent blocks reads and mutations at the dispatcher.
 
 ## Compatibility
 

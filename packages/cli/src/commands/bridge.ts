@@ -1,20 +1,22 @@
 /**
  * `orca-pi bridge` CLI sidecar (UI1.2).
  *
- * The actual current transport for the versioned panel↔bridge protocol:
- * the seam harness (or an operator) invokes one bridge request per CLI
- * call and receives a versioned `BridgeResponse` with a stable request ID
- * and a machine-readable error code. The invocation itself is the seam
- * handshake, so `bridge.capabilities` reached this way reports
- * `seamAvailable: true`; host facts the sidecar cannot observe (Orca app
- * version, pluginApi, granted capabilities) stay unknown unless the caller
- * passes `--host-app-version` / `--host-plugin-api` /
- * `--granted-capability` explicitly (fail-closed when omitted).
+ * One versioned `BridgeRequest` per call, one versioned `BridgeResponse`
+ * out. Two authority modes (explicit `--transport`):
+ * - `operator` (default): a human invoking the CLI directly. The local
+ *   shell already authorizes the call, so the seam consent gate does not
+ *   apply — but root pinning to `--project-root` still does.
+ * - `seam`: the seam harness/adapter forwarding a panel request. Host
+ *   facts (`--host-app-version` / `--host-plugin-api` /
+ *   `--granted-capability`) plus the invocation-as-handshake gate every
+ *   structured operation exactly as the panel path requires; unknown
+ *   facts degrade fail-closed. Never use `operator` to forward untrusted
+ *   panel requests — the adapter always uses `seam`.
  *
  * ```text
- * orca-pi bridge --request '<json|@file>' [--project-root <path>]
- *   [--host-app-version <x.y.z>] [--host-plugin-api <n>]
- *   [--granted-capability <kind> ...] [--json]
+ * orca-pi bridge --request '<json|@file>' [--transport operator|seam]
+ *   [--project-root <path>] [--host-app-version <x.y.z>]
+ *   [--host-plugin-api <n>] [--granted-capability <kind> ...] [--json]
  * ```
  *
  * `--request` is a single `BridgeRequest` object (inline JSON or `@file`).
@@ -46,7 +48,7 @@ export interface BridgeCommandResult {
 }
 
 export const BRIDGE_USAGE =
-  "usage: orca-pi bridge --request '<json|@file>' [--project-root <path>] [--host-app-version <x.y.z>] [--host-plugin-api <n>] [--granted-capability <kind> ...] [--json]\n";
+  "usage: orca-pi bridge --request '<json|@file>' [--transport operator|seam] [--project-root <path>] [--host-app-version <x.y.z>] [--host-plugin-api <n>] [--granted-capability <kind> ...] [--json]\n";
 
 function isHelpFlag(arg: string): boolean {
   return arg === "--help" || arg === "-h" || arg === "help";
@@ -109,6 +111,7 @@ export async function runBridgeCommand(
 ): Promise<BridgeCommandResult> {
   let requestRaw: string | undefined;
   let projectRoot: string | undefined;
+  let transport: "operator" | "seam" = "operator";
   let hostAppVersion: string | undefined;
   let hostPluginApi: number | undefined;
   const grantedCapabilities: string[] = [];
@@ -130,6 +133,15 @@ export async function runBridgeCommand(
       const taken = takeValue(args, index, "--project-root");
       if (taken.error) unknown.push(taken.error);
       else projectRoot = taken.value;
+      index += taken.consumed;
+    } else if (arg === "--transport" || arg.startsWith("--transport=")) {
+      const taken = takeValue(args, index, "--transport");
+      if (taken.error) unknown.push(taken.error);
+      else if (taken.value !== "operator" && taken.value !== "seam") {
+        unknown.push(`--transport must be "operator" or "seam" (got ${JSON.stringify(taken.value)})`);
+      } else {
+        transport = taken.value;
+      }
       index += taken.consumed;
     } else if (arg === "--host-app-version" || arg.startsWith("--host-app-version=")) {
       const taken = takeValue(args, index, "--host-app-version");
@@ -204,11 +216,11 @@ export async function runBridgeCommand(
   const bridgeFs = asBridgeFs(deps.fs);
   const response = await handleBridgeRequest(request, {
     projectRoot: effectiveProjectRoot,
-    // Operator authority: this local invocation proves the transport, so
-    // the seam consent gate does not apply — but the request scope is
-    // still pinned to the authorized root (finding: one worktree's call
-    // must never address another's config).
-    transport: "sidecar",
+    // Authority basis: `operator` (local shell, the default) skips the
+    // seam consent gate; `seam` (adapter-forwarded panel requests) is
+    // gated exactly like the panel path, with this invocation counting
+    // as the seam handshake. Root pinning applies in both modes.
+    transport,
     trustedProjectRoot: effectiveProjectRoot,
     ...(deps.env !== undefined ? { env: deps.env } : {}),
     ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
@@ -221,9 +233,10 @@ export async function runBridgeCommand(
       ...(hostAppVersion !== undefined ? { appVersion: hostAppVersion } : {}),
       ...(hostPluginApi !== undefined ? { pluginApi: hostPluginApi } : {}),
       ...(grantedCapabilities.length > 0 ? { grantedCapabilities } : {}),
-      // The sidecar invocation itself proves the transport: this request
-      // reached the bridge host, so the seam handshake holds here.
-      seamAvailable: true,
+      // In `seam` mode this invocation (by the seam harness) counts as the
+      // seam handshake; versions/grants still come only from explicit
+      // flags and degrade fail-closed when absent.
+      ...(transport === "seam" ? { seamAvailable: true } : {}),
     },
   });
 

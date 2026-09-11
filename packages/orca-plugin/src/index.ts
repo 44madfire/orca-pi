@@ -37,6 +37,12 @@ export {
 } from "./bridge.js";
 export { handleBridgeRequest, type BridgeHostDeps } from "./bridge-host.js";
 export {
+  createSeamAdapter,
+  type SeamAdapter,
+  type SeamAdapterOptions,
+  type SeamHostFacts,
+} from "./seam-adapter.js";
+export {
   createBridgeWorker,
   type BridgeWorker,
   type BridgeWorkerInit,

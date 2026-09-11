@@ -58,9 +58,9 @@ function deps(overrides?: Partial<BridgeHostDeps>): BridgeHostDeps {
   const fs = memFs();
   return {
     projectRoot: "/repo/p",
-    // Dispatcher behavior tests use operator (sidecar-equivalent) transport:
-    // the consent/seam gate below is covered by dedicated enforcement tests.
-    transport: "sidecar",
+    // Dispatcher behavior tests use local operator transport (the consent
+    // gate below is covered by dedicated enforcement tests).
+    transport: "operator",
     env: { HOME: "/home/u" } as NodeJS.ProcessEnv,
     homedir: "/home/u",
     fs,

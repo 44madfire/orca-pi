@@ -32,6 +32,7 @@
  */
 
 import {
+  BRIDGE_OPERATIONS,
   BRIDGE_PROTOCOL_VERSION,
   BRIDGE_VERSION,
   bridgeFail,
@@ -71,17 +72,19 @@ export interface BridgeHostDeps {
   /** Injectable credential fs for GitHub doctor (tests stub; prod resolves node:fs). */
   providerFs?: import("@orca-pi/core").CredentialProviderFs;
   /**
-   * Transport carrying this request.
+   * Transport carrying this request (authority basis).
    * - `"seam"` (default): panel path. Structured operations require
    *   negotiated `structured` support (versions + `workspace:read` consent
    *   + seam handshake); anything beyond `DEGRADED_SAFE_OPERATIONS` is
    *   rejected while unstructured, so "missing consent → degraded" is a
    *   host-enforced property, not UI metadata.
-   * - `"sidecar"`: local operator invocation (`orca-pi bridge`). The
-   *   operator's shell already authorizes the call, so the consent gate
-   *   does not apply — but root pinning below still does.
+   * - `"operator"`: local shell authority (`orca-pi bridge`, the default
+   *   CLI mode). A human invoking the CLI directly already authorizes the
+   *   call, so the consent gate does not apply — but root pinning below
+   *   still does. Never use this mode to forward untrusted panel
+   *   requests; the seam adapter always uses `"seam"`.
    */
-  transport?: "seam" | "sidecar";
+  transport?: "seam" | "operator";
   /**
    * Authoritative root the transport authorized (sidecar `--project-root`,
    * seam-injected worktree root). When set, a request-supplied
@@ -205,7 +208,7 @@ function enforceTransportGate(request: BridgeRequest, deps: BridgeHostDeps): Bri
     }
   }
   const transport = deps.transport ?? "seam";
-  if (transport !== "seam") return undefined;
+  if (transport === "operator") return undefined;
   if ((DEGRADED_SAFE_OPERATIONS as readonly string[]).includes(request.operation)) return undefined;
   const negotiation = negotiateBridgeCapabilities(deps.hostInfo);
   if (negotiation.structured) return undefined;
@@ -282,14 +285,27 @@ async function dispatch(request: BridgeRequest, deps: BridgeHostDeps): Promise<u
 
 function capabilitiesResult(deps: BridgeHostDeps): unknown {
   const negotiation = negotiateBridgeCapabilities(deps.hostInfo);
+  const transport = deps.transport ?? "seam";
+  // `structured` is the panel-path signal (versions + consent +
+  // handshake). `permittedOperations` is what THIS dispatcher will serve:
+  // identical on the seam transport, the full set under local operator
+  // authority. Operators consult `permittedOperations`; panels consult
+  // `structured`. The two always agree on `"seam"`.
+  const permittedOperations: readonly unknown[] =
+    transport === "operator" ? BRIDGE_OPERATIONS : negotiation.supportedOperations;
   return {
     ...negotiation,
+    permittedOperations,
     upstream: {
       commit: "9aa0f7e77d366c23a3cc8de2da32ae550d397dc0",
       appVersion: "1.4.196+ (re-audited 2026-09-11; Host API v0 unchanged — no process:exec/filesystem API)",
     },
     transport: {
-      primary: "versioned bridge host via the `orca-pi bridge --request` CLI sidecar (invocation proves the transport); generic scoped-exec/plugin-service seam is the upstreamable future — no Pi policy in Orca core",
+      mode: transport,
+      primary:
+        transport === "operator"
+          ? "local operator shell (`orca-pi bridge`, default mode): the invoking shell already authorizes the call; root pinning still applies"
+          : "seam harness (`orca-pi bridge --transport seam` or the adapter): host-reported versions/grants/handshake gate every structured operation; generic scoped-exec/plugin-service seam is the upstreamable future — no Pi policy in Orca core",
       degraded: "explicit user-triggered terminal.sendText for read-only CLI commands only (never auto-sent, never parsed)",
       noSecondStore: true,
     },
