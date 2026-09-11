@@ -180,11 +180,18 @@ the fork implements).
 Adapter responsibilities (all tested):
 
 - Bind one adapter per harness-authorized worktree (absolute root).
-- Validate each panel request (`parseBridgeRequest`) before spawning.
-- **Stamp** `worktree.projectRoot` from the harness root, overwriting any
-  panel-supplied scope wholesale — panels never select the filesystem
-  scope (`workspace.readContext` carries no path).
-- Forward host facts and invoke `orca-pi bridge --transport seam
+- Validate each panel request, but **stamp the host-owned `worktree`
+  scope before full `BridgeRequest` validation**: panels cannot know
+  filesystem paths, so a correct panel mutation omits `worktree`
+  entirely — and validation requires an absolute root for writes.
+  Validating the unstamped input first would reject exactly the requests
+  the adapter exists to complete. Panel-supplied scope never survives
+  stamping (overwritten wholesale, not merged).
+- Resolve host facts **fresh on every forwarded request** (provider
+  function preferred over a static snapshot): consent revocation takes
+  effect on the next call with no adapter rebuild, matching the audited
+  Orca bridge's per-action re-check in main.
+- Forward facts and invoke `orca-pi bridge --transport seam
   --request … --project-root <root> --host-app-version …
   --host-plugin-api … --granted-capability … --json`, so missing consent
   blocks reads and mutations at the dispatcher (`auth/setup`).

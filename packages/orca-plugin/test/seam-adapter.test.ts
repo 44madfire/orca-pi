@@ -8,6 +8,7 @@
  * Uses an injected fake spawn — no real processes.
  */
 import { describe, expect, it } from "vitest";
+import { handleBridgeRequest } from "../src/bridge-host.js";
 import { createSeamAdapter } from "../src/seam-adapter.js";
 
 function fakeSpawn(
@@ -108,5 +109,109 @@ describe("seam adapter: host-provisioned scope and consent", () => {
     const res = await adapter.capabilities("cap-1");
     expect(res.requestId).toBe("cap-1");
     expect(fake.calls).toHaveLength(1);
+  });
+
+  it("forwards panel mutations that omit filesystem scope (root stamped before validation)", async () => {
+    const fake = fakeSpawn(echoBridge);
+    const adapter = createSeamAdapter({
+      projectRoot: "/repo/p",
+      hostFacts: { appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: ["workspace:read"] },
+      spawn: fake.spawn,
+    });
+    // A correctly-designed panel mutation carries no worktree: panels
+    // cannot know filesystem paths. The adapter must stamp the harness
+    // root BEFORE full validation (which requires an absolute root for
+    // writes) — validating the unstamped input first would reject it.
+    const res = await adapter.forward({
+      protocolVersion: 1,
+      requestId: "m1",
+      operation: "profile.mutate",
+      params: { action: "create", name: "stamped", scope: "project" },
+    });
+    expect(res.ok).toBe(true);
+    expect(fake.calls).toHaveLength(1);
+    const sent = JSON.parse(fake.calls[0]!.args[fake.calls[0]!.args.indexOf("--request") + 1] as string) as {
+      worktree: { projectRoot: string };
+    };
+    expect(sent.worktree.projectRoot).toBe("/repo/p");
+  });
+
+  it("stamped scopeless mutations succeed through the seam dispatcher", async () => {
+    const files = new Map<string, string>();
+    const memfs = {
+      async readFile(path: string) {
+        if (!files.has(path)) {
+          const error = new Error(`ENOENT: ${path}`) as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return files.get(path)!;
+      },
+      async writeFile(path: string, content: string) {
+        files.set(path, content);
+      },
+      async rename(from: string, to: string) {
+        files.set(to, files.get(from)!);
+        files.delete(from);
+      },
+      async mkdir() {
+        return undefined;
+      },
+    };
+    const fake = fakeSpawn(echoBridge);
+    const adapter = createSeamAdapter({
+      projectRoot: "/repo/p",
+      hostFacts: { appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: ["workspace:read"] },
+      spawn: fake.spawn,
+    });
+    await adapter.forward({
+      protocolVersion: 1,
+      requestId: "m2",
+      operation: "profile.mutate",
+      params: { action: "create", name: "stamped-live", scope: "project" },
+    });
+    const sent = JSON.parse(fake.calls[0]!.args[fake.calls[0]!.args.indexOf("--request") + 1] as string);
+    const verdict = await handleBridgeRequest(sent, {
+      transport: "seam",
+      projectRoot: "/repo/p",
+      trustedProjectRoot: "/repo/p",
+      env: { HOME: "/home/u" } as NodeJS.ProcessEnv,
+      homedir: "/home/u",
+      fs: memfs as unknown as import("@orca-pi/core").MutationFs,
+      hostInfo: { appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: ["workspace:read"], seamAvailable: true },
+    });
+    expect(verdict.ok).toBe(true);
+    expect([...files.keys()].some((k) => k.includes(".pi/profiles.yaml"))).toBe(true);
+  });
+
+  it("re-reads consent per request: revocation blocks without rebuilding the adapter", async () => {
+    let grants: string[] = ["workspace:read"];
+    const fake = fakeSpawn(echoBridge);
+    const adapter = createSeamAdapter({
+      projectRoot: "/repo/p",
+      hostFacts: () => ({ appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: grants }),
+      spawn: fake.spawn,
+    });
+    const granted = () =>
+      fake.calls.length > 0
+        ? fake.calls[fake.calls.length - 1]!.args.filter((a, i, arr) => arr[i - 1] === "--granted-capability")
+        : [];
+    await adapter.forward({ protocolVersion: 1, requestId: "g1", operation: "profiles.list" });
+    expect(granted()).toContain("workspace:read");
+    // Consent revoked while the adapter stays alive: the NEXT forwarded
+    // request must carry the revoked set, and the dispatcher must reject
+    // structured reads with auth/setup — no adapter rebuild.
+    grants = [];
+    await adapter.forward({ protocolVersion: 1, requestId: "g2", operation: "profiles.list" });
+    expect(granted()).not.toContain("workspace:read");
+    const sent = JSON.parse(fake.calls[1]!.args[fake.calls[1]!.args.indexOf("--request") + 1] as string);
+    const verdict = await handleBridgeRequest(sent, {
+      transport: "seam",
+      projectRoot: "/repo/p",
+      trustedProjectRoot: "/repo/p",
+      hostInfo: { appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: grants, seamAvailable: true },
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.error.code).toBe("auth/setup");
   });
 });

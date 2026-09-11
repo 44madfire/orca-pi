@@ -54,8 +54,15 @@ export interface SeamAdapterOptions {
   projectRoot: string;
   /** orca-pi binary (default `"orca-pi"` on PATH; harness may pass absolute). */
   orcaPiBin?: string;
-  /** Host-reported facts forwarded with every request (absent = unknown = degraded). */
-  hostFacts?: SeamHostFacts;
+  /**
+   * Host-reported facts forwarded with every request (absent = unknown =
+   * degraded). Accepts a **provider function** (preferred: resolved fresh
+   * on every forwarded request so consent revocation takes effect
+   * immediately) or a static snapshot object. The audited Orca panel
+   * bridge re-checks capabilities in main for every action; a static
+   * snapshot would keep forwarding stale grants after revocation.
+   */
+  hostFacts?: SeamHostFacts | (() => SeamHostFacts);
   /** Injectable spawn (tests); defaults to bounded `execFile`. */
   spawn?: (
     bin: string,
@@ -116,11 +123,12 @@ function internalError(requestId: string, message: string): BridgeResponse {
 export function createSeamAdapter(options: SeamAdapterOptions): SeamAdapter {
   const bin = options.orcaPiBin ?? "orca-pi";
   const root = options.projectRoot;
-  const facts = options.hostFacts ?? {};
+  const resolveFacts = (): SeamHostFacts =>
+    typeof options.hostFacts === "function" ? options.hostFacts() : (options.hostFacts ?? {});
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const spawn = options.spawn ?? ((b, a) => defaultSpawn(b, a, timeoutMs));
 
-  async function invoke(stamped: Record<string, unknown>): Promise<BridgeResponse> {
+  async function invoke(stamped: Record<string, unknown>, facts: SeamHostFacts): Promise<BridgeResponse> {
     const requestId = typeof stamped["requestId"] === "string" ? (stamped["requestId"] as string) : "unknown";
     const args: string[] = [
       "bridge",
@@ -165,14 +173,30 @@ export function createSeamAdapter(options: SeamAdapterOptions): SeamAdapter {
 
   return {
     async capabilities(requestId = "seam-capabilities-1"): Promise<BridgeResponse> {
-      return await invoke({
-        protocolVersion: BRIDGE_PROTOCOL_VERSION,
-        requestId,
-        operation: "bridge.capabilities" satisfies BridgeOperation,
-      });
+      return await invoke(
+        {
+          protocolVersion: BRIDGE_PROTOCOL_VERSION,
+          requestId,
+          operation: "bridge.capabilities" satisfies BridgeOperation,
+        },
+        resolveFacts(),
+      );
     },
     async forward(data: unknown): Promise<BridgeResponse> {
-      const parsed = parseBridgeRequest(data);
+      // Stamp the host-owned scope BEFORE full BridgeRequest validation:
+      // panels cannot know filesystem paths (workspace.readContext
+      // exposes none), so a correctly-designed panel mutation omits
+      // `worktree` entirely — and `parseBridgeRequest` requires an
+      // absolute root for writes. Validating the unstamped panel input
+      // first would reject exactly the requests the adapter exists to
+      // complete. The spread below is the only pre-validation needed to
+      // copy the envelope safely; non-objects fall through to
+      // `parseBridgeRequest` for the proper validation error.
+      const candidate =
+        data !== null && typeof data === "object" && !Array.isArray(data)
+          ? { ...(data as Record<string, unknown>), worktree: { projectRoot: root } }
+          : data;
+      const parsed = parseBridgeRequest(candidate);
       if (!parsed.ok) {
         return {
           protocolVersion: BRIDGE_PROTOCOL_VERSION,
@@ -181,15 +205,16 @@ export function createSeamAdapter(options: SeamAdapterOptions): SeamAdapter {
           error: parsed.error,
         };
       }
-      // Host-provisioned scope: any panel-supplied worktree claim is
-      // replaced wholesale — panels never select the filesystem scope
-      // (a panel-provided worktreeId/terminalId is dropped with it; the
-      // harness re-attaches host-known terminal identity when needed).
+      // Host-provisioned scope: any panel-supplied worktree claim was
+      // already replaced wholesale above — panels never select the
+      // filesystem scope (a panel-provided worktreeId/terminalId is
+      // dropped with it; the harness re-attaches host-known terminal
+      // identity when needed).
       const stamped: Record<string, unknown> = {
         ...(parsed.request as unknown as Record<string, unknown>),
         worktree: { projectRoot: root },
       };
-      return await invoke(stamped);
+      return await invoke(stamped, resolveFacts());
     },
   };
 }
