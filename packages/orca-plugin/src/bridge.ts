@@ -691,31 +691,19 @@ export function describeTerminalFallback(
       error: { code: "validation", message: "Degraded terminal.sendText requires non-empty CLI text (1-4096 chars)." },
     };
   }
-  // Strict command grammar: the degraded fallback submits with Enter, so
-  // a prefix-only allowlist would admit shell chaining (`orca-pi doctor;
-  // touch /tmp/pwn`). Instead (1) reject any shell metacharacter outright
-  // and (2) match the full token argv against the intended read-only
-  // grammar — fixed templates plus structurally-validated arguments.
-  // Profile names reuse the `[a-z0-9-]+` rule so no flag/value injection
-  // is possible in argument position.
+  // Strict command grammar (single complete validator — see
+  // `isAllowlistedFallbackArgv`): the degraded fallback submits with
+  // Enter, so a prefix-only allowlist would admit shell chaining
+  // (`orca-pi doctor; touch /tmp/pwn`). Profile names reuse the
+  // `[a-z0-9-]+` rule so no flag/value injection is possible in argument
+  // position.
   const trimmed = text.trim();
-  const metacharacter = /[;&|<>`$()\\"'\n\r]/.exec(trimmed);
-  if (metacharacter) {
-    return {
-      ok: false,
-      error: {
-        code: "validation",
-        message: `Degraded terminal.sendText refuses text containing shell metacharacter ${JSON.stringify(metacharacter[0])}: only fixed read-only orca-pi commands may be offered as explicit fallback (mutations require the structured bridge).`,
-        detail: "degraded-allowlist-only",
-      },
-    };
-  }
   if (!isAllowlistedFallbackArgv(trimmed)) {
     return {
       ok: false,
       error: {
         code: "validation",
-        message: `Degraded terminal.sendText refuses non-allowlisted text ${JSON.stringify(trimmed.slice(0, 80))}: only read-only orca-pi CLI commands (doctor, profiles list, profile show/inspect/validate/path/read with validated arguments) may be offered as explicit fallback. Mutations require the structured bridge.`,
+        message: `Degraded terminal.sendText refuses non-allowlisted text ${JSON.stringify(trimmed.slice(0, 80))}: only fixed read-only orca-pi commands with validated arguments may be offered as explicit fallback (shell metacharacters, chaining, line breaks, and off-grammar text are rejected; mutations require the structured bridge).`,
         detail: "degraded-allowlist-only",
       },
     };
@@ -733,9 +721,14 @@ export function describeTerminalFallback(
 const PROFILE_NAME_TOKEN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /**
- * Strict argv grammar for degraded-fallback text (see above). Tokens are
- * split on whitespace (no quoting — quotes are rejected as
- * metacharacters), and every token must belong to the template:
+ * Strict argv grammar for degraded-fallback text — the single complete
+ * validator (both `describeTerminalFallback` and external panels/harness
+ * reuse delegate here, so every public validation path enforces the same
+ * rule). Rejects shell metacharacters and line breaks FIRST (a newline
+ * would submit two shell lines even when tokenization looks identical),
+ * then matches the full token argv. Tokens are split on whitespace (no
+ * quoting — quotes are rejected as metacharacters), and every token must
+ * belong to the template:
  *
  * ```text
  * orca-pi doctor [--json]
@@ -748,11 +741,13 @@ const PROFILE_NAME_TOKEN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
  * ```
  *
  * Path-override flags are deliberately excluded: the fallback always runs
- * against default config locations. Exported for panels/harness reuse and
- * tested as a matrix (chaining, pipes, redirection, substitution,
- * quotes, backticks, newlines, flag injection all rejected).
+ * against default config locations. Tested as a matrix (chaining, pipes,
+ * redirection, substitution, quotes, backticks, CR/LF line breaks, flag
+ * injection all rejected — including minimal same-token forms where an
+ * embedded newline tokenizes identically to the safe command).
  */
 export function isAllowlistedFallbackArgv(trimmed: string): boolean {
+  if (/[;&|<>`$()\\"'\n\r]/.test(trimmed)) return false;
   const tokens = trimmed.split(/\s+/);
   if (tokens.length < 2 || tokens[0] !== "orca-pi") return false;
   const rest = tokens.slice(1);

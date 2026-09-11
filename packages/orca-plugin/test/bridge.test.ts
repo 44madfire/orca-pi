@@ -346,6 +346,11 @@ describe("bridge protocol: degraded terminal.sendText descriptors", () => {
       'orca-pi doctor "x"',
       "orca-pi doctor 'x'",
       "orca-pi doctor\\",
+      "orca-pi\ndoctor",
+      "orca-pi\rdoctor",
+      "orca-pi\r\ndoctor",
+      "orca-pi profile show\nworker",
+      "orca-pi profile show\rworker",
       "orca-pi doctor\norca-pi spawn x",
       "orca-pi profile show worker;orca-pi spawn x",
       // Grammar violations (no metacharacters, still rejected).

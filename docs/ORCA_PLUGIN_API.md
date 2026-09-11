@@ -161,8 +161,9 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
    button, tested end-to-end in `panel-actions.test.ts`). Allowed text is
    a strict argv grammar (`isAllowlistedFallbackArgv`: fixed read-only
    templates plus structurally-validated profile-name/flag arguments —
-   shell metacharacters, chaining, pipes, redirection, substitution, and
-   quotes are all rejected, so `enter: true` cannot smuggle a suffix to
+   shell metacharacters, chaining, pipes, redirection, substitution,
+   quotes, and CR/LF line breaks are all rejected by that single
+   validator, so `enter: true` cannot smuggle a suffix or second line to
    the shell); mutations are never offered this way. The button handler
    calls `workspace.readContext` for an explicit `terminalId` (never
    “active”), shows the target, then sends once — never on load, never
