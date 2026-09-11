@@ -49,17 +49,24 @@ describe("orca-plugin artifact", () => {
     expect(panelHtml).toContain("orca-pi doctor");
   });
 
-  it("declares no worker main and no capabilities (declarative-only scaffold)", () => {
+  it("declares the bridge worker main and only the capabilities actually used", () => {
     const { manifest } = loadArtifact();
     const typed = manifest as {
       main?: string;
-      capabilities: unknown[];
+      capabilities: { kind: string }[];
       contributes: { commands: { action?: string }[] };
     };
-    expect(typed.main).toBeUndefined();
-    expect(typed.capabilities).toEqual([]);
+    // UI1.2: worker entry serves the versioned bridge; panels genuinely
+    // call workspace:read (fallback terminal target) + terminal:send
+    // (explicit user-triggered fallback only) — verified by
+    // panel-actions.test.ts against the shipped scripts. No
+    // storage/secrets/settings/notifications — nothing unused is declared.
+    expect(typed.main).toBe("worker-entry.mjs");
+    const kinds = typed.capabilities.map((cap) => cap.kind).sort();
+    expect(kinds).toEqual(["terminal:send", "workspace:read"]);
     // Every declared command must carry a built-in action alias: action-less
-    // commands are worker commands and would require a `main` entry.
+    // commands are worker commands and would require a `main` entry (we have
+    // one, but UI1.2 still ships no worker commands — invocations degrade).
     for (const command of typed.contributes.commands) {
       expect(typeof command.action).toBe("string");
     }

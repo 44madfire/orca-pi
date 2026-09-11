@@ -132,14 +132,37 @@ describe("profiles panel: rendering states", () => {
 });
 
 describe("profiles panel: feature detection and fallback", () => {
-  it("supports read-only summary on the targeted host, without persistence/editing", () => {
-    const support = detectPanelSupport({ appVersion: "1.4.196", pluginApi: 1 });
+  it("negotiates the structured bridge only with the seam handshake", () => {
+    const support = detectPanelSupport({
+      appVersion: "1.4.196",
+      pluginApi: 1,
+      grantedCapabilities: ["workspace:read", "terminal:send"],
+      seamAvailable: true,
+    });
     expect(support.supported).toBe(true);
     expect(support.readOnlySummary).toBe(true);
-    expect(support.liveReload).toBe(false);
-    expect(support.persistence).toBe(false);
+    expect(support.liveReload).toBe(true);
+    expect(support.persistence).toBe(true);
+    expect(support.editing).toBe(true);
+    expect(support.fallback).toBe("structured");
+    expect(support.degraded).toBe(false);
+    expect(support.bridgeVersion).toBe("1.0.0");
+    expect(support.supportedOperations).toContain("profile.mutate");
+    expect(support.supportedOperations).toContain("profiles.list");
+  });
+
+  it("stays degraded without the seam handshake (stock Orca has no panel↔bridge seam)", () => {
+    const support = detectPanelSupport({
+      appVersion: "1.4.196",
+      pluginApi: 1,
+      grantedCapabilities: ["workspace:read", "terminal:send"],
+    });
+    expect(support.supported).toBe(true);
+    expect(support.readOnlySummary).toBe(true);
     expect(support.editing).toBe(false);
+    expect(support.liveReload).toBe(false);
     expect(support.fallback).toBe("cli-only");
+    expect(support.degraded).toBe(true);
   });
 
   it("degrades gracefully on unsupported hosts without a hidden store", () => {
@@ -147,12 +170,26 @@ describe("profiles panel: feature detection and fallback", () => {
     expect(old.supported).toBe(false);
     expect(old.fallback).toBe("cli-only");
     expect(old.editing).toBe(false);
+    expect(old.degraded).toBe(true);
+    expect(old.liveReload).toBe(false);
     const future = detectPanelSupport({ appVersion: "1.4.196", pluginApi: 99 });
     expect(future.supported).toBe(false);
     expect(future.readOnlySummary).toBe(false);
+    expect(future.degraded).toBe(true);
   });
 
-  it("activates both declarative panels with no worker or capabilities", () => {
+  it("degrades when workspace:read consent is missing", () => {
+    const noConsent = detectPanelSupport({
+      appVersion: "1.4.196",
+      pluginApi: 1,
+      grantedCapabilities: ["terminal:send"],
+    });
+    expect(noConsent.degraded).toBe(true);
+    expect(noConsent.editing).toBe(false);
+    expect(noConsent.fallback).toBe("cli-only");
+  });
+
+  it("activates both panels with the bridge worker and minimal capabilities", () => {
     expect(activate()).toEqual({
       plugin: "44madfire.orca-pi",
       commands: [],
@@ -164,19 +201,41 @@ describe("profiles panel: feature detection and fallback", () => {
     const result = validatePluginManifest(manifest);
     expect(result.errors).toEqual([]);
     expect(result.ok).toBe(true);
+    // UI1.2 declares a worker main + only the capabilities actually called
+    // (workspace:read for the fallback target, terminal:send for the
+    // explicit user-triggered fallback — both verified end-to-end by
+    // panel-actions.test.ts). No storage/secrets/settings/notifications.
+    // `main` is the ESM Orca entry (default-exported activate(orca)).
+    const typed = manifest as { main?: string; capabilities: { kind: string }[] };
+    expect(typed.main).toBe("worker-entry.mjs");
+    const kinds = typed.capabilities.map((cap) => cap.kind).sort();
+    expect(kinds).toEqual(["terminal:send", "workspace:read"]);
+    expect(kinds).not.toContain("storage");
+    expect(kinds).not.toContain("secrets");
+    expect(kinds).not.toContain("settings:own");
+    expect(kinds).not.toContain("notifications:show");
   });
 
-  it("ships both panel entries with CLI fallback content and no escape hatch", () => {
+  it("ships both panel entries with bridge client + CLI fallback and no escape hatch", () => {
     const status = readFileSync(join(here, "..", "panel.html"), "utf8");
     const profiles = readFileSync(join(here, "..", "panel", "profiles.html"), "utf8");
     expect(status).toContain("Orca–Pi Profiles");
     expect(profiles).toContain("Orca–Pi Profiles");
     expect(profiles).toContain("orca-pi profiles list");
     expect(profiles).toContain("orca-pi profile validate");
+    // Structured bridge is the production path (not static injection),
+    // and panels confirm it via bridge.capabilities before any data call.
+    expect(profiles).toContain("__ORCA_PI_BRIDGE__");
+    expect(profiles).toContain("bridge.capabilities");
+    expect(profiles).toContain("profiles.list");
+    expect(status).toContain("__ORCA_PI_BRIDGE__");
+    expect(status).toContain("bridge.capabilities");
     // No undocumented bridge: no worker imports, filesystem requires, or fetch.
     expect(profiles).not.toContain("node:child_process");
     expect(profiles).not.toContain("node:fs");
     expect(profiles).not.toContain('require("fs")');
     expect(profiles).not.toContain("fetch(");
+    expect(status).not.toContain("fetch(");
+    expect(status).not.toContain("node:child_process");
   });
 });

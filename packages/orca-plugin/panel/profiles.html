@@ -1,21 +1,19 @@
 <!doctype html>
 <!--
-  Orca–Pi profiles panel (OP1.7 / JEF-11, read-only).
-  Static by design: the thin plugin must not depend on unrestricted
-  child_process, filesystem, or network access in the panel/worker. The
-  CLI/profile file is authoritative; this panel never creates a second
-  config store and never edits files.
-
-  Live data comes from the companion CLI:
-    orca-pi profiles list --json
-    orca-pi profile show <name>
-    orca-pi profile inspect <name> --context-summary
-    orca-pi profile validate
-    orca-pi profile path [--project|--user]
-
-  When a host bridge provides JSON (window.__ORCA_PI_PROFILES__), the
-  inline script below renders it. Otherwise the panel shows CLI fallback
-  content — no undocumented filesystem/process access is attempted.
+  Orca–Pi profiles panel (UI1.2 bridge).
+  Structured by design: live data flows through the versioned Orca↔Orca-Pi
+  bridge (profiles.list, profile.read, profile.validate, profile.mutate,
+  launch.preview with stable request IDs and
+  validation/conflict/unsupported/auth-setup/internal errors). The panel
+  never scrapes terminal output or YAML and never stores a second copy of
+  profiles in settings/storage. window.__ORCA_PI_PROFILES__ injection is
+  deprecated (legacy read-only fallback only) — the production path is the
+  typed bridge. Degraded hosts show explicit read-only CLI fallback with a
+  real user-triggered terminal.sendText action (explicit terminalId from
+  workspace.readContext, never auto-sent, never parsed).
+  Required capabilities (honest consent — every one is called below):
+  workspace:read (fallback terminal target), terminal:send (explicit
+  user-triggered fallback only).
 -->
 <html lang="en">
   <head>
@@ -29,16 +27,21 @@
       .muted { opacity: .75; }
       ul { padding-left: 1.25em; }
       #profiles-summary ul { margin: 0.5em 0; }
+      .bridge-ok { border-left: 4px solid #2da44e; padding-left: 8px; }
+      .bridge-degraded { border-left: 4px solid #d29922; padding-left: 8px; }
+      button { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid rgba(127,127,127,.5); background: transparent; cursor: pointer; }
+      button:disabled { opacity: .5; cursor: default; }
     </style>
   </head>
   <body>
     <div class="card">
       <h2>Orca–Pi Profiles</h2>
       <p class="muted">
-        Read-only summary of Pi role profiles: effective model/thinking, tool
-        count, skill names/count, extension count, context-file policy, and
-        validation state. The CLI/profile file is authoritative.
+        Pi role profiles via the structured bridge: effective model/thinking, tool
+        count, skill names/count, extension count, context-file policy, provenance
+        (builtin/user/project/inherited), and validation state. The CLI/profile file is authoritative.
       </p>
+      <div id="bridge-state"><p class="muted">Bridge: negotiating structured support (protocol 1, bridge 1.0.0)…</p></div>
       <div id="profiles-summary">
         <p><strong>No live data in the panel.</strong></p>
         <p>Run in a terminal for live diagnostics (read-only):</p>
@@ -51,35 +54,124 @@ orca-pi profile path</code></pre>
           Conservative actions: validate profiles, show/open/copy config
           location (<code>orca-pi profile path</code>), refresh/reload
           configuration (<code>orca-pi profiles list</code>). Editing happens
-          in config files only — the panel keeps no local store.
+          through the structured bridge (<code>profile.mutate</code> with explicit
+          user/project scope + source hash) — the panel keeps no local store.
         </p>
       </div>
-      <p class="muted">Targets Orca app 1.4.196 (pluginApi 1). See docs/ORCA_PLUGIN_API.md.</p>
+      <p class="muted">Targets Orca app 1.4.196+ (pluginApi 1, Host API v0 re-audited 2026-09-11). See docs/ORCA_PLUGIN_API.md.</p>
     </div>
     <script>
-      // Render host-provided JSON only; never fetch, spawn, or touch the
-      // filesystem. Hosts without a supported bridge keep the CLI fallback.
+      // Versioned bridge client + real Host API fallback (UI1.2, round 7).
+      // Never fetch, spawn, or touch the filesystem. Never scrapes terminal
+      // output. Legacy window.__ORCA_PI_PROFILES__ is honored only as a
+      // deprecated read-only fallback and labeled as such. The degraded path
+      // performs real Host API calls (workspace.readContext, then ONE
+      // user-gesture terminal.sendText of an allowlisted read-only command)
+      // over the panel postMessage bridge — exercised by
+      // packages/orca-plugin/test/panel-actions.test.ts against this file.
       (function () {
-        try {
-          var data = window.__ORCA_PI_PROFILES__;
-          if (!data || !data.profiles) return;
-          var root = document.getElementById("profiles-summary");
-          if (!root) return;
-          var esc = function (s) {
-            return String(s)
-              .replace(/&/g, "&amp;")
-              .replace(/</g, "&lt;")
-              .replace(/>/g, "&gt;")
-              .replace(/"/g, "&quot;")
-              .replace(/'/g, "&#39;");
-          };
-          if (data.profiles.length === 0) {
-            root.innerHTML = "<p><strong>No Pi profiles found.</strong> Run <code>orca-pi profile path</code> to locate configuration.</p>";
+        var PROTOCOL_VERSION = 1;
+        var PANEL_ACTION_REQUEST_TYPE = "orca-panel-action";
+        var PANEL_ACTION_RESULT_TYPE = "orca-panel-action-result";
+        var HOST_CALL_TIMEOUT_MS = 8000;
+        // Degraded fallback text for THIS panel. Read-only CLI only — the
+        // same allowlist as describeTerminalFallback() in bridge.ts (keep
+        // in sync; the panel-actions test cross-checks both directions).
+        var FALLBACK_CLI_TEXT = "orca-pi profile validate";
+        var counter = 0;
+        function newRequestId() {
+          counter += 1;
+          return "profiles-" + Date.now().toString(36) + "-" + counter + "-" + Math.random().toString(36).slice(2, 10);
+        }
+        function esc(s) {
+          return String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+        }
+        // Call one Host API method over the panel postMessage bridge.
+        // Resolves with the raw result message; ignores unrelated traffic.
+        function hostAction(action, params) {
+          return new Promise(function (resolve) {
+            var requestId = "host-" + Date.now().toString(36) + "-" + (counter += 1) + "-" + Math.random().toString(36).slice(2, 10);
+            var settled = false;
+            function done(value) {
+              if (settled) return;
+              settled = true;
+              try { window.removeEventListener("message", onMessage); } catch (e) {}
+              resolve(value);
+            }
+            function onMessage(event) {
+              var data = event && event.data;
+              if (!data || data.type !== PANEL_ACTION_RESULT_TYPE) return;
+              if (data.requestId !== requestId) return;
+              done(data);
+            }
+            try { window.addEventListener("message", onMessage); } catch (e) { done({ ok: false, requestId: requestId, error: "cannot listen for host replies" }); return; }
+            setTimeout(function () { done({ ok: false, requestId: requestId, error: "host call timed out" }); }, HOST_CALL_TIMEOUT_MS);
+            try {
+              window.parent.postMessage({ type: PANEL_ACTION_REQUEST_TYPE, requestId: requestId, action: action, params: params }, "*");
+            } catch (e) {
+              done({ ok: false, requestId: requestId, error: "cannot reach the host bridge" });
+            }
+          });
+        }
+        // Explicit user-triggered fallback: read the focused worktree's
+        // terminal list, then type the allowlisted CLI text into the shown
+        // terminal. Every step is user-visible; output is never read back.
+        function offerTerminalFallback(into) {
+          var wrap = document.createElement("div");
+          var btn = document.createElement("button");
+          btn.textContent = "Run `" + FALLBACK_CLI_TEXT + "` in a visible terminal";
+          var note = document.createElement("p");
+          note.setAttribute("class", "muted");
+          note.textContent = "Explicit action only: reads your focused worktree's terminal list, then runs one read-only command. Output is never read back into this panel.";
+          btn.addEventListener("click", function () {
+            btn.disabled = true;
+            note.textContent = "Reading focused worktree terminals (workspace.readContext)…";
+            hostAction("workspace.readContext").then(function (ctx) {
+              var value = ctx && ctx.ok ? ctx.value : null;
+              var terminals = (value && value.terminals) || [];
+              if (!terminals.length) {
+                note.textContent = "No visible terminal in the focused worktree — open one, then try again.";
+                btn.disabled = false;
+                return;
+              }
+              var terminalId = terminals[0].id;
+              note.textContent = "Running in terminal " + terminalId + " (explicit target — never the active terminal)…";
+              hostAction("terminal.sendText", { terminalId: terminalId, text: FALLBACK_CLI_TEXT, enter: true }).then(function (sent) {
+                var accepted = sent && sent.ok && sent.value && sent.value.accepted;
+                if (accepted) {
+                  note.textContent = "Sent to terminal " + terminalId + ". Check the terminal for output — it is never read back here.";
+                } else {
+                  note.textContent = "Terminal send failed (" + esc((sent && (sent.error || (sent.value && sent.value.error))) || "unavailable") + "). Nothing was executed blindly.";
+                  btn.disabled = false;
+                }
+              });
+            });
+          });
+          wrap.appendChild(btn);
+          wrap.appendChild(note);
+          into.appendChild(wrap);
+        }
+        function showDegraded(msg) {
+          var state = document.getElementById("bridge-state");
+          if (state) {
+            state.innerHTML = '<div class="bridge-degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">' + esc(msg) + '</span></p></div>';
+            offerTerminalFallback(state);
+          }
+        }
+        function renderList(root, profiles, note) {
+          if (!profiles || profiles.length === 0) {
+            root.innerHTML = "<p><strong>No Pi profiles found.</strong> Run <code>orca-pi profile path</code> to locate configuration.</p>" +
+              (note ? '<p class="muted">' + esc(note) + "</p>" : "");
             return;
           }
           var html = "<ul>";
-          for (var i = 0; i < data.profiles.length; i++) {
-            var p = data.profiles[i];
+          for (var i = 0; i < profiles.length; i++) {
+            var p = profiles[i];
             var tools = p.toolCount !== undefined ? p.toolCount + " tools" : "default tools";
             var status = p.valid === false ? " — <strong>INVALID</strong>" : "";
             html += "<li><code>" + esc(p.name) + "</code>: " + esc(p.model || "(no model)") +
@@ -87,8 +179,70 @@ orca-pi profile path</code></pre>
               ", " + p.skillCount + " skills, " + p.extensionCount + " extensions" + status + "</li>";
           }
           html += "</ul>";
-          html += "<p class=\"muted\">Live data provided by host. Refresh via <code>orca-pi profiles list --json</code>.</p>";
+          if (note) html += '<p class="muted">' + esc(note) + "</p>";
+          else html += '<p class="muted">Live data via structured bridge (<code>profiles.list</code>). Refresh via <code>orca-pi profiles list --json</code>.</p>';
           root.innerHTML = html;
+        }
+        try {
+          var state = document.getElementById("bridge-state");
+          var root = document.getElementById("profiles-summary");
+          if (!root) return;
+          var bridge = window.__ORCA_PI_BRIDGE__;
+          if (bridge && typeof bridge.request === "function") {
+            if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: confirming structured support (<code>bridge.capabilities</code>, protocol 1)…</p></div>';
+            var capReq = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId(), operation: "bridge.capabilities" };
+            var capPending = bridge.request(capReq);
+            if (capPending && typeof capPending.then === "function") {
+              capPending.then(function (capRes) {
+                try {
+                  if (!capRes || capRes.requestId !== capReq.requestId) return;
+                  // Confirm structured support BEFORE any data call: seam
+                  // presence alone proves nothing about versions/consent,
+                  // and degraded mode is host-enforced, not UI metadata.
+                  var ops = (capRes.ok && capRes.result && capRes.result.supportedOperations) || [];
+                  var structured = !!(capRes.ok && capRes.result && capRes.result.structured === true && ops.indexOf("profiles.list") !== -1);
+                  if (!structured) {
+                    var why = capRes.ok ? "structured support not negotiated (versions/consent unverified)" : ((capRes.error && capRes.error.code + ": " + capRes.error.message) || "unavailable");
+                    showDegraded(why + ". Mutations stay disabled.");
+                    return;
+                  }
+                  if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: requesting <code>profiles.list</code> (structured, protocol 1)…</p></div>';
+                  var req = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId(), operation: "profiles.list" };
+                  var pending = bridge.request(req);
+                  if (!pending || typeof pending.then !== "function") { showDegraded("Bridge request failed; showing CLI guidance."); return; }
+                  pending.then(function (res) {
+                    try {
+                      if (!res || res.requestId !== req.requestId) return;
+                      if (res.ok && res.result && res.result.panel) {
+                        if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: live (<code>profiles.list</code> ok).</p></div>';
+                        renderList(root, res.result.panel.profiles);
+                      } else if (res.ok && res.result && res.result.profiles) {
+                        if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: live.</p></div>';
+                        renderList(root, res.result.profiles);
+                      } else {
+                        var msg = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
+                        showDegraded(msg);
+                      }
+                    } catch (e) { /* keep CLI fallback */ }
+                  }, function () {
+                    showDegraded("Bridge request failed; showing CLI guidance.");
+                  });
+                } catch (e) { /* keep CLI fallback */ }
+              }, function () {
+                showDegraded("Bridge capabilities check failed; showing CLI guidance.");
+              });
+              return;
+            }
+          }
+          // No structured seam on this host: explicit degraded state.
+          showDegraded("Structured bridge seam not present; live editing requires the bridge worker. Mutations stay disabled.");
+          // Deprecated legacy injection: honor read-only, label clearly.
+          var data = window.__ORCA_PI_PROFILES__;
+          if (data && data.profiles) {
+            renderList(root, data.profiles, "Deprecated legacy injection (window.__ORCA_PI_PROFILES__) — read-only fallback only; production path is the structured bridge.");
+            return;
+          }
+          // Static CLI fallback remains (no undocumented access attempted).
         } catch (e) {
           // Keep CLI fallback on any error — never block the panel.
         }

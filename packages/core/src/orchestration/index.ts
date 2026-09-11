@@ -6,6 +6,24 @@
  * layer only carries Orca's identities with stable JSON receipts.
  */
 export {
+  BUILTIN_ROLE_MAPPING,
+  deleteRoleOverride,
+  getProjectOrchestrationPath,
+  getRoleMapping,
+  getUserOrchestrationPath,
+  hashOrchestrationText,
+  ORCHESTRATION_CONFIG_VERSION,
+  OrchestrationConfigError,
+  setRoleMapping,
+  type OrchestrationErrorCode,
+  type OrchestrationFs,
+  type OrchestrationPathOptions,
+  type OrchestrationReadOptions,
+  type OrchestrationScope,
+  type OrchestrationWriteOptions,
+  type RoleMapping,
+} from "./config.js";
+export {
   DEFAULT_POLL_INTERVAL_MS,
   DEFAULT_WAIT_TIMEOUT_MS,
   MAX_POLL_INTERVAL_MS,

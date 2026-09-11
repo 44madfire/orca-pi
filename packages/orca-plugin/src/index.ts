@@ -1,13 +1,57 @@
 /**
- * Thin Orca plugin entry (OP1.1 scaffold).
+ * Thin Orca plugin entry (OP1.1 scaffold + UI1.2 bridge).
  *
  * Deliberately free of `node:child_process`, Electron, and Orca Desktop
- * imports: the plugin worker's capability model is still evolving
- * (stablyai/orca#15637), so all process spawning lives in the companion
- * `orca-pi` CLI. This module only describes contributions and formats a
- * status string from injected version/doctor data — fully testable in Node.
+ * imports. The versioned Orca↔Orca-Pi bridge (bridge.ts / bridge-host.ts /
+ * worker.ts) owns structured configuration/status transport; this module
+ * only describes contributions and formats status strings from injected
+ * data — fully testable in Node.
  */
 import type { DoctorReport } from "@orca-pi/core";
+
+export {
+  BRIDGE_ERROR_CODES,
+  BRIDGE_OPERATIONS,
+  BRIDGE_PROTOCOL_VERSION,
+  BRIDGE_READ_OPERATIONS,
+  BRIDGE_VERSION,
+  BRIDGE_WRITE_OPERATIONS,
+  bridgeFail,
+  bridgeOk,
+  DEGRADED_SAFE_OPERATIONS,
+  describeTerminalFallback,
+  isAbsoluteProjectRoot,
+  isAllowlistedFallbackArgv,
+  makeBridgeRequest,
+  mapMutationCodeToBridge,
+  negotiateBridgeCapabilities,
+  normalizeProjectRoot,
+  parseBridgeRequest,
+  validateBridgeResponse,
+  type BridgeError,
+  type BridgeErrorCode,
+  type BridgeNegotiation,
+  type BridgeNegotiationInput,
+  type BridgeOperation,
+  type BridgeRequest,
+  type BridgeResponse,
+  type BridgeResponseValidation,
+  type BridgeWorktreeScope,
+  type TerminalFallbackAction,
+} from "./bridge.js";
+export { handleBridgeRequest, type BridgeHostDeps } from "./bridge-host.js";
+export {
+  createSeamAdapter,
+  type SeamAdapter,
+  type SeamAdapterOptions,
+  type SeamHostFacts,
+  type SeamHostVersions,
+} from "./seam-adapter.js";
+export {
+  createBridgeWorker,
+  type BridgeWorker,
+  type BridgeWorkerInit,
+} from "./worker.js";
 
 export {
   detectPanelSupport,
@@ -55,12 +99,13 @@ export function renderPluginStatus(input: PluginStatusInput): string {
 }
 
 /**
- * Placeholder activation record. A future Orca plugin host can call this to
- * prove the artifact loads; it performs no I/O and requests no capabilities.
+ * Activation record. The worker entry (`dist/worker.js`, manifest `main`)
+ * serves the versioned bridge; panels stay declarative sandboxed HTML.
  *
- * OP1.7 adds the read-only `orca-pi-profiles` sidebar alongside the status
- * panel. Both panels are declarative sandboxed HTML; live data comes from
- * the companion CLI, never from a worker bridge.
+ * UI1.2 adds the bridge worker alongside the status + profiles panels.
+ * Live data flows through the typed panel↔bridge protocol (request IDs +
+ * structured errors), never through `window.__ORCA_PI_PROFILES__` injection
+ * (deprecated legacy path, read-only fallback only).
  */
 export function activate(): { plugin: string; commands: string[]; panels: string[] } {
   return {
