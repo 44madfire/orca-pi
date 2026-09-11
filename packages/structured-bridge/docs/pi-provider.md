@@ -1,10 +1,14 @@
-# Pi Provider — First Real Pi Structured Chat (SNC1.4)
+# Pi Provider — Real Pi Structured Chat (SNC1.4 + SNC1.5)
 
-> Status: implemented in `packages/structured-bridge/src/pi-provider.ts` (+
-> `pi-provider-cli.js`) with fixture-driven mapping in `pi-mapping.ts`.
-> Proves #14 without touching Orca core: the fork vendors only
-> `framing.ts` + `protocol.ts` + `host.ts`; `pi-provider.ts` stays in
-> `orca-pi` like `provider.ts` + `mock-provider-cli.js` + `pi-mapping.ts`.
+> Status: SNC1.4 basic text chat plus SNC1.5 thinking/tools/errors/lifecycle
+> translation, implemented in `packages/structured-bridge/src/pi-provider.ts`
+> (+ `pi-provider-cli.js`) with fixture-driven mapping in `pi-mapping.ts` and
+> the pure, fixture-testable turn translator in `src/pi-translator.ts`
+> (`test/pi-translator.test.ts` replays real SNC1.1 fixtures with no Orca/Pi).
+> Proves #14 and #15 without touching Orca core: the fork vendors only
+> `framing.ts` + `protocol.ts` + `host.ts`; `pi-provider.ts` (+ `pi-mapping.ts`
+> + `pi-translator.ts`) stays in `orca-pi` like `provider.ts` +
+> `mock-provider-cli.js`.
 
 ## 1. What it does
 
@@ -69,28 +73,41 @@ keystroke injection anywhere on this path.
   transcript order. The provider sends `unknown` fast; callers reconcile via
   history and never auto-resend.
 
-## 3. Streaming
+## 3. Streaming (SNC1.5 translator)
 
-`PiRpcConnection.onEvent` → `mapPiRecordToBridgeEvents` → bridge
-`session_event` with the active dispatch `opId`:
+`PiRpcConnection.onEvent` → `PiTranslator.applyPiRecord` (wrapping
+`mapPiRecordToBridgeEvents` with dedupe/coalescing) → bridge `session_event`
+with the active dispatch `opId` (see `src/pi-translator.ts`, fixture-tested in
+`test/pi-translator.test.ts` without Orca or Pi):
 
 ```text
-Pi turn_start                    → turn_start
-Pi message_update text_start/delta/end → text_start/delta/end
-Pi turn_end{stop/aborted}        → turn_end{stop/aborted}
-Pi agent_settled                 → settled (+ journal + finishTurn)
-Pi extension_ui_request dialog   → prompt_request (pendingPrompt for answer)
-Pi tool_execution_*              → tool_start/progress/end (SNC1.5 owns faithful rendering)
-agent_start/agent_end/message_start/end, toolcall deltas,
-notify/setTitle/setStatus, queue_update → ignored ([])
+Pi turn_start                                 → turn_start (journals pending user)
+Pi message_update text_start/delta/end        → text_start/delta/end (stable contentIndex)
+Pi message_update thinking_*/text_* interleave → thinking_*/text_* (separate channels)
+Pi message_update toolcall_start/end          → tool_start (stable toolCallId, provisional→authoritative)
+Pi tool_execution_start                       → tool_start (dedupe same id → one card)
+Pi tool_execution_update (cumulative)         → tool_progress (replace display)
+Pi tool_execution_end (+isError)              → tool_end (reconciles, isError faithful)
+Pi turn_end{stop/aborted/toolUse}             → turn_end{stop/aborted} (toolUse→stop; journals user→tools→assistant)
+Pi agent_settled{willRetry}                   → settled (drains remainder, clears ALL transient)
+Pi extension_ui_request dialog                → prompt_request (pendingPrompt for answer)
+agent_start/agent_end/message_start/end, toolcall_delta,
+bash_execution_update, queue_update, compaction_*, thinking_level_changed,
+session_info_changed, notify/setTitle/setStatus, responses, unknown → [] (bounded)
 ```
 
-`isStreaming` follows the single active turn; `cancelled.settled` reports actual
-state (`true` only when idle). Assistant text accumulates from authoritative
-`text_end.text` into `get_history` (user + assistant) for `unknown`
-reconciliation. Multi-turn tool flows journal per `turn_end` under the same op
-and complete once per `agent_settled` (SNC1.5 owns per-turn journal identities
-and queued-delivery boundaries).
+`isStreaming` follows the single active turn (lifecycle-driven, not terminal
+heuristics); `cancelled.settled` reports actual state (`true` only when idle).
+Assistant text journals from authoritative `text_end.text` (falling back to
+deltas only for aborted partials with no final) into `get_history` (user +
+tools + assistant) for `unknown` reconciliation — finals reconcile, never
+duplicate deltas. Thinking streams separately and never journals as prose.
+Tool stdout stays in tool events/history (never assistant text). Multi-turn
+tool flows journal per `turn_end` under the same op and complete once per
+authoritative `agent_settled`; settled clears translator transient +
+cancelled-op + pending-prompt state so settled turns retain nothing
+(`hasTransient()===false`). Unknown/suppressed chrome maps to `[]` with no
+state change and never terminates a session.
 
 ## 4. Failures (secret-safe, actionable)
 
@@ -134,9 +151,12 @@ Missing/incompatible bridge still falls back to the ordinary Pi TUI path
 
 ## 6. Scope guard
 
-SNC1.4 is basic text chat. Thinking/tool/error translation beyond text +
-turn + cancel is SNC1.5; model/thinking controls, prompts, images are
-SNC1.6; history/branch/resume is SNC1.7 (which will reconstruct from Pi
-`get_entries`/`get_tree` instead of the live-turn journal used here).
+SNC1.4 was basic text chat; SNC1.5 lands faithful thinking/tool/error/
+lifecycle translation (this doc §3 + `pi-translator.ts` + fixture replay).
+Queued `steer`/`followUp` while busy stays honestly rejected (Pi-owned queue
+fidelity needs `queue_update`/retry/compaction evidence beyond turn
+boundaries — still deferred, not guessed). Model/thinking controls, prompts,
+images are SNC1.6; history/branch/resume is SNC1.7 (which will reconstruct
+from Pi `get_entries`/`get_tree` instead of the live-turn journal used here).
 `set_options` stores + acks; `get_history`/`get_session` serve live-turn
-state.
+state (now user + tools + assistant).

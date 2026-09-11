@@ -1,5 +1,5 @@
 /**
- * Pi-backed external provider (SNC1.4, orca-pi owned).
+ * Pi-backed external provider (SNC1.4 + SNC1.5, orca-pi owned).
  *
  * Combines the production SNC1.2 `PiRpcConnection` transport with the SNC1.3
  * external structured-session bridge to run the first real Pi structured
@@ -42,13 +42,16 @@
  *
  * Scope: SNC1.4 is basic text chat, one turn at a time. Queued delivery while
  * busy (`steer`/`followUp` accepted via Pi-owned queue) is honestly rejected
- * here and deferred to SNC1.5: proving Pi owns a future turn needs
- * user-message/`queue_update` evidence plus retry/compaction boundaries that
- * belong to the lifecycle translator — guessing from turn boundaries
- * misattributes turns and fabricates history. Thinking/tool/error/lifecycle
- * translation beyond text + turn + cancel is SNC1.5; model/thinking
- * controls, prompts, images are SNC1.6; history/branch/resume is SNC1.7.
- * `set_options` stores options and acks (Pi apply lands in SNC1.6);
+ * here: proving Pi owns a future turn needs user-message/`queue_update`
+ * evidence plus retry/compaction boundaries — guessing from turn boundaries
+ * misattributes turns and fabricates history (SNC1.5 keeps the honest reject;
+ * queue fidelity stays deferred pending that evidence). SNC1.5 owns faithful
+ * thinking/tool/error/lifecycle translation (see `pi-translator.ts`): stable
+ * `contentIndex`/`toolCallId` identities, cumulative-vs-delta semantics, tool
+ * journaling with assistant/tool separation, abort fidelity, secret-safe error
+ * shaping, and bounded unknown handling with no retained transient on settle.
+ * Model/thinking controls, prompts, images are SNC1.6; history/branch/resume
+ * is SNC1.7. `set_options` stores options and acks (Pi apply lands in SNC1.6);
  * `get_history`/`get_session` serve the live-turn journal (Pi tree
  * reconstruction lands in SNC1.7).
  */
@@ -86,6 +89,7 @@ import {
   piBridgeCapabilities,
   validatePiDispatch,
 } from "./pi-mapping.js";
+import { PiTranslator } from "./pi-translator.js";
 
 /** Minimal Pi connection surface used by the bridge (real `PiRpcConnection` satisfies it). */
 export interface PiProviderConnection {
@@ -149,25 +153,36 @@ export interface PiBridgeProviderOptions {
 interface PiRuntime {
   conn: PiProviderConnection;
   unsubs: Array<() => void>;
-  /** Accumulated assistant text for the active turn (for `get_history`). */
-  activeText: string;
+  /** SNC1.5 translator: accumulation, dedupe, lifecycle, journal decisions. */
+  translator: PiTranslator;
   /** Pi-side session id observed via `get_state` (for lease identity). */
   piSessionId?: string;
-  // SNC1.4 basic text runs one turn at a time: while a turn streams, queued
-  // `steer`/`followUp` dispatches are honestly rejected (never
-  // accepted-before-owned). Pi-owned queue fidelity — mode-specific delivery,
-  // user-message and `queue_update` evidence, retry/compaction boundaries,
-  // immediate-command classification, ordered ambiguous candidates — needs the
-  // SNC1.5 lifecycle translator, so it is deferred there (see `onPiDispatch`
-  // busy branch) rather than guessed from turn boundaries here.
+  // Single-turn honesty: while a turn streams, queued `steer`/`followUp`
+  // dispatches are honestly rejected (never accepted-before-owned). Pi-owned
+  // queue fidelity would need user-message/`queue_update` evidence plus
+  // retry/compaction boundaries — guessing from turn boundaries misattributes
+  // turns and fabricates history, so the queue stays rejected (see
+  // `onPiDispatch` busy branch). The SNC1.5 translator owns faithful
+  // rendering of the single active turn (text/thinking/tools/lifecycle).
   /**
    * Optimistic user text for an ambiguous idle `prompt` (write may have landed
-   * but the response was lost). NOT journaled yet: `turn_start` (receipt proof)
-   * or `turn_end` journals it first, preserving user-before-assistant order, so
+   * but the response was lost). Mirrors `translator.pendingUser` for
+   * back-compat within this file: `turn_start` (receipt proof) or `turn_end`
+   * journals it first, preserving user-before-assistant order, so
    * `get_history` never fabricates a user entry Pi never received. Cleared on
    * definite refusal, successful journaling, or idle reconciliation.
+   *
+   * SNC1.5: the translator is authoritative for pending-user state; this field
+   * is kept in sync (set/cleared together) so existing branches keep working
+   * while the translator owns dedupe/journal decisions.
    */
   pendingUserText: string | null;
+  /**
+   * Accumulated assistant text for the active turn (for `get_history`).
+   * SNC1.5: mirrors `translator.currentAssistantText()` for back-compat;
+   * the translator is authoritative (finals reconcile, deltas streaming-only).
+   */
+  activeText: string;
 }
 
 function nowIso(): string {
@@ -409,7 +424,7 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompt: null,
       entryCounter: 0,
     });
-    const runtime: PiRuntime = { conn, unsubs: [], activeText: "", piSessionId, pendingUserText: null };
+    const runtime: PiRuntime = { conn, unsubs: [], translator: new PiTranslator(), activeText: "", piSessionId, pendingUserText: null };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
     if (session) this.attachPiStreaming(sessionId, session, runtime);
@@ -496,36 +511,89 @@ export class PiBridgeProvider extends BridgeProvider {
     }
   }
 
-  // -- streaming: Pi events -> bridge session_event --------------------------
+  // -- streaming: Pi events -> bridge session_event (SNC1.5 translator) -------
   //
-  // SNC1.4 runs one turn at a time (queued delivery while busy is honestly
-  // rejected; see `onPiDispatch`). Attribution therefore never guesses across
-  // queued ops from turn boundaries: every streamed event carries the single
-  // active dispatch op, `turn_end` journals its turn, and the authoritative Pi
-  // `agent_settled` completes it. Mode-specific queued delivery, user-message
-  // and `queue_update` evidence, and retry/compaction boundaries belong to the
-  // SNC1.5 lifecycle translator.
+  // Single-turn honesty is preserved (queued delivery while busy is honestly
+  // rejected; see `onPiDispatch`). Attribution never guesses across queued ops
+  // from turn boundaries: every streamed event carries the single active
+  // dispatch op, `turn_end` journals its turn via the translator, and the
+  // authoritative Pi `agent_settled` completes it (translator `settle()` clears
+  // ALL transient so settled turns retain nothing).
+  //
+  // SNC1.5 translator semantics (see `pi-translator.ts`):
+  // - stable `contentIndex`/`toolCallId` identities so deltas coalesce;
+  // - finals reconcile (authoritative) rather than duplicate deltas;
+  // - tool stdout stays in tool events/history (never assistant prose);
+  // - thinking streams separately and never journals as prose;
+  // - `aborted` preserved, `toolUse` → `stop` (multi-turn continuations stay
+  //   on the same op until `agent_settled`);
+  // - unknown/suppressed chrome maps to `[]` and changes no state.
+
+  /** Journal translator entries into bridge history (user → tools → assistant order). */
+  private journalTranslatorEntries(
+    session: ProviderSession,
+    entries: Array<{ role: "user" | "assistant" | "tool"; text: string }>,
+  ): void {
+    for (const entry of entries) {
+      // History roles mirror the translator: `tool` entries carry tool output
+      // (never prose); `assistant` carries reconciled text finals (never tool
+      // output); `user` carries the confirmed prompt. All three are needed so
+      // `unknown`-dispatch reconciliation sees faithful evidence.
+      this.appendHistory(session, { role: entry.role, text: entry.text });
+    }
+    if (entries.length > 0) {
+      session.metadata.messageCount = session.history.filter(
+        (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
+      ).length;
+    }
+  }
+
+  /** Keep the legacy mirrors in sync (translator is authoritative). */
+  private syncRuntimeMirrors(runtime: PiRuntime): void {
+    runtime.pendingUserText = runtime.translator.pendingUser;
+    runtime.activeText = runtime.translator.currentAssistantText();
+  }
 
   private attachPiStreaming(sessionId: string, session: ProviderSession, runtime: PiRuntime): void {
     const onEvent = (event: PiServerEvent): void => {
       const activeOpId = session.activeOpId;
-      // No active turn: only forward stateless chrome that Orca can use
-      // without a turn (currently none — queue_update/compaction are SNC1.5+).
+      const hasActiveOp = (session.activeOpId ?? activeOpId) !== null;
+      // No active turn: turn-scoped events must not mutate translator state
+      // (P1: a late `tool_execution_end` after `agent_settled` would otherwise
+      // repopulate `translator.tools`, survive `resetTurn()` on the next
+      // dispatch, and leak into the next turn's history). Use the pure mapper
+      // with no state change: forward only stateless dialogs (actionable via
+      // requestId), drop everything else. Queue/compaction/retry/unknown
+      // already map to `[]` (bounded) so they never reach here as changes.
       // Dialogs arriving without an active turn are still actionable: emit
       // them without an opId so Orca can answer via requestId.
-      let mapped: ReturnType<typeof mapPiRecordToBridgeEvents>;
+      if (!hasActiveOp) {
+        let stateless: ReturnType<typeof mapPiRecordToBridgeEvents>;
+        try {
+          stateless = mapPiRecordToBridgeEvents(event as unknown as Record<string, unknown>);
+        } catch {
+          return;
+        }
+        for (const bridgeEvent of stateless) {
+          if (bridgeEvent.type !== "prompt_request") continue;
+          session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: "" };
+          this.send({
+            v: 1,
+            kind: "session_event",
+            sessionId,
+            event: bridgeEvent,
+          });
+        }
+        return;
+      }
+      let mapped: ReturnType<PiTranslator["applyPiRecord"]>;
       try {
-        mapped = mapPiRecordToBridgeEvents(event as unknown as Record<string, unknown>);
+        mapped = runtime.translator.applyPiRecord(event as unknown as Record<string, unknown>);
       } catch {
         return;
       }
+      this.syncRuntimeMirrors(runtime);
       for (const bridgeEvent of mapped) {
-        if (bridgeEvent.type === "text_end" && typeof bridgeEvent.text === "string") {
-          // Accumulate authoritative text for history; deltas stay streaming-only.
-          runtime.activeText += bridgeEvent.text;
-        } else if (bridgeEvent.type === "text_delta") {
-          // Deltas stream to the UI but are not journaled until text_end.
-        }
         if (bridgeEvent.type === "prompt_request") {
           const currentOp = session.activeOpId ?? activeOpId ?? "";
           session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: currentOp };
@@ -541,13 +609,19 @@ export class PiBridgeProvider extends BridgeProvider {
         if (bridgeEvent.type === "turn_start") {
           // Authoritative receipt proof for an ambiguous idle prompt: Pi
           // started the turn, so journal the pending user now (before any
-          // assistant text) so a later exit-before-`turn_end` still leaves
-          // history evidence that prevents a duplicate retry.
+          // assistant/tool content) so a later exit-before-`turn_end` still
+          // leaves history evidence that prevents a duplicate retry.
           const currentOp = session.activeOpId ?? activeOpId;
-          if (currentOp && runtime.pendingUserText !== null) {
-            this.appendHistory(session, { role: "user", text: runtime.pendingUserText });
-            runtime.pendingUserText = null;
-            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+          if (currentOp && runtime.translator.pendingUser !== null) {
+            const user = runtime.translator.pendingUser;
+            if (user !== null) {
+              this.appendHistory(session, { role: "user", text: user });
+              runtime.translator.clearPendingUser();
+              this.syncRuntimeMirrors(runtime);
+              session.metadata.messageCount = session.history.filter(
+                (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
+              ).length;
+            }
           }
           const opForEvent = session.activeOpId ?? currentOp;
           if (!opForEvent) continue;
@@ -564,21 +638,20 @@ export class PiBridgeProvider extends BridgeProvider {
             event: bridgeEvent,
           });
           if (currentOp) {
-            // Fallback journaling for turns that settle without a `turn_end`
-            // (robustness; the normal path journals per turn below). Pending
-            // ambiguous users journal first so order stays user→assistant.
-            if (runtime.pendingUserText !== null) {
-              this.appendHistory(session, { role: "user", text: runtime.pendingUserText });
-              runtime.pendingUserText = null;
-            }
-            if (runtime.activeText !== "") {
-              this.appendHistory(session, { role: "assistant", text: runtime.activeText });
-            }
-            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
-            runtime.activeText = "";
-            // Single-turn honesty: the settled op is still active (SNC1.4 never
-            // transfers ownership mid-agent; queued delivery while busy is
-            // rejected, so there is nothing to promote).
+            // Authoritative completion: drain any remaining turn entries
+            // (normal path already journaled per `turn_end`; this covers
+            // settle-without-`turn_end` robustness) in user→tools→assistant
+            // order, then clear ALL transient (requirement) plus per-op
+            // cancel/pending-prompt state so settled turns retain nothing.
+            const entries = runtime.translator.settle();
+            this.journalTranslatorEntries(session, entries);
+            this.syncRuntimeMirrors(runtime);
+            session.cancelledOps.delete(currentOp);
+            if (session.pendingPrompt?.opId === currentOp) session.pendingPrompt = null;
+            // Single-turn honesty: the settled op is still active (queued
+            // delivery while busy is rejected, so there is nothing to
+            // promote). Multi-turn tool continuations already attributed to
+            // this op via per-`turn_end` drains above.
             if (session.activeOpId === currentOp) {
               this.finishTurn(session, currentOp);
               if (session.activeOpId === null) session.metadata.isStreaming = false;
@@ -596,28 +669,25 @@ export class PiBridgeProvider extends BridgeProvider {
             event: bridgeEvent,
           });
           if (currentOp) {
-            // Per-turn boundary: journal this turn (pending ambiguous user
-            // first, then assistant) so later turns attribute correctly.
-            // Tool-only turns journal nothing (SNC1.5 owns tool journaling).
-            if (runtime.pendingUserText !== null) {
-              this.appendHistory(session, { role: "user", text: runtime.pendingUserText });
-              runtime.pendingUserText = null;
-            }
-            if (runtime.activeText !== "") {
-              this.appendHistory(session, { role: "assistant", text: runtime.activeText });
-            }
-            session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
-            runtime.activeText = "";
-            // No promotion: SNC1.4 holds the single active turn until Pi's
+            // Per-turn boundary: journal this turn (pending user first, then
+            // completed tools, then assistant) so later turns attribute
+            // correctly. Tool-only turns journal their tool entries (SNC1.5:
+            // tool stdout never becomes assistant prose). Text finals
+            // reconcile (never duplicate deltas) via the translator.
+            const entries = runtime.translator.drainTurnEnd();
+            this.journalTranslatorEntries(session, entries);
+            this.syncRuntimeMirrors(runtime);
+            // No promotion: hold the single active turn until Pi's
             // authoritative `agent_settled` completes it (see above). Queued
-            // delivery while busy is rejected, so multi-turn tool continuations
-            // always belong to the current prompt and attribute to it.
+            // delivery while busy is rejected, so multi-turn tool
+            // continuations always belong to the current prompt.
           }
           continue;
         }
         // text_*/thinking_*/tool_*: stream with the active turn id.
         // Outside a turn (e.g. late events after settle) they are dropped
-        // rather than journaled under a wrong op.
+        // rather than journaled under a wrong op. Unknown chrome never reaches
+        // here (maps to `[]` above with no state change).
         {
           const currentOp = session.activeOpId ?? activeOpId;
           if (!currentOp) continue;
@@ -642,9 +712,18 @@ export class PiBridgeProvider extends BridgeProvider {
     // Pending ambiguous users are dropped unjournaled when Pi never proved
     // receipt (no `turn_start` arrived to journal them); already-journaled
     // turns survive in history so `unknown` reconciles without duplicates.
+    // SNC1.5: translator transient is cleared (no retained state) plus
+    // per-op cancel/pending-prompt cleanup so exit leaves nothing behind.
     if (runtime) {
+      runtime.translator.resetAll();
       runtime.pendingUserText = null;
       runtime.activeText = "";
+      if (activeOpId) {
+        session.cancelledOps.delete(activeOpId);
+        if (session.pendingPrompt?.opId === activeOpId) session.pendingPrompt = null;
+      } else if (!session.activeOpId) {
+        session.pendingPrompt = null;
+      }
     }
     if (activeOpId) {
       // Pi died mid-turn: the prompt outcome is ambiguous, but the UI must
@@ -700,16 +779,17 @@ export class PiBridgeProvider extends BridgeProvider {
       return;
     }
     if (session.activeOpId) {
-      // SNC1.4 single-turn honesty: while a turn streams, every new dispatch
-      // — including `steer`/`followUp` — is honestly rejected without touching
+      // Single-turn honesty: while a turn streams, every new dispatch —
+      // including `steer`/`followUp` — is honestly rejected without touching
       // Pi (definite refusal: Pi never saw it, safe to retry after idle or
       // cancel). Accepting a queued prompt would require proving Pi owns its
       // future turn across steer/followUp modes, tool-loop continuations,
       // retry/compaction, immediate-command handling, and ambiguous-queue
-      // ordering — all of which need user-message/`queue_update` evidence and
-      // retry/compaction boundaries owned by the SNC1.5 lifecycle translator.
-      // Guessing ownership from turn boundaries misattributes turns and
-      // fabricates history, so SNC1.4 declines the queue and SNC1.5 lands it.
+      // ordering — all needing user-message/`queue_update` evidence and
+      // retry/compaction boundaries. Guessing ownership from turn boundaries
+      // misattributes turns and fabricates history, so the queue stays
+      // rejected; SNC1.5 keeps this honesty and owns faithful rendering of
+      // the single active turn instead.
       this.send({
         v: 1,
         kind: "dispatch_ack",
@@ -723,12 +803,18 @@ export class PiBridgeProvider extends BridgeProvider {
     // Idle: retain pending-op state BEFORE the write so an ambiguous outcome
     // (write landed but the response was lost) still attributes later Pi
     // events to this op. The user text stays pending (NOT journaled) until Pi
-    // actually streams the turn (`turn_end` journals user→assistant in order),
-    // so `get_history` never fabricates a turn Pi never received. Definite
-    // refusal clears everything below (Pi made no change); success journals
-    // immediately; ambiguity reconciles against Pi state before deciding.
+    // actually streams the turn (`turn_start`/`turn_end` journal user first via
+    // the translator), so `get_history` never fabricates a turn Pi never
+    // received. Definite refusal clears everything below (Pi made no change);
+    // success journals immediately; ambiguity reconciles against Pi state.
     session.activeOpId = msg.opId;
     session.metadata.isStreaming = true;
+    // Fresh agent: clear ALL prior translator state (not just per-turn text)
+    // so a late event that raced `settle()` can never leak into the new turn
+    // even if the no-active-op gate above missed it (defense in depth with
+    // the gate; `notePendingUser` re-arms the new turn immediately after).
+    runtime.translator.resetAll();
+    runtime.translator.notePendingUser(msg.message.text);
     runtime.activeText = "";
     runtime.pendingUserText = msg.message.text;
     const piCmd = mapBridgeDispatchToPiPrompt(msg.opId, msg.message, msg.queue ?? "reject");
@@ -749,6 +835,7 @@ export class PiBridgeProvider extends BridgeProvider {
           session.activeOpId = null;
           session.metadata.isStreaming = false;
         }
+        runtime.translator.clearPendingUser();
         runtime.pendingUserText = null;
         const piError = (error as { piError?: unknown }).piError;
         this.send({
@@ -783,10 +870,13 @@ export class PiBridgeProvider extends BridgeProvider {
         if (piStreaming === false) {
           session.activeOpId = null;
           session.metadata.isStreaming = false;
+          runtime.translator.clearPendingUser();
+          runtime.translator.resetTurn();
           runtime.pendingUserText = null;
           runtime.activeText = "";
         }
       } else {
+        runtime.translator.clearPendingUser();
         runtime.pendingUserText = null;
       }
       this.send({
@@ -803,14 +893,20 @@ export class PiBridgeProvider extends BridgeProvider {
     // events drive `turn_start`/deltas/`turn_end`/`settled`. Clear the
     // pending marker so `turn_end` does not journal it a second time. When
     // the turn already settled during the write, `activeOpId` was cleared by
-    // its own `settled` (which journaled user+assistant) — skip the duplicate.
-    if (session.activeOpId === msg.opId && runtime.pendingUserText !== null) {
+    // its own `settled` (which journaled user→tools→assistant) — skip the
+    // duplicate. SNC1.5: translator is authoritative; mirrors kept in sync.
+    if (session.activeOpId === msg.opId && runtime.translator.pendingUser !== null) {
       this.appendHistory(session, { role: "user", text: msg.message.text });
-      session.metadata.messageCount = session.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+      session.metadata.messageCount = session.history.filter(
+        (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
+      ).length;
+      runtime.translator.clearPendingUser();
       runtime.pendingUserText = null;
     } else {
+      runtime.translator.clearPendingUser();
       runtime.pendingUserText = null;
     }
+    this.syncRuntimeMirrors(runtime);
     this.send({ v: 1, kind: "dispatch_ack", opId: msg.opId, sessionId: msg.sessionId, status: "accepted" });
   }
 
@@ -848,8 +944,12 @@ export class PiBridgeProvider extends BridgeProvider {
     // Journal the queued user turn; Pi events will settle it.
     // `finishTurn` set activeOpId before calling here; keep it.
     this.appendHistory(live, { role: "user", text: msg.message.text });
-    live.metadata.messageCount = live.history.filter((e) => e.role === "user" || e.role === "assistant").length;
+    live.metadata.messageCount = live.history.filter(
+      (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
+    ).length;
+    runtime.translator.resetTurn();
     runtime.activeText = "";
+    this.syncRuntimeMirrors(runtime);
     // Do not emit turn_start/settled here: Pi's own turn events drive them
     // through `attachPiStreaming`. If Pi never emits (crashed), `onPiExit`
     // settles the turn.
