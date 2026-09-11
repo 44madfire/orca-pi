@@ -1070,3 +1070,52 @@ describe("SNC1.6 P2 (bounded shared catalog, no pending accumulation)", () => {
     expect(listCalls - callsAfterAcquire).toBeLessThanOrEqual(2);
   });
 });
+
+describe("SNC1.6 option deadlines (bounded Pi RPCs, no late mutation)", () => {
+  it("bounds every Pi option RPC below the host deadline", async () => {
+    const seenTimeouts: Array<number | undefined> = [];
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      piOptionTimeoutMs: 8000,
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        const origListModels = fake.getAvailableModels.bind(fake);
+        fake.getAvailableModels = async (o?: { timeoutMs?: number }) => {
+          seenTimeouts.push(o?.timeoutMs);
+          return origListModels();
+        };
+        const origSetModel = fake.setModel.bind(fake);
+        fake.setModel = async (prov: string, id: string, o?: { timeoutMs?: number }) => {
+          seenTimeouts.push(o?.timeoutMs);
+          return origSetModel(prov, id);
+        };
+        const origLevels = fake.getAvailableThinkingLevels.bind(fake);
+        fake.getAvailableThinkingLevels = async (o?: { timeoutMs?: number }) => {
+          seenTimeouts.push(o?.timeoutMs);
+          return origLevels();
+        };
+        const origSetThinking = fake.setThinkingLevel.bind(fake);
+        fake.setThinkingLevel = async (level: string, o?: { timeoutMs?: number }) => {
+          seenTimeouts.push(o?.timeoutMs);
+          return origSetThinking(level);
+        };
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionId = await acquireSession(provider, out, send);
+    // Clear warmup/catalog calls (background + acquire) to isolate set_options.
+    seenTimeouts.length = 0;
+    send({ v: 1, kind: "set_options", opId: "opt_deadline", sessionId, options: { model: "text-only-model", thinkingLevel: "high" } });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(lastOfKind(out, "options_updated")).toBeDefined();
+    // Every Pi option RPC carried an explicit deadline below the 10s host default.
+    expect(seenTimeouts.length).toBeGreaterThan(0);
+    for (const t of seenTimeouts) {
+      expect(typeof t).toBe("number");
+      expect(t as number).toBeLessThanOrEqual(8000);
+    }
+  });
+});

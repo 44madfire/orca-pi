@@ -135,13 +135,13 @@ export interface PiProviderConnection {
   close(graceMs?: number, opts?: PiRpcCloseOptions): Promise<PiRpcCloseResult>;
   onEvent(handler: (event: PiServerEvent) => void): () => void;
   onExit(handler: (info: PiRpcCloseResult) => void): () => void;
-  getState(): Promise<PiState>;
+  getState(opts?: { timeoutMs?: number }): Promise<PiState>;
   respondToExtensionUi(response: { type: "extension_ui_response"; id: string; value?: unknown; confirmed?: boolean; cancelled?: boolean }): void;
   getAvailableModels?(opts?: { timeoutMs?: number }): Promise<{ models: PiModel[] }>;
   setModel?(provider: string, modelId: string, opts?: { timeoutMs?: number }): Promise<PiModel>;
   getAvailableThinkingLevels?(opts?: { timeoutMs?: number }): Promise<{ levels: string[] }>;
   setThinkingLevel?(level: string, opts?: { timeoutMs?: number }): Promise<void>;
-  setAutoCompaction?(enabled: boolean): Promise<void>;
+  setAutoCompaction?(enabled: boolean, opts?: { timeoutMs?: number }): Promise<void>;
   readonly isClosed: boolean;
 }
 
@@ -172,6 +172,14 @@ export interface PiBridgeProviderOptions {
   startupTimeoutMs?: number;
   /** Grace for per-session Pi teardown (default 2000ms). */
   closeGraceMs?: number;
+  /**
+   * Deadline for Pi option RPCs in bridge requests (default 8000ms, must stay
+   * below the host request deadline — default 10s — so provider mutations
+   * complete (or fail) before Orca drops correlation; avoids late
+   * options_updated after host timeout. Catalog warmup/dispatch lookups use
+   * 3000ms via fetchCatalogShared (shared, bounded).
+   */
+  piOptionTimeoutMs?: number;
   /** Inject a fake Pi connection (tests). Default constructs a real `PiRpcConnection`. */
   createConnection?: PiConnectionFactory;
   /**
@@ -281,6 +289,7 @@ export class PiBridgeProvider extends BridgeProvider {
   private readonly defaultTimeoutMs?: number;
   private readonly startupTimeoutMs?: number;
   private readonly piCloseGraceMs: number;
+  private readonly piOptionTimeoutMs: number;
   private readonly createConnection: PiConnectionFactory;
   private readonly resolvePiSpec?: PiSpecResolver;
 
@@ -304,6 +313,7 @@ export class PiBridgeProvider extends BridgeProvider {
     if (opts.defaultTimeoutMs !== undefined) this.defaultTimeoutMs = opts.defaultTimeoutMs;
     if (opts.startupTimeoutMs !== undefined) this.startupTimeoutMs = opts.startupTimeoutMs;
     this.piCloseGraceMs = opts.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
+    this.piOptionTimeoutMs = opts.piOptionTimeoutMs ?? 8000;
     this.resolvePiSpec = opts.resolvePiSpec;
     this.createConnection =
       opts.createConnection ??
@@ -526,18 +536,10 @@ export class PiBridgeProvider extends BridgeProvider {
     // force-close test fakes only `get_state`). Hint checks remain the floor
     // until the cache lands; `set_model` refreshes it synchronously.
     {
-      const listModels = conn.getAvailableModels?.bind(conn);
-      if (listModels) {
-        void (async () => {
-          try {
-            const listed = await listModels();
-            const live = this.piRuntimes.get(sessionId);
-            if (live) live.cachedModels = [...listed.models];
-          } catch {
-            // Best-effort: hint checks remain the floor.
-          }
-        })();
-      }
+      // P2: route warmup through the shared bounded lookup (3000ms real Pi
+      // deadline, shared inflight) so no default-timeout 30s catalog RPC
+      // remains pending alongside dispatch lookups.
+      void this.fetchCatalogShared(sessionId, 3000).catch(() => null);
     }
     // Observe Pi exit so an dead child never leaves a stuck streaming turn.
     const onExit = (info: PiRpcCloseResult): void => {
@@ -745,7 +747,7 @@ export class PiBridgeProvider extends BridgeProvider {
       }
       let models: PiModel[];
       try {
-        const listed = await conn.getAvailableModels();
+        const listed = await conn.getAvailableModels({ timeoutMs: this.piOptionTimeoutMs });
         models = [...listed.models];
         runtime.cachedModels = models;
       } catch (error) {
@@ -754,7 +756,7 @@ export class PiBridgeProvider extends BridgeProvider {
       const resolved = this.resolveModelRef(options.model, models);
       if (!resolved.ok) return { ok: false, code: resolved.code, message: resolved.message };
       try {
-        const confirmed = await conn.setModel(resolved.provider, resolved.modelId);
+        const confirmed = await conn.setModel(resolved.provider, resolved.modelId, { timeoutMs: this.piOptionTimeoutMs });
         const confirmedProvider =
           typeof (confirmed as PiModel)?.provider === "string" && (confirmed as PiModel).provider !== ""
             ? (confirmed as PiModel).provider
@@ -790,7 +792,7 @@ export class PiBridgeProvider extends BridgeProvider {
       }
       let levels: string[];
       try {
-        const listed = await conn.getAvailableThinkingLevels();
+        const listed = await conn.getAvailableThinkingLevels({ timeoutMs: this.piOptionTimeoutMs });
         levels = [...listed.levels];
       } catch (error) {
         return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`thinking-level list failed: ${this.shortPiError(error)}`) };
@@ -803,7 +805,7 @@ export class PiBridgeProvider extends BridgeProvider {
         };
       }
       try {
-        await conn.setThinkingLevel(options.thinkingLevel);
+        await conn.setThinkingLevel(options.thinkingLevel, { timeoutMs: this.piOptionTimeoutMs });
       } catch (error) {
         return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_thinking_level failed: ${this.shortPiError(error)}`) };
       }
@@ -811,7 +813,7 @@ export class PiBridgeProvider extends BridgeProvider {
       // in `attachPiStreaming`); refresh via `get_state` so the lease never
       // echoes an unconfirmed request when Pi silently coerces.
       try {
-        const state = await conn.getState();
+        const state = await conn.getState({ timeoutMs: this.piOptionTimeoutMs });
         const confirmed = typeof state.thinkingLevel === "string" ? state.thinkingLevel : options.thinkingLevel;
         session.options.thinkingLevel = confirmed;
         session.metadata.thinkingLevel = confirmed;
@@ -824,7 +826,7 @@ export class PiBridgeProvider extends BridgeProvider {
       const conn = runtime.conn;
       if (typeof conn.setAutoCompaction === "function") {
         try {
-          await conn.setAutoCompaction(options.autoCompaction);
+          await conn.setAutoCompaction(options.autoCompaction, { timeoutMs: this.piOptionTimeoutMs });
         } catch (error) {
           return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_auto_compaction failed: ${this.shortPiError(error)}`) };
         }
