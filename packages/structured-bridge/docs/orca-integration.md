@@ -178,3 +178,45 @@ No Pi imports, no credential/env plumbing, no remote/mobile claims, no
 manifest capability widening. Pi translation (`pi-mapping.ts`, Pi provider
 process) stays in `orca-pi` and is referenced only as an example
 provider — upstream reviews a small honest seam, not a Pi stack.
+
+## SNC1.6 fork integration (minor Orca-side mapping, no renderer fork)
+
+SNC1.6 provider/host in `orca-pi` already proves the full contract
+headlessly (`test/pi-provider-snc16.test.ts`: 25 tests + BridgeHost E2E for
+images/options). The fork adapter (`44madfire/orca@
+snc1.3-external-structured-bridge`) needs only thin mappings to expose the
+existing shared Native Chat controls (tracked as fork temps: empty model
+catalog, text-only dispatch):
+
+- **Images:** remove the `hasImageBlocks → rejected (SNC1.6)` gate in
+  `ExternalStructuredSessionAdapter.dispatch()` and map Orca's existing
+  authorized attachment/runtime-context `image-ref` blocks to
+  `BridgeHost.dispatch({ images: [{ data, mimeType }] })` (base64 opaque,
+  never terminal paste syntax). Bridge `images[]` → Pi `prompt.images`
+  is already structured; history journals text only (bytes never journaled).
+  E2E in `orca-pi`: `BridgeHost.dispatch images[] → Pi prompt.images →
+  text-only history` (see SNC1.6 BridgeHost E2E test).
+
+- **Model/thinking list/current/set:** map shared option UI to the bridge
+  (no renderer fork):
+  - current: `BridgeHost.getSession()` → `metadata.model/thinkingLevel`
+    (provider-confirmed qualified `provider/modelId` refs);
+  - set: `BridgeHost.setOptions({ model, thinkingLevel })` → Pi live
+    `set_model`/`set_thinking_level` with exact-match validation
+    (`UNKNOWN_MODEL`/`AMBIGUOUS_MODEL`/`UNKNOWN_THINKING_LEVEL` fail closed);
+  - list: Pi live `get_available_models`/`get_available_thinking_levels`
+    via the provider (SNC1.6 validates through them); bridge v1 has no
+    dedicated catalog response — the native `PiStructuredSessionAdapter`
+    (SNC1.8) carries the full catalog into
+    `AgentSessionOptionsResult.models`/efforts. Until then the fork adapter
+    `readOptions()` can report current + writability from `get_session`
+    (models:[] temp remains until the catalog seam lands in SNC1.8).
+
+- **Prompts:** `session_event prompt_request{requestId}` → normal Orca prompt
+  affordances; `answerPrompt()` → `BridgeHost.answerPrompt(requestId)` with
+  Orca durable CAS (provider enforces exactly-once, stale/late
+  `UNKNOWN_REQUEST`, retirement on settle/cancel/exit).
+
+Packaged Orca still falls back to Pi TUI when the bridge is
+missing/incompatible; these mappings change no renderer, only the
+dev-only adapter delegation.

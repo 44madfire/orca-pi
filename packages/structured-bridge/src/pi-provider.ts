@@ -641,6 +641,23 @@ export class PiBridgeProvider extends BridgeProvider {
     return { ok: true, provider: only.provider, modelId: only.id, matched: only };
   }
 
+  /** Bounded await (never hangs dispatch past the host deadline). */
+  private async withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await new Promise<T>((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('timeout')), ms);
+        (timer as unknown as { unref?: () => void }).unref?.();
+        promise.then(
+          (v) => resolve(v),
+          (e) => reject(e),
+        );
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   /**
    * Live image-support check for the confirmed model (provider-confirmed
    * where cached). Accepts both bare ids and canonical `provider/modelId`
@@ -1243,6 +1260,20 @@ export class PiBridgeProvider extends BridgeProvider {
     // would be wrongly rejected before the authoritative check runs.
     // History never journals image bytes (user entries carry text only).
     const imageCount = msg.message.images?.length ?? 0;
+    // P1-3 race: when images are present but the background acquire catalog
+    // has not landed yet (cache absent), await a bounded live lookup before
+    // issuing a negative hint verdict — otherwise a hint-miss image-capable
+    // model (e.g. minimax-m3) dispatched immediately post-acquire is falsely
+    // rejected. Bounded (3s) so a hung catalog never pushes dispatch past
+    // the host deadline; failures fall back to hints (floor).
+    if (imageCount > 0 && runtime.cachedModels === undefined && typeof runtime.conn.getAvailableModels === 'function') {
+      try {
+        const listed = await this.withTimeout(runtime.conn.getAvailableModels(), 3000);
+        runtime.cachedModels = [...listed.models];
+      } catch {
+        // Fall through to hint/live-null handling below.
+      }
+    }
     const liveSupports =
       imageCount > 0 ? this.modelSupportsImages(session.metadata.model, runtime.cachedModels) : null;
     if (liveSupports === false) {
