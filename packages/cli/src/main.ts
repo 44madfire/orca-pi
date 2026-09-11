@@ -33,6 +33,7 @@ import {
 import { runGithubCommand } from "./commands/github.js";
 import { runProfilesCommand } from "./commands/profiles.js";
 import { runOrchestrationCommand } from "./commands/orchestration.js";
+import { runBridgeCommand } from "./commands/bridge.js";
 
 export interface CliDeps {
   runner: ProcessRunner;
@@ -96,6 +97,7 @@ Usage:
   orca-pi profile delete <name> --scope <user|project> [--json]
   orca-pi profile patch <name> --scope <user|project> (--patch <json|@file> | --data <json|@file>) [--json]
   orca-pi profile read <name> [--json]
+  orca-pi bridge --request '<json|@file>' [--project-root <path>] [--json]
   orca-pi spawn <profile> (--task <spec> | --task-id <id>) [--worktree <policy>] [--identity <name>] [--json]
   orca-pi status [--worker <handle>|--task <id>] [--json]
   orca-pi send --worker <handle> --message <text> [--json]
@@ -121,6 +123,7 @@ Commands:
   wait          Wait for worker/task settlement with bounded polling/backoff/timeout.
   stop          Fence one worker terminal idempotently (never marks the Task complete).
   github        Distinct GitHub identities: formal PR reviews + orca-pi/agent-review check (reviewer App; human merges).
+  bridge        Execute one versioned panel↔bridge request (sidecar transport, JSON response).
 
 Profile config is authoritative (builtins < user/global < project); the UI never
 creates a second store. show/inspect redact large prompt bodies unless
@@ -269,8 +272,21 @@ export async function run(
       runner: deps.runner,
     });
   }
-  if (command === "profile" || command === "profiles") {
-    return await runProfilesCommand(rest, {
+  if (command === "bridge") {
+    return await runBridgeCommand(rest, {
+      stdout: deps.stdout,
+      stderr: deps.stderr,
+      projectRoot: defaultProjectRoot(deps),
+      runner: deps.runner,
+      ...(deps.env !== undefined ? { env: deps.env } : {}),
+      ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
+      ...(deps.osHomedir !== undefined ? { osHomedir: deps.osHomedir } : {}),
+      ...(deps.fs !== undefined ? { fs: deps.fs } : {}),
+      ...(deps.fetchFn !== undefined ? { fetchFn: deps.fetchFn } : {}),
+      ...(deps.providerFs !== undefined ? { providerFs: deps.providerFs } : {}),
+    });
+  }
+  if (command === "profile" || command === "profiles") {    return await runProfilesCommand(rest, {
       stdout: deps.stdout,
       stderr: deps.stderr,
       projectRoot: defaultProjectRoot(deps),

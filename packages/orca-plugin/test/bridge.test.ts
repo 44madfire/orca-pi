@@ -204,44 +204,72 @@ describe("bridge protocol: Windows + WSL paths", () => {
 });
 
 describe("bridge protocol: capability negotiation + degraded fallback", () => {
-  it("negotiates structured support on the targeted host", () => {
-    const res = negotiateBridgeCapabilities({ appVersion: "1.4.196", pluginApi: 1 });
+  const HOST = {
+    appVersion: "1.4.196",
+    pluginApi: 1,
+    grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+    seamAvailable: true,
+  };
+
+  it("negotiates structured support only with the seam handshake", () => {
+    const res = negotiateBridgeCapabilities(HOST);
     expect(res.supported).toBe(true);
+    expect(res.structured).toBe(true);
     expect(res.degraded).toBe(false);
     expect(res.fallback).toBe("structured");
     expect(res.supportedOperations).toContain("profile.mutate");
     expect(res.bridgeVersion).toBe(BRIDGE_VERSION);
   });
 
+  it("stays degraded without the seam handshake even when versions/caps look right", () => {
+    const { seamAvailable: _dropped, ...noSeam } = HOST;
+    void _dropped;
+    const res = negotiateBridgeCapabilities(noSeam);
+    expect(res.supported).toBe(true);
+    expect(res.structured).toBe(false);
+    expect(res.degraded).toBe(true);
+    expect(res.fallback).toBe("cli-only");
+    expect(res.supportedOperations).not.toContain("profile.mutate");
+    expect(res.reasons.join("\n")).toMatch(/seam/);
+  });
+
+  it("degrades fail-closed on unknown versions or grants (never assumes current)", () => {
+    expect(negotiateBridgeCapabilities().structured).toBe(false);
+    expect(negotiateBridgeCapabilities({ seamAvailable: true }).supported).toBe(false);
+    expect(negotiateBridgeCapabilities({ seamAvailable: true }).reasons.join("\n")).toMatch(/unknown/);
+  });
+
   it("degrades explicitly on old hosts, future pluginApi, and missing consent", () => {
-    const old = negotiateBridgeCapabilities({ appVersion: "1.3.0", pluginApi: 1 });
+    const old = negotiateBridgeCapabilities({ appVersion: "1.3.0", pluginApi: 1, seamAvailable: true, grantedCapabilities: HOST.grantedCapabilities });
     expect(old.supported).toBe(false);
+    expect(old.structured).toBe(false);
     expect(old.degraded).toBe(true);
     expect(old.fallback).toBe("cli-only");
-    const future = negotiateBridgeCapabilities({ appVersion: "1.4.196", pluginApi: 99 });
+    const future = negotiateBridgeCapabilities({ appVersion: "1.4.196", pluginApi: 99, seamAvailable: true, grantedCapabilities: HOST.grantedCapabilities });
     expect(future.supported).toBe(false);
+    expect(future.structured).toBe(false);
     const noConsent = negotiateBridgeCapabilities({
       appVersion: "1.4.196",
       pluginApi: 1,
+      seamAvailable: true,
       grantedCapabilities: ["terminal:send"],
     });
-    expect(noConsent.supported).toBe(false);
+    expect(noConsent.structured).toBe(false);
+    expect(noConsent.degraded).toBe(true);
     expect(noConsent.reasons.join("\n")).toMatch(/workspace:read/);
   });
 
   it("ignores unknown future capabilities (additive, no rewrite needed)", () => {
     const res = negotiateBridgeCapabilities({
-      appVersion: "1.4.196",
-      pluginApi: 1,
+      ...HOST,
       grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show", "future:thing"],
     });
-    expect(res.supported).toBe(true);
+    expect(res.structured).toBe(true);
   });
 
   it("notes that storage/settings/secrets are intentionally unused (no second store)", () => {
     const res = negotiateBridgeCapabilities({
-      appVersion: "1.4.196",
-      pluginApi: 1,
+      ...HOST,
       grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show", "storage", "settings:own", "secrets"],
     });
     expect(res.reasons.join("\n")).toMatch(/no second profile store/);

@@ -14,7 +14,6 @@
  */
 
 import type { ProfilesPanelModel } from "@orca-pi/core";
-import { TARGET_ORCA_APP_VERSION, TARGET_ORCA_PLUGIN_API } from "@orca-pi/core";
 import {
   BRIDGE_VERSION,
   negotiateBridgeCapabilities,
@@ -27,6 +26,12 @@ export interface PanelSupportInput {
   appVersion?: string;
   pluginApi?: number;
   grantedCapabilities?: readonly string[];
+  /**
+   * Seam handshake: true only when the panel↔bridge transport is present
+   * (`window.__ORCA_PI_BRIDGE__.request`). Panels detect this at runtime;
+   * absent (default) means structured editing stays disabled.
+   */
+  seamAvailable?: boolean;
 }
 
 export interface PanelSupport {
@@ -72,37 +77,42 @@ function gte(a: string, b: string): boolean {
  * Detect what the installed Orca host supports for the profiles sidebar.
  * Pure function — no I/O, no version sniffing beyond injected values.
  *
- * UI1.2 negotiates the versioned bridge (`bridge.ts`): on hosts with
- * pluginApi 1 + engines.orca >=1.4.0 + `workspace:read` consent, the panel
- * uses structured requests (live reload + persistence + editing behind the
- * bridge host / future scoped-exec seam). Older hosts or missing consent
- * degrade explicitly to read-only CLI fallback — never a hidden store.
+ * UI1.2 negotiates the versioned bridge (`bridge.ts`): structured requests
+ * (live reload + persistence + editing behind the bridge host) require the
+ * explicit seam handshake (`seamAvailable`, detected at runtime from
+ * `window.__ORCA_PI_BRIDGE__.request`) plus versions and `workspace:read`
+ * consent. Stock Orca without the seam degrades explicitly to read-only
+ * CLI fallback — liveReload/persistence/editing stay false and no
+ * "structured available" claim is made. Unknown versions or grants
+ * degrade the same way (fail-closed).
  */
 export function detectPanelSupport(input?: PanelSupportInput): PanelSupport {
   const reasons: string[] = [];
-  const pluginApi = input?.pluginApi ?? TARGET_ORCA_PLUGIN_API;
-  const appVersion = input?.appVersion ?? TARGET_ORCA_APP_VERSION;
+  const pluginApi = input?.pluginApi;
+  const appVersion = input?.appVersion;
   const negotiation = negotiateBridgeCapabilities({
-    appVersion,
-    pluginApi,
+    ...(appVersion !== undefined ? { appVersion } : {}),
+    ...(pluginApi !== undefined ? { pluginApi } : {}),
     ...(input?.grantedCapabilities !== undefined
       ? { grantedCapabilities: input.grantedCapabilities }
       : {}),
+    ...(input?.seamAvailable !== undefined ? { seamAvailable: input.seamAvailable } : {}),
   });
 
-  const readOnlySummary = pluginApi === 1 && gte(appVersion, "1.4.0");
-  const structured = negotiation.supported;
+  const readOnlySummary =
+    pluginApi === 1 && appVersion !== undefined && gte(appVersion, "1.4.0");
+  const structured = negotiation.structured;
   reasons.push(...negotiation.reasons);
   if (structured) {
     reasons.push(
-      `Structured bridge ${BRIDGE_VERSION} available: live data via typed requests (request IDs + validation/conflict/unsupported/auth-setup/internal errors); mutations route through the authoritative core service.`
+      `Structured bridge ${BRIDGE_VERSION} reachable via the seam handshake: live data via typed requests (request IDs + validation/conflict/unsupported/auth-setup/internal errors); mutations route through the authoritative core service.`,
     );
     reasons.push(
-      "Panel never scrapes terminal output or YAML and never stores a second copy of profiles in settings/storage."
+      "Panel never scrapes terminal output or YAML and never stores a second copy of profiles in settings/storage.",
     );
   } else {
     reasons.push(
-      "Structured bridge unavailable — panel degrades explicitly to read-only CLI fallback with actionable terminal.sendText descriptors (explicit user gesture only, never parsed)."
+      "Structured bridge unreachable (no seam handshake, unknown host version, or missing consent) — panel degrades explicitly to read-only CLI fallback with actionable terminal.sendText descriptors (explicit user gesture only, never parsed).",
     );
   }
 

@@ -17,6 +17,7 @@
     "lint": "eslint src test"
   },
   "dependencies": {
-    "@orca-pi/core": "0.1.0"
+    "@orca-pi/core": "0.1.0",
+    "@orca-pi/orca-plugin": "0.1.0"
   }
 }

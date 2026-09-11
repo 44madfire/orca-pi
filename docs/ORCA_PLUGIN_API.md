@@ -104,28 +104,49 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
 `plugin-manifest-contribution-validation.ts`, `plugin-command-actions.ts`,
 `plugin-content-pack-contributions.ts`.
 
-## Transport strategy (why option 2 + degraded fallback)
+## Transport strategy (why sidecar now, seam next, degraded fallback always)
 
 1. **Native structured worker/host path** — not sufficient in current Orca.
    The worker can call only `storage`/`secrets`/`settings`/`events`; it
    cannot read the authoritative profile YAML or run the Orca-Pi services
    without a second copy in `settings`/`storage` (explicitly forbidden) or
-   unrestricted `child_process` (never on the table). So option 1 cannot
-   serve live profile/config data today.
-2. **Narrow Orca core seam / scoped execution capability** — the production
-   target. Orca-Pi already expects an Orca fork for structured Native Chat;
-   a small generic seam is acceptable **iff** it is designed for upstreaming
-   and contains **no Pi-specific policy**. Proposed seam (generic, host-owned):
-   `plugin-service.invoke {service: "orca-pi.bridge", request: <versioned
-   BridgeRequest>}` behind a new capability (e.g. `service:invoke` with an
-   allowlisted service id), validated with the same Zod-on-both-sides
-   discipline as `plugin-host-protocol.ts`, audit-logged as
-   `plugin:<id>`, with explicit `projectRoot` scoping and no shell strings.
-   Orca core would own only the generic invoke + capability gate; all Pi
+   unrestricted `child_process` (never on the table). The audited Host API
+   v0 also offers no panel↔bridge seam of its own (no
+   `plugin-service.invoke`, no scoped `process:exec`/filesystem API), and
+   the worker `orca` API exposes no `appVersion`/`pluginApi` — so versions
+   and consent must never be assumed. Option 1 cannot serve live
+   profile/config data today.
+2. **CLI sidecar (implemented, current transport).** `orca-pi bridge
+   --request '<json|@file>'` executes one versioned `BridgeRequest` per
+   call through `bridge-host.ts` and prints a versioned `BridgeResponse`
+   (see `packages/cli/src/commands/bridge.ts`). The invocation itself is
+   the seam handshake (`seamAvailable: true`); Orca host facts the sidecar
+   cannot observe stay unknown unless the harness declares them
+   (`--host-app-version` / `--host-plugin-api` / `--granted-capability`,
+   fail-closed when omitted). Panels reach the bridge where the seam
+   harness injects `window.__ORCA_PI_BRIDGE__.request`; the worker entry
+   (`worker-entry.mjs`) stays degraded until the harness signals
+   `ORCA_PI_BRIDGE_SEAM=1` / `seamAvailable`.
+3. **Narrow Orca core seam / scoped execution capability** — the
+   upstreamable future. Orca-Pi already expects an Orca fork for structured
+   Native Chat; a small generic seam is acceptable **iff** it is designed
+   for upstreaming and contains **no Pi-specific policy**. Proposed seam
+   (generic, host-owned): `plugin-service.invoke {service:
+   "orca-pi.bridge", request: <versioned BridgeRequest>}` behind a new
+   capability (e.g. `service:invoke` with an allowlisted service id),
+   validated with the same Zod-on-both-sides discipline as
+   `plugin-host-protocol.ts`, audit-logged as `plugin:<id>`. Crucially the
+   seam must **inject the absolute project root / worktree id host-side**:
+   `workspace.readContext` returns only `{branch, displayName,
+   terminals: [{id}]}` — no filesystem path — so panels cannot supply
+   `projectRoot` from readContext, and panel-supplied roots must be
+   treated as untrusted until the host provisions them. Orca core would own
+   only the generic invoke + capability gate + root injection; all Pi
    policy lives in `packages/orca-plugin/src/bridge*.ts` + `@orca-pi/core`.
-   This repo implements the service side now (`bridge-host.ts` dispatcher +
-   `worker.ts` entry) so it can bind behind the seam without a panel rewrite.
-3. **`terminal.sendText` degraded fallback** — clearly-labeled, explicit
+   This repo implements the service side now (`bridge-host.ts` dispatcher
+   + `worker.ts` core + `worker-entry.mjs` activation) so it binds behind
+   the seam without a panel rewrite.
+4. **`terminal.sendText` degraded fallback** — clearly-labeled, explicit
    user actions only. Allowed text is allowlisted to read-only
    `orca-pi doctor | profiles list | profile show/inspect/validate/path/read`;
    mutations are never offered this way. Requires an explicit `terminalId`
@@ -133,13 +154,18 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
    parsed back into the UI. It is not the primary architecture.
 
 **Not solved** by storing a second copy of profiles in plugin
-`settings`/`storage` (divergence risk — forbidden and tested).
+`settings`/`storage` (divergence risk — forbidden and tested). Stock Orca
+without the seam harness stays explicitly degraded/read-only; no
+"structured available" claim is made there (negotiation is seam-gated
+and fail-closed — see below).
 
 ## Bridge contract (owned by Orca-Pi)
 
 - Code: `packages/orca-plugin/src/bridge.ts` (pure protocol),
   `bridge-host.ts` (Node dispatcher over `@orca-pi/core`),
-  `worker.ts` (manifest `main`, capability tracking + lifecycle).
+  `worker.ts` (bridge core) + `worker-entry.mjs` (Orca entry,
+  default-exported `activate(orca)`), `packages/cli/src/commands/bridge.ts`
+  (sidecar transport).
 - Versioned: `bridgeVersion 1.0.0`, `protocolVersion 1`. Requests carry
   `{protocolVersion, requestId ([A-Za-z0-9._-]{1,128}, echoed), operation
   (allowlisted, see below), worktree? {projectRoot, worktreeId?,
@@ -158,10 +184,14 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
   (wrong protocol/host), `auth/setup` (missing consent/setup with actionable
   next steps), `internal`, plus narrow `not-found` / `already-exists`.
 - Worktree/project scoping is explicit and race-safe: mutating ops require
-  `worktree.projectRoot` captured at submission; the host derives
-  `<projectRoot>/.pi/...` for project scope (arbitrary `userPath` /
-  `projectPath` overrides from the panel are rejected). Delayed requests can
-  never be redirected by focus changes.
+  an **absolute** `worktree.projectRoot` captured at submission (relative
+  roots are rejected — they would resolve against the worker's cwd, not a
+  verified worktree); the host derives `<projectRoot>/.pi/...` for project
+  scope (arbitrary `userPath` / `projectPath` overrides from the panel are
+  rejected). Delayed requests can never be redirected by focus changes.
+  `workspace.readContext` is good for terminal identity (explicit
+  `terminalId`) but carries no filesystem paths — absolute roots arrive
+  via the seam/sidecar injection.
 - `window.__ORCA_PI_PROFILES__` injection is **deprecated** (legacy
   read-only fallback only, labeled as such) — production panels use
   `window.__ORCA_PI_BRIDGE__.request` (future seam) with explicit degraded
@@ -180,9 +210,14 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
   filesystem access is scoped to the explicit `projectRoot` via core
   services (no shell strings, no `child_process`).
 - `detectPanelSupport()` / `negotiateBridgeCapabilities()` feature-detect
-  Host API methods/version + granted capabilities; unsupported hosts or
-  missing consent → explicit degraded read-only UI (reason + version +
-  capability status + actionable CLI fallback), never silent divergence.
+  Host API methods/version + granted capabilities **plus the seam
+  handshake**, fail-closed: unknown versions, unknown grants, or a missing
+  seam all degrade to read-only (no optimistic defaults — the worker `orca`
+  API exposes no versions, so absent means unknown, never current).
+  Unsupported hosts or missing consent → explicit degraded read-only UI
+  (reason + version + capability status + actionable CLI fallback), never
+  silent divergence and never a "structured available" claim without the
+  transport to back it.
 - `packages/core/src/pluginManifest.ts` mirrors the v1 rules (closed
   capability kinds, contribution limits, `events:subscribe` gate) so `ok:
   true` means the manifest is expected to pass Orca validation; `test/`

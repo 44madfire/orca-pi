@@ -52,17 +52,26 @@ describe("plugin entry contract", () => {
     };
     expect(typeof entry.default).toBe("function");
 
-    const logs: string[] = [];
-    await entry.default({
-      grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
-      appVersion: "1.4.199",
-      pluginApi: 1,
-      log: (message: string) => {
-        logs.push(message);
-      },
-    });
-    expect(logs.join("\n")).toMatch(/orca-pi bridge .* ready/);
+    const previousSeam = process.env.ORCA_PI_BRIDGE_SEAM;
+    process.env.ORCA_PI_BRIDGE_SEAM = "1";
+    try {
+      const logs: string[] = [];
+      await entry.default({
+        grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+        appVersion: "1.4.199",
+        pluginApi: 1,
+        log: (message: string) => {
+          logs.push(message);
+        },
+      });
+      expect(logs.join("\n")).toMatch(/orca-pi bridge .* ready/);
+    } finally {
+      if (previousSeam === undefined) delete process.env.ORCA_PI_BRIDGE_SEAM;
+      else process.env.ORCA_PI_BRIDGE_SEAM = previousSeam;
+    }
 
+    // Stock worker API (no versions, no grants, no seam signal) degrades
+    // explicitly instead of claiming structured support.
     const degradedLogs: string[] = [];
     await entry.default({
       grantedCapabilities: [],

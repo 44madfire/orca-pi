@@ -168,6 +168,15 @@ describe("bridge host: live profile data (no injection)", () => {
       d,
     );
     expect(created.ok).toBe(true);
+    // Inheritance survives the bridge (folded into initial like CLI --extends).
+    const read = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "r1", operation: "profile.read", params: { name: "worker-fast" } },
+      d,
+    );
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect((read.result as { extendsChain: string[] }).extendsChain).toContain("worker");
+    }
     const listed = await handleBridgeRequest({ protocolVersion: 1, requestId: "l1", operation: "profiles.list" }, d);
     expect(listed.ok).toBe(true);
     if (listed.ok) {
@@ -381,7 +390,7 @@ describe("bridge worker: lifecycle and consent honesty", () => {
 
   it("uses stable requestIds end-to-end", async () => {
     const worker = createBridgeWorker(deps());
-    worker.onInit({ grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"], appVersion: "1.4.196", pluginApi: 1 });
+    worker.onInit({ grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"], appVersion: "1.4.196", pluginApi: 1, seamAvailable: true });
     expect(worker.isBridgeSupported()).toBe(true);
     const res = await worker.handleRequest({ protocolVersion: 1, requestId: "stable-42", operation: "bridge.capabilities" });
     expect(res.requestId).toBe("stable-42");

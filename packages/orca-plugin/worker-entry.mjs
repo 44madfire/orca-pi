@@ -39,15 +39,21 @@ const { BRIDGE_VERSION, BRIDGE_PROTOCOL_VERSION } = require("./dist/bridge.js");
 export default async function activate(orca) {
   const grantedCapabilities = Array.isArray(orca?.grantedCapabilities)
     ? [...orca.grantedCapabilities]
-    : [];
+    : undefined;
+  // Seam handshake: the stock worker `orca` API exposes no transport of
+  // its own, so structured operations stay disabled unless the seam
+  // harness signals it. Either signal suffices; absent means degraded.
+  const seamAvailable =
+    orca?.seamAvailable === true || process.env.ORCA_PI_BRIDGE_SEAM === "1";
   const worker = createBridgeWorker({
     ...(process.env.ORCA_PI_PROJECT_ROOT ? { projectRoot: process.env.ORCA_PI_PROJECT_ROOT } : {}),
   });
   worker.onInit({
     pluginId: "44madfire.orca-pi",
-    grantedCapabilities,
+    ...(grantedCapabilities !== undefined ? { grantedCapabilities } : {}),
     ...(typeof orca?.appVersion === "string" ? { appVersion: orca.appVersion } : {}),
     ...(typeof orca?.pluginApi === "number" ? { pluginApi: orca.pluginApi } : {}),
+    ...(seamAvailable ? { seamAvailable: true } : {}),
   });
   const log = typeof orca?.log === "function" ? orca.log.bind(orca) : () => {};
   if (worker.isBridgeSupported()) {

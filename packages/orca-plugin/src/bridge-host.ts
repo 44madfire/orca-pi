@@ -64,8 +64,8 @@ export interface BridgeHostDeps {
   fetchFn?: import("@orca-pi/core").GithubFetchFn;
   /** Injectable process runner for read-only `diagnostics.doctor` (orca/pi --version probes). */
   runner?: import("@orca-pi/core").ProcessRunner;
-  /** Host version info for `bridge.capabilities` (defaults to audited upstream snapshot). */
-  hostInfo?: { appVersion?: string; pluginApi?: number; grantedCapabilities?: readonly string[] };
+  /** Host version info for `bridge.capabilities` (unknown/absent fields degrade fail-closed). */
+  hostInfo?: { appVersion?: string; pluginApi?: number; grantedCapabilities?: readonly string[]; seamAvailable?: boolean };
   /** Injectable credential fs for GitHub doctor (tests stub; prod resolves node:fs). */
   providerFs?: import("@orca-pi/core").CredentialProviderFs;
 }
@@ -223,7 +223,7 @@ function capabilitiesResult(deps: BridgeHostDeps): unknown {
       appVersion: "1.4.196+ (re-audited 2026-09-11; Host API v0 unchanged — no process:exec/filesystem API)",
     },
     transport: {
-      primary: "versioned bridge host (Node sidecar today; generic scoped-exec/plugin-service seam tomorrow — no Pi policy in Orca core)",
+      primary: "versioned bridge host via the `orca-pi bridge --request` CLI sidecar (invocation proves the transport); generic scoped-exec/plugin-service seam is the upstreamable future — no Pi policy in Orca core",
       degraded: "explicit user-triggered terminal.sendText for read-only CLI commands only (never auto-sent, never parsed)",
       noSecondStore: true,
     },
@@ -238,8 +238,8 @@ function worktreeContextResult(request: BridgeRequest, deps: BridgeHostDeps): un
     ...(request.worktree?.terminalId !== undefined ? { terminalId: request.worktree.terminalId } : {}),
     explicit: request.worktree !== undefined,
     note: request.worktree !== undefined
-      ? "Explicit scope captured at submission — the bridge never re-reads the focused worktree at execution time, so delayed requests cannot be redirected by focus changes."
-      : "No explicit scope on this read. Mutating operations require worktree.projectRoot. Panels obtain the focused worktree via host workspace.readContext and echo it here.",
+      ? "Explicit scope captured at submission — the bridge never re-reads the focused worktree at execution time, so delayed requests cannot be redirected by focus changes. Host workspace.readContext supplies branch/display name/terminal identity only (never filesystem paths); the absolute projectRoot above arrives via the seam/sidecar injection and is re-validated here."
+      : "No explicit scope on this read. Mutating operations require worktree.projectRoot from the seam/sidecar injection (workspace.readContext carries no filesystem path). Panels obtain terminal identity via host workspace.readContext for explicit terminal.sendText targeting.",
   };
 }
 
@@ -389,8 +389,12 @@ async function profileMutateResult(request: BridgeRequest, deps: BridgeHostDeps)
       const name = requireString(params["name"], "params.name");
       const initial = params["initial"] !== undefined ? requireObject(params["initial"], "params.initial") : undefined;
       const extendsParent = params["extends"] !== undefined ? requireString(params["extends"], "params.extends") : undefined;
+      // Core takes inheritance inside `initial` (like `profile create
+      // --extends`, which folds it there) — never as a sibling that would
+      // be silently ignored.
+      const mergedInitial = { ...(initial ?? {}), ...(extendsParent !== undefined ? { extends: extendsParent } : {}) };
       return await core.createProfile(
-        { name, scope: scope as MutationScope, ...(initial !== undefined ? { initial } : {}), ...(extendsParent !== undefined ? { extends: extendsParent } : {}) },
+        { name, scope: scope as MutationScope, ...(Object.keys(mergedInitial).length > 0 ? { initial: mergedInitial } : {}) },
         withHash,
       );
     }

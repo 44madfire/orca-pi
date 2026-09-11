@@ -132,8 +132,13 @@ describe("profiles panel: rendering states", () => {
 });
 
 describe("profiles panel: feature detection and fallback", () => {
-  it("negotiates the structured bridge on the targeted host", () => {
-    const support = detectPanelSupport({ appVersion: "1.4.196", pluginApi: 1 });
+  it("negotiates the structured bridge only with the seam handshake", () => {
+    const support = detectPanelSupport({
+      appVersion: "1.4.196",
+      pluginApi: 1,
+      grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+      seamAvailable: true,
+    });
     expect(support.supported).toBe(true);
     expect(support.readOnlySummary).toBe(true);
     expect(support.liveReload).toBe(true);
@@ -144,6 +149,20 @@ describe("profiles panel: feature detection and fallback", () => {
     expect(support.bridgeVersion).toBe("1.0.0");
     expect(support.supportedOperations).toContain("profile.mutate");
     expect(support.supportedOperations).toContain("profiles.list");
+  });
+
+  it("stays degraded without the seam handshake (stock Orca has no panel↔bridge seam)", () => {
+    const support = detectPanelSupport({
+      appVersion: "1.4.196",
+      pluginApi: 1,
+      grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+    });
+    expect(support.supported).toBe(true);
+    expect(support.readOnlySummary).toBe(true);
+    expect(support.editing).toBe(false);
+    expect(support.liveReload).toBe(false);
+    expect(support.fallback).toBe("cli-only");
+    expect(support.degraded).toBe(true);
   });
 
   it("degrades gracefully on unsupported hosts without a hidden store", () => {

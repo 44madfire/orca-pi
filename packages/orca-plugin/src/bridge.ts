@@ -20,12 +20,17 @@
  * exposes only `workspace.readContext` / `terminal.sendText` /
  * `notifications.show` to panels and `storage` / `secrets` / `settings` /
  * `events.subscribe` to workers — no general/scoped `process:exec` or
- * filesystem API. The native structured worker/host path therefore cannot
- * serve live profile/config data without a second store (forbidden). The
- * production target is a narrow, generic, upstreamable Orca core
- * scoped-exec/plugin-service seam (no Pi-specific policy in Orca core);
- * `terminal.sendText` is only a clearly-labeled degraded fallback for
- * explicit user actions and never the primary architecture.
+ * filesystem API, and no panel↔bridge seam. The native structured
+ * worker/host path therefore cannot serve live profile/config data without
+ * a second store (forbidden). The current transport is the `orca-pi bridge`
+ * CLI sidecar (one versioned request per call; the invocation itself is the
+ * seam handshake); the production target beyond it is a narrow, generic,
+ * upstreamable Orca core scoped-exec/plugin-service seam (no Pi-specific
+ * policy in Orca core). `terminal.sendText` is only a clearly-labeled
+ * degraded fallback for explicit user actions and never the primary
+ * architecture. `workspace.readContext` supplies branch/display
+ * name/terminal identity only — never filesystem paths, so absolute
+ * project roots arrive via the seam/sidecar injection.
  *
  * This module is pure (no I/O, no `node:` imports) so panels, workers, and
  * tests share one validator. `bridge-host.ts` implements the dispatcher
@@ -403,13 +408,32 @@ export interface BridgeNegotiationInput {
   appVersion?: string;
   pluginApi?: number;
   grantedCapabilities?: readonly string[];
+  /**
+   * Explicit transport/seam handshake. True only when the panel↔bridge
+   * transport is present: the sidecar/seam injection
+   * (`window.__ORCA_PI_BRIDGE__.request` in panels, `ORCA_PI_BRIDGE_SEAM=1`
+   * or `seamAvailable` in the worker). Defaults to false (fail-closed):
+   * without a proven transport the bridge reports degraded even when
+   * versions and capabilities look right, because the audited Host API v0
+   * has no panel↔bridge seam of its own.
+   */
+  seamAvailable?: boolean;
 }
 
 export interface BridgeNegotiation {
   bridgeVersion: string;
   protocolVersion: number;
-  /** True when the structured bridge can serve live data (not degraded). */
+  /**
+   * True when the host can render declarative sandboxed panels
+   * (pluginApi v1 + engines.orca >=1.4.0, both explicitly provided).
+   */
   supported: boolean;
+  /**
+   * True when versioned bridge operations are actually reachable
+   * (render support + `workspace:read` consent + seam handshake).
+   * Stock Orca without the seam reports `structured: false`.
+   */
+  structured: boolean;
   /** True when the panel must use the read-only/degraded path. */
   degraded: boolean;
   supportedOperations: readonly BridgeOperation[];
@@ -436,29 +460,44 @@ function gte(a: string, b: string): boolean {
 
 /**
  * Negotiate bridge support for the installed host. Pure — no I/O.
- * Later Host API additions are additive: unknown future capabilities are
- * ignored (never required), and unknown future operations degrade to
- * `unsupported` with an actionable message instead of requiring a panel
- * rewrite.
+ * Fail-closed: unknown versions, missing consent, or a missing seam
+ * handshake all degrade to read-only CLI fallback. In particular the
+ * worker `orca` API exposes no `appVersion`/`pluginApi`, so callers must
+ * not default them to the targeted versions — an absent version is
+ * "unknown", never "current". Later Host API additions are additive:
+ * unknown future capabilities are ignored (never required), and unknown
+ * future operations degrade to `unsupported` with an actionable message
+ * instead of requiring a panel rewrite.
  */
 export function negotiateBridgeCapabilities(input?: BridgeNegotiationInput): BridgeNegotiation {
   const reasons: string[] = [];
-  const pluginApi = input?.pluginApi ?? BRIDGE_TARGET_PLUGIN_API;
-  const appVersion = input?.appVersion ?? BRIDGE_TARGET_ORCA_APP_VERSION;
-  const granted = new Set(input?.grantedCapabilities ?? ["workspace:read", "terminal:send", "notifications:show"]);
+  const pluginApi = input?.pluginApi;
+  const appVersion = input?.appVersion;
+  const granted = input?.grantedCapabilities !== undefined ? new Set(input.grantedCapabilities) : undefined;
+  const seamAvailable = input?.seamAvailable === true;
 
-  let supported = true;
-  if (pluginApi !== BRIDGE_TARGET_PLUGIN_API) {
-    supported = false;
+  let renderSupported = true;
+  if (pluginApi === undefined) {
+    renderSupported = false;
+    reasons.push(
+      `Host pluginApi is unknown (the worker orca API does not expose it) — refusing to assume v${BRIDGE_TARGET_PLUGIN_API}; structured bridge degrades to read-only CLI fallback.`,
+    );
+  } else if (pluginApi !== BRIDGE_TARGET_PLUGIN_API) {
+    renderSupported = false;
     reasons.push(
       `pluginApi ${pluginApi} is not the targeted v1 (${BRIDGE_TARGET_PLUGIN_API}); structured bridge degrades to read-only CLI fallback.`,
     );
   } else {
-    reasons.push("pluginApi 1 supports declarative sandboxed panels; structured Orca-Pi ops ride the versioned bridge (future scoped-exec seam).");
+    reasons.push("pluginApi 1 supports declarative sandboxed panels.");
   }
 
-  if (!gte(appVersion, "1.4.0")) {
-    supported = false;
+  if (appVersion === undefined) {
+    renderSupported = false;
+    reasons.push(
+      `Host app version is unknown (the worker orca API does not expose it) — refusing to assume ${BRIDGE_TARGET_ORCA_APP_VERSION}; structured bridge degrades to read-only CLI fallback.`,
+    );
+  } else if (!gte(appVersion, "1.4.0")) {
+    renderSupported = false;
     reasons.push(
       `Orca app ${appVersion} is older than engines.orca >=1.4.0; structured bridge degrades to read-only CLI fallback.`,
     );
@@ -466,42 +505,63 @@ export function negotiateBridgeCapabilities(input?: BridgeNegotiationInput): Bri
     reasons.push(`Orca app ${appVersion} meets engines.orca >=1.4.0.`);
   }
 
-  if (!granted.has("workspace:read")) {
-    supported = false;
+  // Consent is only meaningful when the host actually reports grants: an
+  // absent grant list is "unknown", never "granted".
+  const hasWorkspaceRead = granted?.has("workspace:read") ?? false;
+  if (granted === undefined) {
+    reasons.push("Granted capabilities are unknown — consent cannot be verified; mutations stay disabled.");
+  } else if (!hasWorkspaceRead) {
     reasons.push("Missing workspace:read consent — worktree context is unavailable; mutations stay disabled (explicit scope cannot be verified).");
   } else {
     reasons.push("workspace:read granted — worktree context available for explicit scoping.");
   }
 
-  if (!granted.has("terminal:send")) {
-    reasons.push("terminal:send not granted — degraded CLI fallback stays text-only (no explicit terminal.sendText action offered).");
-  } else {
-    reasons.push("terminal:send granted — degraded fallback may offer an explicit user-triggered terminal.sendText action (never auto-executed, never parsed).");
+  if (granted !== undefined) {
+    if (!granted.has("terminal:send")) {
+      reasons.push("terminal:send not granted — degraded CLI fallback stays text-only (no explicit terminal.sendText action offered).");
+    } else {
+      reasons.push("terminal:send granted — degraded fallback may offer an explicit user-triggered terminal.sendText action (never auto-executed, never parsed).");
+    }
   }
 
   // The bridge never stores profiles in settings/storage: those
   // capabilities are intentionally unused so no second store can diverge.
-  if (granted.has("storage") || granted.has("settings:own")) {
+  if (granted?.has("storage") || granted?.has("settings:own")) {
     reasons.push("Note: storage/settings capabilities are unused by the Orca-Pi bridge (no second profile store — authoritative YAML only).");
   }
-  if (granted.has("secrets")) {
+  if (granted?.has("secrets")) {
     reasons.push("Note: secrets capability is unused by the Orca-Pi bridge (GitHub tokens never enter the panel; redacted status only).");
   }
 
-  reasons.push(
-    "Current Host API v0 has no scoped process:exec/filesystem API — live data flows through the versioned bridge host (Node sidecar / future scoped-exec seam), not through panel storage.",
-  );
+  // Transport gate: the audited Host API v0 has no panel↔bridge seam
+  // (no scoped process:exec/filesystem API, no plugin-service.invoke).
+  // Versions + consent alone cannot prove reachability, so structured
+  // operations require the explicit seam handshake. Reachable today via
+  // the `orca-pi bridge` CLI sidecar; the generic scoped-exec seam is the
+  // upstreamable future. `workspace.readContext` supplies branch, display
+  // name, and terminal identity only — never filesystem paths, so the
+  // absolute projectRoot for writes must arrive via the seam/sidecar
+  // injection, never via readContext.
+  const isStructured = renderSupported && hasWorkspaceRead && seamAvailable;
+  if (!seamAvailable) {
+    reasons.push(
+      "No panel↔bridge seam handshake (no `window.__ORCA_PI_BRIDGE__.request` / `ORCA_PI_BRIDGE_SEAM=1` / `seamAvailable` signal): structured operations are unreachable on stock Orca — explicit read-only CLI fallback. Live data flows through the `orca-pi bridge` CLI sidecar where the seam harness provides it.",
+    );
+  } else if (isStructured) {
+    reasons.push("Seam handshake present: versioned bridge operations are reachable (request IDs + validation/conflict/unsupported/auth-setup/internal errors). Panel never scrapes terminal output or YAML and never stores a second copy of profiles.");
+  }
 
-  const supportedOperations: readonly BridgeOperation[] = supported
+  const supportedOperations: readonly BridgeOperation[] = isStructured
     ? BRIDGE_OPERATIONS
     : (["bridge.capabilities", "worktree.context", "diagnostics.doctor"] as const);
   return {
     bridgeVersion: BRIDGE_VERSION,
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
-    supported,
-    degraded: !supported,
+    supported: renderSupported,
+    structured: isStructured,
+    degraded: !isStructured,
     supportedOperations,
-    fallback: supported ? "structured" : "cli-only",
+    fallback: isStructured ? "structured" : "cli-only",
     reasons,
   };
 }

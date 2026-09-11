@@ -46,6 +46,13 @@ export interface BridgeWorkerInit {
   grantedCapabilities?: readonly string[];
   appVersion?: string;
   pluginApi?: number;
+  /**
+   * Seam handshake (see `BridgeNegotiationInput.seamAvailable`). The stock
+   * worker `orca` API provides no transport of its own, so this stays
+   * false unless the seam harness signals it (e.g. `ORCA_PI_BRIDGE_SEAM=1`
+   * in the worker entry). Absent means degraded, never "ready".
+   */
+  seamAvailable?: boolean;
 }
 
 export interface BridgeWorker {
@@ -67,26 +74,37 @@ export const PLUGIN_KEY = "44madfire.orca-pi";
  * these; they are host-side configuration, never panel input.
  */
 export function createBridgeWorker(deps: BridgeHostDeps = {}): BridgeWorker {
-  let granted: readonly string[] = [];
+  let granted: readonly string[] | undefined;
   let appVersion: string | undefined;
   let pluginApi: number | undefined;
+  let seamAvailable = false;
+
+  const negotiationInput = (): import("./bridge.js").BridgeNegotiationInput => ({
+    ...(appVersion !== undefined ? { appVersion } : {}),
+    ...(pluginApi !== undefined ? { pluginApi } : {}),
+    ...(granted !== undefined ? { grantedCapabilities: granted } : {}),
+    seamAvailable,
+  });
 
   return {
     pluginKey: PLUGIN_KEY,
     onInit(init: BridgeWorkerInit) {
-      granted = [...(init.grantedCapabilities ?? [])];
+      // Absent fields stay unknown (fail-closed): the stock worker `orca`
+      // API exposes no versions, so an omitted version is never assumed.
+      if (init.grantedCapabilities !== undefined) granted = [...init.grantedCapabilities];
       if (init.appVersion !== undefined) appVersion = init.appVersion;
       if (init.pluginApi !== undefined) pluginApi = init.pluginApi;
+      if (init.seamAvailable === true) seamAvailable = true;
       return { ok: true, bridgeVersion: BRIDGE_VERSION, protocolVersion: BRIDGE_PROTOCOL_VERSION };
     },
     getGrantedCapabilities() {
-      return [...granted];
+      return granted !== undefined ? [...granted] : [];
     },
     isBridgeSupported() {
-      return negotiateBridgeCapabilities({ appVersion, pluginApi, grantedCapabilities: granted }).supported;
+      return negotiateBridgeCapabilities(negotiationInput()).structured;
     },
     degradationReasons() {
-      return negotiateBridgeCapabilities({ appVersion, pluginApi, grantedCapabilities: granted }).reasons;
+      return negotiateBridgeCapabilities(negotiationInput()).reasons;
     },
     async handleRequest(data: unknown) {
       const hostDeps: BridgeHostDeps = {
@@ -94,7 +112,8 @@ export function createBridgeWorker(deps: BridgeHostDeps = {}): BridgeWorker {
         hostInfo: {
           ...(appVersion !== undefined ? { appVersion } : {}),
           ...(pluginApi !== undefined ? { pluginApi } : {}),
-          grantedCapabilities: granted,
+          ...(granted !== undefined ? { grantedCapabilities: granted } : {}),
+          seamAvailable,
         },
       };
       return await handleBridgeRequest(data, hostDeps);
