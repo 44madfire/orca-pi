@@ -653,7 +653,13 @@ export interface TerminalFallbackAction {
   terminalId: string;
   /** Exact CLI text the user explicitly triggers (e.g. `orca-pi profile validate`). */
   text: string;
-  enter: false;
+  /**
+   * Always true: the click itself is the explicit user gesture the issue
+   * requires, and the allowlisted text is read-only — so the line is
+   * submitted, not merely typed. `false` would report success while
+   * producing no command output.
+   */
+  enter: true;
   degraded: true;
   note: string;
 }
@@ -662,8 +668,9 @@ export interface TerminalFallbackAction {
  * Describe (never execute) an explicit degraded `terminal.sendText` action.
  * Requires an explicit `terminalId` from `workspace.readContext` so a focus
  * change can never redirect a delayed request into another pane. The panel
- * must only send this after an explicit user gesture, and must never parse
- * terminal output back into the UI.
+ * must only send this inside an explicit user-gesture handler (the send
+ * submits the allowlisted read-only line), and must never parse terminal
+ * output back into the UI.
  */
 export function describeTerminalFallback(
   terminalId: string,
@@ -701,9 +708,9 @@ export function describeTerminalFallback(
     hostAction: "terminal.sendText",
     terminalId,
     text: trimmed,
-    enter: false,
+    enter: true,
     degraded: true,
-    note: "Degraded fallback: explicit user action only. The panel must not auto-send and must not parse terminal output back into the UI.",
+    note: "Degraded fallback: explicit user gesture only (the gesture submits the allowlisted read-only line). The panel must not auto-send and must not parse terminal output back into the UI.",
   };
 }
 

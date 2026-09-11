@@ -131,7 +131,7 @@ orca-pi profile validate</code></pre>
           btn.textContent = "Run `" + FALLBACK_CLI_TEXT + "` in a visible terminal";
           var note = document.createElement("p");
           note.setAttribute("class", "muted");
-          note.textContent = "Explicit action only: reads your focused worktree's terminal list, then types one read-only command. Output is never read back into this panel.";
+          note.textContent = "Explicit action only: reads your focused worktree's terminal list, then runs one read-only command. Output is never read back into this panel.";
           btn.addEventListener("click", function () {
             btn.disabled = true;
             note.textContent = "Reading focused worktree terminals (workspace.readContext)…";
@@ -144,8 +144,8 @@ orca-pi profile validate</code></pre>
                 return;
               }
               var terminalId = terminals[0].id;
-              note.textContent = "Typing into terminal " + terminalId + " (explicit target — never the active terminal)…";
-              hostAction("terminal.sendText", { terminalId: terminalId, text: FALLBACK_CLI_TEXT, enter: false }).then(function (sent) {
+              note.textContent = "Running in terminal " + terminalId + " (explicit target — never the active terminal)…";
+              hostAction("terminal.sendText", { terminalId: terminalId, text: FALLBACK_CLI_TEXT, enter: true }).then(function (sent) {
                 var accepted = sent && sent.ok && sent.value && sent.value.accepted;
                 if (accepted) {
                   note.textContent = "Sent to terminal " + terminalId + ". Check the terminal for output — it is never read back here.";

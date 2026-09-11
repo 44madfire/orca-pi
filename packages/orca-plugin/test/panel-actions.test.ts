@@ -189,7 +189,7 @@ describe("profiles panel: explicit Host API fallback", () => {
     expect(dom.posted).toHaveLength(2);
     const send = actionOf(dom.posted, 1);
     expect(send.action).toBe("terminal.sendText");
-    expect(send.params).toMatchObject({ terminalId: "term-9", text: "orca-pi profile validate", enter: false });
+    expect(send.params).toMatchObject({ terminalId: "term-9", text: "orca-pi profile validate", enter: true });
     deliver(dom, { type: "orca-panel-action-result", requestId: send.requestId, ok: true, value: { accepted: true } });
     await flush();
     expect(findNoteWith(dom, "term-9")).toBeDefined();
@@ -310,7 +310,7 @@ describe("status panel: explicit Host API fallback", () => {
     });
     await flush();
     const send = actionOf(dom.posted, 1);
-    expect(send.params).toMatchObject({ terminalId: "term-2", text: "orca-pi doctor", enter: false });
+    expect(send.params).toMatchObject({ terminalId: "term-2", text: "orca-pi doctor", enter: true });
     deliver(dom, { type: "orca-panel-action-result", requestId: send.requestId, ok: true, value: { accepted: true } });
     await flush();
     expect(findNoteWith(dom, "term-2")).toBeDefined();

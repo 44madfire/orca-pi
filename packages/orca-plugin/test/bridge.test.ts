@@ -291,7 +291,10 @@ describe("bridge protocol: degraded terminal.sendText descriptors", () => {
     expect("hostAction" in ok && ok.hostAction).toBe("terminal.sendText");
     if ("hostAction" in ok) {
       expect(ok.terminalId).toBe("term-1");
-      expect(ok.enter).toBe(false);
+      // Submitted, not merely typed: the click is the explicit gesture and
+      // the text is allowlisted read-only, so `enter: false` would report
+      // success while producing no command output.
+      expect(ok.enter).toBe(true);
       expect(ok.degraded).toBe(true);
     }
     for (const bad of [
