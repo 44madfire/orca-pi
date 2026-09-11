@@ -159,12 +159,14 @@ Upstream sources (`src/shared/plugins/`): `plugin-host-api.ts`,
 4. **`terminal.sendText` degraded fallback** — clearly-labeled, explicit
    user actions only, implemented for real in both panels (a fallback
    button, tested end-to-end in `panel-actions.test.ts`). Allowed text is
-   allowlisted to read-only `orca-pi doctor | profiles list | profile
-   show/inspect/validate/path/read`; mutations are never offered this
-   way. The button handler calls `workspace.readContext` for an explicit
-   `terminalId` (never “active”), shows the target, then sends once —
-   never on load, never parsed back into the UI. It is not the primary
-   architecture.
+   a strict argv grammar (`isAllowlistedFallbackArgv`: fixed read-only
+   templates plus structurally-validated profile-name/flag arguments —
+   shell metacharacters, chaining, pipes, redirection, substitution, and
+   quotes are all rejected, so `enter: true` cannot smuggle a suffix to
+   the shell); mutations are never offered this way. The button handler
+   calls `workspace.readContext` for an explicit `terminalId` (never
+   “active”), shows the target, then sends once — never on load, never
+   parsed back into the UI. It is not the primary architecture.
 
 **Not solved** by storing a second copy of profiles in plugin
 `settings`/`storage` (divergence risk — forbidden and tested). Stock Orca

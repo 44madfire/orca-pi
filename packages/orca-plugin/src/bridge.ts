@@ -691,15 +691,31 @@ export function describeTerminalFallback(
       error: { code: "validation", message: "Degraded terminal.sendText requires non-empty CLI text (1-4096 chars)." },
     };
   }
-  // Allowlist: degraded fallback may only run read-only / explicitly-scoped
-  // orca-pi CLI commands — never arbitrary shell.
+  // Strict command grammar: the degraded fallback submits with Enter, so
+  // a prefix-only allowlist would admit shell chaining (`orca-pi doctor;
+  // touch /tmp/pwn`). Instead (1) reject any shell metacharacter outright
+  // and (2) match the full token argv against the intended read-only
+  // grammar — fixed templates plus structurally-validated arguments.
+  // Profile names reuse the `[a-z0-9-]+` rule so no flag/value injection
+  // is possible in argument position.
   const trimmed = text.trim();
-  if (!/^orca-pi\s+(doctor|profiles\s+list|profile\s+(show|inspect|validate|path|read)\b)/.test(trimmed)) {
+  const metacharacter = /[;&|<>`$()\\"'\n\r]/.exec(trimmed);
+  if (metacharacter) {
     return {
       ok: false,
       error: {
         code: "validation",
-        message: `Degraded terminal.sendText refuses non-allowlisted text ${JSON.stringify(trimmed.slice(0, 80))}: only read-only orca-pi CLI commands (doctor, profiles list, profile show/inspect/validate/path/read) may be offered as explicit fallback. Mutations require the structured bridge.`,
+        message: `Degraded terminal.sendText refuses text containing shell metacharacter ${JSON.stringify(metacharacter[0])}: only fixed read-only orca-pi commands may be offered as explicit fallback (mutations require the structured bridge).`,
+        detail: "degraded-allowlist-only",
+      },
+    };
+  }
+  if (!isAllowlistedFallbackArgv(trimmed)) {
+    return {
+      ok: false,
+      error: {
+        code: "validation",
+        message: `Degraded terminal.sendText refuses non-allowlisted text ${JSON.stringify(trimmed.slice(0, 80))}: only read-only orca-pi CLI commands (doctor, profiles list, profile show/inspect/validate/path/read with validated arguments) may be offered as explicit fallback. Mutations require the structured bridge.`,
         detail: "degraded-allowlist-only",
       },
     };
@@ -712,6 +728,68 @@ export function describeTerminalFallback(
     degraded: true,
     note: "Degraded fallback: explicit user gesture only (the gesture submits the allowlisted read-only line). The panel must not auto-send and must not parse terminal output back into the UI.",
   };
+}
+
+const PROFILE_NAME_TOKEN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * Strict argv grammar for degraded-fallback text (see above). Tokens are
+ * split on whitespace (no quoting — quotes are rejected as
+ * metacharacters), and every token must belong to the template:
+ *
+ * ```text
+ * orca-pi doctor [--json]
+ * orca-pi profiles list [--json]
+ * orca-pi profile show <name> [--json] [--show-prompt]
+ * orca-pi profile inspect <name> [--json] [--show-prompt] [--context-summary]
+ * orca-pi profile validate [<name>] [--json]
+ * orca-pi profile path [--project|--user] [--json]
+ * orca-pi profile read <name> [--json]
+ * ```
+ *
+ * Path-override flags are deliberately excluded: the fallback always runs
+ * against default config locations. Exported for panels/harness reuse and
+ * tested as a matrix (chaining, pipes, redirection, substitution,
+ * quotes, backticks, newlines, flag injection all rejected).
+ */
+export function isAllowlistedFallbackArgv(trimmed: string): boolean {
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length < 2 || tokens[0] !== "orca-pi") return false;
+  const rest = tokens.slice(1);
+  const flagsOnly = (args: string[], allowed: readonly string[]): boolean =>
+    args.every((arg) => allowed.includes(arg));
+  const nameToken = (token: string | undefined): boolean =>
+    typeof token === "string" && PROFILE_NAME_TOKEN.test(token);
+  const command = rest[0];
+  switch (command) {
+    case "doctor":
+      return flagsOnly(rest.slice(1), ["--json"]);
+    case "profiles":
+      return rest[1] === "list" && flagsOnly(rest.slice(2), ["--json"]);
+    case "profile": {
+      const sub = rest[1];
+      switch (sub) {
+        case "show":
+          return nameToken(rest[2]) && flagsOnly(rest.slice(3), ["--json", "--show-prompt"]);
+        case "inspect":
+          return nameToken(rest[2]) && flagsOnly(rest.slice(3), ["--json", "--show-prompt", "--context-summary"]);
+        case "validate": {
+          const tail = rest.slice(2);
+          const names = tail.filter((arg) => !arg.startsWith("-"));
+          const flags = tail.filter((arg) => arg.startsWith("-"));
+          return names.length <= 1 && names.every(nameToken) && flagsOnly(flags, ["--json"]);
+        }
+        case "path":
+          return flagsOnly(rest.slice(2), ["--project", "--user", "--json"]);
+        case "read":
+          return nameToken(rest[2]) && flagsOnly(rest.slice(3), ["--json"]);
+        default:
+          return false;
+      }
+    }
+    default:
+      return false;
+  }
 }
 
 /**

@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  BRIDGE_ERROR_CODES,
   BRIDGE_OPERATIONS,
   BRIDGE_PROTOCOL_VERSION,
   BRIDGE_VERSION,
@@ -15,6 +16,7 @@ import {
   bridgeOk,
   describeTerminalFallback,
   isAbsoluteProjectRoot,
+  isAllowlistedFallbackArgv,
   makeBridgeRequest,
   mapMutationCodeToBridge,
   negotiateBridgeCapabilities,
@@ -306,6 +308,67 @@ describe("bridge protocol: degraded terminal.sendText descriptors", () => {
       expect("ok" in refused && refused.ok === false).toBe(true);
     }
   });
+
+  it("accepts only the strict fallback grammar (templates + validated args)", () => {
+    const good = [
+      "orca-pi doctor",
+      "orca-pi doctor --json",
+      "orca-pi profiles list",
+      "orca-pi profiles list --json",
+      "orca-pi profile show worker",
+      "orca-pi profile show worker-fast --show-prompt --json",
+      "orca-pi profile inspect scout --context-summary",
+      "orca-pi profile validate",
+      "orca-pi profile validate worker --json",
+      "orca-pi profile path",
+      "orca-pi profile path --project",
+      "orca-pi profile read reviewer --json",
+    ];
+    for (const text of good) {
+      expect(isAllowlistedFallbackArgv(text)).toBe(true);
+      expect("hostAction" in describeTerminalFallback("t", text)).toBe(true);
+    }
+  });
+
+  it("rejects shell chaining, pipes, redirection, substitution, and injection", () => {
+    const bad = [
+      "orca-pi doctor; touch /tmp/pwn",
+      "orca-pi doctor && touch /tmp/pwn",
+      "orca-pi doctor || touch /tmp/pwn",
+      "orca-pi doctor & touch /tmp/pwn",
+      "orca-pi profile validate | tee /tmp/pwn",
+      "orca-pi profile validate > /tmp/pwn",
+      "orca-pi profile validate < /tmp/pwn",
+      "orca-pi doctor `touch /tmp/pwn`",
+      "orca-pi doctor $(touch /tmp/pwn)",
+      "orca-pi doctor ${HOME}",
+      "orca-pi doctor $HOME",
+      'orca-pi doctor "x"',
+      "orca-pi doctor 'x'",
+      "orca-pi doctor\\",
+      "orca-pi doctor\norca-pi spawn x",
+      "orca-pi profile show worker;orca-pi spawn x",
+      // Grammar violations (no metacharacters, still rejected).
+      "orca-pi profile set worker model x --scope project",
+      "orca-pi spawn worker --task x",
+      "orca-pi profile show",
+      "orca-pi profile show Worker",
+      "orca-pi profile show worker extra",
+      "orca-pi profile show --json",
+      "orca-pi doctor --bogus",
+      "orca-pi profile validate a b",
+      "orca-pi profile inspect worker --project-root /elsewhere",
+      "orca-pi profile path --elsewhere",
+      "orca-pi",
+      "",
+      "   ",
+    ];
+    for (const text of bad) {
+      expect(isAllowlistedFallbackArgv(text)).toBe(false);
+      const res = describeTerminalFallback("t", text);
+      expect("ok" in res && res.ok === false).toBe(true);
+    }
+  });
 });
 
 describe("bridge protocol: error-code mapping", () => {
@@ -321,6 +384,12 @@ describe("bridge protocol: error-code mapping", () => {
 });
 
 describe("bridge protocol: response validation", () => {
+  it("exposes the closed machine-readable error code set", () => {
+    for (const code of ["validation", "conflict", "unsupported", "auth/setup", "internal"]) {
+      expect(BRIDGE_ERROR_CODES).toContain(code);
+    }
+  });
+
   it("accepts well-formed success and error responses", () => {
     const ok = validateBridgeResponse(
       { protocolVersion: 1, requestId: "r1", ok: true, result: { a: 1 } },

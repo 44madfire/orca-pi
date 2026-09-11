@@ -21,6 +21,7 @@ export {
   DEGRADED_SAFE_OPERATIONS,
   describeTerminalFallback,
   isAbsoluteProjectRoot,
+  isAllowlistedFallbackArgv,
   makeBridgeRequest,
   mapMutationCodeToBridge,
   negotiateBridgeCapabilities,
