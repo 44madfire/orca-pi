@@ -877,3 +877,139 @@ describe("SNC1.6 ChatGPT review regressions (PR #39 P1s)", () => {
     expect(out.filter((m) => m.kind === "dispatch_ack" && (m as { opId?: string }).opId === "dsp_imm")).toHaveLength(1);
   });
 });
+
+describe("SNC1.6 P1-3 race (background catalog vs immediate image dispatch)", () => {
+  const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+  it("awaits a bounded live catalog before falsely rejecting hint-miss images", async () => {
+    // Acquire lands with model minimax-m3 (image-capable, hint-miss) but the
+    // background getAvailableModels is delayed 200ms. An image dispatched
+    // immediately post-acquire must not be rejected via hints — the provider
+    // awaits the bounded live lookup (3s) and accepts authoritatively.
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        // Start as minimax-m3 (hint-miss, image-capable) so the lease model
+        // is already the hint-miss case without needing set_options first.
+        fake.state = {
+          ...fake.state,
+          model: { id: "minimax-m3", provider: "opencode-go" } as PiState["model"],
+        };
+        const origList = fake.getAvailableModels.bind(fake);
+        fake.getAvailableModels = async () => {
+          await new Promise((r) => setTimeout(r, 200));
+          return origList();
+        };
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    // Acquire (background catalog delayed 200ms; acquired ack is immediate).
+    send({ v: 1, kind: "acquire", opId: "acq_race", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 30));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    // Immediate image dispatch before the background catalog lands.
+    send({
+      v: 1,
+      kind: "dispatch",
+      opId: "dsp_race_img",
+      sessionId,
+      message: { text: "see this fast?", images: [{ data: tinyPng, mimeType: "image/png" }] },
+    });
+    await new Promise((r) => setTimeout(r, 600));
+    // Must be accepted (live authoritative), never hint-rejected.
+    expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_race_img", status: "accepted" });
+    expect(JSON.stringify(lastOfKind(out, "dispatch_ack"))).not.toContain("model-rejects-images");
+  });
+});
+
+describe("SNC1.6 BridgeHost E2E (shared Native Chat controls via bridge)", () => {
+  // Proves Orca's existing shared controls drive Pi with no renderer fork:
+  // BridgeHost.dispatch with images[] reaches Pi as structured images, and
+  // BridgeHost.setOptions/getSession round-trip provider-confirmed values.
+  // The Orca fork adapter maps Native Chat image-ref blocks to
+  // BridgeHost.dispatch({ images }) and AgentSessionOptionsResult to
+  // get_session/set_options (see docs/orca-integration.md §SNC1.6).
+  it("E2E images: BridgeHost dispatch images[] -> Pi structured prompt (no byte journal)", async () => {
+    const { EventEmitter } = await import("node:events");
+    const { BridgeHost } = await import("../src/host.js");
+    const { serializeBridgeLine } = await import("../src/framing.js");
+    const tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const proc = new EventEmitter() as EventEmitter & {
+      stdin: EventEmitter & { write: (s: string) => void; end: () => void };
+      stdout: EventEmitter & { destroy: () => void; destroyed: boolean };
+      stderr: EventEmitter & { destroy: () => void; destroyed: boolean };
+      kill: (signal?: string) => void;
+    };
+    const stdout = new EventEmitter() as EventEmitter & { destroy: () => void; destroyed: boolean };
+    stdout.destroyed = false;
+    stdout.destroy = (() => { stdout.destroyed = true; }) as never;
+    const stderr = new EventEmitter() as EventEmitter & { destroy: () => void; destroyed: boolean };
+    stderr.destroyed = false;
+    stderr.destroy = (() => { stderr.destroyed = true; }) as never;
+    const stdin = new EventEmitter() as EventEmitter & { write: (s: string) => void; end: () => void };
+    (proc as unknown as { stdout: unknown }).stdout = stdout;
+    (proc as unknown as { stderr: unknown }).stderr = stderr;
+    (proc as unknown as { stdin: unknown }).stdin = stdin;
+    provider.attachTestTransport((msg) => {
+      (proc.stdout as unknown as EventEmitter).emit("data", Buffer.from(serializeBridgeLine(msg), "utf8"));
+    });
+    (proc.stdin as unknown as { write: (s: string) => void }).write = ((s: string) => {
+      for (const chunk of s.split("\n")) {
+        if (chunk.trim() === "") continue;
+        provider.onLine(chunk.endsWith("\r") ? chunk.slice(0, -1) : chunk);
+      }
+    }) as never;
+    (proc.stdin as unknown as { end: () => void }).end = (() => {
+      queueMicrotask(() => proc.emit("exit", 0, null));
+    }) as never;
+    (proc as unknown as { kill: (s?: string) => void }).kill = ((signal?: string) => {
+      queueMicrotask(() => proc.emit("exit", null, signal ?? "SIGTERM"));
+    }) as never;
+    const host = new BridgeHost({
+      bridgeCommand: "pi-in-memory",
+      bridgeArgs: [],
+      workspaceRoot: "/tmp/orca-ws",
+      spawnFn: ((() => proc) as never),
+      helloTimeoutMs: 2000,
+      requestTimeoutMs: 5000,
+      closeGraceMs: 50,
+    });
+    const support = await host.probeSupport();
+    expect(support.available).toBe(true);
+    expect(support.capabilities?.options).toBe(true);
+    const { sessionId } = await host.acquire();
+    // Shared image control path: authorized attachment -> bridge images[].
+    const outcome = await host.dispatch({ sessionId, text: "what is this?", images: [{ data: tiny, mimeType: "image/png" }] });
+    expect(outcome.status).toBe("accepted");
+    expect(fakes[0]?.prompts[0]?.message).toBe("what is this?");
+    // Complete the turn so history reconciles without bytes.
+    fakes[0]?.emit({ type: "turn_start" } as PiServerEvent);
+    fakes[0]?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ONE-PIXEL" } } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 40));
+    const history = await host.getHistory(sessionId);
+    expect(history.entries.some((e) => e.text === "what is this?")).toBe(true);
+    expect(JSON.stringify(history)).not.toContain(tiny.slice(0, 32));
+    // Shared option controls: current/set via get_session/set_options.
+    const before = await host.getSession(sessionId);
+    expect(before.sessionId).toBe(sessionId);
+    const updated = await host.setOptions(sessionId, { thinkingLevel: "high" });
+    expect(updated.thinkingLevel).toBe("high");
+    const after = await host.getSession(sessionId);
+    expect(after.thinkingLevel).toBe("high");
+    await host.dispose();
+  });
+});
