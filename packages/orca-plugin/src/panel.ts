@@ -1,25 +1,32 @@
 /**
- * Read-only profiles sidebar helpers (OP1.7 / JEF-11).
+ * Profiles sidebar + Control Center helpers (OP1.7 / JEF-11 + UI1.2 bridge).
  *
  * The thin Orca plugin must not depend on unrestricted `child_process`,
- * filesystem, or network access in the panel/worker (see
- * `docs/ORCA_PLUGIN_API.md` and stablyai/orca#15637). All live data comes
- * from the companion `orca-pi` CLI (`orca-pi profiles list --json`); this
- * module only formats injected data into HTML/text and detects what the
- * installed host supports. When the host lacks a panel↔worker bridge or a
- * supported persistence path, callers fall back to CLI + informational
- * panel content instead of undocumented access — never a hidden
- * panel-local store.
+ * filesystem, or network access in the panel (see `docs/ORCA_PLUGIN_API.md`).
+ * Live data flows through the versioned Orca↔Orca-Pi bridge
+ * (`bridge.ts` / `bridge-host.ts` / `worker.ts`) with stable request IDs and
+ * machine-readable errors; the companion `orca-pi` CLI remains the
+ * degraded fallback. This module only formats injected data into HTML/text
+ * and detects what the installed host supports. When the host lacks the
+ * structured bridge or a required capability, callers fall back to CLI +
+ * informational panel content instead of undocumented access — never a
+ * hidden panel-local store.
  */
 
 import type { ProfilesPanelModel } from "@orca-pi/core";
 import { TARGET_ORCA_APP_VERSION, TARGET_ORCA_PLUGIN_API } from "@orca-pi/core";
+import {
+  BRIDGE_VERSION,
+  negotiateBridgeCapabilities,
+  type BridgeOperation,
+} from "./bridge.js";
 
 export const PROFILES_PANEL_ID = "orca-pi-profiles";
 
 export interface PanelSupportInput {
   appVersion?: string;
   pluginApi?: number;
+  grantedCapabilities?: readonly string[];
 }
 
 export interface PanelSupport {
@@ -27,14 +34,20 @@ export interface PanelSupport {
   supported: boolean;
   /** Declarative sandboxed HTML summary (always true on pluginApi 1). */
   readOnlySummary: boolean;
-  /** Live reload without manual refresh (false in v1 — explicit reload). */
+  /** Live reload without manual refresh (true when the structured bridge is negotiated). */
   liveReload: boolean;
-  /** Supported persistence/host path for edits (false in v1 — CLI owns files). */
+  /** Supported persistence/host path for edits (true only behind the structured bridge). */
   persistence: boolean;
-  /** In-panel editing (false in v1 — no hidden panel-local store). */
+  /** In-panel editing (true only behind the structured bridge; never a hidden store). */
   editing: boolean;
   /** Fallback strategy when capabilities are missing. */
-  fallback: "cli-only";
+  fallback: "structured" | "cli-only";
+  /** True when the panel must use the read-only/degraded path. */
+  degraded: boolean;
+  /** Versioned bridge contract in use. */
+  bridgeVersion: string;
+  /** Structured operations available on this host (degraded hosts expose read-only subset). */
+  supportedOperations: readonly BridgeOperation[];
   reasons: string[];
 }
 
@@ -58,43 +71,51 @@ function gte(a: string, b: string): boolean {
 /**
  * Detect what the installed Orca host supports for the profiles sidebar.
  * Pure function — no I/O, no version sniffing beyond injected values.
+ *
+ * UI1.2 negotiates the versioned bridge (`bridge.ts`): on hosts with
+ * pluginApi 1 + engines.orca >=1.4.0 + `workspace:read` consent, the panel
+ * uses structured requests (live reload + persistence + editing behind the
+ * bridge host / future scoped-exec seam). Older hosts or missing consent
+ * degrade explicitly to read-only CLI fallback — never a hidden store.
  */
 export function detectPanelSupport(input?: PanelSupportInput): PanelSupport {
   const reasons: string[] = [];
   const pluginApi = input?.pluginApi ?? TARGET_ORCA_PLUGIN_API;
   const appVersion = input?.appVersion ?? TARGET_ORCA_APP_VERSION;
+  const negotiation = negotiateBridgeCapabilities({
+    appVersion,
+    pluginApi,
+    ...(input?.grantedCapabilities !== undefined
+      ? { grantedCapabilities: input.grantedCapabilities }
+      : {}),
+  });
 
-  let supported = true;
-  if (pluginApi !== 1) {
-    supported = false;
+  const readOnlySummary = pluginApi === 1 && gte(appVersion, "1.4.0");
+  const structured = negotiation.supported;
+  reasons.push(...negotiation.reasons);
+  if (structured) {
     reasons.push(
-      `pluginApi ${pluginApi} is not the targeted v1 (${TARGET_ORCA_PLUGIN_API}); falling back to CLI-only display.`,
+      `Structured bridge ${BRIDGE_VERSION} available: live data via typed requests (request IDs + validation/conflict/unsupported/auth-setup/internal errors); mutations route through the authoritative core service.`
+    );
+    reasons.push(
+      "Panel never scrapes terminal output or YAML and never stores a second copy of profiles in settings/storage."
     );
   } else {
-    reasons.push("pluginApi 1 supports declarative sandboxed panels (read-only summary).");
-  }
-
-  if (!gte(appVersion, "1.4.0")) {
-    supported = false;
     reasons.push(
-      `Orca app ${appVersion} is older than the minimum engines.orca >=1.4.0; falling back to CLI-only display.`,
+      "Structured bridge unavailable — panel degrades explicitly to read-only CLI fallback with actionable terminal.sendText descriptors (explicit user gesture only, never parsed)."
     );
-  } else {
-    reasons.push(`Orca app ${appVersion} meets engines.orca >=1.4.0.`);
   }
-
-  // v1 has no supported worker bridge, persistence, or editing path for
-  // profiles — the CLI/profile file stays authoritative.
-  reasons.push("No supported panel↔worker persistence/host bridge in v1 — edits happen in config files via the CLI, not in the panel.");
-  reasons.push("Panel degrades gracefully: live data comes from `orca-pi profiles list --json`; missing bridge never blocks orchestration.");
 
   return {
-    supported,
-    readOnlySummary: pluginApi === 1 && gte(appVersion, "1.4.0"),
-    liveReload: false,
-    persistence: false,
-    editing: false,
-    fallback: "cli-only",
+    supported: readOnlySummary,
+    readOnlySummary,
+    liveReload: structured,
+    persistence: structured,
+    editing: structured,
+    fallback: structured ? "structured" : "cli-only",
+    degraded: !structured,
+    bridgeVersion: BRIDGE_VERSION,
+    supportedOperations: negotiation.supportedOperations,
     reasons,
   };
 }

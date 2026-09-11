@@ -4,12 +4,13 @@
   "publisher": "44madfire",
   "name": "Orca–Pi Orchestration",
   "version": "0.1.0",
-  "description": "Thin Orca UI shell over the companion orca-pi CLI. Status panel plus read-only Pi profiles sidebar (CLI authoritative).",
+  "description": "Orca–Pi Control Center bridge: versioned panel↔bridge protocol over authoritative profile/config services. Live data via structured requests; degraded CLI fallback with explicit terminal actions when the host lacks bridge support.",
   "repository": "https://github.com/44madfire/orca-pi",
   "engines": {
     "orca": ">=1.4.0"
   },
   "pluginApi": 1,
+  "main": "dist/worker.js",
   "contributes": {
     "panels": [
       {
@@ -25,5 +26,15 @@
     ],
     "commands": []
   },
-  "capabilities": []
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "notifications:show"
+    }
+  ]
 }
