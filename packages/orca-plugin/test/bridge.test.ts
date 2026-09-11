@@ -20,6 +20,7 @@ import {
   negotiateBridgeCapabilities,
   normalizeProjectRoot,
   parseBridgeRequest,
+  validateBridgeResponse,
 } from "../src/bridge.js";
 
 describe("bridge protocol: request IDs and versioning", () => {
@@ -313,5 +314,51 @@ describe("bridge protocol: error-code mapping", () => {
     expect(mapMutationCodeToBridge("missing-scope")).toBe("validation");
     expect(mapMutationCodeToBridge("atomic-write-failed")).toBe("internal");
     expect(mapMutationCodeToBridge("something-new")).toBe("internal");
+  });
+});
+
+describe("bridge protocol: response validation", () => {
+  it("accepts well-formed success and error responses", () => {
+    const ok = validateBridgeResponse(
+      { protocolVersion: 1, requestId: "r1", ok: true, result: { a: 1 } },
+      "r1",
+    );
+    expect(ok.ok).toBe(true);
+    const err = validateBridgeResponse(
+      { protocolVersion: 1, requestId: "r1", ok: false, error: { code: "conflict", message: "stale" } },
+      "r1",
+    );
+    expect(err.ok).toBe(true);
+  });
+
+  it("maps version skew to unsupported for clean degradation", () => {
+    const res = validateBridgeResponse(
+      { protocolVersion: 99, requestId: "r1", ok: true, result: {} },
+      "r1",
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("unsupported");
+  });
+
+  it("maps every other malformation to internal without trusting data", () => {
+    const bad: unknown[] = [
+      null,
+      "string",
+      [],
+      // Note: {} (missing protocolVersion) maps to `unsupported`, not
+      // `internal` — version skew degrades cleanly (covered above).
+      { protocolVersion: 1, requestId: "r2", ok: true, result: {} },
+      { protocolVersion: 1, requestId: "r1", ok: true },
+      { protocolVersion: 1, requestId: "r1", ok: "yes", result: {} },
+      { protocolVersion: 1, requestId: "r1", ok: false },
+      { protocolVersion: 1, requestId: "r1", ok: false, error: { code: "bogus", message: "x" } },
+      { protocolVersion: 1, requestId: "r1", ok: false, error: { code: "conflict" } },
+      { protocolVersion: 1, requestId: "r1", ok: false, error: "boom" },
+    ];
+    for (const value of bad) {
+      const res = validateBridgeResponse(value, "r1");
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.code).toBe("internal");
+    }
   });
 });

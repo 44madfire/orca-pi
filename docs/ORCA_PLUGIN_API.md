@@ -187,15 +187,21 @@ Adapter responsibilities (all tested):
   Validating the unstamped input first would reject exactly the requests
   the adapter exists to complete. Panel-supplied scope never survives
   stamping (overwritten wholesale, not merged).
-- Resolve host facts **fresh on every forwarded request** (provider
-  function preferred over a static snapshot): consent revocation takes
-  effect on the next call with no adapter rebuild, matching the audited
-  Orca bridge's per-action re-check in main.
+- Resolve host facts **fresh on every forwarded request**: versions may
+  be static or provided, but consent grants MUST come from a per-request
+  provider function (`grantedCapabilities: () => [...]`) — creation
+  rejects any static-grants configuration outright, so no supported
+  adapter setup can forward a revoked grant. This matches the audited
+  Orca bridge, which re-checks capabilities in main for every action.
 - Forward facts and invoke `orca-pi bridge --transport seam
   --request … --project-root <root> --host-app-version …
   --host-plugin-api … --granted-capability … --json`, so missing consent
   blocks reads and mutations at the dispatcher (`auth/setup`).
-- Verify the sidecar response (JSON shape + `requestId` echo); transport
+- Verify the sidecar response with a real versioned-envelope validator
+  (`validateBridgeResponse`: object shape, `protocolVersion`,
+  `requestId` echo, `ok` discriminant, success/error fields against the
+  closed code set) — never a cast. Version skew degrades to
+  `unsupported`; any other malformation becomes `internal`. Transport
   failures degrade to `internal` without trusting output.
 
 Fork-side injection contract (`window.__ORCA_PI_BRIDGE__`):

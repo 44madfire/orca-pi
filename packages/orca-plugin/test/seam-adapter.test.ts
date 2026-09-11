@@ -44,7 +44,8 @@ describe("seam adapter: host-provisioned scope and consent", () => {
     const fake = fakeSpawn(echoBridge);
     const adapter = createSeamAdapter({
       projectRoot: "/repo/p",
-      hostFacts: { appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: ["workspace:read"] },
+      hostVersions: { appVersion: "1.4.199", pluginApi: 1 },
+      grantedCapabilities: () => ["workspace:read"],
       spawn: fake.spawn,
     });
     const res = await adapter.forward({
@@ -69,7 +70,7 @@ describe("seam adapter: host-provisioned scope and consent", () => {
 
   it("rejects malformed panel requests before spawning", async () => {
     const fake = fakeSpawn(echoBridge);
-    const adapter = createSeamAdapter({ projectRoot: "/repo/p", spawn: fake.spawn });
+    const adapter = createSeamAdapter({ projectRoot: "/repo/p", grantedCapabilities: () => [], spawn: fake.spawn });
     const res = await adapter.forward({ protocolVersion: 1, requestId: "bad id!", operation: "profiles.list" });
     expect(res.ok).toBe(false);
     expect(fake.calls).toHaveLength(0);
@@ -81,13 +82,13 @@ describe("seam adapter: host-provisioned scope and consent", () => {
       stderr: "",
       code: 0,
     }));
-    const adapter = createSeamAdapter({ projectRoot: "/repo/p", spawn: mismatch.spawn });
+    const adapter = createSeamAdapter({ projectRoot: "/repo/p", grantedCapabilities: () => [], spawn: mismatch.spawn });
     const res = await adapter.forward({ protocolVersion: 1, requestId: "f2", operation: "profiles.list" });
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error.code).toBe("internal");
 
     const garbage = fakeSpawn(() => ({ stdout: "not json", stderr: "boom", code: 1 }));
-    const adapter2 = createSeamAdapter({ projectRoot: "/repo/p", spawn: garbage.spawn });
+    const adapter2 = createSeamAdapter({ projectRoot: "/repo/p", grantedCapabilities: () => [], spawn: garbage.spawn });
     const res2 = await adapter2.forward({ protocolVersion: 1, requestId: "f3", operation: "profiles.list" });
     expect(res2.ok).toBe(false);
     if (!res2.ok) expect(res2.error.code).toBe("internal");
@@ -96,6 +97,7 @@ describe("seam adapter: host-provisioned scope and consent", () => {
   it("surfaces spawn failures as internal errors", async () => {
     const adapter = createSeamAdapter({
       projectRoot: "/repo/p",
+      grantedCapabilities: () => [],
       spawn: () => Promise.reject(new Error("ENOENT: orca-pi")),
     });
     const res = await adapter.forward({ protocolVersion: 1, requestId: "f4", operation: "profiles.list" });
@@ -103,9 +105,27 @@ describe("seam adapter: host-provisioned scope and consent", () => {
     if (!res.ok) expect(res.error.code).toBe("internal");
   });
 
+  it("refuses a static grants snapshot: no supported config can forward revoked grants", () => {
+    // Consent must be re-readable per request, so grants have no static
+    // form at all — misconfiguration fails fast at creation, and every
+    // construction below carries a live provider.
+    expect(() =>
+      createSeamAdapter({
+        projectRoot: "/repo/p",
+        grantedCapabilities: ["workspace:read"] as unknown as () => readonly string[],
+      }),
+    ).toThrow(/per-request provider/);
+    expect(() =>
+      createSeamAdapter({
+        projectRoot: "/repo/p",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any),
+    ).toThrow(/per-request provider/);
+  });
+
   it("capabilities() reports what the seam transport will permit", async () => {
     const fake = fakeSpawn(echoBridge);
-    const adapter = createSeamAdapter({ projectRoot: "/repo/p", spawn: fake.spawn });
+    const adapter = createSeamAdapter({ projectRoot: "/repo/p", grantedCapabilities: () => [], spawn: fake.spawn });
     const res = await adapter.capabilities("cap-1");
     expect(res.requestId).toBe("cap-1");
     expect(fake.calls).toHaveLength(1);
@@ -115,7 +135,8 @@ describe("seam adapter: host-provisioned scope and consent", () => {
     const fake = fakeSpawn(echoBridge);
     const adapter = createSeamAdapter({
       projectRoot: "/repo/p",
-      hostFacts: { appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: ["workspace:read"] },
+      hostVersions: { appVersion: "1.4.199", pluginApi: 1 },
+      grantedCapabilities: () => ["workspace:read"],
       spawn: fake.spawn,
     });
     // A correctly-designed panel mutation carries no worktree: panels
@@ -161,7 +182,8 @@ describe("seam adapter: host-provisioned scope and consent", () => {
     const fake = fakeSpawn(echoBridge);
     const adapter = createSeamAdapter({
       projectRoot: "/repo/p",
-      hostFacts: { appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: ["workspace:read"] },
+      hostVersions: { appVersion: "1.4.199", pluginApi: 1 },
+      grantedCapabilities: () => ["workspace:read"],
       spawn: fake.spawn,
     });
     await adapter.forward({
@@ -189,7 +211,8 @@ describe("seam adapter: host-provisioned scope and consent", () => {
     const fake = fakeSpawn(echoBridge);
     const adapter = createSeamAdapter({
       projectRoot: "/repo/p",
-      hostFacts: () => ({ appVersion: "1.4.199", pluginApi: 1, grantedCapabilities: grants }),
+      hostVersions: { appVersion: "1.4.199", pluginApi: 1 },
+      grantedCapabilities: () => grants,
       spawn: fake.spawn,
     });
     const granted = () =>

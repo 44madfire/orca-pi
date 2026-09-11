@@ -35,13 +35,17 @@
 import {
   BRIDGE_PROTOCOL_VERSION,
   parseBridgeRequest,
+  validateBridgeResponse,
   type BridgeOperation,
   type BridgeResponse,
 } from "./bridge.js";
 
-export interface SeamHostFacts {
+export interface SeamHostVersions {
   appVersion?: string;
   pluginApi?: number;
+}
+
+export interface SeamHostFacts extends SeamHostVersions {
   grantedCapabilities?: readonly string[];
 }
 
@@ -55,14 +59,21 @@ export interface SeamAdapterOptions {
   /** orca-pi binary (default `"orca-pi"` on PATH; harness may pass absolute). */
   orcaPiBin?: string;
   /**
-   * Host-reported facts forwarded with every request (absent = unknown =
-   * degraded). Accepts a **provider function** (preferred: resolved fresh
-   * on every forwarded request so consent revocation takes effect
-   * immediately) or a static snapshot object. The audited Orca panel
-   * bridge re-checks capabilities in main for every action; a static
-   * snapshot would keep forwarding stale grants after revocation.
+   * Host identity facts (Orca app version / pluginApi). Immutable per
+   * host, so a static object or a provider are both fine; absent means
+   * unknown (fail-closed degradation).
    */
-  hostFacts?: SeamHostFacts | (() => SeamHostFacts);
+  hostVersions?: SeamHostVersions | (() => SeamHostVersions);
+  /**
+   * Per-request consent-grant provider (REQUIRED). Resolved fresh on
+   * every forwarded request so consent revocation takes effect on the
+   * next call with no adapter rebuild — matching the audited Orca panel
+   * bridge, which re-checks capabilities in main for every action.
+   * There is deliberately no static-grants form: a snapshot would keep
+   * forwarding stale grants after Orca revokes them, so no supported
+   * adapter configuration can forward a revoked grant.
+   */
+  grantedCapabilities: () => readonly string[];
   /** Injectable spawn (tests); defaults to bounded `execFile`. */
   spawn?: (
     bin: string,
@@ -123,10 +134,16 @@ function internalError(requestId: string, message: string): BridgeResponse {
 export function createSeamAdapter(options: SeamAdapterOptions): SeamAdapter {
   const bin = options.orcaPiBin ?? "orca-pi";
   const root = options.projectRoot;
-  const resolveFacts = (): SeamHostFacts =>
-    typeof options.hostFacts === "function" ? options.hostFacts() : (options.hostFacts ?? {});
+  if (typeof options.grantedCapabilities !== "function") {
+    throw new Error("createSeamAdapter requires grantedCapabilities as a per-request provider function — static grant snapshots would keep forwarding stale grants after revocation.");
+  }
+  const grantsProvider = options.grantedCapabilities;
+  const resolveVersions = (): SeamHostVersions =>
+    typeof options.hostVersions === "function" ? options.hostVersions() : (options.hostVersions ?? {});
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const spawn = options.spawn ?? ((b, a) => defaultSpawn(b, a, timeoutMs));
+
+  const resolveFacts = (): SeamHostFacts => ({ ...resolveVersions(), grantedCapabilities: grantsProvider() });
 
   async function invoke(stamped: Record<string, unknown>, facts: SeamHostFacts): Promise<BridgeResponse> {
     const requestId = typeof stamped["requestId"] === "string" ? (stamped["requestId"] as string) : "unknown";
@@ -161,14 +178,21 @@ export function createSeamAdapter(options: SeamAdapterOptions): SeamAdapter {
         `Seam adapter received a non-JSON sidecar response (exit ${result.code})${hint ? `: ${hint}` : "."} No data was trusted.`,
       );
     }
-    if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      (parsed as { requestId?: unknown }).requestId !== requestId
-    ) {
-      return internalError(requestId, "Seam adapter rejected a sidecar response with a mismatched requestId. No data was trusted.");
+    // Full versioned-envelope validation (protocolVersion, requestId
+    // echo, discriminant, success/error fields): version skew maps to
+    // `unsupported` for clean degradation, every other malformation to
+    // `internal`. A skewed or compromised sidecar cannot smuggle unshaped
+    // data to the panel.
+    const validation = validateBridgeResponse(parsed, requestId);
+    if (!validation.ok) {
+      return {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        requestId,
+        ok: false,
+        error: { code: validation.code, message: `Seam adapter rejected the sidecar response: ${validation.message}` },
+      };
     }
-    return parsed as BridgeResponse;
+    return validation.response;
   }
 
   return {

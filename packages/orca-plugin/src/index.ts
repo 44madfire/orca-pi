@@ -10,6 +10,7 @@
 import type { DoctorReport } from "@orca-pi/core";
 
 export {
+  BRIDGE_ERROR_CODES,
   BRIDGE_OPERATIONS,
   BRIDGE_PROTOCOL_VERSION,
   BRIDGE_READ_OPERATIONS,
@@ -25,6 +26,7 @@ export {
   negotiateBridgeCapabilities,
   normalizeProjectRoot,
   parseBridgeRequest,
+  validateBridgeResponse,
   type BridgeError,
   type BridgeErrorCode,
   type BridgeNegotiation,
@@ -32,6 +34,7 @@ export {
   type BridgeOperation,
   type BridgeRequest,
   type BridgeResponse,
+  type BridgeResponseValidation,
   type BridgeWorktreeScope,
   type TerminalFallbackAction,
 } from "./bridge.js";
@@ -41,6 +44,7 @@ export {
   type SeamAdapter,
   type SeamAdapterOptions,
   type SeamHostFacts,
+  type SeamHostVersions,
 } from "./seam-adapter.js";
 export {
   createBridgeWorker,

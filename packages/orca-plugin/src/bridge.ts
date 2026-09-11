@@ -62,6 +62,17 @@ export type BridgeErrorCode =
   | "not-found"
   | "already-exists";
 
+/** Closed machine-readable error code set (mirrors `BridgeErrorCode`). */
+export const BRIDGE_ERROR_CODES: readonly BridgeErrorCode[] = [
+  "validation",
+  "conflict",
+  "unsupported",
+  "auth/setup",
+  "internal",
+  "not-found",
+  "already-exists",
+] as const;
+
 export type BridgeOperation =
   | "bridge.capabilities"
   | "worktree.context"
@@ -368,6 +379,53 @@ export function bridgeFail(
       ...(extra?.detail !== undefined ? { detail: extra.detail } : {}),
     },
   };
+}
+
+export type BridgeResponseValidation =
+  | { ok: true; response: BridgeResponse }
+  | { ok: false; code: "unsupported" | "internal"; message: string };
+
+/**
+ * Validate an unknown value as the `BridgeResponse` for one request.
+ * Checks the versioned envelope end to end: object shape,
+ * `protocolVersion`, `requestId` echo, the `ok` discriminant, and the
+ * success (`result`) vs error (`error: {code, message}` against the
+ * closed code set) fields. Version skew maps to `unsupported` (clean
+ * degradation); every other malformation maps to `internal`. Pure — the
+ * seam adapter uses this instead of trusting a sidecar cast, so a
+ * compromised or skewed sidecar cannot smuggle unshaped data to the panel.
+ */
+export function validateBridgeResponse(data: unknown, expectedRequestId: string): BridgeResponseValidation {
+  if (!isRecord(data)) {
+    return { ok: false, code: "internal", message: "Bridge response must be an object. No data was trusted." };
+  }
+  if (data["protocolVersion"] !== BRIDGE_PROTOCOL_VERSION) {
+    return {
+      ok: false,
+      code: "unsupported",
+      message: `Unsupported bridge protocolVersion ${JSON.stringify(data["protocolVersion"])} (supported: ${BRIDGE_PROTOCOL_VERSION}). No data was trusted.`,
+    };
+  }
+  if (data["requestId"] !== expectedRequestId) {
+    return { ok: false, code: "internal", message: "Bridge response requestId mismatch. No data was trusted." };
+  }
+  if (data["ok"] === true) {
+    if (!("result" in data)) {
+      return { ok: false, code: "internal", message: "Bridge success response is missing `result`. No data was trusted." };
+    }
+    return { ok: true, response: data as unknown as BridgeResponse };
+  }
+  if (data["ok"] === false) {
+    const error = (data as { error?: unknown }).error;
+    if (!isRecord(error) || typeof error["message"] !== "string" || error["message"].length === 0) {
+      return { ok: false, code: "internal", message: "Bridge error response has no usable `error.message`. No data was trusted." };
+    }
+    if (typeof error["code"] !== "string" || !(BRIDGE_ERROR_CODES as readonly string[]).includes(error["code"])) {
+      return { ok: false, code: "internal", message: `Bridge error response carries an unknown code ${JSON.stringify(error["code"])}. No data was trusted.` };
+    }
+    return { ok: true, response: data as unknown as BridgeResponse };
+  }
+  return { ok: false, code: "internal", message: "Bridge response has a non-boolean `ok` discriminant. No data was trusted." };
 }
 
 /** Create a new request with a caller-supplied stable id (panels generate these per action). */
