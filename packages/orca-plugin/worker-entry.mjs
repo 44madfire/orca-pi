@@ -1,3 +1,4 @@
+/* global process */
 /**
  * Orca plugin entry (UI1.2).
  *
