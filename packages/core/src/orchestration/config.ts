@@ -23,9 +23,16 @@
  *     `~/.pi/agent/orchestration.json`)
  *   - project      (`<projectRoot>/.pi/orchestration.json`)
  *
- * Writes are schema-validated and atomic (temp sibling + rename). Stale
- * writes fail with `conflict` via SHA-256 source hashes — never silently
- * overwritten. No secrets belong here (profile names only, never tokens).
+ * Writes are schema-validated and atomic (temp sibling + rename) under the
+ * shared profile-transaction bakery lock (`<target>.lock.d`): the lock is
+ * held from before the initial load until after the atomic replace, so a
+ * second writer — same process or a concurrent `orca-pi bridge` sidecar
+ * process — always loads the first writer's commit. Stale writes fail with
+ * `conflict` via SHA-256 source hashes — never silently overwritten. (An
+ * injected filesystem without exclusive-create/directory-listing cannot
+ * coordinate across processes; there the in-process mutex plus the hash
+ * check still detect stale writes.) No secrets belong here (profile names
+ * only, never tokens).
  *
  * Windows + WSL: all paths use slash-normalized joins; `\\wsl.localhost`
  * and drive-letter roots are preserved as opaque prefixes (never
@@ -33,6 +40,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { withMutationLock, type MutationFs } from "../profile/mutate.js";
 
 export type OrchestrationScope = "user" | "project";
 
@@ -135,6 +143,14 @@ export interface OrchestrationFs {
   mkdir(path: string, options?: { recursive: boolean }): Promise<string | undefined>;
   stat?(path: string): Promise<unknown>;
   unlink?(path: string): Promise<void>;
+  /**
+   * Coordination surface for the cross-process write lock (same contract
+   * as `MutationFs`). When absent, writes serialize within this process
+   * only; the `expectedSourceHash` check still detects stale writes.
+   */
+  readdir?(path: string): Promise<string[]>;
+  writeExclusive?(path: string, content: string): Promise<void>;
+  rmdir?(path: string): Promise<void>;
 }
 
 export interface OrchestrationPathOptions {
@@ -232,6 +248,9 @@ async function realFs(): Promise<OrchestrationFs> {
     mkdir: (p, opts) => fs.mkdir(p, opts),
     stat: (p) => fs.stat(p),
     unlink: (p) => fs.unlink(p),
+    readdir: (p) => fs.readdir(p) as Promise<string[]>,
+    writeExclusive: (p, c) => fs.writeFile(p, c, { encoding: "utf8", flag: "wx" }).then(() => undefined),
+    rmdir: (p) => fs.rmdir(p),
   };
 }
 
@@ -367,23 +386,53 @@ async function atomicWrite(target: string, content: string, fs: OrchestrationFs)
   }
 }
 
-/** In-process mutex per target path (serializes concurrent writes in this process). */
-const mutexes = new Map<string, Promise<void>>();
-
-async function withMutex<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const prev = mutexes.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const mine = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const chain = prev.then(() => mine);
-  mutexes.set(key, chain);
-  await prev;
+/**
+ * Mutual exclusion for the read → validate → commit path, cross-process.
+ *
+ * Reuses the profile mutation transaction's bakery lock (`<target>.lock.d`
+ * with unique per-contender tickets: only live number holders proceed,
+ * dead contenders are ignored via PID liveness, nobody ever deletes
+ * another contender's files). The lock is held from before the initial
+ * load until after the atomic replace, so a second writer — same process
+ * or a concurrent `orca-pi bridge` sidecar process — always loads the
+ * first writer's committed state and fails `conflict` on a stale
+ * `expectedSourceHash` instead of silently overwriting. Lock-acquisition
+ * failures surface as `OrchestrationConfigError` (never the profile
+ * module's error type); the transaction body only throws orchestration
+ * errors, so any profile-typed error escaping here came from the lock.
+ */
+async function withOrchestrationLock<T>(
+  target: string,
+  fs: OrchestrationFs,
+  fn: () => Promise<T>,
+  scope: OrchestrationScope,
+  role: string,
+): Promise<T> {
   try {
-    return await fn();
-  } finally {
-    release();
-    if (mutexes.get(key) === chain) mutexes.delete(key);
+    return await withMutationLock(target, fs as MutationFs, () => fn());
+  } catch (error) {
+    if (error && typeof error === "object" && (error as { name?: unknown }).name === "ProfileMutationError") {
+      const code = (error as { code?: unknown }).code;
+      if (code === "conflict") {
+        throw new OrchestrationConfigError({
+          code: "conflict",
+          scope,
+          role,
+          message:
+            `Concurrent orchestration write in progress for ${target}: another writer holds the mutation lock. ` +
+            `Wait for it to finish, reload, and retry. No data was overwritten.`,
+          cause: error,
+        });
+      }
+      throw new OrchestrationConfigError({
+        code: "atomic-write-failed",
+        scope,
+        role,
+        message: error instanceof Error ? error.message : String(error),
+        cause: error,
+      });
+    }
+    throw error;
   }
 }
 
@@ -460,7 +509,7 @@ export async function setRoleMapping(
   const { userPath, projectPath } = resolvePaths(options, options.projectRoot ?? ".");
   const target = input.scope === "user" ? userPath : projectPath;
   const fs = options.fs ?? (await realFs());
-  return await withMutex(target, async () => {
+  return await withOrchestrationLock(target, fs, async () => {
     const before = await loadLayer(target, fs);
     if (options.expectedSourceHash !== undefined) {
       const expected = options.expectedSourceHash;
@@ -493,7 +542,7 @@ export async function setRoleMapping(
       path: target,
       sourceHashAfter: hashOrchestrationText(content),
     };
-  });
+  }, input.scope, input.role);
 }
 
 /**
@@ -511,7 +560,7 @@ export async function deleteRoleOverride(
   const { userPath, projectPath } = resolvePaths(options, options.projectRoot ?? ".");
   const target = input.scope === "user" ? userPath : projectPath;
   const fs = options.fs ?? (await realFs());
-  return await withMutex(target, async () => {
+  return await withOrchestrationLock(target, fs, async () => {
     const before = await loadLayer(target, fs);
     if (options.expectedSourceHash !== undefined) {
       const expected = options.expectedSourceHash;
@@ -540,5 +589,5 @@ export async function deleteRoleOverride(
     delete next[input.role];
     await atomicWrite(target, serializeRoles(next), fs);
     return { role: input.role, scope: input.scope, path: target, removed: true };
-  });
+  }, input.scope, input.role);
 }

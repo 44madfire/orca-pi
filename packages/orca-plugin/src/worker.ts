@@ -109,6 +109,11 @@ export function createBridgeWorker(deps: BridgeHostDeps = {}): BridgeWorker {
     async handleRequest(data: unknown) {
       const hostDeps: BridgeHostDeps = {
         ...deps,
+        // Panel path: enforce negotiated structured support at the host
+        // boundary. The harness-authorized scope (env-provided project
+        // root) pins request roots when present.
+        transport: "seam",
+        ...(deps.projectRoot !== undefined ? { trustedProjectRoot: deps.projectRoot } : {}),
         hostInfo: {
           ...(appVersion !== undefined ? { appVersion } : {}),
           ...(pluginApi !== undefined ? { pluginApi } : {}),

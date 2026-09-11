@@ -36,8 +36,10 @@ import {
   BRIDGE_VERSION,
   bridgeFail,
   bridgeOk,
+  DEGRADED_SAFE_OPERATIONS,
   mapMutationCodeToBridge,
   negotiateBridgeCapabilities,
+  normalizeProjectRoot,
   parseBridgeRequest,
   type BridgeErrorCode,
   type BridgeRequest,
@@ -68,6 +70,26 @@ export interface BridgeHostDeps {
   hostInfo?: { appVersion?: string; pluginApi?: number; grantedCapabilities?: readonly string[]; seamAvailable?: boolean };
   /** Injectable credential fs for GitHub doctor (tests stub; prod resolves node:fs). */
   providerFs?: import("@orca-pi/core").CredentialProviderFs;
+  /**
+   * Transport carrying this request.
+   * - `"seam"` (default): panel path. Structured operations require
+   *   negotiated `structured` support (versions + `workspace:read` consent
+   *   + seam handshake); anything beyond `DEGRADED_SAFE_OPERATIONS` is
+   *   rejected while unstructured, so "missing consent → degraded" is a
+   *   host-enforced property, not UI metadata.
+   * - `"sidecar"`: local operator invocation (`orca-pi bridge`). The
+   *   operator's shell already authorizes the call, so the consent gate
+   *   does not apply — but root pinning below still does.
+   */
+  transport?: "seam" | "sidecar";
+  /**
+   * Authoritative root the transport authorized (sidecar `--project-root`,
+   * seam-injected worktree root). When set, a request-supplied
+   * `worktree.projectRoot` must normalize-equal it; mismatches are
+   * rejected before dispatch so one worktree can never address another's
+   * config. Applies to every scope — user/global reads/writes included.
+   */
+  trustedProjectRoot?: string;
 }
 
 function defaultProjectRoot(deps: BridgeHostDeps, request?: BridgeRequest): string {
@@ -150,11 +172,55 @@ export async function handleBridgeRequest(data: unknown, deps: BridgeHostDeps = 
   }
   const { request } = parsed;
   try {
+    const gate = enforceTransportGate(request, deps);
+    if (gate) return gate;
     const result = await dispatch(request, deps);
     return bridgeOk(request.requestId, result);
   } catch (error) {
     return toBridgeError(request.requestId, error);
   }
+}
+
+/**
+ * Host-side transport enforcement (round-3 hardening).
+ *
+ * 1. Root pinning: when the transport authorized one root
+ *    (`trustedProjectRoot`), a request-supplied `worktree.projectRoot` must
+ *    normalize-equal it. A mismatch is rejected with `validation` before
+ *    any read or write, so a request smuggled through one worktree's seam
+ *    can never address another worktree's config (any scope).
+ * 2. Structured gate (seam transport only): while negotiation reports
+ *    unstructured, only `DEGRADED_SAFE_OPERATIONS` are served. Reads of
+ *    config data and all mutations are rejected — `auth/setup` when the
+ *    block is consent, `unsupported` when it is reachability — so degraded
+ *    mode is enforced here, not merely advertised to the UI.
+ *
+ * Returns a rejection response, or undefined when the request may proceed.
+ */
+function enforceTransportGate(request: BridgeRequest, deps: BridgeHostDeps): BridgeResponse | undefined {
+  const trusted = deps.trustedProjectRoot;
+  if (trusted !== undefined && request.worktree?.projectRoot !== undefined) {
+    if (normalizeProjectRoot(request.worktree.projectRoot) !== normalizeProjectRoot(trusted)) {
+      return bridgeFail(request.requestId, "validation", `Untrusted worktree.projectRoot ${JSON.stringify(request.worktree.projectRoot)}: this transport authorized ${JSON.stringify(normalizeProjectRoot(trusted))} and requests outside it are rejected before any read or write.`, { detail: "untrusted-scope" });
+    }
+  }
+  const transport = deps.transport ?? "seam";
+  if (transport !== "seam") return undefined;
+  if ((DEGRADED_SAFE_OPERATIONS as readonly string[]).includes(request.operation)) return undefined;
+  const negotiation = negotiateBridgeCapabilities(deps.hostInfo);
+  if (negotiation.structured) return undefined;
+  if (!negotiation.consentOk) {
+    return bridgeFail(
+      request.requestId,
+      "auth/setup",
+      `Refusing ${request.operation}: workspace:read consent is unverified for this transport (grants unknown or missing). Grant the capability and retry through the seam, or run the read-only CLI fallback. No data was read or written.`,
+    );
+  }
+  return bridgeFail(
+    request.requestId,
+    "unsupported",
+    `Refusing ${request.operation}: the structured bridge is unreachable on this transport (no seam handshake or unknown host version). Serve it via the \`orca-pi bridge\` sidecar or the degraded CLI fallback. No data was read or written.`,
+  );
 }
 
 function toBridgeError(requestId: string, error: unknown): BridgeResponse {

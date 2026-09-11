@@ -102,26 +102,50 @@ orca-pi profile path</code></pre>
           if (!root) return;
           var bridge = window.__ORCA_PI_BRIDGE__;
           if (bridge && typeof bridge.request === "function") {
-            if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: requesting <code>profiles.list</code> (structured, protocol 1)…</p></div>';
-            var req = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId(), operation: "profiles.list" };
-            var pending = bridge.request(req);
-            if (pending && typeof pending.then === "function") {
-              pending.then(function (res) {
+            if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: confirming structured support (<code>bridge.capabilities</code>, protocol 1)…</p></div>';
+            var capReq = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId(), operation: "bridge.capabilities" };
+            var capPending = bridge.request(capReq);
+            if (capPending && typeof capPending.then === "function") {
+              var showDegraded = function (msg) {
+                if (state) state.innerHTML = '<div class="bridge-degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">' + esc(msg) + '</span></p></div>';
+              };
+              capPending.then(function (capRes) {
                 try {
-                  if (!res || res.requestId !== req.requestId) return;
-                  if (res.ok && res.result && res.result.panel) {
-                    if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: live (<code>profiles.list</code> ok).</p></div>';
-                    renderList(root, res.result.panel.profiles);
-                  } else if (res.ok && res.result && res.result.profiles) {
-                    if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: live.</p></div>';
-                    renderList(root, res.result.profiles);
-                  } else {
-                    var msg = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
-                    if (state) state.innerHTML = '<div class="bridge-degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">' + esc(msg) + '</span></p></div>';
+                  if (!capRes || capRes.requestId !== capReq.requestId) return;
+                  // Confirm structured support BEFORE any data call: seam
+                  // presence alone proves nothing about versions/consent,
+                  // and degraded mode is host-enforced, not UI metadata.
+                  var ops = (capRes.ok && capRes.result && capRes.result.supportedOperations) || [];
+                  var structured = !!(capRes.ok && capRes.result && capRes.result.structured === true && ops.indexOf("profiles.list") !== -1);
+                  if (!structured) {
+                    var why = capRes.ok ? "structured support not negotiated (versions/consent unverified)" : ((capRes.error && capRes.error.code + ": " + capRes.error.message) || "unavailable");
+                    showDegraded(why + ". Mutations stay disabled.");
+                    return;
                   }
+                  if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: requesting <code>profiles.list</code> (structured, protocol 1)…</p></div>';
+                  var req = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId(), operation: "profiles.list" };
+                  var pending = bridge.request(req);
+                  if (!pending || typeof pending.then !== "function") { showDegraded("Bridge request failed; showing CLI guidance."); return; }
+                  pending.then(function (res) {
+                    try {
+                      if (!res || res.requestId !== req.requestId) return;
+                      if (res.ok && res.result && res.result.panel) {
+                        if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: live (<code>profiles.list</code> ok).</p></div>';
+                        renderList(root, res.result.panel.profiles);
+                      } else if (res.ok && res.result && res.result.profiles) {
+                        if (state) state.innerHTML = '<div class="bridge-ok"><p class="muted">Bridge: live.</p></div>';
+                        renderList(root, res.result.profiles);
+                      } else {
+                        var msg = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
+                        showDegraded(msg);
+                      }
+                    } catch (e) { /* keep CLI fallback */ }
+                  }, function () {
+                    showDegraded("Bridge request failed; showing CLI guidance.");
+                  });
                 } catch (e) { /* keep CLI fallback */ }
               }, function () {
-                if (state) state.innerHTML = '<div class="bridge-degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">Bridge request failed; showing CLI guidance.</span></p></div>';
+                showDegraded("Bridge capabilities check failed; showing CLI guidance.");
               });
               return;
             }

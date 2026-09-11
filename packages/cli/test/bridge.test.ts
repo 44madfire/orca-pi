@@ -163,6 +163,33 @@ describe("orca-pi bridge sidecar", () => {
     expect(before).toContain("sidecar-fast");
   });
 
+  it("rejects absolute-but-untrusted roots without touching them", async () => {
+    const d = deps();
+    const result = await run(
+      [
+        "bridge",
+        "--request",
+        JSON.stringify({
+          protocolVersion: 1,
+          requestId: "u1",
+          operation: "profile.mutate",
+          worktree: { projectRoot: "/other" },
+          params: { action: "create", name: "evil", scope: "project" },
+        }),
+        "--project-root",
+        "/repo/p",
+        "--json",
+      ],
+      d,
+    );
+    expect(result.exitCode).toBe(1);
+    const response = parseOut(d) as { ok: boolean; error: { code: string; message: string } };
+    expect(response.ok).toBe(false);
+    expect(response.error.code).toBe("validation");
+    expect(response.error.message).toMatch(/Untrusted worktree/);
+    expect([...d.fs.files.keys()].some((k) => k.startsWith("/other"))).toBe(false);
+  });
+
   it("rejects relative-root mutations with a validation error (exit 1)", async () => {
     const d = deps();
     const result = await run(
@@ -204,4 +231,73 @@ describe("orca-pi bridge sidecar", () => {
     expect((await run(["bridge", "--request", "{nope", "--json"], deps())).exitCode).toBe(2);
     expect((await run(["bridge", "--bogus", "--json"], deps())).exitCode).toBe(2);
   });
+
+  // Round-3 regression: two concurrent sidecar PROCESSES racing one
+  // orchestration write with the same stale hash must not both succeed —
+  // the cross-process lock serializes them and the loser conflicts.
+  it("serializes concurrent sidecar processes (one wins, one conflicts)", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const runFile = promisify(execFile);
+    const cliEntry = new URL("../dist/main.js", import.meta.url);
+    const { fileURLToPath } = await import("node:url");
+    const cliPath = fileURLToPath(cliEntry);
+    const sandbox = mkdtempSync(join(tmpdir(), "orca-pi-bridge-race-"));
+    try {
+      const projectRoot = join(sandbox, "proj");
+      const home = join(sandbox, "home");
+      const env = { ...process.env, HOME: home };
+      const bridge = async (requestId: string, params: unknown): Promise<{ stdout: string; stderr: string; code: number }> => {
+        const argv = [cliPath, "bridge", "--request", JSON.stringify({ protocolVersion: 1, requestId, operation: "orchestration.set", worktree: { projectRoot }, params }), "--project-root", projectRoot, "--json"];
+        try {
+          const out = await runFile(process.execPath, argv, { env });
+          return { stdout: out.stdout as string, stderr: out.stderr as string, code: 0 };
+        } catch (error) {
+          // Non-zero exit (e.g. the conflict loser) still carries the JSON
+          // BridgeResponse on stdout — surface it instead of throwing.
+          const execError = error as { stdout?: unknown; stderr?: unknown; code?: unknown };
+          return {
+            stdout: typeof execError.stdout === "string" ? execError.stdout : "",
+            stderr: typeof execError.stderr === "string" ? execError.stderr : String(error),
+            code: typeof execError.code === "number" ? execError.code : 1,
+          };
+        }
+      };
+      const seed = await bridge("seed", { role: "worker", profile: "alpha", scope: "project" });
+      expect(seed.stderr).toBe("");
+      expect(seed.code).toBe(0);
+      const seeded = JSON.parse(seed.stdout) as { ok: boolean };
+      expect(seeded.ok).toBe(true);
+      const got = await runFile(
+        process.execPath,
+        [cliPath, "bridge", "--request", JSON.stringify({ protocolVersion: 1, requestId: "get", operation: "orchestration.get" }), "--project-root", projectRoot, "--json"],
+        { env },
+      );
+      const mapping = JSON.parse(got.stdout) as { ok: boolean; result: { sourceHash: { project: string } } };
+      expect(mapping.ok).toBe(true);
+      const hash = mapping.result.sourceHash.project;
+      const [first, second] = await Promise.all([
+        bridge("race-a", { role: "worker", profile: "beta", scope: "project", expectedSourceHash: hash }),
+        bridge("race-b", { role: "worker", profile: "gamma", scope: "project", expectedSourceHash: hash }),
+      ]);
+      const outcomes = [first, second].map((r) => JSON.parse(r.stdout) as { ok: boolean; error?: { code?: string } });
+      expect(outcomes.map((o) => o.ok).sort()).toEqual([false, true]);
+      const loser = outcomes.find((o) => !o.ok)!;
+      expect(loser.error?.code).toBe("conflict");
+      const winner = outcomes.find((o) => o.ok)!;
+      void winner;
+      const final = await runFile(
+        process.execPath,
+        [cliPath, "bridge", "--request", JSON.stringify({ protocolVersion: 1, requestId: "final", operation: "orchestration.get" }), "--project-root", projectRoot, "--json"],
+        { env },
+      );
+      const finalMapping = JSON.parse(final.stdout) as { ok: boolean; result: { effective: { worker: string } } };
+      expect(["beta", "gamma"]).toContain(finalMapping.result.effective.worker);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  }, 60000);
 });

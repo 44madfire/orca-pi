@@ -100,8 +100,14 @@ orca-pi profile validate</code></pre>
             pending.then(function (res) {
               try {
                 if (!res || res.requestId !== req.requestId) return;
-                if (res.ok) {
+                // Structured support must be confirmed before any other
+                // bridge call: a seam object alone proves nothing about
+                // versions/consent, and degraded mode is host-enforced.
+                var structured = !!(res.ok && res.result && res.result.structured === true);
+                if (structured) {
                   root.innerHTML = '<div class="bridge-ok"><p><strong>Bridge ready</strong> (v' + BRIDGE_VERSION + ', protocol ' + PROTOCOL_VERSION + '). Live data via structured requests; degraded CLI fallback available.</p></div>';
+                } else if (res.ok) {
+                  renderDegraded(root, "Seam present but structured support not negotiated (versions/consent unverified).");
                 } else {
                   var code = res.error && res.error.code ? res.error.code : "unsupported";
                   renderDegraded(root, "Bridge reports " + code + ": " + ((res.error && res.error.message) || "unavailable") + ".");

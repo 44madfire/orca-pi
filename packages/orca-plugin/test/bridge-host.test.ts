@@ -58,6 +58,9 @@ function deps(overrides?: Partial<BridgeHostDeps>): BridgeHostDeps {
   const fs = memFs();
   return {
     projectRoot: "/repo/p",
+    // Dispatcher behavior tests use operator (sidecar-equivalent) transport:
+    // the consent/seam gate below is covered by dedicated enforcement tests.
+    transport: "sidecar",
     env: { HOME: "/home/u" } as NodeJS.ProcessEnv,
     homedir: "/home/u",
     fs,
@@ -370,15 +373,128 @@ describe("bridge host: GitHub and diagnostics are redacted", () => {
   });
 });
 
+describe("bridge host: transport enforcement (seam path)", () => {
+  const STRUCTURED = {
+    appVersion: "1.4.199",
+    pluginApi: 1,
+    grantedCapabilities: ["workspace:read", "terminal:send", "notifications:show"],
+    seamAvailable: true,
+  };
+
+  function seamDeps(extraHostInfo: Record<string, unknown> = {}): BridgeHostDeps {
+    const d = deps();
+    return {
+      ...d,
+      transport: "seam",
+      hostInfo: { ...STRUCTURED, ...extraHostInfo } as BridgeHostDeps["hostInfo"],
+    };
+  }
+
+  it("serves everything once structured support is negotiated", async () => {
+    const d = seamDeps();
+    const list = await handleBridgeRequest({ protocolVersion: 1, requestId: "e1", operation: "profiles.list" }, d);
+    expect(list.ok).toBe(true);
+    const mutate = await handleBridgeRequest(
+      {
+        protocolVersion: 1,
+        requestId: "e2",
+        operation: "profile.mutate",
+        worktree: { projectRoot: "/repo/p" },
+        params: { action: "create", name: "enforced-ok", scope: "project" },
+      },
+      d,
+    );
+    expect(mutate.ok).toBe(true);
+  });
+
+  it("rejects config reads and mutations while unstructured (auth/setup when consent unverified)", async () => {
+    const d = deps();
+    const noHostInfo = { ...d, transport: "seam" as const };
+    for (const operation of ["profiles.list", "profile.mutate", "orchestration.get", "launch.preview"]) {
+      const res = await handleBridgeRequest(
+        {
+          protocolVersion: 1,
+          requestId: "e3",
+          operation,
+          ...(operation === "profile.mutate"
+            ? { worktree: { projectRoot: "/repo/p" }, params: { action: "create", name: "x", scope: "project" } }
+            : {}),
+        },
+        noHostInfo,
+      );
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("auth/setup");
+    }
+  });
+
+  it("rejects with unsupported when consent holds but the seam handshake is missing", async () => {
+    const d = seamDeps({ seamAvailable: false });
+    const res = await handleBridgeRequest({ protocolVersion: 1, requestId: "e4", operation: "profiles.list" }, d);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).toBe("unsupported");
+  });
+
+  it("still serves bootstrap/diagnostic ops while unstructured", async () => {
+    const d = { ...deps(), transport: "seam" as const };
+    for (const operation of ["bridge.capabilities", "worktree.context", "diagnostics.doctor"]) {
+      const res = await handleBridgeRequest({ protocolVersion: 1, requestId: "e5", operation }, d);
+      expect(res.ok).toBe(true);
+    }
+  });
+
+  it("pins request roots to the transport-authorized root (untrusted-scope rejected, untouched)", async () => {
+    const d = { ...deps(), trustedProjectRoot: "/repo/p" };
+    const res = await handleBridgeRequest(
+      {
+        protocolVersion: 1,
+        requestId: "e6",
+        operation: "profile.mutate",
+        worktree: { projectRoot: "/other" },
+        params: { action: "create", name: "evil", scope: "project" },
+      },
+      d,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("validation");
+      expect(res.error.message).toMatch(/Untrusted worktree/);
+    }
+    const fs = (d.fs as { files: Map<string, string> }).files;
+    expect([...fs.keys()].some((k) => k.startsWith("/other"))).toBe(false);
+    expect([...fs.keys()].some((k) => k.includes("evil"))).toBe(false);
+  });
+
+  it("accepts matching pinned roots (slash-normalized)", async () => {
+    const d = { ...deps(), trustedProjectRoot: "C:/repo/p" };
+    const res = await handleBridgeRequest(
+      {
+        protocolVersion: 1,
+        requestId: "e7",
+        operation: "profile.mutate",
+        worktree: { projectRoot: "C:\\repo\\p" },
+        params: { action: "create", name: "pinned-ok", scope: "project" },
+      },
+      d,
+    );
+    expect(res.ok).toBe(true);
+  });
+});
+
 describe("bridge worker: lifecycle and consent honesty", () => {
-  it("tracks granted capabilities and degrades without workspace:read", async () => {
+  it("tracks granted capabilities and enforces degraded mode at the host boundary", async () => {
     const worker = createBridgeWorker(deps());
     worker.onInit({ pluginId: "44madfire.orca-pi", grantedCapabilities: ["terminal:send"], appVersion: "1.4.196", pluginApi: 1 });
     expect(worker.isBridgeSupported()).toBe(false);
     expect(worker.degradationReasons().join("\n")).toMatch(/workspace:read/);
+    // Worker transport is the seam path: unstructured reads of config data
+    // are rejected here (auth/setup), not merely hidden by the UI.
     const res = await worker.handleRequest({ protocolVersion: 1, requestId: "w1", operation: "profiles.list" });
-    // Reads still serve (live data is host-side); writes would fail scope checks.
     expect(res.requestId).toBe("w1");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).toBe("auth/setup");
+    // Bootstrap stays available so callers can learn the degraded state.
+    const caps = await worker.handleRequest({ protocolVersion: 1, requestId: "w2", operation: "bridge.capabilities" });
+    expect(caps.ok).toBe(true);
   });
 
   it("rejects worker commands explicitly (no silent exec)", () => {

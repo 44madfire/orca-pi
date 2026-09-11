@@ -436,10 +436,25 @@ export interface BridgeNegotiation {
   structured: boolean;
   /** True when the panel must use the read-only/degraded path. */
   degraded: boolean;
+  /** Version/consent/handshake sub-signals (for host-side enforcement). */
+  versionsOk: boolean;
+  consentOk: boolean;
+  seamHandshake: boolean;
   supportedOperations: readonly BridgeOperation[];
   fallback: "structured" | "cli-only";
   reasons: string[];
 }
+
+/**
+ * Operations served without structured support (bootstrap/diagnostic only).
+ * Everything else — including all reads of config data and all mutations —
+ * requires negotiated `structured` support at the host boundary.
+ */
+export const DEGRADED_SAFE_OPERATIONS: readonly BridgeOperation[] = [
+  "bridge.capabilities",
+  "worktree.context",
+  "diagnostics.doctor",
+] as const;
 
 function parseMajorMinorPatch(version: string): [number, number, number] | undefined {
   const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
@@ -553,13 +568,16 @@ export function negotiateBridgeCapabilities(input?: BridgeNegotiationInput): Bri
 
   const supportedOperations: readonly BridgeOperation[] = isStructured
     ? BRIDGE_OPERATIONS
-    : (["bridge.capabilities", "worktree.context", "diagnostics.doctor"] as const);
+    : DEGRADED_SAFE_OPERATIONS;
   return {
     bridgeVersion: BRIDGE_VERSION,
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     supported: renderSupported,
     structured: isStructured,
     degraded: !isStructured,
+    versionsOk: renderSupported,
+    consentOk: hasWorkspaceRead,
+    seamHandshake: seamAvailable,
     supportedOperations,
     fallback: isStructured ? "structured" : "cli-only",
     reasons,

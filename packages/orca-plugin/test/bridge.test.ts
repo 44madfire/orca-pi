@@ -219,6 +219,9 @@ describe("bridge protocol: capability negotiation + degraded fallback", () => {
     expect(res.fallback).toBe("structured");
     expect(res.supportedOperations).toContain("profile.mutate");
     expect(res.bridgeVersion).toBe(BRIDGE_VERSION);
+    expect(res.versionsOk).toBe(true);
+    expect(res.consentOk).toBe(true);
+    expect(res.seamHandshake).toBe(true);
   });
 
   it("stays degraded without the seam handshake even when versions/caps look right", () => {

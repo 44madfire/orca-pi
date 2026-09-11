@@ -180,18 +180,33 @@ and fail-closed — see below).
   `github.status` / `github.doctor` (redacted only — no token/private key
   ever returned), `diagnostics.doctor` (orca/pi versions + bridge support).
 - Errors: `validation` (incl. allowlist rejects for `exec`/`shell`/arbitrary
-  ops), `conflict` (stale source hash → reload+retry), `unsupported`
-  (wrong protocol/host), `auth/setup` (missing consent/setup with actionable
-  next steps), `internal`, plus narrow `not-found` / `already-exists`.
+  ops and `untrusted-scope` rejections when a request root leaves the
+  transport-authorized root), `conflict` (stale source hash → reload+retry),
+  `unsupported` (wrong protocol/host or unreachable transport),
+  `auth/setup` (missing consent/setup with actionable next steps),
+  `internal`, plus narrow `not-found` / `already-exists`.
 - Worktree/project scoping is explicit and race-safe: mutating ops require
   an **absolute** `worktree.projectRoot` captured at submission (relative
   roots are rejected — they would resolve against the worker's cwd, not a
   verified worktree); the host derives `<projectRoot>/.pi/...` for project
   scope (arbitrary `userPath` / `projectPath` overrides from the panel are
-  rejected). Delayed requests can never be redirected by focus changes.
-  `workspace.readContext` is good for terminal identity (explicit
-  `terminalId`) but carries no filesystem paths — absolute roots arrive
-  via the seam/sidecar injection.
+  rejected). When the transport authorized one root (sidecar
+  `--project-root`, seam-injected worktree root), request roots must
+  normalize-equal it — `untrusted-scope` mismatches are rejected before
+  any read or write, in every scope. Delayed requests can never be
+  redirected by focus changes. `workspace.readContext` is good for
+  terminal identity (explicit `terminalId`) but carries no filesystem
+  paths — absolute roots arrive via the seam/sidecar injection.
+- Enforcement lives at the host boundary, not in the UI: on the seam
+  transport, anything beyond `bridge.capabilities` / `worktree.context` /
+  `diagnostics.doctor` requires negotiated `structured` support
+  (versions + `workspace:read` consent + handshake) — otherwise reads and
+  mutations are rejected (`auth/setup` for consent, `unsupported` for
+  reachability). The sidecar transport (local operator invocation) skips
+  the consent gate — the operator's shell is the authority — but keeps
+  root pinning. Orchestration writes hold the shared cross-process bakery
+  lock from load to replace, so concurrent sidecar processes serialize
+  and losers conflict instead of losing updates.
 - `window.__ORCA_PI_PROFILES__` injection is **deprecated** (legacy
   read-only fallback only, labeled as such) — production panels use
   `window.__ORCA_PI_BRIDGE__.request` (future seam) with explicit degraded

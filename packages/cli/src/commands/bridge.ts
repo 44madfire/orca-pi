@@ -204,6 +204,12 @@ export async function runBridgeCommand(
   const bridgeFs = asBridgeFs(deps.fs);
   const response = await handleBridgeRequest(request, {
     projectRoot: effectiveProjectRoot,
+    // Operator authority: this local invocation proves the transport, so
+    // the seam consent gate does not apply — but the request scope is
+    // still pinned to the authorized root (finding: one worktree's call
+    // must never address another's config).
+    transport: "sidecar",
+    trustedProjectRoot: effectiveProjectRoot,
     ...(deps.env !== undefined ? { env: deps.env } : {}),
     ...(deps.homedir !== undefined ? { homedir: deps.homedir } : {}),
     ...(deps.osHomedir !== undefined ? { osHomedir: deps.osHomedir } : {}),

@@ -221,10 +221,13 @@ describe("profiles panel: feature detection and fallback", () => {
     expect(profiles).toContain("Orca–Pi Profiles");
     expect(profiles).toContain("orca-pi profiles list");
     expect(profiles).toContain("orca-pi profile validate");
-    // Structured bridge is the production path (not static injection).
+    // Structured bridge is the production path (not static injection),
+    // and panels confirm it via bridge.capabilities before any data call.
     expect(profiles).toContain("__ORCA_PI_BRIDGE__");
+    expect(profiles).toContain("bridge.capabilities");
     expect(profiles).toContain("profiles.list");
     expect(status).toContain("__ORCA_PI_BRIDGE__");
+    expect(status).toContain("bridge.capabilities");
     // No undocumented bridge: no worker imports, filesystem requires, or fetch.
     expect(profiles).not.toContain("node:child_process");
     expect(profiles).not.toContain("node:fs");
