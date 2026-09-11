@@ -252,8 +252,25 @@ describe("bridge host: mutations route through the core service", () => {
     if (!stale.ok) expect(stale.error.code).toBe("conflict");
   });
 
-  it("ignores arbitrary userPath/projectPath overrides from the panel", async () => {
-    const d = deps();
+  it("rejects relative projectRoot mutations (never worker-cwd-relative)", async () => {
+    const res = await handleBridgeRequest(
+      {
+        protocolVersion: 1,
+        requestId: "rel",
+        operation: "profile.mutate",
+        worktree: { projectRoot: "../../somewhere" },
+        params: { action: "create", name: "rel", scope: "project" },
+      },
+      deps(),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("validation");
+      expect(res.error.message).toMatch(/absolute/);
+    }
+  });
+
+  it("ignores arbitrary userPath/projectPath overrides from the panel", async () => {    const d = deps();
     const res = await handleBridgeRequest(
       {
         protocolVersion: 1,

@@ -185,8 +185,9 @@ describe("profiles panel: feature detection and fallback", () => {
     // UI1.2 declares a worker main + only the capabilities actually used
     // (workspace:read, terminal:send for degraded fallback, notifications:show).
     // No storage/secrets/settings — no second profile store can diverge.
+    // `main` is the ESM Orca entry (default-exported activate(orca)).
     const typed = manifest as { main?: string; capabilities: { kind: string }[] };
-    expect(typeof typed.main).toBe("string");
+    expect(typed.main).toBe("worker-entry.mjs");
     const kinds = typed.capabilities.map((cap) => cap.kind).sort();
     expect(kinds).toEqual(["notifications:show", "terminal:send", "workspace:read"]);
     expect(kinds).not.toContain("storage");

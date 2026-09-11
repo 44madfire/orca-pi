@@ -56,10 +56,12 @@ describe("orca-plugin artifact", () => {
       capabilities: { kind: string }[];
       contributes: { commands: { action?: string }[] };
     };
-    // UI1.2: worker serves the versioned bridge; panels use workspace:read
+    // UI1.2: worker entry serves the versioned bridge; panels use workspace:read
     // (explicit scoping) + terminal:send (degraded fallback, explicit only)
     // + notifications:show. No storage/secrets/settings — no second store.
-    expect(typed.main).toBe("dist/worker.js");
+    // `main` is the ESM Orca entry (default-exported activate(orca)); the
+    // bridge core stays in testable `dist/` modules required by the entry.
+    expect(typed.main).toBe("worker-entry.mjs");
     const kinds = typed.capabilities.map((cap) => cap.kind).sort();
     expect(kinds).toEqual(["notifications:show", "terminal:send", "workspace:read"]);
     // Every declared command must carry a built-in action alias: action-less

@@ -1,10 +1,18 @@
 /**
- * Orca plugin worker entry (UI1.2).
+ * Orca-Pi bridge worker core (UI1.2).
  *
- * Manifest `main` for `44madfire.orca-pi`. Runs out-of-process via
- * `child_process.fork` channel in Orca main (see upstream
- * `plugin-host-protocol.ts`); the host re-gates every host call
- * regardless of what this worker believes is granted.
+ * Testable bridge logic behind the Orca plugin entry
+ * (`worker-entry.mjs`, the manifest `main`). Orca's worker runtime imports
+ * that entry via file URL and requires a default-exported
+ * `activate(orca)` function; the entry uses only the handed `orca` API
+ * (`commands.register`, `events.on`, `host.call`, `grantedCapabilities`,
+ * `log`). Nothing here reimplements the parent↔child fork/IPC channel —
+ * that protocol (callIds, `hostCall`/`hostResult`, `invokeCommand`,
+ * `deliverEvent`) is owned by Orca's own `plugin-host-entry` and validated
+ * with Zod on both sides upstream. The method names below (`onInit`,
+ * `handleRequest`, `handleInvokeCommand`, `handleDeliverEvent`) are this
+ * bridge worker's own small testable surface (no callIds, no fork
+ * channel), not the Orca IPC protocol.
  *
  * Responsibilities:
  * - Track consented capabilities from `init` (`grantedCapabilities`) and

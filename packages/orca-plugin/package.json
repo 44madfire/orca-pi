@@ -11,7 +11,8 @@
     "orca-plugin.json",
     "panel.html",
     "panel",
-    "skills"
+    "skills",
+    "worker-entry.mjs"
   ],
   "scripts": {
     "build": "tsc -b",

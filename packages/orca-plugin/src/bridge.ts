@@ -173,7 +173,12 @@ export function normalizeProjectRoot(root: string): string {
   normalized = normalized.replace(/\/+/g, "/");
   if (isUnc) normalized = `/${normalized}`;
   if (normalized.length > 1 && normalized.endsWith("/")) {
-    normalized = normalized.replace(/\/+$/, "");
+    // Preserve roots whose trailing slash is load-bearing: POSIX `/` is
+    // already excluded by length, but a bare Windows drive root (`C:/`)
+    // must keep its slash to stay absolute per `isAbsoluteProjectRoot`.
+    if (!/^[A-Za-z]:\/$/.test(normalized)) {
+      normalized = normalized.replace(/\/+$/, "");
+    }
   }
   return normalized;
 }
@@ -227,6 +232,14 @@ function validateWorktreeScope(
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f]/.test(projectRoot)) {
     errors.push("worktree.projectRoot must not contain control characters.");
+    return undefined;
+  }
+  if (requiresScope && !isAbsoluteProjectRoot(projectRoot)) {
+    errors.push(
+      `worktree.projectRoot must be an absolute path for "${operation}" (got ${JSON.stringify(projectRoot)}). ` +
+        `Project-scoped writes resolve against this root — a relative root would resolve against the worker's cwd instead of a verified worktree. ` +
+        `Capture the explicit worktree root at submission (POSIX, drive-letter, or UNC/WSL).`,
+    );
     return undefined;
   }
   if (worktreeId !== undefined) {

@@ -10,7 +10,7 @@
     "orca": ">=1.4.0"
   },
   "pluginApi": 1,
-  "main": "dist/worker.js",
+  "main": "worker-entry.mjs",
   "contributes": {
     "panels": [
       {

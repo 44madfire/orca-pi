@@ -139,6 +139,44 @@ describe("bridge protocol: explicit worktree/project scoping (race-safe)", () =>
     });
     expect(bad.ok).toBe(false);
   });
+
+  it("requires absolute projectRoot for mutating ops (never worker-cwd-relative)", () => {
+    for (const operation of ["profile.mutate", "orchestration.set"] as const) {
+      for (const projectRoot of ["relative/path", "../../somewhere", ".", "repo\\p"]) {
+        const parsed = parseBridgeRequest({
+          protocolVersion: 1,
+          requestId: "r1",
+          operation,
+          worktree: { projectRoot },
+        });
+        expect(parsed.ok).toBe(false);
+        if (!parsed.ok) {
+          expect(parsed.error.code).toBe("validation");
+          expect(parsed.error.message).toMatch(/absolute/);
+        }
+      }
+      // Absolute roots (POSIX, drive-letter, UNC/WSL) are accepted.
+      for (const projectRoot of ["/repo/p", "C:/repo/p", "C:\\repo\\p", "\\\\wsl.localhost\\Ubuntu\\repo"]) {
+        const parsed = parseBridgeRequest({
+          protocolVersion: 1,
+          requestId: "r1",
+          operation,
+          worktree: { projectRoot },
+        });
+        expect(parsed.ok).toBe(true);
+      }
+    }
+  });
+
+  it("still allows relative roots for reads (normalized, never executed)", () => {
+    const parsed = parseBridgeRequest({
+      protocolVersion: 1,
+      requestId: "r1",
+      operation: "profiles.list",
+      worktree: { projectRoot: "relative/path" },
+    });
+    expect(parsed.ok).toBe(true);
+  });
 });
 
 describe("bridge protocol: Windows + WSL paths", () => {
@@ -146,6 +184,13 @@ describe("bridge protocol: Windows + WSL paths", () => {
     expect(normalizeProjectRoot("C:\\repo\\p\\")).toBe("C:/repo/p");
     expect(normalizeProjectRoot("\\\\wsl.localhost\\Ubuntu\\repo")).toBe("//wsl.localhost/Ubuntu/repo");
     expect(normalizeProjectRoot("/repo/p//")).toBe("/repo/p");
+  });
+
+  it("preserves bare roots so they stay absolute", () => {
+    expect(normalizeProjectRoot("C:/")).toBe("C:/");
+    expect(normalizeProjectRoot("C:\\")).toBe("C:/");
+    expect(normalizeProjectRoot("/")).toBe("/");
+    expect(isAbsoluteProjectRoot(normalizeProjectRoot("C:/"))).toBe(true);
   });
 
   it("detects absolute scopes (POSIX, drive-letter, UNC)", () => {
