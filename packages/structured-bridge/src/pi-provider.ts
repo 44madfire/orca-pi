@@ -137,10 +137,10 @@ export interface PiProviderConnection {
   onExit(handler: (info: PiRpcCloseResult) => void): () => void;
   getState(): Promise<PiState>;
   respondToExtensionUi(response: { type: "extension_ui_response"; id: string; value?: unknown; confirmed?: boolean; cancelled?: boolean }): void;
-  getAvailableModels?(): Promise<{ models: PiModel[] }>;
-  setModel?(provider: string, modelId: string): Promise<PiModel>;
-  getAvailableThinkingLevels?(): Promise<{ levels: string[] }>;
-  setThinkingLevel?(level: string): Promise<void>;
+  getAvailableModels?(opts?: { timeoutMs?: number }): Promise<{ models: PiModel[] }>;
+  setModel?(provider: string, modelId: string, opts?: { timeoutMs?: number }): Promise<PiModel>;
+  getAvailableThinkingLevels?(opts?: { timeoutMs?: number }): Promise<{ levels: string[] }>;
+  setThinkingLevel?(level: string, opts?: { timeoutMs?: number }): Promise<void>;
   setAutoCompaction?(enabled: boolean): Promise<void>;
   readonly isClosed: boolean;
 }
@@ -206,6 +206,8 @@ interface PiRuntime {
   pendingPrompts: Map<string, string>;
   /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
   cachedModels?: PiModel[];
+  /** Shared in-flight catalog lookup (P2: concurrent image dispatches share one Pi RPC). */
+  catalogInflight?: Promise<PiModel[]> | null;
   /**
    * SNC1.6 immediate `/` command in flight (no turn). While set, the first
    * Pi dialog for this session acks `accepted` early (Pi definitely owns the
@@ -641,20 +643,44 @@ export class PiBridgeProvider extends BridgeProvider {
     return { ok: true, provider: only.provider, modelId: only.id, matched: only };
   }
 
-  /** Bounded await (never hangs dispatch past the host deadline). */
-  private async withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Shared bounded catalog lookup (P2: no pending accumulation).
+   * A single in-flight `get_available_models` per session is shared by
+   * concurrent image dispatches; the timeout is propagated as the real Pi
+   * RPC deadline (`{timeoutMs}`) so the underlying request rejects (and
+   * leaves `PiRpcConnection.pending`) after `timeoutMs`, not after the
+   * 30s production default. Callers cache the result in
+   * `runtime.cachedModels` on success; failures leave the cache absent
+   * (hint fallback) and clear the shared slot so the next dispatch retries.
+   */
+  private async fetchCatalogShared(sessionId: string, timeoutMs: number): Promise<PiModel[] | null> {
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!runtime) return null;
+    if (runtime.cachedModels !== undefined) return runtime.cachedModels;
+    if (runtime.catalogInflight) {
+      try {
+        return await runtime.catalogInflight;
+      } catch {
+        return null;
+      }
+    }
+    const listModels = runtime.conn.getAvailableModels?.bind(runtime.conn);
+    if (!listModels) return null;
+    const inflight: Promise<PiModel[]> = (async () => {
+      const listed = await listModels({ timeoutMs });
+      const models = [...listed.models];
+      const live = this.piRuntimes.get(sessionId);
+      if (live) live.cachedModels = models;
+      return models;
+    })();
+    runtime.catalogInflight = inflight;
     try {
-      return await new Promise<T>((resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('timeout')), ms);
-        (timer as unknown as { unref?: () => void }).unref?.();
-        promise.then(
-          (v) => resolve(v),
-          (e) => reject(e),
-        );
-      });
+      return await inflight;
+    } catch {
+      return null;
     } finally {
-      if (timer) clearTimeout(timer);
+      const live = this.piRuntimes.get(sessionId);
+      if (live?.catalogInflight === inflight) live.catalogInflight = null;
     }
   }
 
@@ -1266,13 +1292,10 @@ export class PiBridgeProvider extends BridgeProvider {
     // model (e.g. minimax-m3) dispatched immediately post-acquire is falsely
     // rejected. Bounded (3s) so a hung catalog never pushes dispatch past
     // the host deadline; failures fall back to hints (floor).
-    if (imageCount > 0 && runtime.cachedModels === undefined && typeof runtime.conn.getAvailableModels === 'function') {
-      try {
-        const listed = await this.withTimeout(runtime.conn.getAvailableModels(), 3000);
-        runtime.cachedModels = [...listed.models];
-      } catch {
-        // Fall through to hint/live-null handling below.
-      }
+    if (imageCount > 0 && runtime.cachedModels === undefined) {
+      // Bounded shared lookup (P2): real {timeoutMs:3000} propagates to Pi
+      // so no 30s pending accumulates; concurrent dispatches share one RPC.
+      await this.fetchCatalogShared(msg.sessionId, 3000);
     }
     const liveSupports =
       imageCount > 0 ? this.modelSupportsImages(session.metadata.model, runtime.cachedModels) : null;

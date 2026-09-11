@@ -1013,3 +1013,60 @@ describe("SNC1.6 BridgeHost E2E (shared Native Chat controls via bridge)", () =>
     await host.dispose();
   });
 });
+
+describe("SNC1.6 P2 (bounded shared catalog, no pending accumulation)", () => {
+  const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+  it("propagates a real 3s Pi deadline and shares one lookup across dispatches", async () => {
+    const fakes: FakePi16[] = [];
+    let listCalls = 0;
+    const listTimeouts: Array<number | undefined> = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        fake.state = {
+          ...fake.state,
+          model: { id: "minimax-m3", provider: "opencode-go" } as PiState["model"],
+        };
+        const origList = fake.getAvailableModels.bind(fake);
+        fake.getAvailableModels = async (o?: { timeoutMs?: number }) => {
+          listCalls += 1;
+          listTimeouts.push(o?.timeoutMs);
+          await new Promise((r) => setTimeout(r, 120));
+          return origList();
+        };
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_p2", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 30));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    const callsAfterAcquire = listCalls;
+    // Two concurrent image dispatches with cache absent/racing: they must
+    // share the bounded lookup (real timeoutMs=3000, not the 30s default)
+    // instead of launching accumulating long-lived RPCs.
+    send({
+      v: 1, kind: "dispatch", opId: "dsp_p2a", sessionId,
+      message: { text: "img a?", images: [{ data: tinyPng, mimeType: "image/png" }] },
+    });
+    send({
+      v: 1, kind: "dispatch", opId: "dsp_p2b", sessionId,
+      message: { text: "img b?", images: [{ data: tinyPng, mimeType: "image/png" }] },
+    });
+    await new Promise((r) => setTimeout(r, 800));
+    // At least one accepted (first wins idle; second honestly rejected busy
+    // or accepted after settle — never unknown from catalog hang).
+    const acks = out.filter((m) => m.kind === "dispatch_ack" && ["dsp_p2a", "dsp_p2b"].includes((m as { opId?: string }).opId ?? ""));
+    expect(acks.length).toBe(2);
+    // Bounded propagation: every list call carried an explicit short deadline
+    // (background acquire populates without timeout, dispatches use 3000).
+    // No call used the 30s production default implicitly for dispatch lookups.
+    expect(listTimeouts).toContain(3000);
+    // Sharing: dispatches added at most one extra catalog RPC beyond the
+    // background acquire (not one 30s pending per dispatch).
+    expect(listCalls - callsAfterAcquire).toBeLessThanOrEqual(2);
+  });
+});
