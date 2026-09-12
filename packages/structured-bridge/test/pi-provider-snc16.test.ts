@@ -53,6 +53,13 @@ class FakePi16 implements PiProviderConnection {
     { id: "gpt-5.6-luna", provider: "opencode-go", input: ["text", "image"] } as PiModel,
   ];
   levels: string[] = ["low", "high", "max"];
+  /**
+   * Per-model level sets keyed by qualified `provider/id` (default: global
+   * `levels`). Models the live contract where the levels RPC is scoped to
+   * the CURRENT Pi model — lets regressions prove compound validation runs
+   * against the target model, not the incumbent.
+   */
+  modelLevels: Record<string, string[]> = {};
   setModelCalls: Array<{ provider: string; modelId: string }> = [];
   setThinkingCalls: string[] = [];
   setAutoCompactionCalls: boolean[] = [];
@@ -153,7 +160,11 @@ class FakePi16 implements PiProviderConnection {
 
   async getAvailableThinkingLevels(): Promise<{ levels: string[] }> {
     if (this.failListLevelsWith) throw this.failListLevelsWith;
-    return { levels: [...this.levels] };
+    const m = this.state.model as unknown as { provider?: unknown; id?: unknown } | undefined;
+    const key =
+      m && typeof m.provider === "string" && typeof m.id === "string" ? `${m.provider}/${m.id}` : "";
+    const scoped = this.modelLevels[key];
+    return { levels: [...(scoped ?? this.levels)] };
   }
 
   async setThinkingLevel(level: string): Promise<void> {
@@ -1126,7 +1137,7 @@ describe("SNC1.6 option deadlines (bounded Pi RPCs, no late mutation)", () => {
 });
 
 describe("SNC1.6 ChatGPT review regressions (PR #41 P1s)", () => {
-  it("P1-compound: valid model + bogus thinking fails with zero Pi mutations", async () => {
+  it("P1-compound: valid model + bogus thinking fails without stranding a half-applied model", async () => {
     const fakes: FakePi16[] = [];
     const provider = new PiBridgeProvider({
       createConnection: (opts) => {
@@ -1138,14 +1149,16 @@ describe("SNC1.6 ChatGPT review regressions (PR #41 P1s)", () => {
     const { out, send, hello } = drive(provider);
     hello();
     const sessionId = await acquireSession(provider, out, send);
-    const modelBefore = fakes[0]?.state.model;
+    const modelBefore = fakes[0]?.state.model as unknown as { provider?: string; id?: string } | undefined;
     send({ v: 1, kind: "get_session", opId: "ses_before", sessionId });
     await new Promise((r) => setTimeout(r, 30));
     const before = (lastOfKind(out, "session") as unknown as { metadata: { model?: string; thinkingLevel?: string } }).metadata;
-    // Compound request: first field valid, later field invalid. Preflight
-    // must reject before ANY mutating Pi RPC (no set_model call, no lease
-    // change), so the bridge never strands a half-applied model Pi uses but
-    // the host never learns about.
+    // Compound request: first field valid, later field invalid. Levels are
+    // target-scoped, so the model applies first and thinking validates
+    // after the switch — but a mismatch rolls Pi BACK to the incumbent
+    // (and the lease with it) instead of stranding a half-applied model
+    // the host never learns about. Thinking itself is never applied:
+    // lenient Pi would have coerced silently.
     send({
       v: 1,
       kind: "set_options",
@@ -1157,9 +1170,11 @@ describe("SNC1.6 ChatGPT review regressions (PR #41 P1s)", () => {
     const err = lastOfKind(out, "error") as unknown as { opId: string; error: { code: string } };
     expect(err.opId).toBe("opt_compound");
     expect(err.error.code).toBe("UNKNOWN_THINKING_LEVEL");
-    expect(fakes[0]?.setModelCalls).toHaveLength(0);
+    // Model went on then back off (apply + rollback); thinking never sent.
+    expect(fakes[0]?.setModelCalls).toHaveLength(2);
     expect(fakes[0]?.setThinkingCalls).toHaveLength(0);
-    expect(fakes[0]?.state.model).toEqual(modelBefore);
+    const modelAfter = fakes[0]?.state.model as unknown as { provider?: string; id?: string } | undefined;
+    expect({ provider: modelAfter?.provider, id: modelAfter?.id }).toEqual({ provider: modelBefore?.provider, id: modelBefore?.id });
     send({ v: 1, kind: "get_session", opId: "ses_compound", sessionId });
     await new Promise((r) => setTimeout(r, 30));
     const meta = (lastOfKind(out, "session") as unknown as { metadata: { model?: string; thinkingLevel?: string } }).metadata;
@@ -1213,5 +1228,86 @@ describe("SNC1.6 ChatGPT review regressions (PR #41 P1s)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(fakeA?.uiResponses).toEqual([{ type: "extension_ui_response", id: "dlg_same", value: "X" }]);
     expect(fakeB?.uiResponses).toHaveLength(1);
+  });
+
+  it("P1-target-levels: compound thinking validates against the target model with rollback", async () => {
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        // Target model exposes a NARROWER level set than the incumbent:
+        // `high` is valid on glm but invalid on text-only-model.
+        fake.modelLevels["opencode-go/text-only-model"] = ["low"];
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionId = await acquireSession(provider, out, send);
+    send({ v: 1, kind: "get_session", opId: "ses_before", sessionId });
+    await new Promise((r) => setTimeout(r, 30));
+    const before = (lastOfKind(out, "session") as unknown as { metadata: { model?: string; thinkingLevel?: string } }).metadata;
+    expect(before.model).toBe("opencode-go/glm-5.3-flash");
+    // Compound: level valid on the INCUMBENT but invalid on the TARGET.
+    // Pre-switch validation must not consult incumbent levels; post-switch
+    // validation fails closed and rolls Pi back to the incumbent.
+    send({
+      v: 1,
+      kind: "set_options",
+      opId: "opt_target",
+      sessionId,
+      options: { model: "opencode-go/text-only-model", thinkingLevel: "high" },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const err = lastOfKind(out, "error") as unknown as { opId: string; error: { code: string; message: string } };
+    expect(err.opId).toBe("opt_target");
+    expect(err.error.code).toBe("UNKNOWN_THINKING_LEVEL");
+    expect(err.error.message).toContain("opencode-go/text-only-model");
+    // Thinking never applied (lenient Pi would have coerced silently).
+    expect(fakes[0]?.setThinkingCalls).toHaveLength(0);
+    // Rollback restored the incumbent on live Pi AND the lease.
+    expect(fakes[0]?.state.model).toEqual({ id: "glm-5.3-flash", provider: "opencode-go", input: ["text", "image"] });
+    send({ v: 1, kind: "get_session", opId: "ses_after", sessionId });
+    await new Promise((r) => setTimeout(r, 30));
+    const after = (lastOfKind(out, "session") as unknown as { metadata: { model?: string; thinkingLevel?: string } }).metadata;
+    expect(after.model).toBe(before.model);
+    expect(after.thinkingLevel).toBe(before.thinkingLevel);
+    // Positive control: level valid on the TARGET applies cleanly.
+    send({
+      v: 1,
+      kind: "set_options",
+      opId: "opt_ok",
+      sessionId,
+      options: { model: "opencode-go/text-only-model", thinkingLevel: "low" },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(lastOfKind(out, "options_updated")).toMatchObject({ opId: "opt_ok" });
+    expect(fakes[0]?.setThinkingCalls).toEqual(["low"]);
+  });
+
+  it("P2-autocompaction: unsupported transports fail closed instead of persisting synthetic success", async () => {
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        // Minimal transport: no set_auto_compaction (SNC1.4-style fake).
+        (fake as unknown as Record<string, unknown>).setAutoCompaction = undefined;
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionId = await acquireSession(provider, out, send);
+    send({ v: 1, kind: "set_options", opId: "opt_ac", sessionId, options: { autoCompaction: false } });
+    await new Promise((r) => setTimeout(r, 30));
+    const err = lastOfKind(out, "error") as unknown as { opId: string; error: { code: string } };
+    expect(err.opId).toBe("opt_ac");
+    expect(err.error.code).toBe("PI_OPTION_UNSUPPORTED");
+    // No synthetic success: no options_updated, nothing persisted.
+    expect(out.some((m) => m.kind === "options_updated")).toBe(false);
+    expect(fakes[0]?.setAutoCompactionCalls).toHaveLength(0);
+    expect(fakes[0]?.autoCompaction).toBe(true);
   });
 });

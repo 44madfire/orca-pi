@@ -732,13 +732,19 @@ export class PiBridgeProvider extends BridgeProvider {
    * (the caller reports `error`, never a diverging `options_updated`).
    *
    * Two-phase discipline (PR #41 P1): VALIDATE everything before MUTATING
-   * anything. Phase 1 checks transport capability (no RPCs). Phase 2 runs
-   * only read-only RPCs (model catalog list + ref resolution, thinking-level
-   * list + membership) and returns the first failure with zero Pi mutations
-   * — so a compound request like `{model: valid, thinkingLevel: bogus}`
-   * leaves both Pi and the lease untouched instead of stranding a half-applied
-   * model the host never learns about. Phase 3 issues the mutating RPCs and
-   * persists confirmed values. Residual risk: a *transport* failure mid-apply
+   * anything. Phase 1 checks transport capability — model, thinking, AND
+   * autoCompaction (a real Pi settings mutation — PR #41 P2) — with no RPCs.
+   * Phase 2 runs only read-only RPCs (model catalog list + ref resolution;
+   * thinking-level list + membership for thinking-only requests, where the
+   * current model IS the target; incumbent-model snapshot via `get_state`
+   * for compound requests) and returns the first failure with zero Pi
+   * mutations — so a compound request like `{model: valid, thinkingLevel:
+   * bogus}` leaves both Pi and the lease untouched instead of stranding a
+   * half-applied model the host never learns about. Phase 3 issues the
+   * mutating RPCs and persists confirmed values; compound thinking levels
+   * are re-validated target-scoped after the switch (the levels RPC
+   * describes the current model only), with best-effort rollback to the
+   * incumbent on mismatch. Residual risk: a *transport* failure mid-apply
    * (after an earlier field landed) can still partially apply — that path
    * also returns `error` with no `options_updated`, and the host reconciles
    * actual Pi state via `get_session` (provider-confirmed lease), never by
@@ -772,9 +778,21 @@ export class PiBridgeProvider extends BridgeProvider {
     if (options.thinkingLevel !== undefined && (typeof listLevels !== "function" || typeof applyLevel !== "function")) {
       return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support thinking-level operations" };
     }
+    // autoCompaction is a real Pi mutation (`set_auto_compaction` rewrites
+    // global settings): a transport without it must fail closed, never
+    // persist a synthetic success Pi never applied (PR #41 P2).
+    if (options.autoCompaction !== undefined && typeof conn.setAutoCompaction !== "function") {
+      return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support auto-compaction operations" };
+    }
     // Phase 2 — validation via read-only RPCs (no Pi mutations): resolve the
     // model ref against the live catalog and check thinking membership.
     // Any failure here returns with Pi and the lease untouched.
+    //
+    // Thinking validation is model-scoped (PR #41 P1): the levels RPC
+    // describes the CURRENT model, so for a compound {model, thinking}
+    // request the current levels describe the WRONG model and must not
+    // gate anything — target validation happens in Phase 3 after the
+    // switch, with best-effort rollback below.
     let resolvedModel: { provider: string; modelId: string } | null = null;
     let listedModels: PiModel[] | null = null;
     if (options.model !== undefined) {
@@ -804,9 +822,10 @@ export class PiBridgeProvider extends BridgeProvider {
       resolvedModel = { provider: resolved.provider, modelId: resolved.modelId };
       listedModels = models;
     }
-    if (options.thinkingLevel !== undefined) {
-      // Exact live-level validation (Pi is lenient and would silently fall
-      // back — the bridge fails closed instead).
+    if (options.thinkingLevel !== undefined && resolvedModel === null) {
+      // Thinking-only: the current model IS the target — exact pre-mutation
+      // validation (Pi is lenient and would silently fall back; the bridge
+      // fails closed instead).
       let levels: string[];
       try {
         // Defense in depth: see model list above.
@@ -824,6 +843,27 @@ export class PiBridgeProvider extends BridgeProvider {
           code: "UNKNOWN_THINKING_LEVEL",
           message: sanitizeCode(`unknown thinking level: ${options.thinkingLevel} (available: ${levels.join(", ") || "none"})`),
         };
+      }
+    }
+    // Compound {model, thinking}: record the incumbent model (read-only)
+    // for best-effort rollback if the level proves invalid on the target.
+    // Absent/unreadable incumbent means rollback is unavailable — a later
+    // thinking failure then keeps the switched model in the lease
+    // (truthful: Pi IS on it) with `error` and `get_session` reconciliation.
+    let incumbentModel: { provider: string; modelId: string } | null = null;
+    if (options.thinkingLevel !== undefined && resolvedModel !== null) {
+      try {
+        const st = await conn.getState({ timeoutMs: this.piOptionTimeoutMs });
+        if (
+          typeof st.model?.id === "string" &&
+          st.model.id !== "" &&
+          typeof st.model?.provider === "string" &&
+          st.model.provider !== ""
+        ) {
+          incumbentModel = { provider: st.model.provider, modelId: st.model.id };
+        }
+      } catch {
+        incumbentModel = null;
       }
     }
     // Phase 3 — apply (mutating RPCs) only after every requested field
@@ -867,6 +907,48 @@ export class PiBridgeProvider extends BridgeProvider {
       }
     }
     if (options.thinkingLevel !== undefined && applyLevel !== undefined) {
+      // Compound {model, thinking}: the Phase-2 levels described the OLD
+      // model — re-list (now target-scoped) and validate BEFORE mutating
+      // thinking. Pi's lenient set would otherwise silently coerce a level
+      // the target model rejects.
+      if (resolvedModel !== null) {
+        if (typeof listLevels !== "function" || typeof applyModel !== "function") {
+          return { ok: false, code: "PI_OPTION_FAILED", message: "thinking-level operations unavailable" };
+        }
+        let targetLevels: string[];
+        try {
+          targetLevels = [...(await listLevels({ timeoutMs: this.piOptionTimeoutMs })).levels];
+        } catch (error) {
+          // Model already switched (lease truthfully persists it above);
+          // report the thinking failure and let the host reconcile.
+          return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`thinking-level list failed: ${this.shortPiError(error)}`) };
+        }
+        if (!targetLevels.includes(options.thinkingLevel)) {
+          const targetRef = `${resolvedModel.provider}/${resolvedModel.modelId}`;
+          // Best-effort rollback to the incumbent so a failed compound
+          // leaves Pi where it started. Rollback failure (or unknown
+          // incumbent) keeps the switched model in the lease — truthful,
+          // reconciled via `get_session`, never a diverging ack.
+          if (incumbentModel !== null) {
+            try {
+              await applyModel(incumbentModel.provider, incumbentModel.modelId, { timeoutMs: this.piOptionTimeoutMs });
+              const restored = `${incumbentModel.provider}/${incumbentModel.modelId}`;
+              session.options.model = restored;
+              session.metadata.model = restored;
+            } catch {
+              // Rollback failed: lease keeps the switched model (Pi IS on
+              // it). Fall through to the thinking error below.
+            }
+          }
+          return {
+            ok: false,
+            code: "UNKNOWN_THINKING_LEVEL",
+            message: sanitizeCode(
+              `unknown thinking level for ${targetRef}: ${options.thinkingLevel} (available: ${targetLevels.join(", ") || "none"})`,
+            ),
+          };
+        }
+      }
       // Defense in depth: see model apply above.
       if (typeof applyLevel !== "function") {
         return { ok: false, code: "PI_OPTION_FAILED", message: "thinking-level operations unavailable" };
@@ -890,13 +972,17 @@ export class PiBridgeProvider extends BridgeProvider {
       }
     }
     if (options.autoCompaction !== undefined) {
-      const conn = runtime.conn;
-      if (typeof conn.setAutoCompaction === "function") {
-        try {
-          await conn.setAutoCompaction(options.autoCompaction, { timeoutMs: this.piOptionTimeoutMs });
-        } catch (error) {
-          return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_auto_compaction failed: ${this.shortPiError(error)}`) };
-        }
+      // Phase 1 preflight guarantees the RPC exists when requested;
+      // re-check at the call site (narrowing does not cross `await`).
+      // Bound: unbound extraction would lose `this` on the real connection.
+      const setAC = conn.setAutoCompaction?.bind(conn);
+      if (typeof setAC !== "function") {
+        return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support auto-compaction operations" };
+      }
+      try {
+        await setAC(options.autoCompaction, { timeoutMs: this.piOptionTimeoutMs });
+      } catch (error) {
+        return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_auto_compaction failed: ${this.shortPiError(error)}`) };
       }
       // No live confirmation RPC for this flag: persist the requested value
       // (Pi `set_auto_compaction` is idempotent `success:true`; failures

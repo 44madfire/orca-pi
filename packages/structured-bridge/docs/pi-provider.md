@@ -48,10 +48,13 @@ keystroke injection anywhere on this path.
   (no fuzzy/wildcard) → `options_updated` with provider-confirmed values
   (Orca-normal persistence: `session.options` + `metadata` hold confirmed
   state; `acquire` restores the same way). Two-phase discipline: every
-  requested field is validated via read-only RPCs before any mutating RPC
-  issues, so a compound failure (e.g. valid model + bogus thinking level)
-  leaves Pi and the lease untouched instead of stranding a half-applied
-  update. Failures return shaped `error`
+  requested field passes capability preflight (model/thinking/autoCompaction)
+  and read-only validation before any mutating RPC issues. Thinking levels
+  are current-model-scoped, so a compound `{model, thinking}` validates the
+  level against the TARGET model after the switch, with best-effort rollback
+  to the incumbent on mismatch. Validation failures leave Pi and the lease
+  untouched; a mid-apply *transport* failure reports `error` and the host
+  reconciles actual Pi state via `get_session`. Failures return shaped `error`
   (`UNKNOWN_MODEL` / `AMBIGUOUS_MODEL` / `UNKNOWN_THINKING_LEVEL` /
   `PI_OPTION_FAILED` / `PI_OPTION_UNSUPPORTED`), never a diverging ack;
   a mid-apply *transport* failure also reports `error` and the host
