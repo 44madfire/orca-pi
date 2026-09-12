@@ -47,9 +47,15 @@ keystroke injection anywhere on this path.
   `set_thinking_level`, `set_auto_compaction` with exact-match semantics
   (no fuzzy/wildcard) → `options_updated` with provider-confirmed values
   (Orca-normal persistence: `session.options` + `metadata` hold confirmed
-  state; `acquire` restores the same way). Failures return shaped `error`
+  state; `acquire` restores the same way). Two-phase discipline: every
+  requested field is validated via read-only RPCs before any mutating RPC
+  issues, so a compound failure (e.g. valid model + bogus thinking level)
+  leaves Pi and the lease untouched instead of stranding a half-applied
+  update. Failures return shaped `error`
   (`UNKNOWN_MODEL` / `AMBIGUOUS_MODEL` / `UNKNOWN_THINKING_LEVEL` /
-  `PI_OPTION_FAILED` / `PI_OPTION_UNSUPPORTED`), never a diverging ack.
+  `PI_OPTION_FAILED` / `PI_OPTION_UNSUPPORTED`), never a diverging ack;
+  a mid-apply *transport* failure also reports `error` and the host
+  reconciles actual Pi state via `get_session`.
 - `get_session` → best-effort `get_state` refresh (provider-confirmed
   model/thinking/counts/streaming) + cached lease fallback (never fails on
   transient state reads). `thinking_level_changed` Pi events also update
@@ -61,7 +67,10 @@ keystroke injection anywhere on this path.
   `cancelled{settled}` + Pi `turn_end{aborted}`/`settled`
 - `answer_prompt` → exactly-once Pi `extension_ui_response` (select/input/
   editor `{value}`, confirm `{confirmed}`, cancel `{cancelled:true}`) with
-  stable `requestId` identity; duplicates / unknown / retired ids refuse
+  stable per-session `requestId` identity (`<sessionId>:<piId>` — Pi children
+  are independently spawned processes with only process-local dialog ids, so
+  the bridge namespaces them and retains the raw Pi id for the response);
+  duplicates / unknown / retired ids refuse
   with `UNKNOWN_REQUEST` (never re-sent, never broadcast); benign `ANSWERED`
   ack resolves the host without echoing values
 - `release`/`close{mode}` → bounded `PiRpcConnection.close()` per child

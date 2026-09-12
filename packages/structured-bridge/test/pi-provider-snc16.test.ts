@@ -212,6 +212,11 @@ function sessionEvents(out: ProviderToHostMessage[], opId?: string): Array<{ opI
     .filter((m) => (opId === undefined ? true : m.opId === opId));
 }
 
+/** Bridge-visible prompt id for a Pi-local dialog id (namespaced per session). */
+function bid(sessionId: string, piId: string): string {
+  return `${sessionId}:${piId}`;
+}
+
 async function acquireSession(
   provider: PiBridgeProvider,
   out: ProviderToHostMessage[],
@@ -435,13 +440,13 @@ describe("SNC1.6 interactive prompts (stable identity, exactly-once, retirement)
     await new Promise((r) => setTimeout(r, 20));
     expect(sessionEvents(out, "dsp_1").some((e) => e.event.type === "prompt_request")).toBe(true);
 
-    send({ v: 1, kind: "answer_prompt", opId: "ans_1", requestId: "dlg_1", value: "A", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_1", requestId: bid(sessionId, "dlg_1"), value: "A", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(fakes[0]?.uiResponses).toEqual([{ type: "extension_ui_response", id: "dlg_1", value: "A" }]);
     expect(lastOfKind(out, "error")).toMatchObject({ opId: "ans_1", error: { code: "ANSWERED" } });
 
     // Duplicate answer for the same requestId: stale refusal, never re-sent.
-    send({ v: 1, kind: "answer_prompt", opId: "ans_2", requestId: "dlg_1", value: "B", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_2", requestId: bid(sessionId, "dlg_1"), value: "B", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "error")).toMatchObject({ opId: "ans_2", error: { code: "UNKNOWN_REQUEST" } });
     expect(fakes[0]?.uiResponses).toHaveLength(1);
@@ -465,12 +470,12 @@ describe("SNC1.6 interactive prompts (stable identity, exactly-once, retirement)
     fakes[0]?.emit({ type: "extension_ui_request", id: "dlg_b", method: "confirm", title: "Second", message: "Sure?" } as unknown as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
     const prompts = sessionEvents(out, "dsp_1").filter((e) => e.event.type === "prompt_request");
-    expect(prompts.map((e) => (e.event as { requestId?: string }).requestId).sort()).toEqual(["dlg_a", "dlg_b"]);
+    expect(prompts.map((e) => (e.event as { requestId?: string }).requestId).sort()).toEqual([bid(sessionId, "dlg_a"), bid(sessionId, "dlg_b")].sort());
 
     // Answer out of order; confirm maps boolean → confirmed.
-    send({ v: 1, kind: "answer_prompt", opId: "ans_b", requestId: "dlg_b", value: true, cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_b", requestId: bid(sessionId, "dlg_b"), value: true, cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
-    send({ v: 1, kind: "answer_prompt", opId: "ans_a", requestId: "dlg_a", value: "B", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_a", requestId: bid(sessionId, "dlg_a"), value: "B", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(fakes[0]?.uiResponses).toContainEqual({ type: "extension_ui_response", id: "dlg_b", confirmed: true });
     expect(fakes[0]?.uiResponses).toContainEqual({ type: "extension_ui_response", id: "dlg_a", value: "B" });
@@ -516,7 +521,7 @@ describe("SNC1.6 interactive prompts (stable identity, exactly-once, retirement)
     fakes[0]?.emit({ type: "agent_settled" } as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
     // Late answer after settle: retired, never forwarded.
-    send({ v: 1, kind: "answer_prompt", opId: "ans_late", requestId: "dlg_settle", value: "too-late", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_late", requestId: bid(sessionId, "dlg_settle"), value: "too-late", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "error")).toMatchObject({ opId: "ans_late", error: { code: "UNKNOWN_REQUEST" } });
     expect(fakes[0]?.uiResponses).toHaveLength(0);
@@ -540,7 +545,7 @@ describe("SNC1.6 interactive prompts (stable identity, exactly-once, retirement)
     await new Promise((r) => setTimeout(r, 20));
     send({ v: 1, kind: "cancel", opId: "cnl_1", sessionId, targetOpId: "dsp_1" });
     await new Promise((r) => setTimeout(r, 20));
-    send({ v: 1, kind: "answer_prompt", opId: "ans_after_cancel", requestId: "dlg_cancel", value: "A", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_after_cancel", requestId: bid(sessionId, "dlg_cancel"), value: "A", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "error")).toMatchObject({ opId: "ans_after_cancel", error: { code: "UNKNOWN_REQUEST" } });
     expect(fakes[0]?.uiResponses).toHaveLength(0);
@@ -564,7 +569,7 @@ describe("SNC1.6 interactive prompts (stable identity, exactly-once, retirement)
     fakes[0]?.emit({ type: "extension_ui_request", id: "dlg_dup", method: "select", title: "Pick", options: ["A"] } as unknown as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
     expect(sessionEvents(out, "dsp_1").filter((e) => e.event.type === "prompt_request")).toHaveLength(1);
-    send({ v: 1, kind: "answer_prompt", opId: "ans_1", requestId: "dlg_dup", value: "A", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_1", requestId: bid(sessionId, "dlg_dup"), value: "A", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(fakes[0]?.uiResponses).toHaveLength(1);
   });
@@ -611,7 +616,7 @@ describe("SNC1.6 interactive prompts (stable identity, exactly-once, retirement)
     await new Promise((r) => setTimeout(r, 20));
     fakes[0]?.emit({ type: "extension_ui_request", id: "dlg_c", method: "input", title: "Name" } as unknown as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
-    send({ v: 1, kind: "answer_prompt", opId: "ans_c", requestId: "dlg_c", cancelled: true });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_c", requestId: bid(sessionId, "dlg_c"), cancelled: true });
     await new Promise((r) => setTimeout(r, 20));
     expect(fakes[0]?.uiResponses).toEqual([{ type: "extension_ui_response", id: "dlg_c", cancelled: true }]);
     expect(JSON.stringify(lastOfKind(out, "error"))).not.toContain("secret-answer-value");
@@ -729,7 +734,7 @@ describe("SNC1.6 acquisition fences (no option/prompt leak across sessions)", ()
     await new Promise((r) => setTimeout(r, 20));
     // Answer routes to A's child only (exactly one Pi sees it).
     const totalBefore = fakes.reduce((n, f) => n + f.uiResponses.length, 0);
-    send({ v: 1, kind: "answer_prompt", opId: "ans_fence", requestId: "dlg_fence", value: "X", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_fence", requestId: bid(sessionA, "dlg_fence"), value: "X", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     const totalAfter = fakes.reduce((n, f) => n + f.uiResponses.length, 0);
     expect(totalAfter - totalBefore).toBe(1);
@@ -755,7 +760,7 @@ describe("SNC1.6 acquisition fences (no option/prompt leak across sessions)", ()
     send({ v: 1, kind: "release", opId: "rel_1", sessionId });
     await new Promise((r) => setTimeout(r, 20));
     // Late answer after release: unknown (fenced), never forwarded.
-    send({ v: 1, kind: "answer_prompt", opId: "ans_old", requestId: "dlg_old", value: "A", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_old", requestId: bid(sessionId, "dlg_old"), value: "A", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOfKind(out, "error")).toMatchObject({ opId: "ans_old", error: { code: "UNKNOWN_REQUEST" } });
     expect(fakes[0]?.uiResponses).toHaveLength(0);
@@ -870,7 +875,7 @@ describe("SNC1.6 ChatGPT review regressions (PR #39 P1s)", () => {
     expect(lastOfKind(out, "dispatch_ack")).toMatchObject({ opId: "dsp_imm", status: "accepted" });
     expect(sessionEvents(out, "dsp_imm").some((e) => e.event.type === "prompt_request")).toBe(true);
     // Now answer (slow user is fine — ownership was already acked).
-    send({ v: 1, kind: "answer_prompt", opId: "ans_delayed", requestId: "dlg_delayed", value: "A", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_delayed", requestId: bid(sessionId, "dlg_delayed"), value: "A", cancelled: false });
     await new Promise((r) => setTimeout(r, 80));
     expect(fakes[0]?.uiResponses).toContainEqual({ type: "extension_ui_response", id: "dlg_delayed", value: "A" });
     // Exactly one ack, no duplicate after the delayed prompt response.
@@ -1117,5 +1122,96 @@ describe("SNC1.6 option deadlines (bounded Pi RPCs, no late mutation)", () => {
       expect(typeof t).toBe("number");
       expect(t as number).toBeLessThanOrEqual(8000);
     }
+  });
+});
+
+describe("SNC1.6 ChatGPT review regressions (PR #41 P1s)", () => {
+  it("P1-compound: valid model + bogus thinking fails with zero Pi mutations", async () => {
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionId = await acquireSession(provider, out, send);
+    const modelBefore = fakes[0]?.state.model;
+    send({ v: 1, kind: "get_session", opId: "ses_before", sessionId });
+    await new Promise((r) => setTimeout(r, 30));
+    const before = (lastOfKind(out, "session") as unknown as { metadata: { model?: string; thinkingLevel?: string } }).metadata;
+    // Compound request: first field valid, later field invalid. Preflight
+    // must reject before ANY mutating Pi RPC (no set_model call, no lease
+    // change), so the bridge never strands a half-applied model Pi uses but
+    // the host never learns about.
+    send({
+      v: 1,
+      kind: "set_options",
+      opId: "opt_compound",
+      sessionId,
+      options: { model: "opencode-go/glm-5.3-flash", thinkingLevel: "bogus-level" },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const err = lastOfKind(out, "error") as unknown as { opId: string; error: { code: string } };
+    expect(err.opId).toBe("opt_compound");
+    expect(err.error.code).toBe("UNKNOWN_THINKING_LEVEL");
+    expect(fakes[0]?.setModelCalls).toHaveLength(0);
+    expect(fakes[0]?.setThinkingCalls).toHaveLength(0);
+    expect(fakes[0]?.state.model).toEqual(modelBefore);
+    send({ v: 1, kind: "get_session", opId: "ses_compound", sessionId });
+    await new Promise((r) => setTimeout(r, 30));
+    const meta = (lastOfKind(out, "session") as unknown as { metadata: { model?: string; thinkingLevel?: string } }).metadata;
+    expect(meta.model).toBe(before.model);
+    expect(meta.thinkingLevel).toBe(before.thinkingLevel);
+  });
+
+  it("P1-fence: identical Pi dialog ids in two sessions route independently", async () => {
+    const fakes: FakePi16[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi16(opts);
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    const sessionA = await acquireSession(provider, out, send, "acq_a");
+    const sessionB = await acquireSession(provider, out, send, "acq_b");
+    send({ v: 1, kind: "dispatch", opId: "dsp_a", sessionId: sessionA, message: { text: "ask A" } });
+    send({ v: 1, kind: "dispatch", opId: "dsp_b", sessionId: sessionB, message: { text: "ask B" } });
+    await new Promise((r) => setTimeout(r, 20));
+    const fakeA = fakes.find((f) => f.prompts.some((p) => p.message === "ask A"));
+    const fakeB = fakes.find((f) => f.prompts.some((p) => p.message === "ask B"));
+    expect(fakeA).toBeDefined();
+    expect(fakeB).toBeDefined();
+    expect(fakeA).not.toBe(fakeB);
+    // Both Pi children emit the SAME process-local dialog id (no
+    // cross-process uniqueness). Bridge-visible ids must differ per session.
+    fakeA?.emit({ type: "extension_ui_request", id: "dlg_same", method: "select", title: "Pick", options: ["X", "Y"] } as unknown as PiServerEvent);
+    fakeB?.emit({ type: "extension_ui_request", id: "dlg_same", method: "select", title: "Pick", options: ["X", "Y"] } as unknown as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 20));
+    const idsA = sessionEvents(out, "dsp_a")
+      .filter((e) => e.event.type === "prompt_request")
+      .map((e) => (e.event as { requestId?: string }).requestId);
+    const idsB = sessionEvents(out, "dsp_b")
+      .filter((e) => e.event.type === "prompt_request")
+      .map((e) => (e.event as { requestId?: string }).requestId);
+    expect(idsA).toEqual([bid(sessionA, "dlg_same")]);
+    expect(idsB).toEqual([bid(sessionB, "dlg_same")]);
+    expect(idsA[0]).not.toBe(idsB[0]);
+    // Answer B's dialog: only B's Pi child sees the raw id; A stays pending.
+    send({ v: 1, kind: "answer_prompt", opId: "ans_b", requestId: idsB[0], value: "Y", cancelled: false });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOfKind(out, "error")).toMatchObject({ opId: "ans_b", error: { code: "ANSWERED" } });
+    expect(fakeB?.uiResponses).toEqual([{ type: "extension_ui_response", id: "dlg_same", value: "Y" }]);
+    expect(fakeA?.uiResponses).toHaveLength(0);
+    // A's dialog is still answerable with its own namespaced id.
+    send({ v: 1, kind: "answer_prompt", opId: "ans_a", requestId: idsA[0], value: "X", cancelled: false });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fakeA?.uiResponses).toEqual([{ type: "extension_ui_response", id: "dlg_same", value: "X" }]);
+    expect(fakeB?.uiResponses).toHaveLength(1);
   });
 });

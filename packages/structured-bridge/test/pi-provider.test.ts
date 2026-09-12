@@ -499,7 +499,7 @@ describe("PiBridgeProvider basic structured chat (SNC1.4)", () => {
     fakes[0]?.emit({ type: "extension_ui_request", id: "dlg_1", method: "select", title: "Pick", options: ["A", "B"] } as unknown as PiServerEvent);
     await new Promise((r) => setTimeout(r, 20));
     expect(sessionEvents(out, "dsp_1").some((e) => e.event.type === "prompt_request")).toBe(true);
-    send({ v: 1, kind: "answer_prompt", opId: "ans_1", requestId: "dlg_1", value: "A", cancelled: false });
+    send({ v: 1, kind: "answer_prompt", opId: "ans_1", requestId: `${sessionId}:dlg_1`, value: "A", cancelled: false });
     await new Promise((r) => setTimeout(r, 20));
     expect(fakes[0]?.uiResponses).toEqual([{ type: "extension_ui_response", id: "dlg_1", value: "A" }]);
     expect(JSON.stringify(lastOfKind(out, "error"))).not.toContain("\"A\"-leak-check-unused");

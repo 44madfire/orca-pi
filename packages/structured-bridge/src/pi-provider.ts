@@ -200,8 +200,9 @@ interface PiRuntime {
   /** Pi-side session id observed via `get_state` (for lease identity). */
   piSessionId?: string;
   /**
-   * SNC1.6 interactive prompts: stable `requestId` → originating dispatch
-   * `opId` for every unanswered Pi dialog in this session. Exactly-once:
+   * SNC1.6 interactive prompts: bridge-visible `requestId`
+   * (`<sessionId>:<piId>`, see `promptPiIds`) → originating dispatch `opId`
+   * for every unanswered Pi dialog in this session. Exactly-once:
    * the first `answer_prompt` for a `requestId` forwards one Pi
    * `extension_ui_response` and deletes the entry; later answers for the
    * same id are stale/late refusals (`UNKNOWN_REQUEST`, never re-sent).
@@ -212,6 +213,16 @@ interface PiRuntime {
    * support; the single slot would overwrite overlapping dialogs).
    */
   pendingPrompts: Map<string, string>;
+  /**
+   * Bridge-visible prompt id → originating Pi `extension_ui_request.id`.
+   * Bridge ids are namespaced per session (`<sessionId>:<piId>`) because Pi
+   * children are independently spawned processes whose local dialog ids
+   * carry no cross-process uniqueness guarantee: two sessions may hold the
+   * same Pi-local id, and the raw id alone cannot route an answer. The map
+   * gives the exact reverse lookup without parsing (Pi ids may contain any
+   * separator). Cleared/retired together with `pendingPrompts`.
+   */
+  promptPiIds: Map<string, string>;
   /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
   cachedModels?: PiModel[];
   /** Shared in-flight catalog lookup (P2: concurrent image dispatches share one Pi RPC). */
@@ -524,6 +535,7 @@ export class PiBridgeProvider extends BridgeProvider {
       piSessionId,
       pendingUserText: null,
       pendingPrompts: new Map<string, string>(),
+      promptPiIds: new Map<string, string>(),
       pendingImmediate: null,
     };
     this.piRuntimes.set(sessionId, runtime);
@@ -717,8 +729,20 @@ export class PiBridgeProvider extends BridgeProvider {
    * `session.metadata` only with provider-confirmed values (Pi RPC results
    * / live level lists / `get_state` refresh). Returns `{ok:true}` when every
    * requested field applied, else `{ok:false, code, message}` fail-closed
-   * (succeeded fields stay applied — Pi mutations are not transactional —
-   * but the caller reports `error`, never a diverging `options_updated`).
+   * (the caller reports `error`, never a diverging `options_updated`).
+   *
+   * Two-phase discipline (PR #41 P1): VALIDATE everything before MUTATING
+   * anything. Phase 1 checks transport capability (no RPCs). Phase 2 runs
+   * only read-only RPCs (model catalog list + ref resolution, thinking-level
+   * list + membership) and returns the first failure with zero Pi mutations
+   * — so a compound request like `{model: valid, thinkingLevel: bogus}`
+   * leaves both Pi and the lease untouched instead of stranding a half-applied
+   * model the host never learns about. Phase 3 issues the mutating RPCs and
+   * persists confirmed values. Residual risk: a *transport* failure mid-apply
+   * (after an earlier field landed) can still partially apply — that path
+   * also returns `error` with no `options_updated`, and the host reconciles
+   * actual Pi state via `get_session` (provider-confirmed lease), never by
+   * assuming the request landed.
    */
   private async applyPiOptions(
     sessionId: string,
@@ -732,22 +756,44 @@ export class PiBridgeProvider extends BridgeProvider {
     if (runtime.conn.isClosed) {
       return { ok: false, code: "PI_EXITED", message: "pi-exited (reacquire the session)" };
     }
-    // Model: exact-ref resolution via live catalog, then Pi `set_model`.
-    // Provider-confirmed canonical `provider/modelId` is persisted in both
-    // `metadata.model` and `options.model` (so a later restore/acquire with
-    // duplicate bare ids — e.g. `gpt-5.6-luna` under `openai-codex` +
-    // `opencode-go` in the live catalog — resolves without `AMBIGUOUS_MODEL`,
-    // and image-capability lookup disambiguates by provider). Bare unique
-    // ids still resolve (exact unique match), but persistence is always
-    // qualified for restore safety.
+    // Phase 1 — capability preflight (no RPCs): every requested field must be
+    // supportable before anything is validated or mutated. Bound to const
+    // locals: property-access narrowing does not survive `await`, so the
+    // checks below both gate support AND keep precise callable types for
+    // phases 2–3 (unbound extraction would also lose `this`).
+    const conn = runtime.conn;
+    const listModels = options.model !== undefined ? conn.getAvailableModels?.bind(conn) : undefined;
+    const applyModel = options.model !== undefined ? conn.setModel?.bind(conn) : undefined;
+    if (options.model !== undefined && (typeof listModels !== "function" || typeof applyModel !== "function")) {
+      return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support model operations" };
+    }
+    const listLevels = options.thinkingLevel !== undefined ? conn.getAvailableThinkingLevels?.bind(conn) : undefined;
+    const applyLevel = options.thinkingLevel !== undefined ? conn.setThinkingLevel?.bind(conn) : undefined;
+    if (options.thinkingLevel !== undefined && (typeof listLevels !== "function" || typeof applyLevel !== "function")) {
+      return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support thinking-level operations" };
+    }
+    // Phase 2 — validation via read-only RPCs (no Pi mutations): resolve the
+    // model ref against the live catalog and check thinking membership.
+    // Any failure here returns with Pi and the lease untouched.
+    let resolvedModel: { provider: string; modelId: string } | null = null;
+    let listedModels: PiModel[] | null = null;
     if (options.model !== undefined) {
-      const conn = runtime.conn;
-      if (typeof conn.getAvailableModels !== "function" || typeof conn.setModel !== "function") {
-        return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support model operations" };
-      }
+      // Exact-ref resolution via live catalog. Provider-confirmed canonical
+      // `provider/modelId` is persisted in both `metadata.model` and
+      // `options.model` (so a later restore/acquire with duplicate bare ids
+      // — e.g. `gpt-5.6-luna` under `openai-codex` + `opencode-go` in the live
+      // catalog — resolves without `AMBIGUOUS_MODEL`, and image-capability
+      // lookup disambiguates by provider). Bare unique ids still resolve
+      // (exact unique match), but persistence is always qualified for
+      // restore safety.
       let models: PiModel[];
       try {
-        const listed = await conn.getAvailableModels({ timeoutMs: this.piOptionTimeoutMs });
+        // Defense in depth: Phase 1 already gated support; re-check at the
+        // call site because narrowing does not cross `await` boundaries.
+        if (typeof listModels !== "function") {
+          return { ok: false, code: "PI_OPTION_FAILED", message: "model operations unavailable" };
+        }
+        const listed = await listModels({ timeoutMs: this.piOptionTimeoutMs });
         models = [...listed.models];
         runtime.cachedModels = models;
       } catch (error) {
@@ -755,21 +801,58 @@ export class PiBridgeProvider extends BridgeProvider {
       }
       const resolved = this.resolveModelRef(options.model, models);
       if (!resolved.ok) return { ok: false, code: resolved.code, message: resolved.message };
+      resolvedModel = { provider: resolved.provider, modelId: resolved.modelId };
+      listedModels = models;
+    }
+    if (options.thinkingLevel !== undefined) {
+      // Exact live-level validation (Pi is lenient and would silently fall
+      // back — the bridge fails closed instead).
+      let levels: string[];
       try {
-        const confirmed = await conn.setModel(resolved.provider, resolved.modelId, { timeoutMs: this.piOptionTimeoutMs });
+        // Defense in depth: see model list above.
+        if (typeof listLevels !== "function") {
+          return { ok: false, code: "PI_OPTION_FAILED", message: "thinking-level operations unavailable" };
+        }
+        const listed = await listLevels({ timeoutMs: this.piOptionTimeoutMs });
+        levels = [...listed.levels];
+      } catch (error) {
+        return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`thinking-level list failed: ${this.shortPiError(error)}`) };
+      }
+      if (!levels.includes(options.thinkingLevel)) {
+        return {
+          ok: false,
+          code: "UNKNOWN_THINKING_LEVEL",
+          message: sanitizeCode(`unknown thinking level: ${options.thinkingLevel} (available: ${levels.join(", ") || "none"})`),
+        };
+      }
+    }
+    // Phase 3 — apply (mutating RPCs) only after every requested field
+    // validated. A *transport* failure here can still land after an earlier
+    // field applied; that path returns `error` with no `options_updated` and
+    // the host reconciles via `get_session`, never by assuming success.
+    if (resolvedModel !== null && listedModels !== null) {
+      const rm = resolvedModel;
+      const lm = listedModels;
+      // Defense in depth: Phase 1 already gated support (unreachable unless
+      // the conn was mutated mid-flight); fail closed, never crash.
+      if (typeof applyModel !== "function") {
+        return { ok: false, code: "PI_OPTION_FAILED", message: "model operations unavailable" };
+      }
+      try {
+        const confirmed = await applyModel(rm.provider, rm.modelId, { timeoutMs: this.piOptionTimeoutMs });
         const confirmedProvider =
           typeof (confirmed as PiModel)?.provider === "string" && (confirmed as PiModel).provider !== ""
             ? (confirmed as PiModel).provider
-            : resolved.provider;
+            : rm.provider;
         const confirmedId =
-          typeof confirmed?.id === "string" && confirmed.id !== "" ? confirmed.id : resolved.modelId;
+          typeof confirmed?.id === "string" && confirmed.id !== "" ? confirmed.id : rm.modelId;
         const qualified = `${confirmedProvider}/${confirmedId}`;
         session.options.model = qualified;
         session.metadata.model = qualified;
         // Refresh cached catalog entry (confirmed model may carry new caps).
-        const idx = models.findIndex((m) => m.provider === resolved.provider && m.id === resolved.modelId);
-        if (idx >= 0) models[idx] = confirmed;
-        runtime.cachedModels = models;
+        const idx = lm.findIndex((m) => m.provider === rm.provider && m.id === rm.modelId);
+        if (idx >= 0) lm[idx] = confirmed;
+        runtime.cachedModels = lm;
       } catch (error) {
         const code = (error as { code?: unknown })?.code;
         if (code === "rejected") {
@@ -783,29 +866,13 @@ export class PiBridgeProvider extends BridgeProvider {
         return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_model failed: ${this.shortPiError(error)}`) };
       }
     }
-    // Thinking: exact live-level validation first (Pi is lenient and would
-    // silently fall back — the bridge fails closed instead), then apply.
-    if (options.thinkingLevel !== undefined) {
-      const conn = runtime.conn;
-      if (typeof conn.getAvailableThinkingLevels !== "function" || typeof conn.setThinkingLevel !== "function") {
-        return { ok: false, code: "PI_OPTION_UNSUPPORTED", message: "Pi connection does not support thinking-level operations" };
-      }
-      let levels: string[];
-      try {
-        const listed = await conn.getAvailableThinkingLevels({ timeoutMs: this.piOptionTimeoutMs });
-        levels = [...listed.levels];
-      } catch (error) {
-        return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`thinking-level list failed: ${this.shortPiError(error)}`) };
-      }
-      if (!levels.includes(options.thinkingLevel)) {
-        return {
-          ok: false,
-          code: "UNKNOWN_THINKING_LEVEL",
-          message: sanitizeCode(`unknown thinking level: ${options.thinkingLevel} (available: ${levels.join(", ") || "none"})`),
-        };
+    if (options.thinkingLevel !== undefined && applyLevel !== undefined) {
+      // Defense in depth: see model apply above.
+      if (typeof applyLevel !== "function") {
+        return { ok: false, code: "PI_OPTION_FAILED", message: "thinking-level operations unavailable" };
       }
       try {
-        await conn.setThinkingLevel(options.thinkingLevel, { timeoutMs: this.piOptionTimeoutMs });
+        await applyLevel(options.thinkingLevel, { timeoutMs: this.piOptionTimeoutMs });
       } catch (error) {
         return { ok: false, code: "PI_OPTION_FAILED", message: sanitizeCode(`set_thinking_level failed: ${this.shortPiError(error)}`) };
       }
@@ -1048,35 +1115,41 @@ export class PiBridgeProvider extends BridgeProvider {
         }
         for (const bridgeEvent of stateless) {
           if (bridgeEvent.type !== "prompt_request") continue;
-          // Stable identity: duplicate Pi ids while pending are ignored
-          // (never emit a second card for the same request).
-          if (runtime.pendingPrompts.has(bridgeEvent.requestId)) continue;
+          // Stable identity, namespaced per session (PR #41 P1): raw Pi ids
+          // are process-local, so the bridge-visible id carries the owning
+          // session. Duplicate Pi ids while pending are ignored (never emit
+          // a second card for the same request).
+          const piId = bridgeEvent.requestId;
+          const promptId = this.bridgePromptId(sessionId, piId);
+          if (runtime.pendingPrompts.has(promptId)) continue;
           const immediate = runtime.pendingImmediate;
           if (immediate && !immediate.acked) {
             // First dialog for the pending immediate command: Pi definitely
             // owns it. Attribute the dialog to the immediate op and ack
             // early; the `prompt` response (after the answer) needs no
             // second ack.
-            runtime.pendingPrompts.set(bridgeEvent.requestId, immediate.opId);
-            session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: immediate.opId };
+            runtime.pendingPrompts.set(promptId, immediate.opId);
+            runtime.promptPiIds.set(promptId, piId);
+            session.pendingPrompt = { requestId: promptId, opId: immediate.opId };
             this.send({
               v: 1,
               kind: "session_event",
               sessionId,
               opId: immediate.opId,
-              event: bridgeEvent,
+              event: { ...bridgeEvent, requestId: promptId },
             });
             immediate.acked = true;
             this.send({ v: 1, kind: "dispatch_ack", opId: immediate.opId, sessionId, status: "accepted" });
             continue;
           }
-          runtime.pendingPrompts.set(bridgeEvent.requestId, "");
-          session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: "" };
+          runtime.pendingPrompts.set(promptId, "");
+          runtime.promptPiIds.set(promptId, piId);
+          session.pendingPrompt = { requestId: promptId, opId: "" };
           this.send({
             v: 1,
             kind: "session_event",
             sessionId,
-            event: bridgeEvent,
+            event: { ...bridgeEvent, requestId: promptId },
           });
         }
         return;
@@ -1091,18 +1164,22 @@ export class PiBridgeProvider extends BridgeProvider {
       for (const bridgeEvent of mapped) {
         if (bridgeEvent.type === "prompt_request") {
           const currentOp = session.activeOpId ?? activeOpId ?? "";
-          // SNC1.6 stable identity: ignore duplicate Pi ids while pending
-          // (one card per requestId; the first op wins). New ids are tracked
-          // for exactly-once answers + retirement (see `onPiAnswerPrompt`).
-          if (runtime.pendingPrompts.has(bridgeEvent.requestId)) continue;
-          runtime.pendingPrompts.set(bridgeEvent.requestId, currentOp);
-          session.pendingPrompt = { requestId: bridgeEvent.requestId, opId: currentOp };
+          // SNC1.6 stable identity, namespaced per session (PR #41 P1):
+          // ignore duplicate Pi ids while pending (one card per namespaced
+          // id; the first op wins). New ids are tracked for exactly-once
+          // answers + retirement (see `onPiAnswerPrompt`).
+          const piId = bridgeEvent.requestId;
+          const promptId = this.bridgePromptId(sessionId, piId);
+          if (runtime.pendingPrompts.has(promptId)) continue;
+          runtime.pendingPrompts.set(promptId, currentOp);
+          runtime.promptPiIds.set(promptId, piId);
+          session.pendingPrompt = { requestId: promptId, opId: currentOp };
           this.send({
             v: 1,
             kind: "session_event",
             sessionId,
             ...(currentOp ? { opId: currentOp } : {}),
-            event: bridgeEvent,
+            event: { ...bridgeEvent, requestId: promptId },
           });
           continue;
         }
@@ -1212,7 +1289,10 @@ export class PiBridgeProvider extends BridgeProvider {
    * stale refusals (`UNKNOWN_REQUEST`). */
   private retirePromptsForOp(session: ProviderSession, runtime: PiRuntime, opId: string): void {
     for (const [requestId, ownerOp] of [...runtime.pendingPrompts]) {
-      if (ownerOp === opId) runtime.pendingPrompts.delete(requestId);
+      if (ownerOp === opId) {
+        runtime.pendingPrompts.delete(requestId);
+        runtime.promptPiIds.delete(requestId);
+      }
     }
     if (session.pendingPrompt?.opId === opId) session.pendingPrompt = null;
   }
@@ -1220,6 +1300,7 @@ export class PiBridgeProvider extends BridgeProvider {
   /** Retire every pending dialog in a session (exit/release/close fence). */
   private retireAllPrompts(session: ProviderSession, runtime: PiRuntime): void {
     runtime.pendingPrompts.clear();
+    runtime.promptPiIds.clear();
     session.pendingPrompt = null;
     runtime.pendingImmediate = null;
   }
@@ -1637,17 +1718,33 @@ export class PiBridgeProvider extends BridgeProvider {
 
   // -- dialogs: answer_prompt -> Pi extension_ui_response (SNC1.6) ------------
   //
-  // Stable identity: Pi `extension_ui_request.id` is preserved verbatim as
-  // bridge `prompt_request.requestId` (never synthesized). Exactly-once:
-  // the first `answer_prompt` for a `requestId` forwards one Pi
-  // `extension_ui_response` and deletes the map entry; later answers for the
-  // same id are stale/late refusals (`UNKNOWN_REQUEST`, never re-sent to
-  // Pi) — this is what lets Orca do a durable CAS and then answer once.
-  // Retirement: turn settle / cancel / Pi exit / release / close clear the
-  // map (acquisition fence — prompts never leak across sessions/turns).
-  // Bounded unsupported kinds: fire-and-forget / unknown Pi UI methods map
-  // to `[]` in `pi-mapping.ts` and never create entries, so they never block
-  // and can never be answered (any answer for their ids is UNKNOWN).
+  // Stable identity, namespaced per session (PR #41 P1): the bridge-visible
+  // `prompt_request.requestId` is `<sessionId>:<piId>` (see `bridgePromptId`),
+  // never the raw Pi id. Pi children are independently spawned processes
+  // whose `extension_ui_request.id` values carry no cross-process uniqueness
+  // guarantee, so a raw id alone cannot route an answer: two sessions may
+  // hold the same Pi-local id. The per-runtime `promptPiIds` map retains the
+  // original Pi id for `extension_ui_response` (exact reverse lookup, no
+  // parsing). Exactly-once: the first `answer_prompt` for a bridge id
+  // forwards one Pi `extension_ui_response` and deletes the map entries;
+  // later answers for the same id are stale/late refusals (`UNKNOWN_REQUEST`,
+  // never re-sent to Pi) — this is what lets Orca do a durable CAS and then
+  // answer once. Retirement: turn settle / cancel / Pi exit / release / close
+  // clear the maps (acquisition fence — prompts never leak across
+  // sessions/turns). Bounded unsupported kinds: fire-and-forget / unknown Pi
+  // UI methods map to `[]` in `pi-mapping.ts` and never create entries, so
+  // they never block and can never be answered (any answer for their ids is
+  // UNKNOWN).
+
+  /**
+   * Bridge-visible prompt id for a Pi dialog in a session. Deterministic
+   * (same Pi id re-emitted while pending maps to the same bridge id, so
+   * duplicates stay ignored) and unique across sessions sharing one
+   * provider process. The Pi id travels in `promptPiIds`, never parsed out.
+   */
+  private bridgePromptId(sessionId: string, piId: string): string {
+    return `${sessionId}:${piId}`;
+  }
 
   private onPiAnswerPrompt(msg: AnswerPromptRequest): void {
     if (!this.requireHello(msg.opId)) return;
@@ -1686,16 +1783,21 @@ export class PiBridgeProvider extends BridgeProvider {
     }
     const session = this.sessions.get(ownerId);
     // Exactly-once: delete before forwarding so a racing duplicate cannot
-    // double-send to Pi even if `respondToExtensionUi` throws.
+    // double-send to Pi even if `respondToExtensionUi` throws. Resolve the
+    // originating Pi-local id via the namespace map (never parse it out of
+    // the bridge id); fall back to the raw id only for entries predating
+    // the namespace (defense in depth, e.g. hot-restarted providers).
+    const piId = ownerRuntime.promptPiIds.get(msg.requestId) ?? msg.requestId;
     ownerRuntime.pendingPrompts.delete(msg.requestId);
+    ownerRuntime.promptPiIds.delete(msg.requestId);
     if (session?.pendingPrompt?.requestId === msg.requestId) session.pendingPrompt = null;
     try {
       if (msg.cancelled) {
-        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: msg.requestId, cancelled: true });
+        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: piId, cancelled: true });
       } else if (typeof msg.value === "boolean") {
-        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: msg.requestId, confirmed: msg.value });
+        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: piId, confirmed: msg.value });
       } else {
-        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: msg.requestId, value: msg.value });
+        ownerRuntime.conn.respondToExtensionUi({ type: "extension_ui_response", id: piId, value: msg.value });
       }
     } catch {
       // Pi is gone; the turn will settle via exit handling. The answer is
@@ -1730,15 +1832,18 @@ export class PiBridgeProvider extends BridgeProvider {
     // session providers in tests); never broadcast to every child.
     const target = runtime ?? (this.piRuntimes.size === 1 ? [...this.piRuntimes.values()][0] : undefined);
     if (!target) return;
-    // Consume the map entry when present so base + map stay consistent.
+    // Consume the map entries when present so base + map stay consistent.
+    // Resolve the Pi-local id through the owning runtime's namespace map.
+    const piId = target.promptPiIds.get(requestId) ?? requestId;
     target.pendingPrompts.delete(requestId);
+    target.promptPiIds.delete(requestId);
     try {
       if (cancelled) {
-        target.conn.respondToExtensionUi({ type: "extension_ui_response", id: requestId, cancelled: true });
+        target.conn.respondToExtensionUi({ type: "extension_ui_response", id: piId, cancelled: true });
       } else if (typeof value === "boolean") {
-        target.conn.respondToExtensionUi({ type: "extension_ui_response", id: requestId, confirmed: value });
+        target.conn.respondToExtensionUi({ type: "extension_ui_response", id: piId, confirmed: value });
       } else {
-        target.conn.respondToExtensionUi({ type: "extension_ui_response", id: requestId, value });
+        target.conn.respondToExtensionUi({ type: "extension_ui_response", id: piId, value });
       }
     } catch {
       // Pi is gone; the turn will settle via exit handling.
