@@ -654,22 +654,27 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
       entries: Array<{ id: string; role: string; text?: string }>;
       leafId?: string;
     };
-    // Pi leaf exposed, rows still live-keyed (mapping window missed).
-    expect(afterA.leafId).toBe("e4");
+    // Stale Pi leaf suppressed: rows exist beyond the learned leaf's
+    // identified state, so the transcript tail (always honest: it names the
+    // actual last row) is advertised instead (P1 round-3 fix).
+    expect(afterA.leafId).toBe("live-2");
     expect(afterA.entries.map((e) => e.id)).toEqual(["live-1", "live-2"]);
-    const leafA = afterA.leafId as string;
 
     await liveTurn("dsp_B", "B", "b-out");
-    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: leafA });
+    // Self-tracked row cursor (last seen row) pages honestly.
+    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: "live-2" });
     await new Promise((r) => setTimeout(r, 20));
     const pageB = lastOfKind(out, "history") as unknown as {
       entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
     };
-    // Without the leafEnds fix this replays A together with B.
+    // Without cursor honesty this replays A together with B.
     expect(pageB.entries.map((e) => [e.role, e.text])).toEqual([
       ["user", "B"],
       ["assistant", "b-out"],
     ]);
+    // Cover is clean again (B reconciled): the current leaf is advertised.
+    expect(pageB.leafId).toBe("e6");
   });
 
   it("keeps cursors honest across a reconcile mismatch (leaf advances, rows stay live)", async () => {
@@ -729,11 +734,12 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
       ["assistant", "a-out"],
     ]);
     expect(afterA.entries.every((e) => e.id.startsWith("live-"))).toBe(true);
-    const leafA = afterA.leafId as string;
-    expect(leafA.startsWith("d")).toBe(true);
+    // Stale Pi leaf suppressed (tip rows unmapped): the honest transcript
+    // tail is advertised instead.
+    expect(afterA.leafId).toBe("live-2");
 
     await liveTurn("dsp_B", "B", "B-out");
-    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: leafA });
+    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: "live-2" });
     await new Promise((r) => setTimeout(r, 20));
     const pageB = lastOfKind(out, "history") as unknown as {
       entries: Array<{ id: string; role: string; text?: string }>;
@@ -742,6 +748,104 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
       ["user", "B"],
       ["assistant", "B-out"],
     ]);
+  });
+
+  it("never replays through a stale leaf across gated reconciliation (reviewer round-3 regression)", async () => {
+    // Reviewer script, adapted to the suppression norm (their first offered
+    // option: never re-advertise a stale leaf with a new meaning): resume at
+    // message leaf e6 → gate settle reconciliation → turn A →
+    // get_history(cursor=e6) returns A with NO stale leaf (nextCursor pages)
+    // → release reconciliation (A re-keys, tombstone live-2→e8) → turn B →
+    // the step-3 nextCursor returns only B, not A+B.
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    const assistantFor: Record<string, string> = { A: "a-out", B: "b-out" };
+    let seq = 6;
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        seedTwoTurnSession(fake);
+        fake.historyGate = gate;
+        fake.autoJournal = (message: string) => {
+          const u = `e${++seq}`;
+          const a = `e${++seq}`;
+          fake.entries.push(piMsg(u, fake.leafId, "user", [{ type: "text", text: message }]));
+          fake.entries.push(piMsg(a, u, "assistant", [{ type: "text", text: assistantFor[message] ?? "?" }]));
+          fake.leafId = a;
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    // Ungate for the resume rebuild itself, then re-gate before the turn.
+    releaseGate();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws", resumePath: "/tmp/pi/ses.jsonl" });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(lastOfKind(out, "acquired")).toMatchObject({ resumed: true });
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    // Re-gate: settle reconciliation for turn A will pend.
+    let releaseGate2!: () => void;
+    const gate2 = new Promise<void>((r) => {
+      releaseGate2 = r;
+    });
+    const fake = (provider as unknown as { piRuntimes: Map<string, { conn: FakePi17 }> }).piRuntimes.get(sessionId)?.conn;
+    if (fake) fake.historyGate = gate2;
+
+    send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId, message: { text: "A" } });
+    await new Promise((r) => setTimeout(r, 20));
+    fake?.emit({ type: "turn_start" } as PiServerEvent);
+    fake?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-out" } } as unknown as PiServerEvent);
+    fake?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fake?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Step 3: cursor=e6 (historical row) returns A; the stale leaf e6 is NOT
+    // re-advertised (suppression) — the tail fallback is.
+    send({ v: 1, kind: "get_history", opId: "his_A", sessionId, cursor: "e6" });
+    await new Promise((r) => setTimeout(r, 20));
+    const pageA = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+      nextCursor?: string;
+    };
+    expect(pageA.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "A"],
+      ["assistant", "a-out"],
+    ]);
+    // The stale Pi leaf e6 is NOT re-advertised (suppression); the honest
+    // transcript tail is. Full pages emit no nextCursor, so the caller
+    // self-tracks live-2 — which the tombstone keeps resolving after re-key.
+    expect(pageA.leafId).toBe("live-2");
+    expect(pageA.nextCursor).toBeUndefined();
+
+    // Release: A re-keys to e7/e8 (tombstone live-2→e8); turn B converges.
+    releaseGate2();
+    await new Promise((r) => setTimeout(r, 80));
+    send({ v: 1, kind: "dispatch", opId: "dsp_B", sessionId, message: { text: "B" } });
+    await new Promise((r) => setTimeout(r, 20));
+    fake?.emit({ type: "turn_start" } as PiServerEvent);
+    fake?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "b-out" } } as unknown as PiServerEvent);
+    fake?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fake?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Reusing the step-3 cursor returns only B (tombstone translates live-2
+    // to e8 first — without it, the retired id would page empty).
+    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: "live-2" });
+    await new Promise((r) => setTimeout(r, 20));
+    const pageB = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    expect(pageB.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "B"],
+      ["assistant", "b-out"],
+    ]);
+    // Cover clean again: current leaf advertised.
+    expect(pageB.leafId).toBe("e10");
   });
 
   it("namespaces live rows so they never collide with Pi entry ids", async () => {

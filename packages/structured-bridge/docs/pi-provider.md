@@ -199,11 +199,14 @@ get_history → rebuilt + live-appended transcript, leafId = Pi leaf
   Pi ids with per-row chain positions; live rows are keyed `live-N`
   (namespaced — never colliding with Pi ids) and re-keyed to Pi ids at settle
   when the Pi tail converges by exact `(role, text)` sequence (background,
-  bounded, mismatch keeps live ids). `get_history(cursor=…)` resolves
-  transcript id → previously advertised leaf (which denotes the end of its
-  page, even when the covered rows are still unmapped `live-N` — round-2 fix
-  for the fresh-acquire race and reconcile mismatches) → chain position, so
-  the transcript stays pageable across resumes and live turns alike.
+  bounded, mismatch keeps live ids, tombstones keep retired live ids
+  resolving). `get_history(cursor=…)` resolves retired live id →
+  previously advertised leaf (write-once: a token's meaning is immutable) →
+  transcript row → chain position. A cached Pi leaf is advertised only when
+  the transcript holds nothing beyond the state it identifies (round-3 fix —
+  a stale/reused leaf is suppressed, never re-advertised with a new meaning);
+  otherwise the transcript tail (or nothing, when empty) is the cursor and
+  callers page with `nextCursor` until the leaf becomes current again.
 - Workspace binding on resume (P1 round-2 fix, verified against Pi 0.85.1):
   `switch_session` rebinds the runtime cwd to the session file's stored cwd
   with no RPC cwdOverride, so the provider reads the file's

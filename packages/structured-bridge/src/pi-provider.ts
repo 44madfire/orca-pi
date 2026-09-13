@@ -288,6 +288,15 @@ interface PiRuntime {
    * so recorded ends stay valid across reconciles.
    */
   leafEnds: Map<string, number>;
+  /**
+   * Re-key tombstones (P1 round-3 fix): `live-N` id → Pi entry id for every
+   * settled row that `reconcileSettledTurn` re-keyed in place. Re-keying
+   * retires the live id from the transcript, but already-returned
+   * `nextCursor` values may still name it — resolving through the tombstone
+   * keeps those cursors positional-stable (the Pi row never moves). Cleared
+   * on wholesale rebuild (ids from the old transcript are meaningless).
+   */
+  rekeyedFrom: Map<string, string>;
   /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
   cachedModels?: PiModel[];
   /** Shared in-flight catalog lookup (P2: concurrent image dispatches share one Pi RPC). */
@@ -617,6 +626,7 @@ export class PiBridgeProvider extends BridgeProvider {
       liveSeq: 0,
       opHistoryBase: null,
       leafEnds: new Map<string, number>(),
+      rekeyedFrom: new Map<string, string>(),
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
@@ -837,6 +847,7 @@ export class PiBridgeProvider extends BridgeProvider {
       liveSeq: 0,
       opHistoryBase: null,
       leafEnds: new Map<string, number>(),
+      rekeyedFrom: new Map<string, string>(),
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
@@ -1035,6 +1046,7 @@ export class PiBridgeProvider extends BridgeProvider {
     runtime.historyChainPos.splice(0, dropped, ...positions);
     runtime.opHistoryBase = null;
     runtime.leafEnds.clear();
+    runtime.rekeyedFrom.clear();
     session.entryCounter = history.length;
     session.metadata.messageCount = history.filter((e) => e.role === "user" || e.role === "assistant" || e.role === "tool").length;
     runtime.piLeafId = leafId;
@@ -1173,12 +1185,17 @@ export class PiBridgeProvider extends BridgeProvider {
       if (!a || !b || a.role !== b.role || (a.text ?? "") !== (b.text ?? "")) return;
     }
     // Converged: re-key in place (order + content identical, Pi ids win for
-    // exact handoff metadata and cursor stability).
+    // exact handoff metadata and cursor stability). Record tombstones so
+    // cursors emitted under the retired live ids keep resolving.
     for (let i = 0; i < expected.length; i++) {
       const row = expected[i];
+      const prev = session.history[base + i];
       if (row !== undefined) session.history[base + i] = row;
       const pos = tailPos[i];
       if (pos !== undefined) runtime.historyChainPos[base + i] = pos;
+      if (prev !== undefined && row !== undefined && prev.id !== row.id) {
+        runtime.rekeyedFrom.set(prev.id, row.id);
+      }
     }
   }
 
@@ -1230,16 +1247,19 @@ export class PiBridgeProvider extends BridgeProvider {
   /**
    * SNC1.7 `get_history`: serve the rebuilt + live-appended transcript with
    * the Pi session leaf (never the page end). Cursor resolution is ordinal,
-   * in this order: (1) a cursor naming a transcript row returns
-   * strictly-after rows; (2) a cursor naming a previously advertised `leafId`
-   * resumes after the transcript length it was advertised with (P1 round-2
-   * fix — the leaf denotes the end of its page even when the covered rows
-   * are still unmapped `live-N` rows); (3) any other Pi chain id (e.g. a
-   * skipped non-message entry) maps to the last row at/before that chain
-   * position, so unreconciled live tip rows are included, never dropped.
+   * in this order: (1) retired live ids translate through re-key tombstones
+   * (P1 round-3 fix — re-keyed rows keep old cursors positional-stable);
+   * (2) a cursor naming a previously advertised `leafId` resumes after the
+   * transcript length it was advertised with (write-once: a token's meaning
+   * is immutable); (3) a cursor naming a transcript row returns
+   * strictly-after rows; (4) any other Pi chain id (e.g. a skipped
+   * non-message entry) maps to the last row at/before that chain position.
    * Unknown cursors return an empty page (same as the base). `limit` paging
-   * and `nextCursor` (last returned id) match the base; `leafId` is the
-   * cached Pi leaf when known, else the transcript leaf.
+   * and `nextCursor` (last returned id) match the base. The cached Pi leaf is
+   * advertised only when the transcript holds nothing beyond the state it
+   * identifies (P1 round-3 fix — a stale/reused leaf is suppressed rather
+   * than re-advertised with a new meaning); otherwise the transcript tail
+   * (or nothing, when empty) is the cursor.
    */
   protected override onGetHistory(opId: string, sessionId: string, cursor?: string, limit?: number): void {
     if (!this.requireHello(opId)) return;
@@ -1255,19 +1275,20 @@ export class PiBridgeProvider extends BridgeProvider {
     }
     const full = session.history;
     const pos = runtime.historyChainPos;
-    const leafId = runtime.piLeafId ?? (full.length > 0 ? full[full.length - 1]?.id : undefined);
+    const effectiveCursor = cursor ? (runtime.rekeyedFrom.get(cursor) ?? cursor) : undefined;
     let start = 0;
-    if (cursor) {
-      const idx = full.findIndex((e) => e.id === cursor);
+    if (effectiveCursor) {
+      const idx = full.findIndex((e) => e.id === effectiveCursor);
       if (idx !== -1) {
         start = idx + 1;
-      } else if (runtime.leafEnds.has(cursor)) {
+      } else if (runtime.leafEnds.has(effectiveCursor)) {
         // Previously advertised leaf: resume after the page end it denoted
-        // (recorded below when that page was returned).
-        start = Math.min(runtime.leafEnds.get(cursor) as number, full.length);
+        // (recorded below when that page was returned; write-once, so the
+        // meaning is immutable).
+        start = Math.min(runtime.leafEnds.get(effectiveCursor) as number, full.length);
       } else {
         const chain = runtime.piChainIds;
-        const chainIdx = chain ? chain.indexOf(cursor) : -1;
+        const chainIdx = chain ? chain.indexOf(effectiveCursor) : -1;
         if (chainIdx === -1) {
           start = full.length;
         } else {
@@ -1283,13 +1304,39 @@ export class PiBridgeProvider extends BridgeProvider {
       }
     }
     const rest = full.slice(start);
-    // The advertised leaf denotes the end of THIS page (P1 round-2 fix).
-    if (leafId) runtime.leafEnds.set(leafId, full.length);
     let entries = rest;
     let nextCursor: string | undefined;
     if (limit !== undefined && rest.length > limit) {
       entries = rest.slice(0, limit);
       nextCursor = entries.length > 0 ? entries[entries.length - 1]?.id : undefined;
+    }
+    // Advertise the cached Pi leaf only when the transcript holds nothing
+    // beyond the state it identifies: every row must be mapped at/before the
+    // leaf's chain position (unmapped tip rows are conservatively beyond).
+    // Otherwise suppress it — re-advertising a stale leaf under a new
+    // transcript length would give one token two meanings. Callers page with
+    // `nextCursor` (row ids never move) until the leaf becomes current again.
+    let leafId: string | undefined;
+    const cached = runtime.piLeafId;
+    if (cached !== undefined) {
+      const chain = runtime.piChainIds;
+      const li = chain ? chain.indexOf(cached) : -1;
+      if (li !== -1) {
+        let cover = 0;
+        for (let i = 0; i < full.length; i++) {
+          const q = pos[i];
+          if (q !== null && q !== undefined && q <= li) cover = i + 1;
+        }
+        if (cover === full.length) leafId = cached;
+      }
+    }
+    leafId ??= full.length > 0 ? full[full.length - 1]?.id : undefined;
+    // Record advertised Pi leaves write-once (first end wins — a token's
+    // meaning is immutable); transcript-tail fallbacks are positional-stable
+    // by construction (rows never move) and need no record. Only complete
+    // pages (no `nextCursor`) define a leaf's page end.
+    if (leafId && leafId === cached && nextCursor === undefined) {
+      if (!runtime.leafEnds.has(leafId)) runtime.leafEnds.set(leafId, full.length);
     }
     this.send({
       v: 1,
@@ -2136,6 +2183,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // dialog, and Pi can never answer it either).
     if (runtime) {
       runtime.translator.resetAll();
+      runtime.opHistoryBase = null;
       runtime.pendingUserText = null;
       runtime.activeText = "";
       this.retireAllPrompts(session, runtime);
