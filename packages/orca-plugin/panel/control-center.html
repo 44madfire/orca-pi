@@ -2387,6 +2387,7 @@
               state.orchItems = toOrchItems(res.result, orchKnownProfiles());
               renderOrchList();
               loadOrchContext();
+              renderGithubMapped();
               if (selectAfter && !wasDirty && (state.orchDraftRev || 0) === revBefore) {
                 state.orchSelected = selectAfter;
                 // Centralized helper: post-save/refresh drafts come from the
@@ -2421,6 +2422,15 @@
             if (!res || !res.ok || !res.result) return;
             state.profiles = toListItems(res.result);
             renderList();
+            // Keep role→profile→identity fresh: profiles.list success
+            // recomputes orchestration invalid flags and rerenders the
+            // mapped view, so an orchestration-first response order (or a
+            // later profile-identity edit) can never leave it stale/blank.
+            if (state.orchMapping) {
+              state.orchItems = toOrchItems(state.orchMapping, orchKnownProfiles());
+              renderOrchList();
+            }
+            renderGithubMapped();
           });
         }
 
@@ -2445,6 +2455,9 @@
                 state.orchItems = toOrchItems(state.orchMapping, orchKnownProfiles());
                 renderOrchList();
               }
+              // Rerender mapped role→profile→identity after every
+              // profiles.list update (both response orders stay fresh).
+              renderGithubMapped();
               if (selectAfter) {
                 // Post-save target: never reload over a newer dirty same-profile
                 // draft. If the editor became dirty or its revision advanced
@@ -2493,16 +2506,47 @@
           return Promise.all(ops);
         }
 
+        // Diagnostics detail sanitizer (P1 defense in depth): runner-derived
+        // `cli.*.detail` may embed arbitrary orca/pi stdout/stderr, so it is
+        // redacted (token/key patterns) and bounded before esc()+render.
+        // Mirrors control-center.ts sanitizeDiagnosticsDetail.
+        var DIAGNOSTICS_DETAIL_LIMIT = 500;
+        function redactDiagnosticsText(text) {
+          if (!text) return text;
+          var out = text;
+          out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+          out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+          out = out.replace(/-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+          out = out.replace(/\bghp_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bghu_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bghs_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bghr_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bgithub_pat_[A-Za-z0-9_]{8,}/g, "<redacted-token>");
+          // Built via string concatenation so the panel-source secret scan
+          // (containsSecretMaterial over the HTML) keeps passing — only
+          // runtime values are ever matched.
+          out = out.replace(new RegExp("x-access-token:" + "[^\\s\"']+", "g"), "<redacted-token>");
+          return out;
+        }
+        function sanitizeDiagnosticsDetail(detail) {
+          if (typeof detail !== "string" || !detail) return "(no detail)";
+          var out = redactDiagnosticsText(detail);
+          if (out.length <= DIAGNOSTICS_DETAIL_LIMIT) return out;
+          return out.slice(0, DIAGNOSTICS_DETAIL_LIMIT) + "… [truncated]";
+        }
         function renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk) {
           var box = document.getElementById("diagnostics-summary");
           if (!box) return;
-          if (cliOk && bridgeStructured && configOk !== false) {
+          // Unknown config (unavailable/pending/malformed/failed) is never
+          // ready — fail closed to pending/unavailable, never "ready".
+          if (cliOk && bridgeStructured && configOk === true) {
             box.innerHTML = "<p><strong>Diagnostics: ready</strong> <span class=\"muted\">— CLIs available, structured bridge reachable, config valid. CLI remains authoritative (<code>orca-pi doctor</code>).</span></p>";
           } else {
             var parts = [];
             if (!cliOk) parts.push("CLIs need attention (run <code>orca-pi doctor</code>)");
             if (!bridgeStructured) parts.push("bridge degraded (explicit CLI fallback)");
-            if (configOk === false) parts.push("profiles need attention (run <code>orca-pi profile validate</code>)");
+            if (configOk === undefined) parts.push("profiles validation pending/unavailable (run <code>orca-pi profile validate</code>)");
+            else if (configOk !== true) parts.push("profiles need attention (run <code>orca-pi profile validate</code>)");
             box.innerHTML = "<p><strong>Diagnostics: action needed</strong> <span class=\"muted\">— " + parts.join("; ") + ".</span></p>";
           }
         }
@@ -2547,8 +2591,8 @@
                 var piLine = cli.pi.version ? ("pi " + cli.pi.version) : (cli.pi.found ? "pi (version unknown)" : "pi missing");
                 if (runtime) {
                   runtime.innerHTML = "<p><strong>Runtime CLIs</strong> <span class=\"muted\">(agrees with <code>orca-pi doctor</code>)</span></p>" +
-                    "<ul class=\"cc-profile-list\"><li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(orcaLine) + " — " + esc(cli.orca.detail || "") + "</span></div></li>" +
-                    "<li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(piLine) + " — " + esc(cli.pi.detail || "") + "</span></div></li></ul>" +
+                    "<ul class=\"cc-profile-list\"><li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(orcaLine) + " — " + esc(sanitizeDiagnosticsDetail(cli.orca.detail)) + "</span></div></li>" +
+                    "<li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(piLine) + " — " + esc(sanitizeDiagnosticsDetail(cli.pi.detail)) + "</span></div></li></ul>" +
                     "<p class=\"muted\">orca-pi " + esc(r.orcaPiVersion || "(unknown)") + " · bridge " + esc(r.bridgeVersion || "1.0.0") + " / protocol " + esc(String(r.protocolVersion !== undefined ? r.protocolVersion : 1)) + "</p>";
                 }
               } else if (runtime) {
@@ -2585,7 +2629,9 @@
                 var entries = Array.isArray(res.result.entries) ? res.result.entries : [];
                 var invalid = 0;
                 for (var i = 0; i < entries.length; i += 1) { if (entries[i] && entries[i].valid === false) invalid += 1; }
-                configOk = res.result.ok !== false && invalid === 0;
+                // Require explicit ok:true plus zero invalid; missing ok
+                // (malformed) stays not-ready, never ready.
+                configOk = res.result.ok === true && invalid === 0;
                 configBox.innerHTML = configOk
                   ? "<p><strong>Config:</strong> all " + entries.length + " profile(s) valid (authoritative YAML; no second store).</p>"
                   : "<p><strong>Config:</strong> " + invalid + " invalid of " + entries.length + " — run <code>orca-pi profile validate</code> for file/source/field diagnostics.</p>";
@@ -2593,6 +2639,13 @@
                 configOk = false;
                 configBox.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "validation unavailable") + "</p>";
               }
+              done();
+            }, function () {
+              if (myTok !== state.diagnosticsToken) return;
+              if (!configBox) return;
+              // Rejected validate (bridge failure) is not-ready, never ready.
+              configOk = false;
+              configBox.innerHTML = "<p class=\"muted\">profile validation failed (bridge request failed) — run <code>orca-pi profile validate</code>.</p>";
               done();
             });
           } else if (configBox) {

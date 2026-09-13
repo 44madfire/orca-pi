@@ -47,11 +47,13 @@ import {
   type BridgeResponse,
 } from "./bridge.js";
 import type {
+  DoctorCheck,
   DoctorReport,
   GithubDoctorReport,
   MutationScope,
   OrchestrationScope,
 } from "@orca-pi/core";
+import { DIAGNOSTICS_DETAIL_LIMIT, sanitizeDiagnosticsDetail } from "./control-center.js";
 
 export interface BridgeHostDeps {
   /** Explicit project root fallback when a request carries no worktree scope (reads only). */
@@ -678,16 +680,44 @@ async function diagnosticsDoctorResult(request: BridgeRequest, deps: BridgeHostD
   const core = await import("@orca-pi/core");
   let cli: DoctorReport | undefined;
   if (deps.runner) {
-    cli = await core.doctor(deps.runner);
+    const raw = await core.doctor(deps.runner);
+    cli = sanitizeDoctorReportForBridge(raw, core.collectSecretsFromEnv(deps.env ?? process.env));
   }
   const negotiation = negotiateBridgeCapabilities(deps.hostInfo);
-  return {
+  const result = {
     orcaPiVersion: core.ORCA_PI_VERSION,
     bridgeVersion: BRIDGE_VERSION,
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     ...(cli !== undefined ? { cli } : { cli: "(no runner injected — CLI probes unavailable; run `orca-pi doctor` for live orca/pi versions)" }),
     bridge: negotiation,
     target: { appVersion: "1.4.196+", pluginApi: 1, upstreamCommit: "9aa0f7e77d366c23a3cc8de2da32ae550d397dc0" },
+  };
+  assertNoSecrets(result, "diagnostics.doctor");
+  return result;
+}
+
+/**
+ * Sanitize a core DoctorReport before it crosses the bridge (P1).
+ *
+ * `core.doctor` embeds arbitrary orca/pi runner stdout/stderr in
+ * `detail`; a CLI/helper echoing a GitHub token or private key would
+ * otherwise reach the panel DOM. Each detail is redacted (explicit env
+ * secrets + token/key patterns) and bounded to
+ * `DIAGNOSTICS_DETAIL_LIMIT` chars; only allowlisted fields
+ * (`executable`/`found`/`version`/`detail`/`ok`) survive. Actionable
+ * non-secret diagnostics (found/version/hints) are preserved.
+ */
+function sanitizeDoctorReportForBridge(report: DoctorReport, secrets: readonly string[] = []): DoctorReport {
+  const sanitizeCheck = (check: DoctorCheck): DoctorCheck => ({
+    executable: check.executable,
+    found: check.found === true,
+    ...(typeof check.version === "string" && check.version.length > 0 ? { version: check.version.slice(0, 64) } : {}),
+    detail: sanitizeDiagnosticsDetail(check.detail, DIAGNOSTICS_DETAIL_LIMIT, secrets),
+  });
+  return {
+    orca: sanitizeCheck(report.orca),
+    pi: sanitizeCheck(report.pi),
+    ok: report.ok === true,
   };
 }
 

@@ -32,6 +32,7 @@ import {
   describeTokenFreshness,
   describeWorktreeHealth,
   diagnosticsHeadline,
+  DIAGNOSTICS_DETAIL_LIMIT,
   GITHUB_DEFAULT_AMBIENT,
   GITHUB_DEFAULT_REPO,
   GITHUB_IDENTITIES,
@@ -40,7 +41,9 @@ import {
   HUMAN_REVIEW_ACTOR,
   isSecretFreePayload,
   mapGithubErrorToField,
+  redactDiagnosticsText,
   REVIEW_ACTOR_NOTE,
+  sanitizeDiagnosticsDetail,
   toDiagnosticsBridgeHealth,
   toDiagnosticsCliHealth,
   toDiagnosticsConfigHealth,
@@ -687,5 +690,220 @@ describe("ui1.5: panel honors the typed redacted contract", () => {
     expect(html).not.toMatch(/\.token\b/);
     expect(html).not.toContain("privateKey");
     expect(containsSecretMaterial(html)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 regression: diagnostics.doctor never leaks runner stdout/stderr secrets
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/p1: diagnostics detail sanitization (no runner secret crosses)", () => {
+  const LEAK_TOKEN = "ghp_leakedsecret0123456789";
+  const LEAK_KEY = "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
+
+  it("redacts token/key patterns from free text (pure)", () => {
+    expect(redactDiagnosticsText("all clear")).toBe("all clear");
+    expect(redactDiagnosticsText(`saw ${LEAK_TOKEN} here`)).not.toContain(LEAK_TOKEN);
+    expect(redactDiagnosticsText(`saw ${LEAK_TOKEN} here`)).toContain("<redacted-token>");
+    expect(redactDiagnosticsText(`key ${LEAK_KEY} end`)).not.toContain("BEGIN PRIVATE KEY");
+    expect(redactDiagnosticsText(`key ${LEAK_KEY} end`)).toContain("[redacted-private-key]");
+    // Var-name labels alone are not values — left intact for actionable guidance.
+    expect(redactDiagnosticsText("see ORCA_PI_GITHUB_WORKER_TOKEN")).toContain("ORCA_PI_GITHUB_WORKER_TOKEN");
+  });
+
+  it("bounds long details (actionable prefix survives, tail truncated)", () => {
+    const long = `hint: run \`orca-pi doctor\`. ` + "x".repeat(DIAGNOSTICS_DETAIL_LIMIT + 200);
+    const out = sanitizeDiagnosticsDetail(long);
+    expect(out.length).toBeLessThanOrEqual(DIAGNOSTICS_DETAIL_LIMIT + "… [truncated]".length);
+    expect(out).toContain("orca-pi doctor");
+    expect(out).toContain("[truncated]");
+    expect(sanitizeDiagnosticsDetail(undefined)).toBe("(no detail)");
+    expect(sanitizeDiagnosticsDetail("")).toBe("(no detail)");
+  });
+
+  it("redacts explicit env secret values (non-token-like) when provided", () => {
+    const secret = "my-ultra-secret-value-9999";
+    const out = sanitizeDiagnosticsDetail(`Output: ${secret} happened`, DIAGNOSTICS_DETAIL_LIMIT, [secret]);
+    expect(out).not.toContain(secret);
+    expect(out).toContain("<redacted>");
+  });
+
+  it("toDiagnosticsCliHealth sanitizes details from a compromised payload", () => {
+    const health = toDiagnosticsCliHealth({
+      cli: {
+        orca: { executable: "orca", found: false, detail: `boom ${LEAK_TOKEN} ${LEAK_KEY}` },
+        pi: { executable: "pi", found: false, detail: "plain failure, see install hint" },
+        ok: false,
+      },
+    })!;
+    expect(containsSecretMaterial(health.orca.detail)).toBe(false);
+    expect(isSecretFreePayload(health)).toBe(true);
+    expect(health.pi.detail).toContain("install hint");
+  });
+
+  it("bridge diagnostics.doctor redacts secret-like runner output, keeps actionable diagnostics", async () => {
+    const envSecret = "env-echoed-secret-4242";
+    const leakyRunner = {
+      async run(exe: string) {
+        if (exe === "pi") {
+          return { exitCode: 1, stdout: `helper said ${LEAK_TOKEN}`, stderr: `${LEAK_KEY} plus ${envSecret}` };
+        }
+        // orca: --version yields nothing, status --json fails with secret output.
+        return { exitCode: 1, stdout: `status blew up with ${LEAK_TOKEN}`, stderr: `trace ${envSecret}` };
+      },
+    } as unknown as import("@orca-pi/core").ProcessRunner;
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "leak1", operation: "diagnostics.doctor" },
+      bridgeDeps({
+        runner: leakyRunner,
+        env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: envSecret } as NodeJS.ProcessEnv,
+      }),
+    );
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const text = JSON.stringify(res.result);
+      expect(text).not.toContain(LEAK_TOKEN);
+      expect(text).not.toContain("BEGIN PRIVATE KEY");
+      expect(text).not.toContain(envSecret);
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(isSecretFreePayload(res.result)).toBe(true);
+      const cli = (res.result as Record<string, unknown>)["cli"] as {
+        orca: { detail: string; found: boolean };
+        pi: { detail: string; found: boolean };
+      };
+      // Actionable non-secret diagnostics survive: exit-code context + hints.
+      expect(cli.pi.detail.length).toBeLessThanOrEqual(DIAGNOSTICS_DETAIL_LIMIT + 20);
+      expect(cli.orca.detail.length).toBeLessThanOrEqual(DIAGNOSTICS_DETAIL_LIMIT + 20);
+      expect(`${cli.pi.detail} ${cli.orca.detail}`).toMatch(/exit code|Install|not found|no.*version/i);
+    }
+  });
+
+  it("panel renders sanitized (bounded/redacted) details, never raw cli.*.detail", () => {
+    const html = controlHtml();
+    expect(html).toContain("sanitizeDiagnosticsDetail");
+    expect(html).toContain("redactDiagnosticsText");
+    expect(html).toContain("sanitizeDiagnosticsDetail(cli.orca.detail)");
+    expect(html).toContain("sanitizeDiagnosticsDetail(cli.pi.detail)");
+    expect(html).not.toContain('esc(cli.orca.detail || "")');
+    expect(html).not.toContain('esc(cli.pi.detail || "")');
+    expect(containsSecretMaterial(html)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 race: mapped role→profile→identity rerenders after every profiles.list
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/p2: mapped profiles stay fresh regardless of response order", () => {
+  const profilesPayload = [
+    { name: "worker", githubIdentity: "worker" },
+    { name: "reviewer", githubIdentity: "reviewer" },
+    { name: "scout" },
+  ];
+  const orchPayload = {
+    effective: { worker: "worker", scout: "scout", reviewer: "reviewer" },
+    provenance: { worker: "builtin", scout: "builtin", reviewer: "builtin" },
+  };
+
+  function join(profiles: readonly unknown[], orchItems: ReturnType<typeof toOrchestrationItems>) {
+    return toGithubMappedProfiles(profiles, orchItems);
+  }
+
+  it("profiles-first and orchestration-first converge to the same mapped rows", () => {
+    // Order A: profiles.list wins first, orchestration.get second.
+    const orchAfterProfiles = toOrchestrationItems(orchPayload, profilesPayload.map((p) => p.name));
+    const rowsA = join(profilesPayload, orchAfterProfiles);
+    // Order B: orchestration.get wins first (profiles unknown → blank, not
+    // wrong), then profiles.list arrives and the rerender fills identities.
+    const orchBeforeProfiles = toOrchestrationItems(orchPayload, []);
+    const rowsBlank = join([], orchBeforeProfiles);
+    expect(rowsBlank.find((r) => r.role === "worker")!.githubIdentity).toBeUndefined();
+    const orchAfterLateProfiles = toOrchestrationItems(orchPayload, profilesPayload.map((p) => p.name));
+    const rowsB = join(profilesPayload, orchAfterLateProfiles);
+    expect(rowsB).toEqual(rowsA);
+    expect(rowsB.find((r) => r.role === "worker")!.githubIdentity).toBe("worker");
+    expect(rowsB.find((r) => r.role === "reviewer")!.githubIdentity).toBe("reviewer");
+    expect(rowsB.find((r) => r.role === "scout")!.githubIdentity).toBeUndefined();
+    expect(githubMappedSummary(rowsB)).toContain("worker→worker");
+  });
+
+  it("profile-identity edits propagate on the next profiles.list join", () => {
+    const orchItems = toOrchestrationItems(orchPayload, ["worker", "scout", "reviewer"]);
+    const before = join([{ name: "worker", githubIdentity: "worker" }], orchItems);
+    expect(before.find((r) => r.role === "worker")!.githubIdentity).toBe("worker");
+    const after = join([{ name: "worker", githubIdentity: "reviewer" }], orchItems);
+    expect(after.find((r) => r.role === "worker")!.githubIdentity).toBe("reviewer");
+  });
+
+  it("panel rerenders mapped after every profiles.list + orchestration update", () => {
+    const html = controlHtml();
+    const bodyOf = (fn: string): string => {
+      const start = html.indexOf(`function ${fn}(`);
+      expect(start).toBeGreaterThan(-1);
+      const next = html.indexOf("\n        function ", start + 1);
+      return html.slice(start, next === -1 ? start + 8000 : next);
+    };
+    // Every profiles.list success path rerenders the mapped view.
+    expect(bodyOf("refreshListOnly")).toContain("renderGithubMapped()");
+    expect(bodyOf("refreshAll")).toContain("renderGithubMapped()");
+    // Every orchestration.get success path rerenders the mapped view.
+    expect(bodyOf("loadOrchestration")).toContain("renderGithubMapped()");
+    expect(bodyOf("refreshOrchListOnly")).toContain("renderGithubMapped()");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 diagnostics readiness: unknown config is never "ready"
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/p2: diagnostics headline never claims ready without validation", () => {
+  it("requires explicit ok:true on every leg for ready", () => {
+    expect(
+      diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: true } }),
+    ).toContain("ready");
+    // Unknown (pending/unavailable/malformed/failed) legs are action-needed.
+    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: undefined })).toContain(
+      "action needed",
+    );
+    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: undefined })).toMatch(
+      /pending\/unavailable/,
+    );
+    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true } })).toContain("action needed");
+    expect(
+      diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: false } }),
+    ).toContain("action needed");
+    expect(
+      diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: false } }),
+    ).toMatch(/profiles need attention/);
+  });
+
+  it("treats malformed/unavailable validate payloads as unknown (never valid)", () => {
+    expect(toDiagnosticsConfigHealth(null)).toBeUndefined();
+    expect(toDiagnosticsConfigHealth({})).toBeUndefined();
+    // Entries without an explicit ok flag are malformed → unknown.
+    expect(toDiagnosticsConfigHealth({ entries: [{ valid: true }] })).toBeUndefined();
+    // Server ok:true contradicted by invalid entries fails closed.
+    expect(toDiagnosticsConfigHealth({ entries: [{ valid: true }, { valid: false }], ok: true })!.ok).toBe(false);
+    expect(toDiagnosticsConfigHealth({ entries: [{ valid: true }], ok: true })!.ok).toBe(true);
+    // Unknown config never headlines as ready even with healthy CLI/bridge.
+    expect(
+      diagnosticsHeadline({
+        cli: { ok: true },
+        bridge: { structured: true },
+        config: toDiagnosticsConfigHealth({ entries: [{ valid: true }] }) as never,
+      }),
+    ).toContain("action needed");
+  });
+
+  it("panel headline requires configOk === true and handles rejection/unavailable", () => {
+    const html = controlHtml();
+    expect(html).toContain("configOk === true");
+    expect(html).not.toMatch(/configOk !== false\)/);
+    expect(html).toContain("profiles validation pending/unavailable");
+    // profile.validate uses explicit ok:true (malformed never ready).
+    expect(html).toContain("res.result.ok === true && invalid === 0");
+    expect(html).not.toContain("res.result.ok !== false && invalid === 0");
+    // Rejected validate requests fail closed and still update the headline.
+    expect(html).toContain("profile validation failed (bridge request failed)");
   });
 });

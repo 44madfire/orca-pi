@@ -1304,6 +1304,11 @@ export interface DiagnosticsCliEntry {
  * Normalize `diagnostics.doctor` CLI health (never throws). Returns
  * undefined when the payload carries no CLI block (e.g. no runner
  * injected — the UI then points at `orca-pi doctor`).
+ *
+ * Details are sanitized via {@link sanitizeDiagnosticsDetail} (redact +
+ * bound) so even a compromised bridge payload cannot smuggle runner
+ * stdout/stderr secrets into the DOM — defense in depth behind the
+ * bridge-host sanitize-before-return.
  */
 export function toDiagnosticsCliHealth(payload: unknown): { orca: DiagnosticsCliEntry; pi: DiagnosticsCliEntry; ok: boolean } | undefined {
   if (!isPlainRecord(payload)) return undefined;
@@ -1317,8 +1322,8 @@ export function toDiagnosticsCliHealth(payload: unknown): { orca: DiagnosticsCli
   const entry = (raw: Record<string, unknown>, name: string): DiagnosticsCliEntry => ({
     executable: name,
     found: raw["found"] === true,
-    ...(typeof raw["version"] === "string" && (raw["version"] as string).length > 0 ? { version: raw["version"] as string } : {}),
-    detail: typeof raw["detail"] === "string" ? (raw["detail"] as string) : "(no detail)",
+    ...(typeof raw["version"] === "string" && (raw["version"] as string).length > 0 ? { version: (raw["version"] as string).slice(0, 64) } : {}),
+    detail: sanitizeDiagnosticsDetail(raw["detail"]),
   });
   const orca = entry(orcaRaw as Record<string, unknown>, "orca");
   const pi = entry(piRaw as Record<string, unknown>, "pi");
@@ -1401,7 +1406,11 @@ export function describeWorktreeHealth(health: DiagnosticsWorktreeHealth | undef
 
 /**
  * Normalize `profile.validate` health (never throws). Returns undefined
- * when the payload is not a validation shape.
+ * when the payload is not a validation shape — including when the
+ * entries block is present but the explicit `ok` flag is missing
+ * (malformed): callers treat unknown as pending/unavailable, never as
+ * valid, so a malformed validate response can never yield a "ready"
+ * headline (fail closed).
  */
 export function toDiagnosticsConfigHealth(
   payload: unknown,
@@ -1413,12 +1422,15 @@ export function toDiagnosticsConfigHealth(
     if (typeof rec["ok"] === "boolean") return { ok: rec["ok"] === true, invalidCount: 0, total: 0 };
     return undefined;
   }
+  if (typeof rec["ok"] !== "boolean") return undefined;
   const total = entries.length;
   let invalidCount = 0;
   for (const entry of entries as unknown[]) {
     if (isPlainRecord(entry) && entry["valid"] === false) invalidCount += 1;
   }
-  const ok = typeof rec["ok"] === "boolean" ? (rec["ok"] as boolean) : invalidCount === 0;
+  // Trust the explicit server flag, but fail closed when it disagrees
+  // with the entries (ok:true with invalid entries is still not-ready).
+  const ok = (rec["ok"] as boolean) === true && invalidCount === 0;
   return { ok, invalidCount, total };
 }
 
@@ -1429,6 +1441,50 @@ export function describeConfigHealth(health: { ok: boolean; invalidCount: number
   return health.ok
     ? `profiles: all ${health.total} valid (authoritative YAML; no second store).`
     : `profiles: ${health.invalidCount} invalid of ${health.total} — run \`orca-pi profile validate\` for file/source/field diagnostics.`;
+}
+
+/** Max chars of runner-derived diagnostics detail that may cross the bridge/DOM. */
+export const DIAGNOSTICS_DETAIL_LIMIT = 500;
+
+/**
+ * Redact token/private-key material from free-form diagnostics text
+ * (pure, never throws). Mirrors {@link containsSecretMaterial} patterns:
+ * full PEM blocks collapse to `[redacted-private-key]`, token-like
+ * shapes to `<redacted-token>`. Var-name labels (`*_TOKEN`) are left
+ * intact — only values are redacted.
+ */
+export function redactDiagnosticsText(text: string): string {
+  if (!text) return text;
+  let out = text;
+  out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+  out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+  out = out.replace(/-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+  out = out.replace(/\bghp_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+  out = out.replace(/\bghu_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+  out = out.replace(/\bghs_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+  out = out.replace(/\bghr_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+  out = out.replace(/\bgithub_pat_[A-Za-z0-9_]{8,}/g, "<redacted-token>");
+  out = out.replace(/x-access-token:[^\s"']+/g, "<redacted-token>");
+  return out;
+}
+
+/**
+ * Sanitize runner-derived detail for bridge/DOM display (pure, never
+ * throws): redacts explicit `secrets` values plus token/key patterns,
+ * then bounds to `limit` chars. Non-string input yields `"(no detail)"`.
+ * The bridge passes env-collected secrets; the panel passes none
+ * (pattern redaction + bound only) as defense in depth.
+ */
+export function sanitizeDiagnosticsDetail(detail: unknown, limit: number = DIAGNOSTICS_DETAIL_LIMIT, secrets: readonly string[] = []): string {
+  if (typeof detail !== "string" || detail.length === 0) return "(no detail)";
+  let out = detail;
+  for (const secret of secrets) {
+    if (!secret || secret.length < 4) continue;
+    out = out.split(secret).join("<redacted>");
+  }
+  out = redactDiagnosticsText(out);
+  if (out.length <= limit) return out;
+  return `${out.slice(0, limit)}… [truncated]`;
 }
 
 /**
@@ -1472,7 +1528,9 @@ export function isSecretFreePayload(payload: unknown): boolean {
   return true;
 }
 
-/** Overall diagnostics headline (CLI + bridge + config). */
+/** Overall diagnostics headline (CLI + bridge + config). Unknown config
+ * (unavailable/pending/malformed/failed → undefined) is never ready:
+ * it renders as pending/unavailable, fail-closed like an explicit invalid. */
 export function diagnosticsHeadline(input: {
   cli?: { ok: boolean } | undefined;
   bridge?: { structured: boolean } | undefined;
@@ -1480,11 +1538,13 @@ export function diagnosticsHeadline(input: {
 }): string {
   const cliOk = input.cli?.ok === true;
   const bridgeOk = input.bridge?.structured === true;
-  const configOk = input.config?.ok !== false;
+  const configOk = input.config?.ok === true;
+  const configUnknown = input.config === undefined;
   if (cliOk && bridgeOk && configOk) return "diagnostics: ready — CLIs available, structured bridge reachable, config valid.";
   const parts: string[] = [];
   if (!cliOk) parts.push("CLIs need attention (run `orca-pi doctor`)");
   if (!bridgeOk) parts.push("bridge degraded (explicit CLI fallback)");
-  if (!configOk) parts.push("profiles need attention (run `orca-pi profile validate`)");
+  if (configUnknown) parts.push("profiles validation pending/unavailable (run `orca-pi profile validate`)");
+  else if (!configOk) parts.push("profiles need attention (run `orca-pi profile validate`)");
   return `diagnostics: action needed — ${parts.join("; ")}.`;
 }
