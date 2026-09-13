@@ -41,11 +41,11 @@ describe("control center: shell + sections", () => {
     expect([...CONTROL_CENTER_COMPAT_PANEL_IDS]).toEqual(["orca-pi-status", "orca-pi-profiles"]);
   });
 
-  it("defines Profiles + placeholders for later issues", () => {
+  it("defines Profiles + Orchestration as implemented (GitHub still placeholder)", () => {
     const sections = controlCenterSections();
     expect(sections.map((s) => s.id)).toEqual(["profiles", "orchestration", "github", "diagnostics"]);
     expect(sections.find((s) => s.id === "profiles")!.implemented).toBe(true);
-    expect(sections.find((s) => s.id === "orchestration")!.implemented).toBe(false);
+    expect(sections.find((s) => s.id === "orchestration")!.implemented).toBe(true);
     expect(sections.find((s) => s.id === "github")!.implemented).toBe(false);
     expect(sections.find((s) => s.id === "diagnostics")!.implemented).toBe(true);
   });
