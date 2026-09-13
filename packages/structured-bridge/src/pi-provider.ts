@@ -1256,13 +1256,17 @@ export class PiBridgeProvider extends BridgeProvider {
    * non-message entry) maps to the last row at/before that chain position.
    * Unknown cursors return an empty page (same as the base). `limit` paging
    * and `nextCursor` (last returned id) match the base. The cached Pi leaf is
-   * advertised only when the transcript holds nothing beyond the state it
-   * identifies (P1 round-3/4 fixes — a stale/reused leaf is suppressed rather
+   * advertised only when EVERY transcript row is mapped at/before its chain
+   * position (P1 round-3/4/5 fixes — a stale/reused leaf is suppressed rather
    * than re-advertised with a new meaning, and NO synthetic transcript-tail
    * id is ever substituted: the contract promises `leafId` always names the
    * session leaf, never the page end, and only opaque Pi `providerSessionId`/
-   * `leafId` stay stable across helper restart). Callers page with
-   * `nextCursor` (row ids never move) until the leaf becomes current again.
+   * `leafId` stay stable across helper restart). A single unmapped hole
+   * ANYWHERE (not just the tip) suppresses the leaf: a later reconciled turn
+   * must not make the leaf look cover-clean while an earlier mismatch is
+   * still unreconciled, otherwise a restart could rebuild that hole's content
+   * invisibly under an already-advertised leaf. Callers page with
+   * `nextCursor` (row ids never move) until every hole is mapped.
    */
   protected override onGetHistory(opId: string, sessionId: string, cursor?: string, limit?: number): void {
     if (!this.requireHello(opId)) return;
@@ -1313,27 +1317,31 @@ export class PiBridgeProvider extends BridgeProvider {
       entries = rest.slice(0, limit);
       nextCursor = entries.length > 0 ? entries[entries.length - 1]?.id : undefined;
     }
-    // Advertise the cached Pi leaf only when the transcript holds nothing
-    // beyond the state it identifies: every row must be mapped at/before the
-    // leaf's chain position (unmapped tip rows are conservatively beyond).
-    // Otherwise OMIT it — re-advertising a stale leaf under a new transcript
-    // length would give one token two meanings, and substituting a synthetic
-    // transcript-tail id would lie about provider state (P1 round-4 fix: the
-    // tail is a page position, `live-N` ids vanish on rebuild, so a persisted
-    // synthetic leaf is unresolvable after helper restart). Callers page with
-    // `nextCursor` (row ids never move) until the leaf becomes current again.
+    // Advertise the cached Pi leaf only when EVERY transcript row is mapped
+    // at/before its chain position (P1 round-5 fix — the earlier max-index
+    // cover only detected unmapped rows at the tip, hiding a diverged hole
+    // as soon as a later turn reconciled). Any unmapped (`null`) row
+    // ANYWHERE, any row mapped past the leaf, or a length-misaligned
+    // position array suppresses the leaf: re-advertising it (or substituting
+    // a synthetic tail id, P1 round-4) would promise coverage the transcript
+    // cannot keep across a restart rebuild. Callers page with `nextCursor`
+    // (row ids never move) until every hole is mapped. Empty transcripts are
+    // vacuously clean (bootstrap leaves stay advertised).
     let leafId: string | undefined;
     const cached = runtime.piLeafId;
     if (cached !== undefined) {
       const chain = runtime.piChainIds;
       const li = chain ? chain.indexOf(cached) : -1;
-      if (li !== -1) {
-        let cover = 0;
+      if (li !== -1 && pos.length === full.length) {
+        let clean = true;
         for (let i = 0; i < full.length; i++) {
           const q = pos[i];
-          if (q !== null && q !== undefined && q <= li) cover = i + 1;
+          if (q === null || q === undefined || q > li) {
+            clean = false;
+            break;
+          }
         }
-        if (cover === full.length) leafId = cached;
+        if (clean) leafId = cached;
       }
     }
     // Record advertised Pi leaves write-once (first end wins — a token's

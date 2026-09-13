@@ -673,8 +673,10 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
       ["user", "B"],
       ["assistant", "b-out"],
     ]);
-    // Cover is clean again (B reconciled): the current leaf is advertised.
-    expect(pageB.leafId).toBe("e6");
+    // Strict cover (P1 round-5 fix): A's hole is still unmapped, so the leaf
+    // stays suppressed even though B reconciled — the row cursor above is
+    // the honest paging mechanism.
+    expect(pageB.leafId).toBeUndefined();
   });
 
   it("keeps cursors honest across a reconcile mismatch (leaf advances, rows stay live)", async () => {
@@ -952,6 +954,121 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect((lastOfKind(d2.out, "history") as unknown as { entries: unknown[] }).entries).toHaveLength(0);
     void firstFakes;
+  });
+
+  it("omits the leaf while any hole is unmapped, then restarts honestly (reviewer round-5 regression)", async () => {
+    // Resume e6 → divergent/unreconciled turn A → successfully reconciled
+    // turn B → get_history must still omit leafId (strict cover: EVERY row
+    // mapped, not just the tip) → restart/resume the same Pi file → the
+    // rebuilt transcript reflects Pi truth (divergent text visible, nothing
+    // changed invisibly under a previously advertised leaf) with an
+    // authoritative Pi leaf.
+    const sharedPi: { entries: Array<Record<string, unknown>>; leafId: string } = {
+      entries: [],
+      leafId: "",
+    };
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        seedTwoTurnSession(fake);
+        sharedPi.entries = fake.entries;
+        sharedPi.leafId = fake.leafId;
+        fake.autoJournal = (message: string) => {
+          const seq = fake.entries.length;
+          const u = `h${seq + 1}`;
+          const a = `h${seq + 2}`;
+          const anchor = (fake.entries[fake.entries.length - 1] as { id: string }).id;
+          // Turn A diverges (Pi keeps different text than streamed live);
+          // turn B converges.
+          const reply = message === "A" ? "a-DIVERGED" : `${message}-out`;
+          fake.entries.push(piMsg(u, anchor, "user", [{ type: "text", text: message }]));
+          fake.entries.push(piMsg(a, u, "assistant", [{ type: "text", text: reply }]));
+          fake.leafId = a;
+          sharedPi.leafId = a;
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws", resumePath: "/tmp/pi/ses.jsonl" });
+    await new Promise((r) => setTimeout(r, 40));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+
+    async function liveTurn(opId: string, text: string, reply: string): Promise<void> {
+      send({ v: 1, kind: "dispatch", opId, sessionId, message: { text } });
+      await new Promise((r) => setTimeout(r, 20));
+      const fake = (provider as unknown as { piRuntimes: Map<string, { conn: FakePi17 }> }).piRuntimes.get(sessionId)?.conn;
+      fake?.emit({ type: "turn_start" } as PiServerEvent);
+      fake?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: reply } } as unknown as PiServerEvent);
+      fake?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake?.emit({ type: "agent_settled" } as PiServerEvent);
+      await new Promise((r) => setTimeout(r, 80));
+    }
+
+    await liveTurn("dsp_A", "A", "a-out");
+    await liveTurn("dsp_B", "B", "B-out");
+    send({ v: 1, kind: "get_history", opId: "his_AB", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const full = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    // B reconciled (Pi ids), A still live-keyed (diverged): the leaf must be
+    // omitted — advertising it would promise hole-free coverage.
+    expect(full.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "Say FIRST."],
+      ["assistant", "FIRST."],
+      ["user", "Say SECOND."],
+      ["assistant", "SECOND."],
+      ["user", "A"],
+      ["assistant", "a-out"],
+      ["user", "B"],
+      ["assistant", "B-out"],
+    ]);
+    expect(full.leafId).toBeUndefined();
+
+    // Restart + resume the same file: Pi truth (divergent A text) is now
+    // VISIBLE in the rebuilt transcript — nothing changed invisibly under a
+    // previously advertised leaf, because none was ever advertised while the
+    // hole existed. The fresh leaf is authoritative with stable Pi ids.
+    const second = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        fake.entries = sharedPi.entries;
+        fake.leafId = sharedPi.leafId;
+        fake.state = { ...fake.state, sessionId: "pi_hole_restart", messageCount: 6 };
+        return fake;
+      },
+    });
+    const d2 = drive(second);
+    d2.hello();
+    d2.send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws", resumePath: "/tmp/pi/ses.jsonl", sessionId });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(lastOfKind(d2.out, "acquired")).toMatchObject({ resumed: true });
+    d2.send({ v: 1, kind: "get_history", opId: "his_2", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const postRestart = lastOfKind(d2.out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    expect(postRestart.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "Say FIRST."],
+      ["assistant", "FIRST."],
+      ["user", "Say SECOND."],
+      ["assistant", "SECOND."],
+      ["user", "A"],
+      ["assistant", "a-DIVERGED"],
+      ["user", "B"],
+      ["assistant", "B-out"],
+    ]);
+    expect(postRestart.entries.every((e) => !e.id.startsWith("live-"))).toBe(true);
+    // Cover clean after rebuild: authoritative Pi leaf, pages to the tip.
+    expect(typeof postRestart.leafId).toBe("string");
+    expect((postRestart.leafId as string).startsWith("live-")).toBe(false);
+    d2.send({ v: 1, kind: "get_history", opId: "his_3", sessionId, cursor: postRestart.leafId });
+    await new Promise((r) => setTimeout(r, 20));
+    expect((lastOfKind(d2.out, "history") as unknown as { entries: unknown[] }).entries).toHaveLength(0);
   });
 
   it("namespaces live rows so they never collide with Pi entry ids", async () => {

@@ -203,10 +203,12 @@ get_history → rebuilt + live-appended transcript, leafId = Pi leaf
   resolving). `get_history(cursor=…)` resolves retired live id →
   previously advertised leaf (write-once: a token's meaning is immutable) →
   transcript row → chain position. A cached Pi leaf is advertised only when
-  the transcript holds nothing beyond the state it identifies (round-3 fix —
-  a stale/reused leaf is suppressed, never re-advertised with a new meaning);
-  otherwise NO leaf is advertised and callers page with `nextCursor` until
-  the leaf becomes current again. Nothing synthetic is ever substituted:
+  EVERY transcript row is mapped at/before its chain position (round-3 fix,
+  strict in round-5: a max-index cover hid mid-history holes once a later
+  turn reconciled — a single unmapped hole anywhere suppresses the leaf, so
+  a restart can never rebuild hole content invisibly under an advertised
+  leaf); otherwise NO leaf is advertised and callers page with `nextCursor`
+  until every hole is mapped. Nothing synthetic is ever substituted:
   `leafId` always names the Pi leaf or is absent (round-4 fix — a
   transcript-tail id would lie about provider state and would not survive
   helper restart, since `live-N` ids vanish on rebuild).
