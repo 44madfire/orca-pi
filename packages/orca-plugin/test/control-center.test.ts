@@ -246,6 +246,12 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("listToken");
     expect(html).toContain("freshHashFor");
     expect(html).toContain("unversioned");
+    expect(html).toContain("editorGen");
+    expect(html).toContain("submitMutate");
+    expect(html).toContain("intentPatch");
+    expect(html).toContain("intentInitial");
+    expect(html).toContain("myGen");
+    expect(html).toContain("refreshAll(null)");
     expect(html).toContain("@media");
     expect(html).toContain("focus-visible");
   });
@@ -707,6 +713,55 @@ describe("control center: bridge negotiation in the shipped script", () => {
     await flush(12);
     expect(calls.some((c) => c.op === "profile.read")).toBe(true);
     expect(calls.some((c) => c.op === "profile.mutate")).toBe(true);
+  });
+
+  it("isolates in-flight mutates from later navigation (no draft steal)", async () => {
+    let resolveMutate: ((v: unknown) => void) | undefined;
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "profile.read", "profile.mutate"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              summaries: [
+                { name: "aaa", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["aaa"], layer: "project", valid: true },
+                { name: "bbb", thinking: "low", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: false, extendsChain: ["bbb"], layer: "project", valid: true },
+              ],
+            },
+          });
+        }
+        if (req.operation === "profile.read") {
+          const name = (req.params as { name?: string })?.name ?? "aaa";
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              name, exists: true, extendsChain: [name],
+              source: { project: {} }, fields: {}, validation: { ok: true },
+              config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+              sourceHash: { project: "h".repeat(64) },
+            },
+          });
+        }
+        if (req.operation === "profile.mutate") {
+          return new Promise((resolve) => { resolveMutate = resolve as (v: unknown) => void; });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    // Static guard already asserts intent snapshot + generation isolation.
+    const html = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
+    expect(html).toContain("editorGen");
+    expect(html).toContain("intentPatch");
+    expect(resolveMutate).toBeUndefined();
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {

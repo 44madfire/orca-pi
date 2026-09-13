@@ -363,6 +363,9 @@
           globalError: null,
           conflict: null,
           launch: null,
+          detailToken: 0,
+          listToken: 0,
+          editorGen: 0,
         };
 
         function setDirty(dirty) {
@@ -554,9 +557,10 @@
           if (state.dirty && state.selected !== name) {
             if (!window.confirm("Unsaved changes will be lost. Switch profiles anyway?")) return;
           }
-          // Invalidate any in-flight detail request so a slow earlier
-          // response can never render under a newer selection.
+          // Invalidate any in-flight detail/mutation so a slow earlier
+          // response can never render under or clear a newer selection.
           state.detailToken = (state.detailToken || 0) + 1;
+          state.editorGen = (state.editorGen || 0) + 1;
           state.selected = name;
           state.draftMode = "edit";
           state.draft = {};
@@ -603,6 +607,7 @@
         function startCreate() {
           if (state.dirty && !window.confirm("Unsaved changes will be lost. Start a new profile anyway?")) return;
           state.detailToken = (state.detailToken || 0) + 1;
+          state.editorGen = (state.editorGen || 0) + 1;
           state.selected = null;
           state.detail = null;
           state.draftMode = "create";
@@ -768,6 +773,8 @@
               state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
               setDirty(false);
             }
+            state.editorGen = (state.editorGen || 0) + 1;
+            state.detailToken = (state.detailToken || 0) + 1;
             state.scope = next;
             renderEditor();
           });
@@ -1091,21 +1098,31 @@
         }
 
         function resetScope(name) {
-          // Reset = delete the scope's override (unset all fields) — server decides removal vs empty.
-          if (!window.confirm("Reset " + state.scope + " override for \"" + name + "\"? This deletes the " + state.scope + " layer entry.")) return;
-          var hash = currentHashFor(state.scope);
-          var params = { action: "delete", name: name, scope: state.scope };
-          if (hash !== undefined) {
-            if (hash === null) { window.alert("No " + state.scope + " override exists to reset."); return; }
-            params.expectedSourceHash = hash;
+          // Reset = delete the scope's override — snapshot generation so an
+          // in-flight reset never clears a newer draft after navigation.
+          var myGen = state.editorGen || 0;
+          var scopeAtSubmit = state.scope;
+          if (!window.confirm("Reset " + scopeAtSubmit + " override for \"" + name + "\"? This deletes the " + scopeAtSubmit + " layer entry.")) return;
+          var hash = currentHashFor(scopeAtSubmit);
+          if (hash === undefined) {
+            state.globalError = "Reset aborted: no fresh version. Reload, then retry.";
+            renderEditor();
+            return;
           }
+          if (hash === null) { window.alert("No " + scopeAtSubmit + " override exists to reset."); return; }
+          var params = { action: "delete", name: name, scope: scopeAtSubmit, expectedSourceHash: hash };
           request("profile.mutate", params).then(function (res) {
+            if (myGen !== (state.editorGen || 0)) { refreshAll(null); return; }
             if (res && res.ok) { state.draft = {}; setDirty(false); refreshAll(name); }
             else {
               var mapped = mapError(res && res.error);
               state.globalError = mapped.message;
               renderEditor();
             }
+          }, function () {
+            if (myGen !== (state.editorGen || 0)) { refreshAll(null); return; }
+            state.globalError = "Bridge request failed.";
+            renderEditor();
           });
         }
 
@@ -1131,46 +1148,56 @@
             return;
           }
           var scope = state.scope;
+          // Snapshot the full mutation intent synchronously: name/scope/patch
+          // or initial plus the editor generation. Async receipt fetches below
+          // must never recompute the patch from a later draft.
+          var myGen = state.editorGen || 0;
           if (isCreate) {
+            var intentInitial = draftPatch();
+            var intentName = name;
+            var intentScope = scope;
             // Versioned create: fetch a fresh receipt for the scope file so
             // concurrent creators conflict instead of silently replacing.
-            freshHashFor(state.profiles.length ? state.profiles[0].name : name, scope).then(function (receipt) {
+            freshHashFor(state.profiles.length ? state.profiles[0].name : intentName, intentScope).then(function (receipt) {
+              if (myGen !== (state.editorGen || 0)) return;
               if (receipt.hash === undefined && state.profiles.length) {
                 state.globalError = "Create aborted: " + (receipt.error || "no fresh version") + ". Refresh, then retry.";
                 renderEditor();
                 return;
               }
-              var initial = draftPatch();
-              var params = { action: "create", name: name, scope: scope, initial: initial };
+              var params = { action: "create", name: intentName, scope: intentScope, initial: intentInitial };
               if (receipt.hash === null || !state.profiles.length) {
-                // No file for this scope yet (or empty list): assert absence.
                 if (receipt.hash === null || !state.profiles.length) params.expectedAbsent = true;
               } else if (typeof receipt.hash === "string") params.expectedSourceHash = receipt.hash;
-              submitMutate(params, name);
+              submitMutate(params, intentName, myGen);
             });
             return;
           } else {
             var hash = currentHashFor(scope);
-            // Editor patch is versioned from the loaded detail receipt;
-            // a missing receipt aborts instead of mutating unversioned.
             if (hash === undefined) {
               state.globalError = "Save aborted: no fresh version for this scope. Reload the profile, then retry — never saving unversioned.";
               renderEditor();
               return;
             }
-            // Builtin-named profiles patch the selected layer override;
-            // the server rejects only base deletes with no override.
-            var patchParams = { action: "patch", name: name, scope: scope, patch: draftPatch() };
+            var intentPatch = draftPatch();
+            var patchParams = { action: "patch", name: name, scope: scope, patch: intentPatch };
             if (hash === null) patchParams.expectedAbsent = true;
             else patchParams.expectedSourceHash = hash;
-            submitMutate(patchParams, name);
+            submitMutate(patchParams, name, myGen);
             return;
           }
-          function submitMutate(params, targetName) {
+          function submitMutate(params, targetName, gen) {
+          var myMutGen = gen !== undefined ? gen : (state.editorGen || 0);
           var ed = document.getElementById("profile-editor");
           request("profile.mutate", params).then(function (res) {
+            // Isolate in-flight mutations: when the user navigated or started
+            // a new draft while this save was pending, preserve the live
+            // editor and refresh list data without stealing selection.
+            if (myMutGen !== (state.editorGen || 0)) {
+              refreshAll(null);
+              return;
+            }
             if (res && res.ok) {
-              // Round-trip authoritative state: refresh list + detail from returned state.
               state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
               setDirty(false);
               refreshAll(targetName);
@@ -1189,6 +1216,7 @@
               }
             }
           }, function () {
+            if (myMutGen !== (state.editorGen || 0)) { refreshAll(null); return; }
             state.globalError = "Bridge request failed.";
             renderEditor();
           });
@@ -1335,6 +1363,8 @@
               state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
               setDirty(false);
             }
+            state.editorGen = (state.editorGen || 0) + 1;
+            state.detailToken = (state.detailToken || 0) + 1;
             state.scope = nextDefault;
             renderEditor();
           });
