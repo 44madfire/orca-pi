@@ -1552,6 +1552,22 @@
           var v = layer[role];
           return typeof v === "string" ? v : undefined;
         }
+        // Centralized scoped-draft initializer (single helper for every
+        // role/scope/reload path): the selected layer's own authoritative
+        // value wins; the merged effective winner is only the intentional
+        // inheritance fallback when that layer has no override. This keeps
+        // user-scope edits from ever staging a project winner for overwrite.
+        function orchEffectiveProfile(role) {
+          for (var i = 0; i < (state.orchItems || []).length; i += 1) {
+            if (state.orchItems[i].role === role) return state.orchItems[i].profile;
+          }
+          return "";
+        }
+        function orchScopedDraft(role, scope) {
+          var layerVal = orchLayerValue(role, scope);
+          if (layerVal !== undefined) return { role: role, profile: layerVal };
+          return { role: role, profile: orchEffectiveProfile(role) };
+        }
         // Toolbar default scope (visible #orch-scope). New selections seed from
         // here so the visible default and the actual target never disagree.
         function orchToolbarDefault() {
@@ -1717,12 +1733,10 @@
             state.orchSaveGen = (state.orchSaveGen || 0) + 1;
             state.orchScope = next;
             syncOrchToolbar(next);
-            // Re-init the draft from the newly selected layer's own value
-            // (never the merged effective winner) so switching to user can
-            // never silently stage the project winner for overwrite.
+            // Re-init the draft from the newly selected layer via the
+            // centralized helper (never the merged winner staged wrong).
             if (!isNew && item) {
-              var layerVal = orchLayerValue(item.role, next);
-              state.orchDraft = { role: item.role, profile: layerVal !== undefined ? layerVal : item.profile };
+              state.orchDraft = orchScopedDraft(item.role, next);
             }
             renderOrchEditor();
           });
@@ -1754,11 +1768,14 @@
           var cancel = el("button", null, "Cancel");
           cancel.addEventListener("click", function () {
             if (state.orchDirty && !window.confirm("Discard unsaved mapping changes?")) return;
-            state.orchDraft = { role: "", profile: "" };
             state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
             setOrchDirty(false);
-            if (!isNew && state.orchSelected) renderOrchEditor();
-            else { state.orchSelected = null; renderOrchEditor(); }
+            // Cancel restores the selected layer's authoritative value via
+            // the centralized helper (never the merged winner).
+            if (!isNew && state.orchSelected) {
+              state.orchDraft = orchScopedDraft(state.orchSelected, state.orchScope);
+              renderOrchEditor();
+            } else { state.orchSelected = null; state.orchDraft = { role: "", profile: "" }; renderOrchEditor(); }
           });
           row.appendChild(save); row.appendChild(cancel);
           if (!isNew && item && item.provenance !== "builtin") {
@@ -1785,14 +1802,8 @@
           // shown default and the actual target never disagree.
           state.orchScope = orchToolbarDefault();
           syncOrchToolbar(state.orchScope);
-          var found = null;
-          for (var i = 0; i < (state.orchItems || []).length; i += 1) {
-            if (state.orchItems[i].role === role) found = state.orchItems[i];
-          }
-          // Initialize from the selected layer's own value, never the merged
-          // effective winner: saving user scope must not copy a project win.
-          var layerVal = orchLayerValue(role, state.orchScope);
-          state.orchDraft = { role: role, profile: layerVal !== undefined ? layerVal : (found ? found.profile : "") };
+          // Initialize from the selected layer via the centralized helper.
+          state.orchDraft = orchScopedDraft(role, state.orchScope);
           state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
           setOrchDirty(false);
           renderOrchList();
@@ -2055,11 +2066,9 @@
               loadOrchContext();
               if (selectAfter && !wasDirty && (state.orchDraftRev || 0) === revBefore) {
                 state.orchSelected = selectAfter;
-                var found = null;
-                for (var i = 0; i < state.orchItems.length; i += 1) {
-                  if (state.orchItems[i].role === selectAfter) found = state.orchItems[i];
-                }
-                state.orchDraft = { role: selectAfter, profile: found ? found.profile : "" };
+                // Centralized helper: post-save/refresh drafts come from the
+                // selected layer, never the merged winner.
+                state.orchDraft = orchScopedDraft(selectAfter, state.orchScope);
                 renderOrchEditor();
               } else if (!wasDirty) {
                 renderOrchEditor();
@@ -2246,6 +2255,11 @@
             }
             state.orchSaveGen = (state.orchSaveGen || 0) + 1;
             state.orchScope = nextDefault;
+            // Re-init from the newly selected layer via the centralized
+            // helper so the toolbar switch cannot stage the wrong layer.
+            if (state.orchSelected && state.orchSelected !== "__new__") {
+              state.orchDraft = orchScopedDraft(state.orchSelected, nextDefault);
+            }
             renderOrchEditor();
           });
           var orchPrev = document.getElementById("btn-orch-preview");
