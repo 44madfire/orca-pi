@@ -654,10 +654,10 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
       entries: Array<{ id: string; role: string; text?: string }>;
       leafId?: string;
     };
-    // Stale Pi leaf suppressed: rows exist beyond the learned leaf's
-    // identified state, so the transcript tail (always honest: it names the
-    // actual last row) is advertised instead (P1 round-3 fix).
-    expect(afterA.leafId).toBe("live-2");
+    // Stale Pi leaf suppressed AND no synthetic substitute (P1 round-4
+    // fix): rows exist beyond the learned leaf's identified state, so no
+    // leaf is advertised at all. Callers page with row cursors.
+    expect(afterA.leafId).toBeUndefined();
     expect(afterA.entries.map((e) => e.id)).toEqual(["live-1", "live-2"]);
 
     await liveTurn("dsp_B", "B", "b-out");
@@ -734,9 +734,9 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
       ["assistant", "a-out"],
     ]);
     expect(afterA.entries.every((e) => e.id.startsWith("live-"))).toBe(true);
-    // Stale Pi leaf suppressed (tip rows unmapped): the honest transcript
-    // tail is advertised instead.
-    expect(afterA.leafId).toBe("live-2");
+    // Stale Pi leaf suppressed (tip rows unmapped) with no synthetic
+    // substitute (P1 round-4 fix).
+    expect(afterA.leafId).toBeUndefined();
 
     await liveTurn("dsp_B", "B", "B-out");
     send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: "live-2" });
@@ -803,7 +803,7 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
     await new Promise((r) => setTimeout(r, 60));
 
     // Step 3: cursor=e6 (historical row) returns A; the stale leaf e6 is NOT
-    // re-advertised (suppression) — the tail fallback is.
+    // re-advertised (suppression) and nothing synthetic replaces it.
     send({ v: 1, kind: "get_history", opId: "his_A", sessionId, cursor: "e6" });
     await new Promise((r) => setTimeout(r, 20));
     const pageA = lastOfKind(out, "history") as unknown as {
@@ -815,10 +815,11 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
       ["user", "A"],
       ["assistant", "a-out"],
     ]);
-    // The stale Pi leaf e6 is NOT re-advertised (suppression); the honest
-    // transcript tail is. Full pages emit no nextCursor, so the caller
-    // self-tracks live-2 — which the tombstone keeps resolving after re-key.
-    expect(pageA.leafId).toBe("live-2");
+    // The stale Pi leaf e6 is NOT re-advertised (suppression) and no
+    // synthetic tail id is substituted (P1 round-4 fix). Full pages emit no
+    // nextCursor, so the caller self-tracks live-2 — which the tombstone
+    // keeps resolving after re-key.
+    expect(pageA.leafId).toBeUndefined();
     expect(pageA.nextCursor).toBeUndefined();
 
     // Release: A re-keys to e7/e8 (tombstone live-2→e8); turn B converges.
@@ -846,6 +847,111 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
     ]);
     // Cover clean again: current leaf advertised.
     expect(pageB.leafId).toBe("e10");
+  });
+
+  it("keeps the advertised leaf authoritative across helper restart (reviewer round-4 regression)", async () => {
+    // Resume at Pi leaf e6 → gate reconciliation → live turn A → the
+    // response carries NO leaf (stale e6 suppressed, no synthetic live-N
+    // substitute) → restart provider/helper and resume the same file → the
+    // advertised leaf is again an authoritative Pi id (e8), never an
+    // ephemeral live-N token, with A's rows recovered as stable Pi rows.
+    const sharedPi: { entries: Array<Record<string, unknown>>; leafId: string } = {
+      entries: [],
+      leafId: "",
+    };
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    const firstFakes: FakePi17[] = [];
+    const first = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        seedTwoTurnSession(fake);
+        sharedPi.entries = fake.entries;
+        sharedPi.leafId = fake.leafId;
+        fake.historyGate = gate;
+        fake.autoJournal = (message: string) => {
+          fake.entries.push(piMsg("e7", fake.leafId, "user", [{ type: "text", text: message }]));
+          fake.entries.push(piMsg("e8", "e7", "assistant", [{ type: "text", text: "a-out" }]));
+          fake.leafId = "e8";
+          sharedPi.leafId = "e8";
+        };
+        firstFakes.push(fake);
+        return fake;
+      },
+    });
+    const d1 = drive(first);
+    d1.hello();
+    // Ungate for the resume rebuild, then re-gate before the live turn.
+    releaseGate();
+    d1.send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws", resumePath: "/tmp/pi/ses.jsonl" });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(lastOfKind(d1.out, "acquired")).toMatchObject({ resumed: true });
+    const s1 = (lastOfKind(d1.out, "acquired") as unknown as { sessionId: string }).sessionId;
+    let releaseGate2!: () => void;
+    const gate2 = new Promise<void>((r) => {
+      releaseGate2 = r;
+    });
+    const fake1 = firstFakes[0] as FakePi17;
+    fake1.historyGate = gate2;
+    void releaseGate2;
+
+    d1.send({ v: 1, kind: "dispatch", opId: "dsp_A", sessionId: s1, message: { text: "A" } });
+    await new Promise((r) => setTimeout(r, 20));
+    fake1.emit({ type: "turn_start" } as PiServerEvent);
+    fake1.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "a-out" } } as unknown as PiServerEvent);
+    fake1.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fake1.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 60));
+    d1.send({ v: 1, kind: "get_history", opId: "his_A", sessionId: s1 });
+    await new Promise((r) => setTimeout(r, 20));
+    const preRestart = lastOfKind(d1.out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    expect(preRestart.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "Say FIRST."],
+      ["assistant", "FIRST."],
+      ["user", "Say SECOND."],
+      ["assistant", "SECOND."],
+      ["user", "A"],
+      ["assistant", "a-out"],
+    ]);
+    // No leaf while the tip is unmapped — and crucially NOT a synthetic one.
+    expect(preRestart.leafId).toBeUndefined();
+
+    // Restart: brand-new provider (empty tombstones/maps) resumes the same
+    // Pi file, whose journal already contains A.
+    const second = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        fake.entries = sharedPi.entries;
+        fake.leafId = sharedPi.leafId;
+        fake.state = { ...fake.state, sessionId: "pi_shared_2", messageCount: 6 };
+        return fake;
+      },
+    });
+    const d2 = drive(second);
+    d2.hello();
+    d2.send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws", resumePath: "/tmp/pi/ses.jsonl", sessionId: s1 });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(lastOfKind(d2.out, "acquired")).toMatchObject({ resumed: true });
+    d2.send({ v: 1, kind: "get_history", opId: "his_2", sessionId: s1 });
+    await new Promise((r) => setTimeout(r, 20));
+    const postRestart = lastOfKind(d2.out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    // Authoritative Pi leaf (resolvable without any prior in-memory state),
+    // stable Pi ids throughout — nothing ephemeral crossed the restart.
+    expect(postRestart.leafId).toBe("e8");
+    expect(postRestart.entries.map((e) => e.id)).toEqual(["e3", "e4", "e5", "e6", "e7", "e8"]);
+    expect(postRestart.entries.every((e) => !e.id.startsWith("live-"))).toBe(true);
+    d2.send({ v: 1, kind: "get_history", opId: "his_3", sessionId: s1, cursor: postRestart.leafId });
+    await new Promise((r) => setTimeout(r, 20));
+    expect((lastOfKind(d2.out, "history") as unknown as { entries: unknown[] }).entries).toHaveLength(0);
+    void firstFakes;
   });
 
   it("namespaces live rows so they never collide with Pi entry ids", async () => {

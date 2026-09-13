@@ -1257,9 +1257,12 @@ export class PiBridgeProvider extends BridgeProvider {
    * Unknown cursors return an empty page (same as the base). `limit` paging
    * and `nextCursor` (last returned id) match the base. The cached Pi leaf is
    * advertised only when the transcript holds nothing beyond the state it
-   * identifies (P1 round-3 fix — a stale/reused leaf is suppressed rather
-   * than re-advertised with a new meaning); otherwise the transcript tail
-   * (or nothing, when empty) is the cursor.
+   * identifies (P1 round-3/4 fixes — a stale/reused leaf is suppressed rather
+   * than re-advertised with a new meaning, and NO synthetic transcript-tail
+   * id is ever substituted: the contract promises `leafId` always names the
+   * session leaf, never the page end, and only opaque Pi `providerSessionId`/
+   * `leafId` stay stable across helper restart). Callers page with
+   * `nextCursor` (row ids never move) until the leaf becomes current again.
    */
   protected override onGetHistory(opId: string, sessionId: string, cursor?: string, limit?: number): void {
     if (!this.requireHello(opId)) return;
@@ -1313,8 +1316,11 @@ export class PiBridgeProvider extends BridgeProvider {
     // Advertise the cached Pi leaf only when the transcript holds nothing
     // beyond the state it identifies: every row must be mapped at/before the
     // leaf's chain position (unmapped tip rows are conservatively beyond).
-    // Otherwise suppress it — re-advertising a stale leaf under a new
-    // transcript length would give one token two meanings. Callers page with
+    // Otherwise OMIT it — re-advertising a stale leaf under a new transcript
+    // length would give one token two meanings, and substituting a synthetic
+    // transcript-tail id would lie about provider state (P1 round-4 fix: the
+    // tail is a page position, `live-N` ids vanish on rebuild, so a persisted
+    // synthetic leaf is unresolvable after helper restart). Callers page with
     // `nextCursor` (row ids never move) until the leaf becomes current again.
     let leafId: string | undefined;
     const cached = runtime.piLeafId;
@@ -1330,7 +1336,6 @@ export class PiBridgeProvider extends BridgeProvider {
         if (cover === full.length) leafId = cached;
       }
     }
-    leafId ??= full.length > 0 ? full[full.length - 1]?.id : undefined;
     // Record advertised Pi leaves write-once (first end wins — a token's
     // meaning is immutable); transcript-tail fallbacks are positional-stable
     // by construction (rows never move) and need no record. Only complete
