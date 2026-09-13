@@ -835,7 +835,6 @@ describe("control center: bridge negotiation in the shipped script", () => {
   it("keeps user scope when edits land during a clean-started read (deferred read race)", async () => {
     let resolveList2: ((v: unknown) => void) | undefined;
     let listCount = 0;
-    let readCount = 0;
     const dom = makeControlDom({
       request: (req: { operation: string; requestId: string; params?: unknown }) => {
         if (req.operation === "bridge.capabilities") {
@@ -856,7 +855,6 @@ describe("control center: bridge negotiation in the shipped script", () => {
           return new Promise((resolve) => { resolveList2 = resolve as (v: unknown) => void; });
         }
         if (req.operation === "profile.read") {
-          readCount += 1;
           return Promise.resolve({
             protocolVersion: 1, requestId: req.requestId, ok: true,
             result: {
