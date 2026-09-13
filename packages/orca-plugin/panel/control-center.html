@@ -1,6 +1,6 @@
 <!doctype html>
 <!--
-  Orca-Pi Control Center (UI1.3).
+  Orca-Pi Control Center (UI1.3 shell + Profiles, UI1.4 Orchestration).
   Single Orca-native shell + structured Profiles editor over the versioned
   Orca↔Orca-Pi bridge (protocol 1, bridge 1.0.0). Live data flows through
   window.__ORCA_PI_BRIDGE__.request with stable request IDs and
@@ -205,9 +205,43 @@
 
         <section id="section-orchestration" role="tabpanel" aria-labelledby="tab-orchestration" hidden>
           <div class="cc-card">
-            <h2>Orchestration</h2>
-            <p class="muted">UI1.4 owns full role→profile mapping UI. This shell reserves the section and shows live read-only mapping when the bridge supports it (Orca owns task/DAG/worktree/run lifecycle; Orca-Pi owns only role→profile policy).</p>
-            <div id="orchestration-summary"><p class="muted">Loading orchestration mapping…</p></div>
+            <h2>Orchestration — role→profile mapping</h2>
+            <p class="muted">Orca owns task/DAG/worktree/run lifecycle; Orca-Pi owns only role→profile policy. This section never duplicates Orca's native UI: no task board, no DAG viewer, no worker monitor — only Pi execution policy with read-only context that links back to Orca's native surface.</p>
+            <p class="muted">Resolution chain: <code>Orchestration role mapping → profile → user/project profile layers → effective launch</code>. Team presets and DAG membership stay Orca-native; custom roles below act as extensible preset slots backed by the authoritative orchestration service (builtins &lt; user &lt; project).</p>
+            <div class="cc-toolbar">
+              <button id="btn-orch-refresh" type="button">Refresh mapping</button>
+              <label class="muted" for="orch-scope">Default save scope
+                <select id="orch-scope">
+                  <option value="project" selected>project</option>
+                  <option value="user">user</option>
+                </select>
+              </label>
+              <span class="spacer"></span>
+              <span id="orch-dirty" class="muted" aria-live="polite"></span>
+            </div>
+            <div id="orch-context" aria-live="polite"><p class="muted">Worktree context: loading via <code>worktree.context</code>…</p></div>
+            <div id="orchestration-summary" aria-live="polite"><p class="muted">Loading orchestration mapping via <code>orchestration.get</code>…</p></div>
+          </div>
+          <div class="cc-grid two">
+            <div>
+              <h3>Role defaults</h3>
+              <p class="muted">Built-ins <code>worker</code>/<code>scout</code>/<code>reviewer</code> plus optional custom named roles (same <code>[a-z0-9-]+</code> grammar). Invalid references surface before launch.</p>
+              <ul id="orch-list" class="cc-profile-list" aria-label="Role to profile mapping"></ul>
+            </div>
+            <div>
+              <h3>Mapping editor</h3>
+              <div id="orch-editor" aria-live="polite"><p class="muted">Select a role to edit, or add a custom role. Saves use <code>orchestration.set</code> with explicit scope + source hash (expectedSourceHash); resets send <code>clear: true</code> and fall back to the lower layer.</p></div>
+              <details id="orch-preview-wrap">
+                <summary>Resolved profile + launch preview (reuses launch compiler)</summary>
+                <div id="orch-preview"><p class="muted">Select a role, then load its resolved Pi profile and sanitized launch preview via <code>launch.preview</code>. Display-only — never executed. Provenance shows the full chain.</p></div>
+                <button id="btn-orch-preview" type="button">Load role launch preview</button>
+              </details>
+              <details>
+                <summary>Team presets (Orca-native)</summary>
+                <p class="muted">v1 has no separate team-preset store: Orca owns presets/DAG membership natively. The role defaults above are the Pi policy layer they resolve through. Custom roles extend the mapping without exposing raw Orca DAG internals as the editing surface.</p>
+                <p class="muted">CLI parity: <code>orca-pi bridge --request orchestration.get/set</code> observes the same files; <code>spawn</code>/<code>status</code>/<code>send</code>/<code>wait</code>/<code>stop</code> remain compatible (Orca stays authoritative for completion/status).</p>
+              </details>
+            </div>
           </div>
         </section>
 
@@ -232,7 +266,7 @@
       <p class="muted">Targets Orca app 1.4.196+ (pluginApi 1, Host API v0 re-audited 2026-09-11). See docs/ORCA_PLUGIN_API.md. No manual CLI/YAML editing is required for normal profile customization.</p>
     </div>
     <script>
-      // Control Center client (UI1.3). Structured by design: every live call
+      // Control Center client (UI1.3 shell + Profiles, UI1.4 Orchestration). Structured by design: every live call
       // goes through window.__ORCA_PI_BRIDGE__.request with protocol 1 and
       // stable request IDs. No fetch, no filesystem, no shell, no static
       // injection. Degraded path uses real Host API calls over postMessage
@@ -286,9 +320,10 @@
             }
           }
           // Single guarded entry for both mouse and keyboard activation:
-          // dirty editors confirm before leaving Profiles (acceptance criteria).
+          // dirty editors confirm before leaving Profiles/Orchestration (acceptance criteria).
           function guardedSelect(tab, focus) {
             if (state.dirty && !window.confirm("Unsaved profile changes will be lost. Switch sections anyway?")) return;
+            if (state.orchDirty && !window.confirm("Unsaved orchestration mapping changes will be lost. Switch sections anyway?")) return;
             select(tab, focus);
           }
           tabs.forEach(function (tab, idx) {
@@ -368,7 +403,27 @@
           previewToken: 0,
           editorGen: 0,
           draftRev: 0,
+          // Orchestration (UI1.4): role→profile mapping over orchestration.get/set.
+          // Orca owns task/DAG/worktree/run; this owns only role→profile policy.
+          orchItems: [],
+          orchMapping: null,
+          orchSelected: null,
+          orchDraft: { role: "", profile: "" },
+          orchScope: "project",
+          orchDirty: false,
+          orchFieldErrors: {},
+          orchGlobalError: null,
+          orchConflict: null,
+          orchContext: null,
+          orchListToken: 0,
+          orchPreviewToken: 0,
+          orchSaveGen: 0,
+          orchDraftRev: 0,
         };
+        var ORCH_BUILTINS = ["worker", "scout", "reviewer"];
+        var ORCH_CHAIN = "Orchestration role mapping → profile → user/project profile layers → effective launch";
+        var ORCH_ROLE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+        var ORCH_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
         // Every user edit bumps draftRev so in-flight saves can tell whether
         // the draft changed after submission (edits-after-save must survive).
@@ -421,6 +476,12 @@
             ed.appendChild(p);
           }
           setSaveEnabled(false, "Structured bridge unreachable — Save disabled.");
+          var orchBox = document.getElementById("orchestration-summary");
+          if (orchBox) orchBox.innerHTML = "<p><strong>Degraded (read-only CLI fallback).</strong> <span class=\"muted\">" + esc(reason) + " Mapping edits stay disabled; mutations require <code>orchestration.get</code> + <code>orchestration.set</code> over the structured bridge — never a hidden store.</span></p>";
+          var orchEd = document.getElementById("orch-editor");
+          if (orchEd) orchEd.innerHTML = "<p class=\"muted\">Save is disabled on this host: the structured bridge is unreachable (needs <code>orchestration.get</code> + <code>orchestration.set</code>). Use the explicit terminal action above for read-only CLI commands.</p>";
+          var orchCtx = document.getElementById("orch-context");
+          if (orchCtx) orchCtx.innerHTML = "<p class=\"muted\">Worktree context unavailable while degraded.</p>";
         }
         function setSaveEnabled(enabled, why) {
           var btn = document.getElementById("btn-save");
@@ -1372,6 +1433,658 @@
           });
         }
 
+        // -----------------------------------------------------------------
+        // Orchestration role→profile mapping (UI1.4).
+        // Orca owns task/DAG/worktree/run lifecycle; Orca-Pi owns only
+        // role→profile policy. Live data flows through orchestration.get/set
+        // (authoritative orchestration service, never panel-local files) and
+        // launch.preview (JEF-7 compiler, display-only). Panels omit
+        // filesystem paths; the seam adapter/sidecar stamps explicit
+        // worktree scope host-side so delayed requests cannot be redirected
+        // by focus changes. Team presets/DAG stay Orca-native and are never
+        // duplicated here: no task board, no DAG viewer, no worker monitor.
+        // -----------------------------------------------------------------
+        function orchValidateRole(role) {
+          if (typeof role !== "string" || !role) return "expected a role name (e.g. worker, scout, reviewer).";
+          if (role === "__proto__" || role === "constructor" || role === "prototype") return "reserved name.";
+          if (role.length > 64 || !ORCH_ROLE_RE.test(role)) return "use 1-64 chars matching [a-z0-9]+(-[a-z0-9]+)*.";
+          return null;
+        }
+        function orchValidateProfile(ref) {
+          if (typeof ref !== "string" || !ref) return "expected a Pi profile name (e.g. worker-fast).";
+          if (ref === "__proto__" || ref === "constructor" || ref === "prototype") return "reserved name.";
+          if (ref.length > 64 || !ORCH_PROFILE_RE.test(ref)) return "use 1-64 chars matching [A-Za-z0-9][A-Za-z0-9_-]* (roles stay narrow; profile refs accept full Pi grammar).";
+          return null;
+        }
+        function orchClientErrors(role, profile) {
+          var errs = {};
+          var r = orchValidateRole(role);
+          if (r) errs.role = r;
+          var p = orchValidateProfile(profile);
+          if (p) errs.profile = p;
+          return errs;
+        }
+        function toOrchItems(payload, knownProfiles) {
+          var out = [];
+          if (!payload || typeof payload !== "object" || Array.isArray(payload)) return out;
+          var rec = payload;
+          var mapping = null;
+          if (rec.effective && typeof rec.effective === "object" && !Array.isArray(rec.effective)) mapping = rec.effective;
+          else if (rec.roles && typeof rec.roles === "object" && !Array.isArray(rec.roles)) mapping = rec.roles;
+          else if (rec.mapping && typeof rec.mapping === "object" && !Array.isArray(rec.mapping)) mapping = rec.mapping;
+          if (!mapping) return out;
+          var provMap = (rec.provenance && typeof rec.provenance === "object" && !Array.isArray(rec.provenance)) ? rec.provenance : {};
+          var invalidSet = {};
+          if (Array.isArray(rec.invalidRefs)) {
+            for (var i = 0; i < rec.invalidRefs.length; i += 1) {
+              if (typeof rec.invalidRefs[i] === "string") invalidSet[rec.invalidRefs[i]] = true;
+            }
+          }
+          var hasInvalidRefs = Array.isArray(rec.invalidRefs);
+          var known = null;
+          var knownCount = 0;
+          if (Array.isArray(knownProfiles)) { known = {}; for (var k = 0; k < knownProfiles.length; k += 1) { known[knownProfiles[k]] = true; knownCount += 1; } }
+          for (var role in mapping) {
+            if (!Object.prototype.hasOwnProperty.call(mapping, role)) continue;
+            var profile = mapping[role];
+            if (typeof profile !== "string") continue;
+            if (orchValidateRole(role)) continue;
+            var prov = provMap[role] === "user" || provMap[role] === "project" ? provMap[role] : "builtin";
+            // Trust bridge invalidRefs when provided; fall back to known only
+            // when non-empty (empty known = profiles not yet loaded, never all-invalid).
+            var invalid = !!invalidSet[role] || (!hasInvalidRefs && known !== null && knownCount > 0 && !known[profile]);
+            out.push({ role: role, profile: profile, provenance: prov, invalid: invalid });
+          }
+          var order = { worker: 0, scout: 1, reviewer: 2 };
+          out.sort(function (a, b) {
+            var ao = order[a.role] !== undefined ? order[a.role] : 1000;
+            var bo = order[b.role] !== undefined ? order[b.role] : 1000;
+            if (ao !== bo) return ao - bo;
+            return a.role < b.role ? -1 : a.role > b.role ? 1 : 0;
+          });
+          return out;
+        }
+        function describeOrchProv(prov) {
+          if (prov === "project") return "project (.pi/orchestration.json)";
+          if (prov === "user") return "user/global (orchestration.json)";
+          return "built-in defaults";
+        }
+        function orchChainText(role, profile) {
+          return 'Role "' + role + '" → profile "' + profile + '" → user/project profile layers → effective launch (' + ORCH_CHAIN + ').';
+        }
+        function mapOrchError(err) {
+          var code = (err && err.code) || "internal";
+          var message = (err && err.message) || "Request failed.";
+          var field = (err && err.field) || "_global";
+          if (typeof field === "string" && field.indexOf(".") !== -1) {
+            var parts = field.split(".");
+            field = parts[parts.length - 1];
+          }
+          if (field !== "role" && field !== "profile" && field !== "scope") {
+            var m = /role\s+"[^"]+"|profile\s+"[^"]+"/i.exec(message);
+            if (m) field = /role/i.test(m[0]) ? "role" : "profile";
+            else field = "_global";
+          }
+          return { kind: code, message: message, field: field, isConflict: code === "conflict" };
+        }
+        function setOrchDirty(dirty) {
+          state.orchDirty = dirty;
+          var badge = document.getElementById("orch-dirty");
+          if (badge) {
+            badge.textContent = dirty ? "● Unsaved mapping changes" : "";
+            if (dirty) badge.setAttribute("class", "cc-dirty");
+            else badge.setAttribute("class", "muted");
+          }
+        }
+        function touchOrchDraft() {
+          state.orchDraftRev = (state.orchDraftRev || 0) + 1;
+          setOrchDirty(true);
+        }
+        function orchKnownProfiles() {
+          return (state.profiles || []).map(function (p) { return p.name; });
+        }
+        // Authoritative per-layer value for one role (never the merged winner).
+        // Returns the layer's own entry when present, else undefined (no override).
+        function orchLayerValue(role, scope) {
+          if (!state.orchMapping || !state.orchMapping.layers) return undefined;
+          var layer = state.orchMapping.layers[scope];
+          if (!layer || typeof layer !== "object" || Array.isArray(layer)) return undefined;
+          var v = layer[role];
+          return typeof v === "string" ? v : undefined;
+        }
+        // Centralized scoped-draft initializer (single helper for every
+        // role/scope/reload path): the selected layer's own authoritative
+        // value wins; the merged effective winner is only the intentional
+        // inheritance fallback when that layer has no override. This keeps
+        // user-scope edits from ever staging a project winner for overwrite.
+        function orchEffectiveProfile(role) {
+          for (var i = 0; i < (state.orchItems || []).length; i += 1) {
+            if (state.orchItems[i].role === role) return state.orchItems[i].profile;
+          }
+          return "";
+        }
+        function orchScopedDraft(role, scope) {
+          var layerVal = orchLayerValue(role, scope);
+          if (layerVal !== undefined) return { role: role, profile: layerVal };
+          return { role: role, profile: orchEffectiveProfile(role) };
+        }
+        // Toolbar default scope (visible #orch-scope). New selections seed from
+        // here so the visible default and the actual target never disagree.
+        function orchToolbarDefault() {
+          var def = document.getElementById("orch-scope");
+          var v = def ? def.value : null;
+          return v === "user" || v === "project" ? v : state.orchScope;
+        }
+        function syncOrchToolbar(scope) {
+          var def = document.getElementById("orch-scope");
+          if (def && (scope === "user" || scope === "project")) def.value = scope;
+        }
+        function orchCurrentHash(scope) {
+          if (!state.orchMapping || !state.orchMapping.sourceHash) return undefined;
+          var h = state.orchMapping.sourceHash[scope];
+          if (typeof h === "string") return h;
+          return null;
+        }
+        function renderOrchList() {
+          var root = document.getElementById("orch-list");
+          var summary = document.getElementById("orchestration-summary");
+          if (!root) return;
+          root.innerHTML = "";
+          var items = state.orchItems || [];
+          if (summary) {
+            if (!items.length) {
+              summary.innerHTML = "<p><strong>No role mappings found.</strong> Built-ins worker/scout/reviewer always resolve; add a custom role to extend.</p>";
+            } else {
+              var invalid = items.filter(function (i) { return i.invalid; });
+              summary.innerHTML = invalid.length
+                ? "<p><strong>Validation: " + invalid.length + " invalid reference(s): " + esc(invalid.map(function (i) { return i.role + "→" + i.profile; }).join(", ")) + ".</strong> Fix before launch — the referenced Pi profile is missing or deleted.</p>"
+                : "<p>Validation: all " + items.length + " mapping(s) valid. Live via <code>orchestration.get</code>. " + esc("Orca owns task/DAG/worktree/run lifecycle; Orca-Pi owns only role→profile policy.") + "</p>";
+            }
+          }
+          items.forEach(function (item) {
+            var li = el("li", { class: "cc-profile-item" });
+            li.setAttribute("aria-selected", state.orchSelected === item.role ? "true" : "false");
+            var title = item.role + " → " + item.profile;
+            li.appendChild(el("h3", null, title));
+            var meta = el("div", { class: "cc-meta" });
+            var builtin = ORCH_BUILTINS.indexOf(item.role) !== -1;
+            meta.innerHTML =
+              '<span class="cc-pill' + (item.invalid ? " invalid" : "") + '">' + esc(describeOrchProv(item.provenance)) + "</span>" +
+              (item.invalid ? '<span class="cc-pill invalid">INVALID — missing profile</span>' : "") +
+              (builtin ? '<span class="cc-pill builtin">built-in role</span>' : '<span class="cc-pill">custom role</span>') +
+              "<span>" + esc(orchChainText(item.role, item.profile)) + "</span>";
+            li.appendChild(meta);
+            var actions = el("div", { class: "cc-actions" });
+            var edit = el("button", null, "Edit");
+            edit.addEventListener("click", function () { selectOrchRole(item.role); });
+            var preview = el("button", null, "Preview launch");
+            preview.addEventListener("click", function () { if (item.role !== state.orchSelected) selectOrchRole(item.role); loadOrchPreview(item.role); });
+            var clone = el("button", null, "Clone");
+            clone.addEventListener("click", function () { cloneOrchRole(item.role, item.profile); });
+            actions.appendChild(edit); actions.appendChild(clone); actions.appendChild(preview);
+            if (item.provenance !== "builtin") {
+              var reset = el("button", null, "Reset " + item.provenance + " override");
+              reset.addEventListener("click", function () { resetOrchRole(item.role, item.provenance); });
+              actions.appendChild(reset);
+            } else {
+              actions.appendChild(el("span", { class: "muted" }, "built-in default: Edit creates a user/project override"));
+            }
+            li.appendChild(actions);
+            root.appendChild(li);
+          });
+          // Add-custom-role row.
+          var addLi = el("li", { class: "cc-profile-item" });
+          addLi.appendChild(el("h3", null, "Custom role"));
+          addLi.appendChild(el("p", { class: "muted" }, "Custom named roles extend the mapping (same [a-z0-9-]+ grammar). They act as preset slots; Orca owns team presets/DAG natively."));
+          var addBtn = el("button", null, "Add custom role");
+          addBtn.addEventListener("click", startOrchAdd);
+          addLi.appendChild(addBtn);
+          root.appendChild(addLi);
+        }
+        function renderOrchEditor() {
+          var ed = document.getElementById("orch-editor");
+          if (!ed) return;
+          ed.innerHTML = "";
+          var isNew = state.orchSelected === null || state.orchSelected === "__new__";
+          var item = null;
+          if (!isNew) {
+            for (var i = 0; i < (state.orchItems || []).length; i += 1) {
+              if (state.orchItems[i].role === state.orchSelected) item = state.orchItems[i];
+            }
+          }
+          if (!isNew && !item) {
+            ed.appendChild(el("p", { class: "muted" }, "Select a role to edit."));
+            return;
+          }
+          var roleWrap = el("div", { class: "cc-field" });
+          roleWrap.appendChild(el("label", null, "Role"));
+          var roleInput;
+          if (isNew) {
+            roleInput = el("input"); roleInput.type = "text"; roleInput.id = "orch-role";
+            roleInput.value = state.orchDraft.role || "";
+            roleInput.setAttribute("placeholder", "worker, scout, reviewer, or custom-role");
+            roleInput.setAttribute("aria-label", "Role name");
+            roleInput.addEventListener("input", function () { state.orchDraft.role = roleInput.value; touchOrchDraft(); });
+          } else {
+            roleWrap.appendChild(el("p", null, item.role + (ORCH_BUILTINS.indexOf(item.role) !== -1 ? " (built-in role)" : " (custom role)")));
+            roleWrap.appendChild(el("p", { class: "prov" }, "Provenance: " + describeOrchProv(item.provenance) + ". Built-ins < user < project."));
+          }
+          if (isNew) {
+            roleWrap.appendChild(roleInput);
+            roleWrap.appendChild(el("p", { class: "hint" }, "1-64 chars matching [a-z0-9]+(-[a-z0-9]+)*. Validated server-side."));
+          }
+          ed.appendChild(roleWrap);
+          var profWrap = el("div", { class: "cc-field" });
+          var profLab = el("label", null, "Pi profile for this role");
+          profLab.setAttribute("for", "orch-profile");
+          profWrap.appendChild(profLab);
+          var profInput = el("input"); profInput.type = "text"; profInput.id = "orch-profile";
+          var curProfile = state.orchDraft.profile !== undefined && state.orchDraft.profile !== "" ? state.orchDraft.profile : (item ? item.profile : "");
+          profInput.value = curProfile;
+          profInput.setAttribute("placeholder", "worker-fast");
+          profInput.setAttribute("aria-label", "Pi profile for role");
+          profInput.setAttribute("list", "orch-profile-list");
+          profInput.addEventListener("input", function () { state.orchDraft.profile = profInput.value; touchOrchDraft(); });
+          profWrap.appendChild(profInput);
+          var dl = document.createElement("datalist");
+          dl.id = "orch-profile-list";
+          orchKnownProfiles().forEach(function (n) {
+            var o = document.createElement("option"); o.value = n;
+            dl.appendChild(o);
+          });
+          profWrap.appendChild(dl);
+          profWrap.appendChild(el("p", { class: "hint" }, "Model/thinking come from the profile — never duplicated here. Unknown names are flagged INVALID before launch."));
+          if (item) {
+            profWrap.appendChild(el("p", { class: "prov" }, orchChainText(item.role, curProfile || item.profile)));
+            // Per-layer visibility: the editor edits exactly one layer; show
+            // both layers plus the effective winner so user/project divergence
+            // is never hidden (builtins < user < project).
+            var userVal = orchLayerValue(item.role, "user");
+            var projectVal = orchLayerValue(item.role, "project");
+            var layersText = "Layers: user=" + (userVal !== undefined ? JSON.stringify(userVal) : "(no override)") + " | project=" + (projectVal !== undefined ? JSON.stringify(projectVal) : "(no override)") + " | effective=" + JSON.stringify(item.profile) + ". Editing " + state.orchScope + " layer" + (orchLayerValue(item.role, state.orchScope) === undefined ? " (no " + state.orchScope + " override yet — saving creates it)" : " (override exists — saving updates it)") + ".";
+            profWrap.appendChild(el("p", { class: "prov" }, layersText));
+          }
+          var roleErr = state.orchFieldErrors.role;
+          var profErr = state.orchFieldErrors.profile;
+          if (roleErr) profWrap.appendChild(el("p", { class: "error" }, "role: " + roleErr));
+          if (profErr) profWrap.appendChild(el("p", { class: "error" }, profErr));
+          ed.appendChild(profWrap);
+          var scopeWrap = el("div", { class: "cc-field" });
+          var scopeLab = el("label", null, "Save scope (required)");
+          scopeLab.setAttribute("for", "orch-scope-edit");
+          scopeWrap.appendChild(scopeLab);
+          var scopeSel = el("select"); scopeSel.id = "orch-scope-edit";
+          ["project", "user"].forEach(function (s) {
+            var o = el("option", null, s + (s === "project" ? " (.pi/orchestration.json)" : " (global)"));
+            o.value = s; if (state.orchScope === s) o.selected = true;
+            scopeSel.appendChild(o);
+          });
+          scopeSel.addEventListener("change", function () {
+            var next = scopeSel.value;
+            if (next === state.orchScope) return;
+            if (state.orchDirty) {
+              if (!window.confirm('Switch save scope to "' + next + '"? Unsaved ' + state.orchScope + ' edits will be discarded (drafts are per-layer).')) {
+                scopeSel.value = state.orchScope;
+                return;
+              }
+              state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+              setOrchDirty(false);
+            }
+            state.orchSaveGen = (state.orchSaveGen || 0) + 1;
+            state.orchScope = next;
+            syncOrchToolbar(next);
+            // Re-init the draft from the newly selected layer via the
+            // centralized helper (never the merged winner staged wrong).
+            if (!isNew && item) {
+              state.orchDraft = orchScopedDraft(item.role, next);
+            }
+            renderOrchEditor();
+          });
+          scopeWrap.appendChild(scopeSel);
+          scopeWrap.appendChild(el("p", { class: "hint" }, "Writes go only to the selected layer via orchestration.set; the other layer is untouched."));
+          ed.appendChild(scopeWrap);
+          if (state.orchGlobalError) ed.appendChild(el("p", { class: "error" }, state.orchGlobalError));
+          if (state.orchConflict) {
+            var c = el("div", { class: "cc-conflict" });
+            c.appendChild(el("p", null, "Stale write conflict: the file changed since you loaded it. No data was overwritten."));
+            c.appendChild(el("p", { class: "muted" }, state.orchConflict));
+            var reloadBtn = el("button", null, "Reload latest and compare");
+            reloadBtn.addEventListener("click", function () {
+              state.orchConflict = null; state.orchFieldErrors = {}; state.orchGlobalError = null;
+              loadOrchestration();
+            });
+            c.appendChild(reloadBtn);
+            ed.appendChild(c);
+          }
+          var row = el("div", { class: "cc-actions" });
+          var save = el("button", null, isNew ? "Create mapping" : "Save " + state.orchScope + " layer");
+          save.id = "btn-orch-save";
+          save.setAttribute("class", "primary");
+          if (!state.structured || !can("orchestration.set")) {
+            save.disabled = true;
+            save.title = "Structured bridge unreachable or orchestration.set unavailable — Save disabled.";
+          }
+          save.addEventListener("click", saveOrchDraft);
+          var cancel = el("button", null, "Cancel");
+          cancel.addEventListener("click", function () {
+            if (state.orchDirty && !window.confirm("Discard unsaved mapping changes?")) return;
+            state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+            setOrchDirty(false);
+            // Cancel restores the selected layer's authoritative value via
+            // the centralized helper (never the merged winner).
+            if (!isNew && state.orchSelected) {
+              state.orchDraft = orchScopedDraft(state.orchSelected, state.orchScope);
+              renderOrchEditor();
+            } else { state.orchSelected = null; state.orchDraft = { role: "", profile: "" }; renderOrchEditor(); }
+          });
+          row.appendChild(save); row.appendChild(cancel);
+          if (!isNew && item && item.provenance !== "builtin") {
+            var resetBtn = el("button", null, "Reset " + state.orchScope + " override");
+            resetBtn.addEventListener("click", function () { resetOrchRole(item.role, state.orchScope); });
+            row.appendChild(resetBtn);
+          }
+          ed.appendChild(row);
+          setOrchDirty(state.orchDirty);
+        }
+        function selectOrchRole(role) {
+          if (role === state.orchSelected) {
+            if (state.orchDirty) return;
+            state.orchListToken = (state.orchListToken || 0) + 1;
+            renderOrchEditor();
+            return;
+          }
+          if (state.orchDirty) {
+            if (!window.confirm("Unsaved mapping changes will be lost. Switch roles anyway?")) return;
+          }
+          state.orchSaveGen = (state.orchSaveGen || 0) + 1;
+          state.orchSelected = role;
+          // Seed each new selection from the visible toolbar default so the
+          // shown default and the actual target never disagree.
+          state.orchScope = orchToolbarDefault();
+          syncOrchToolbar(state.orchScope);
+          // Initialize from the selected layer via the centralized helper.
+          state.orchDraft = orchScopedDraft(role, state.orchScope);
+          state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+          setOrchDirty(false);
+          renderOrchList();
+          renderOrchEditor();
+        }
+        function startOrchAdd() {
+          if (state.orchDirty && !window.confirm("Unsaved mapping changes will be lost. Add a new role anyway?")) return;
+          state.orchSaveGen = (state.orchSaveGen || 0) + 1;
+          state.orchSelected = "__new__";
+          state.orchDraft = { role: "", profile: "" };
+          state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+          var defScope = document.getElementById("orch-scope");
+          if (defScope) state.orchScope = defScope.value;
+          setOrchDirty(false);
+          renderOrchList();
+          renderOrchEditor();
+        }
+        function cloneOrchRole(sourceRole, sourceProfile) {
+          var dest = null;
+          try { dest = window.prompt('Clone role "' + sourceRole + '" (→ ' + sourceProfile + ') to new role name (e.g. impl-fast):', sourceRole + "-copy"); } catch (e) {}
+          if (!dest) return;
+          dest = String(dest).trim();
+          if (orchValidateRole(dest)) { window.alert("Invalid role name: use 1-64 chars matching [a-z0-9]+(-[a-z0-9]+)*."); return; }
+          if (state.orchDirty && !window.confirm("Unsaved mapping changes will be lost. Clone anyway?")) return;
+          state.orchSaveGen = (state.orchSaveGen || 0) + 1;
+          state.orchSelected = "__new__";
+          // Clones seed from the visible toolbar default like Add (never a
+          // stale editor-local scope left behind by a prior role).
+          state.orchScope = orchToolbarDefault();
+          syncOrchToolbar(state.orchScope);
+          state.orchDraft = { role: dest, profile: sourceProfile };
+          state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+          setOrchDirty(true);
+          renderOrchList();
+          renderOrchEditor();
+        }
+        function orchFreshHashNote() {
+          return "no fresh version for this scope. Reload the mapping, then retry — never saving unversioned.";
+        }
+        function saveOrchDraft() {
+          state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+          var isNew = state.orchSelected === null || state.orchSelected === "__new__";
+          var role = isNew ? String((state.orchDraft.role || "").trim()) : state.orchSelected;
+          var profile = String((state.orchDraft.profile || "").trim());
+          var shape = orchClientErrors(role, profile);
+          if (Object.keys(shape).length) {
+            state.orchFieldErrors = shape;
+            state.orchGlobalError = "Fix the highlighted fields, then save again. Server validation still applies.";
+            renderOrchEditor();
+            return;
+          }
+          var scope = state.orchScope;
+          var myGen = state.orchSaveGen || 0;
+          var myRev = state.orchDraftRev || 0;
+          var hash = orchCurrentHash(scope);
+          if (hash === undefined) {
+            state.orchGlobalError = "Save aborted: " + orchFreshHashNote();
+            renderOrchEditor();
+            return;
+          }
+          var params = { role: role, profile: profile, scope: scope };
+          if (hash === null) params.expectedAbsent = true;
+          else params.expectedSourceHash = hash;
+          var scopeAtSubmit = scope;
+          var roleAtSubmit = role;
+          request("orchestration.set", params).then(function (res) {
+            if (myGen !== (state.orchSaveGen || 0) || (state.orchDraftRev || 0) !== myRev) { refreshOrchListOnly(); return; }
+            if (res && res.ok) {
+              state.orchDraft = { role: "", profile: "" };
+              state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+              setOrchDirty(false);
+              state.orchSelected = roleAtSubmit;
+              state.orchScope = scopeAtSubmit;
+              loadOrchestration(roleAtSubmit);
+            } else {
+              var mapped = mapOrchError(res && res.error);
+              if (mapped.isConflict) {
+                state.orchConflict = mapped.message + " Reload to compare; never silently overwriting.";
+                renderOrchEditor();
+              } else if (mapped.field !== "_global") {
+                state.orchFieldErrors[mapped.field] = mapped.message;
+                state.orchGlobalError = "Server validation failed — see the highlighted field.";
+                renderOrchEditor();
+              } else {
+                state.orchGlobalError = "(" + mapped.kind + ") " + mapped.message;
+                renderOrchEditor();
+              }
+            }
+          }, function () {
+            if (myGen !== (state.orchSaveGen || 0) || (state.orchDraftRev || 0) !== myRev) { refreshOrchListOnly(); return; }
+            state.orchGlobalError = "Bridge request failed.";
+            renderOrchEditor();
+          });
+        }
+        function resetOrchRole(role, scope) {
+          var myGen = state.orchSaveGen || 0;
+          var myRev = state.orchDraftRev || 0;
+          var scopeAtClick = typeof scope === "string" ? scope : state.orchScope;
+          if (!window.confirm('Reset ' + scopeAtClick + ' override for "' + role + '"? This deletes the ' + scopeAtClick + ' layer entry (clear: true) and falls back to the lower layer.')) return;
+          var hash = orchCurrentHash(scopeAtClick);
+          if (hash === undefined) {
+            state.orchGlobalError = "Reset aborted: " + orchFreshHashNote();
+            renderOrchEditor();
+            return;
+          }
+          if (hash === null) { window.alert("No " + scopeAtClick + " override exists to reset."); return; }
+          var params = { role: role, scope: scopeAtClick, clear: true, expectedSourceHash: hash };
+          request("orchestration.set", params).then(function (res) {
+            if (myGen !== (state.orchSaveGen || 0) || (state.orchDraftRev || 0) !== myRev) { refreshOrchListOnly(); return; }
+            if (res && res.ok) {
+              var stillOwner = state.orchSelected === role;
+              if (stillOwner && !state.orchDirty) {
+                state.orchDraft = { role: role, profile: "" };
+                setOrchDirty(false);
+              }
+              loadOrchestration(stillOwner ? role : null);
+            } else {
+              var mapped = mapOrchError(res && res.error);
+              state.orchGlobalError = "(" + mapped.kind + ") " + mapped.message;
+              renderOrchEditor();
+            }
+          }, function () {
+            if (myGen !== (state.orchSaveGen || 0) || (state.orchDraftRev || 0) !== myRev) { refreshOrchListOnly(); return; }
+            state.orchGlobalError = "Bridge request failed.";
+            renderOrchEditor();
+          });
+        }
+        function loadOrchPreview(role) {
+          var box = document.getElementById("orch-preview");
+          var targetRole = role || state.orchSelected;
+          if (!targetRole || targetRole === "__new__") { if (box) box.innerHTML = "<p class=\"muted\">Select a role first.</p>"; return; }
+          var found = null;
+          for (var i = 0; i < (state.orchItems || []).length; i += 1) {
+            if (state.orchItems[i].role === targetRole) found = state.orchItems[i];
+          }
+          // Only use the dirty draft when the preview target actually owns it:
+          // the role being edited (never a different row, never __new__ for
+          // an existing role). Otherwise previews leak one role's unsaved
+          // profile into another role's chain label.
+          var ownsDraft = !!state.orchDirty && targetRole === state.orchSelected && state.orchSelected !== "__new__";
+          var profile = ownsDraft && state.orchDraft.profile ? String(state.orchDraft.profile).trim() || (found ? found.profile : null) : (found ? found.profile : null);
+          if (!profile) { if (box) box.innerHTML = "<p class=\"muted\">No profile mapped for this role.</p>"; return; }
+          if (found && found.invalid && !ownsDraft) {
+            if (box) box.innerHTML = "<p><strong>Invalid reference:</strong> role <code>" + esc(targetRole) + "</code> points at missing profile <code>" + esc(profile) + "</code>. Fix the mapping before launch — no launch preview is available for a deleted profile.</p><p class=\"muted\">" + esc(orchChainText(targetRole, profile)) + "</p>";
+            return;
+          }
+          if (!can("launch.preview")) { if (box) box.innerHTML = "<p class=\"muted\">launch.preview unavailable on this host.</p>"; return; }
+          state.orchPreviewToken = (state.orchPreviewToken || 0) + 1;
+          var myPreviewToken = state.orchPreviewToken;
+          var myRole = targetRole;
+          var myProfile = profile;
+          if (box) box.innerHTML = "<p class=\"muted\">Loading launch preview for profile <code>" + esc(myProfile) + "</code> via <code>launch.preview</code> (JEF-7 compiler, display-only)…</p>";
+          request("launch.preview", { name: myProfile }).then(function (res) {
+            if (!box) return;
+            if (myPreviewToken !== state.orchPreviewToken) return;
+            if (myRole !== (role || state.orchSelected)) return;
+            if (res && res.ok && res.result) {
+              var r = res.result;
+              var resolved = r.resolved || {};
+              var launch = r.launch || {};
+              var html = "<p><strong>Role:</strong> <code>" + esc(myRole) + "</code> → <strong>profile:</strong> <code>" + esc(myProfile) + "</code></p>";
+              html += "<p class=\"muted\">" + esc(orchChainText(myRole, myProfile)) + "</p>";
+              html += "<p>Model/thinking: " + esc(resolved.model || "(no model)") + " / " + esc(resolved.thinking || "") + "</p>";
+              var tools = resolved.tools ? resolved.tools.join(", ") : "(defaults)";
+              html += "<p>Tools/skills/extensions/context: " + esc(tools) + " / " + esc((resolved.skills || []).join(", ") || "(none)") + " / " + esc((resolved.extensions || []).join(", ") || "(none)") + " / context " + (resolved.contextFiles ? "on" : "off") + "</p>";
+              html += "<p>Prompt source: " + esc((launch && launch.promptSource) || r.promptSource || "(see preview)") + "</p>";
+              var preview = (launch && launch.preview) || r.preview || "";
+              html += "<pre><code>" + esc(preview).slice(0, 4000) + "</code></pre>";
+              if (launch && launch.spec && launch.spec.args) {
+                html += "<p class=\"muted\">Sanitized argv (display-only, never executed):</p><pre><code>" + esc(JSON.stringify(launch.spec.args).slice(0, 2000)) + "</code></pre>";
+              }
+              box.innerHTML = html;
+            } else {
+              var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
+              if (found && found.invalid) {
+                box.innerHTML = "<p><strong>Preview failed (invalid reference).</strong> <span class=\"muted\">" + esc(msg) + " — role <code>" + esc(myRole) + "</code> points at missing profile <code>" + esc(myProfile) + "</code>. Fix before launch.</span></p><p class=\"muted\">" + esc(orchChainText(myRole, myProfile)) + "</p>";
+              } else {
+                box.innerHTML = "<p><strong>Preview failed.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+              }
+            }
+          }, function () {
+            if (!box) return;
+            if (myPreviewToken !== state.orchPreviewToken) return;
+            box.innerHTML = "<p><strong>Preview failed.</strong> <span class=\"muted\">bridge request failed</span></p>";
+          });
+        }
+        function loadOrchContext() {
+          var box = document.getElementById("orch-context");
+          if (!box) return;
+          if (!can("worktree.context")) {
+            // worktree.context is degraded-safe: when unavailable, show the
+            // explicit-scope note instead of claiming focus-based targeting.
+            box.innerHTML = "<p class=\"muted\">Worktree context unavailable on this host (needs <code>worktree.context</code>). Saves still bind to the explicit scope selected below — never to UI focus at completion time.</p>";
+            return;
+          }
+          box.innerHTML = "<p class=\"muted\">Worktree context: loading via <code>worktree.context</code>…</p>";
+          request("worktree.context").then(function (res) {
+            if (!box) return;
+            if (res && res.ok && res.result) {
+              var r = res.result;
+              var root = r.projectRoot || "(unknown)";
+              var wid = r.worktreeId ? " · worktree " + r.worktreeId : "";
+              var workerProf = null, reviewerProf = null;
+              for (var i = 0; i < (state.orchItems || []).length; i += 1) {
+                if (state.orchItems[i].role === "worker") workerProf = state.orchItems[i];
+                if (state.orchItems[i].role === "reviewer") reviewerProf = state.orchItems[i];
+              }
+              var html = "<p>Focused worktree/project (read-only): <code>" + esc(root) + "</code>" + esc(wid) + ". Mutations bind to the explicit scope captured at submission — never to focus at completion time.</p>";
+              if (workerProf || reviewerProf) {
+                html += "<p class=\"muted\">A worker launched here would use <code>" + esc(workerProf ? workerProf.profile : "(unmapped)") + "</code>" + (workerProf ? " (" + esc(describeOrchProv(workerProf.provenance)) + ")" : "") + "; a reviewer would use <code>" + esc(reviewerProf ? reviewerProf.profile : "(unmapped)") + "</code>" + (reviewerProf ? " (" + esc(describeOrchProv(reviewerProf.provenance)) + ")" : "") + ". Project override source: " + esc(state.orchMapping && state.orchMapping.config ? JSON.stringify(state.orchMapping.config.projectPath || state.orchMapping.config) : "(see mapping)") + ".</p>";
+              }
+              box.innerHTML = html;
+            } else {
+              box.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "context unavailable") + "</p>";
+            }
+          }, function () {
+            if (!box) return;
+            box.innerHTML = "<p class=\"muted\">Worktree context request failed.</p>";
+          });
+        }
+        function refreshOrchListOnly() {
+          if (!state.structured || !can("orchestration.get")) return Promise.resolve([]);
+          state.orchListToken = (state.orchListToken || 0) + 1;
+          var myTok = state.orchListToken;
+          return request("orchestration.get").then(function (res) {
+            if (myTok !== state.orchListToken) return;
+            if (!res || !res.ok || !res.result) return;
+            state.orchMapping = res.result;
+            state.orchItems = toOrchItems(res.result, orchKnownProfiles());
+            renderOrchList();
+            loadOrchContext();
+          });
+        }
+        function loadOrchestration(selectAfter) {
+          if (!state.structured) {
+            var box0 = document.getElementById("orchestration-summary");
+            if (box0) box0.innerHTML = "<p class=\"muted\">Structured bridge unreachable — mapping edits stay disabled. Use the explicit terminal action for read-only CLI commands.</p>";
+            var ed0 = document.getElementById("orch-editor");
+            if (ed0) ed0.innerHTML = "<p class=\"muted\">Save is disabled on this host: the structured bridge is unreachable (needs <code>orchestration.get</code> + <code>orchestration.set</code>). Mutations require the structured bridge — never a hidden store.</p>";
+            return Promise.resolve(null);
+          }
+          if (!can("orchestration.get")) {
+            var ob = document.getElementById("orchestration-summary");
+            if (ob) ob.innerHTML = "<p class=\"muted\">orchestration.get unavailable on this host. Mapping edits stay disabled.</p>";
+            return Promise.resolve(null);
+          }
+          state.orchListToken = (state.orchListToken || 0) + 1;
+          var myTok = state.orchListToken;
+          var box = document.getElementById("orchestration-summary");
+          if (box) box.innerHTML = "<p class=\"muted\">Loading orchestration mapping via <code>orchestration.get</code>…</p>";
+          return request("orchestration.get").then(function (res) {
+            if (myTok !== state.orchListToken) return null;
+            if (res && res.ok && res.result) {
+              // Never silently overwrite a dirty draft from a background refresh.
+              var wasDirty = !!state.orchDirty;
+              var revBefore = state.orchDraftRev || 0;
+              state.orchMapping = res.result;
+              state.orchItems = toOrchItems(res.result, orchKnownProfiles());
+              renderOrchList();
+              loadOrchContext();
+              if (selectAfter && !wasDirty && (state.orchDraftRev || 0) === revBefore) {
+                state.orchSelected = selectAfter;
+                // Centralized helper: post-save/refresh drafts come from the
+                // selected layer, never the merged winner.
+                state.orchDraft = orchScopedDraft(selectAfter, state.orchScope);
+                renderOrchEditor();
+              } else if (!wasDirty) {
+                renderOrchEditor();
+              }
+              return res.result;
+            } else {
+              var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
+              if (box) box.innerHTML = "<p><strong>Could not load mapping.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+              return null;
+            }
+          }, function () {
+            if (myTok !== state.orchListToken) return null;
+            if (box) box.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
+            return null;
+          });
+        }
         // List-only refresh for stale/background paths: updates the profile
         // list + placeholders without touching a dirty editor (never calls
         // loadDetail while dirty, so scope can never be silently retargeted).
@@ -1402,6 +2115,13 @@
               if (!res || !res.ok || !res.result) return;
               state.profiles = toListItems(res.result);
               renderList();
+              // Recompute orchestration invalid flags with fresh profile names
+              // (bridge invalidRefs stay authoritative; known-list is fallback).
+              // Never touches a dirty mapping draft — list metadata only.
+              if (state.orchMapping) {
+                state.orchItems = toOrchItems(state.orchMapping, orchKnownProfiles());
+                renderOrchList();
+              }
               if (selectAfter) {
                 // Post-save target: never reload over a newer dirty same-profile
                 // draft. If the editor became dirty or its revision advanced
@@ -1439,17 +2159,9 @@
               }
             }));
           }
-          if (can("orchestration.get")) {
-            request("orchestration.get").then(function (res) {
-              var box = document.getElementById("orchestration-summary");
-              if (!box) return;
-              if (res && res.ok) box.innerHTML = "<pre><code>" + esc(JSON.stringify(res.result).slice(0, 3000)) + "</code></pre><p class=\"muted\">Full mapping UI lands in UI1.4.</p>";
-              else box.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "unavailable") + "</p>";
-            });
-          } else {
-            var ob = document.getElementById("orchestration-summary");
-            if (ob) ob.innerHTML = "<p class=\"muted\">orchestration.get unavailable on this host. Full UI in UI1.4.</p>";
-          }
+          // Orchestration mapping (UI1.4): full role→profile table + editor +
+          // launch preview. Never silently overwrites a dirty mapping draft.
+          ops.push(loadOrchestration(null));
           if (can("github.status")) {
             request("github.status").then(function (res) {
               var box = document.getElementById("github-summary");
@@ -1517,6 +2229,41 @@
           if (lp) lp.addEventListener("click", function () { loadLaunchPreview(null); });
           var dr = document.getElementById("btn-diagnostics-reload");
           if (dr) dr.addEventListener("click", loadDiagnostics);
+          // Orchestration (UI1.4) toolbar: explicit scope + race-safe refresh.
+          var orchRefresh = document.getElementById("btn-orch-refresh");
+          if (orchRefresh) orchRefresh.addEventListener("click", function () {
+            if (state.orchDirty && !window.confirm("Unsaved mapping changes will be lost. Refresh anyway?")) return;
+            state.orchDraft = { role: "", profile: "" };
+            state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+            setOrchDirty(false);
+            loadOrchestration(state.orchSelected && state.orchSelected !== "__new__" ? state.orchSelected : null);
+          });
+          var orchScope = document.getElementById("orch-scope");
+          if (orchScope) orchScope.addEventListener("change", function () {
+            var nextDefault = orchScope.value;
+            var editorActive = !!(state.orchSelected);
+            if (!editorActive) { state.orchScope = nextDefault; return; }
+            if (nextDefault === state.orchScope) return;
+            if (state.orchDirty) {
+              if (!window.confirm('Change default scope to "' + nextDefault + '"? This discards unsaved ' + state.orchScope + ' edits and reloads the editor for ' + nextDefault + ' (drafts are per-layer).')) {
+                orchScope.value = state.orchScope;
+                return;
+              }
+              state.orchDraft = { role: state.orchSelected === "__new__" ? "" : state.orchSelected, profile: "" };
+              state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
+              setOrchDirty(false);
+            }
+            state.orchSaveGen = (state.orchSaveGen || 0) + 1;
+            state.orchScope = nextDefault;
+            // Re-init from the newly selected layer via the centralized
+            // helper so the toolbar switch cannot stage the wrong layer.
+            if (state.orchSelected && state.orchSelected !== "__new__") {
+              state.orchDraft = orchScopedDraft(state.orchSelected, nextDefault);
+            }
+            renderOrchEditor();
+          });
+          var orchPrev = document.getElementById("btn-orch-preview");
+          if (orchPrev) orchPrev.addEventListener("click", function () { loadOrchPreview(null); });
 
           var b = bridge();
           var st = document.getElementById("bridge-state");

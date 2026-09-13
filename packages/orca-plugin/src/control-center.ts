@@ -1,5 +1,5 @@
 /**
- * Orca-Pi Control Center helpers (UI1.3).
+ * Orca-Pi Control Center helpers (UI1.3 shell + Profiles, UI1.4 Orchestration).
  *
  * Pure, dependency-light helpers for the single Control Center shell and the
  * structured Profiles editor. No I/O, no `node:` imports, no DOM — panels,
@@ -40,7 +40,7 @@ export type ControlCenterSectionId =
 export interface ControlCenterSection {
   id: ControlCenterSectionId;
   title: string;
-  /** True when UI1.3 implements the section; others are placeholders. */
+  /** True when the section is implemented (Profiles UI1.3, Orchestration UI1.4, Diagnostics UI1.3); others are placeholders. */
   implemented: boolean;
   blurb: string;
 }
@@ -57,9 +57,9 @@ export function controlCenterSections(): readonly ControlCenterSection[] {
     {
       id: "orchestration",
       title: "Orchestration",
-      implemented: false,
+      implemented: true,
       blurb:
-        "Role→profile mapping lives here in UI1.4. This shell reserves the section so later issues populate it without rewriting navigation.",
+        "Map Orca roles/task types to Pi profiles (worker/scout/reviewer defaults plus custom roles) with provenance, validation, and launch preview. Saves through the authoritative orchestration service; Orca owns task/DAG/worktree/run lifecycle.",
     },
     {
       id: "github",
@@ -599,4 +599,261 @@ export function toListItems(payload: unknown): ControlCenterListItem[] {
     });
   }
   return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration role→profile mapping (UI1.4)
+//
+// Pure helpers for the Orca-native orchestration configuration UI. Orca owns
+// task/DAG/worktree/run lifecycle; Orca-Pi owns only Pi-specific execution
+// policy (which Pi profile backs each logical role). All mutations route
+// through the authoritative orchestration service via `orchestration.set`
+// with explicit user/project scope + source hash; the panel never writes
+// files directly and never stores a second copy of the mapping.
+//
+// Backend model (v1, from `@orca-pi/core` orchestration/config.ts):
+// - Builtins (lowest layer): worker→worker, scout→scout, reviewer→reviewer.
+// - user/global (`orchestration.json` alongside profiles) < project
+//   (`<projectRoot>/.pi/orchestration.json`); project wins.
+// - Custom named roles are supported (same `[a-z0-9-]+` grammar); they act
+//   as extensible preset slots. There is no separate team-preset store in
+//   v1 — team presets/DAG remain Orca-native and are never duplicated here.
+// - Dangling refs never throw at read time so the UI can surface them
+//   before launch via `invalidRefs` / known-profile comparison.
+// ---------------------------------------------------------------------------
+
+/** Built-in orchestration roles (lowest layer, always present). */
+export const ORCHESTRATION_BUILTIN_ROLES = ["worker", "scout", "reviewer"] as const;
+
+/** Ownership boundary shown in the UI (never duplicate Orca surfaces). */
+export const ORCHESTRATION_OWNERSHIP_NOTE =
+  "Orca owns task/DAG/worktree/run lifecycle; Orca-Pi owns only role→profile policy.";
+
+/** Resolution chain shown alongside every launch preview. */
+export const ORCHESTRATION_CHAIN_LABEL =
+  "Orchestration role mapping → profile → user/project profile layers → effective launch";
+
+/** Scope for orchestration writes. Never inferred — always explicit. */
+export type OrchestrationScope = "user" | "project";
+
+/** One normalized role→profile row for the mapping table. */
+export interface OrchestrationItem {
+  role: string;
+  profile: string;
+  provenance: "builtin" | "user" | "project";
+  /** True when the referenced profile has no matching Pi profile. */
+  invalid: boolean;
+}
+
+/** True for shipped role defaults (worker/scout/reviewer). */
+export function isBuiltinOrchestrationRole(role: string): boolean {
+  return (ORCHESTRATION_BUILTIN_ROLES as readonly string[]).includes(role);
+}
+
+const ORCH_ROLE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** Canonical Pi profile-name grammar (mirrors core profile/schema.ts); role names stay narrow. */
+const ORCH_PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const ORCH_MAX_NAME = 64;
+const ORCH_RESERVED = new Set(["__proto__", "prototype", "constructor"]);
+
+/** Validate one role name against the backend grammar (mirrors core). */
+export function validateOrchestrationRole(role: unknown): string | undefined {
+  if (typeof role !== "string" || role.length === 0) return "expected a role name (e.g. \"worker\", \"scout\", \"reviewer\").";
+  if (ORCH_RESERVED.has(role)) return "reserved name: never use \"__proto__\", \"constructor\", or \"prototype\".";
+  if (role.length > ORCH_MAX_NAME || !ORCH_ROLE_PATTERN.test(role)) {
+    return `use 1-${ORCH_MAX_NAME} chars matching [a-z0-9]+(-[a-z0-9]+)* (e.g. "worker-fast").`;
+  }
+  return undefined;
+}
+
+/** Validate one profile reference against the canonical Pi profile grammar (letters/digits/_/-). */
+export function validateOrchestrationProfileRef(ref: unknown): string | undefined {
+  if (typeof ref !== "string" || ref.length === 0) return "expected a Pi profile name (e.g. \"worker-fast\").";
+  if (ORCH_RESERVED.has(ref)) return "reserved name: never use \"__proto__\", \"constructor\", or \"prototype\".";
+  if (ref.length > ORCH_MAX_NAME || !ORCH_PROFILE_PATTERN.test(ref)) {
+    return `use 1-${ORCH_MAX_NAME} chars matching [A-Za-z0-9][A-Za-z0-9_-]* (e.g. "worker-fast", "Worker_Fast"). Roles stay narrow; profile refs accept the full Pi grammar.`;
+  }
+  return undefined;
+}
+
+/** Client-side shape checks for the orchestration draft (server remains authoritative). */
+export function validateOrchestrationDraft(draft: { role?: unknown; profile?: unknown }): DraftIssue[] {
+  const issues: DraftIssue[] = [];
+  const roleErr = draft.role !== undefined ? validateOrchestrationRole(draft.role) : "expected a role name.";
+  if (roleErr) issues.push({ field: "role", message: roleErr });
+  const profileErr = draft.profile !== undefined ? validateOrchestrationProfileRef(draft.profile) : "expected a Pi profile name.";
+  if (profileErr) issues.push({ field: "profile", message: profileErr });
+  return issues;
+}
+
+/**
+ * Build `orchestration.set` params for one role→profile mapping.
+ * - `expectedSourceHash`: SHA-256 of the scope file as last seen (optimistic concurrency).
+ * - `expectedAbsent: true` asserts the scope file is still absent (fresh installs).
+ * Never includes shell strings; scope is always explicit.
+ */
+export function buildOrchestrationSetParams(options: {
+  role: string;
+  profile: string;
+  scope: OrchestrationScope;
+  expectedSourceHash?: string | null;
+  expectedAbsent?: boolean;
+}): Record<string, unknown> {
+  const { role, profile, scope } = options;
+  const hash =
+    options.expectedSourceHash !== undefined
+      ? { expectedSourceHash: options.expectedSourceHash }
+      : options.expectedAbsent === true
+        ? { expectedAbsent: true }
+        : {};
+  return { role, profile, scope, ...hash };
+}
+
+/**
+ * Build `orchestration.set` params that clear one role override
+ * (`clear: true` falls back to the lower layer; builtins can never be
+ * deleted, only overridden). Same versioning contract as set.
+ */
+export function buildOrchestrationClearParams(options: {
+  role: string;
+  scope: OrchestrationScope;
+  expectedSourceHash?: string | null;
+  expectedAbsent?: boolean;
+}): Record<string, unknown> {
+  const { role, scope } = options;
+  const hash =
+    options.expectedSourceHash !== undefined
+      ? { expectedSourceHash: options.expectedSourceHash }
+      : options.expectedAbsent === true
+        ? { expectedAbsent: true }
+        : {};
+  return { role, scope, clear: true, ...hash };
+}
+
+function asProvenance(value: unknown): "builtin" | "user" | "project" {
+  if (value === "user" || value === "project") return value;
+  return "builtin";
+}
+
+/**
+ * Normalize an unknown `orchestration.get` payload into table rows (never throws).
+ * Accepts the bridge shape `{effective|roles, provenance, invalidRefs?}` plus
+ * the raw `{roles}` file shape. `knownProfiles` (from `profiles.list`) marks
+ * `invalid` when the payload carries no `invalidRefs` of its own, so deleted
+ * profiles surface before launch instead of hiding the config.
+ * Sort: worker/scout/reviewer first (builtin order), then custom roles alpha.
+ */
+export function toOrchestrationItems(payload: unknown, knownProfiles?: readonly string[]): OrchestrationItem[] {
+  if (!isPlainRecord(payload)) return [];
+  const rec = payload as Record<string, unknown>;
+  const mappingRaw =
+    (isPlainRecord(rec["effective"]) ? rec["effective"] : undefined) ??
+    (isPlainRecord(rec["roles"]) ? rec["roles"] : undefined) ??
+    (isPlainRecord(rec["mapping"]) ? rec["mapping"] : undefined);
+  if (!isPlainRecord(mappingRaw)) return [];
+  const provenanceRaw = isPlainRecord(rec["provenance"]) ? (rec["provenance"] as Record<string, unknown>) : {};
+  const hasInvalidRefs = Array.isArray(rec["invalidRefs"]);
+  const invalidSet = new Set<string>(
+    hasInvalidRefs ? (rec["invalidRefs"] as unknown[]).filter((r): r is string => typeof r === "string") : [],
+  );
+  const known = knownProfiles !== undefined ? new Set(knownProfiles) : undefined;
+  const out: OrchestrationItem[] = [];
+  for (const [role, profile] of Object.entries(mappingRaw)) {
+    if (typeof profile !== "string") continue;
+    if (validateOrchestrationRole(role) !== undefined) continue;
+    const provenance = asProvenance(provenanceRaw[role]);
+    // Trust the bridge's invalidRefs when provided (even when empty = all
+    // valid). Fall back to known-profile comparison only when the payload
+    // carries no invalidRefs of its own and the known list is non-empty —
+    // an empty known list means profiles haven't loaded yet, never "all invalid".
+    const invalid =
+      invalidSet.has(role) || (!hasInvalidRefs && known !== undefined && known.size > 0 && !known.has(profile));
+    out.push({ role, profile, provenance, invalid });
+  }
+  const builtinOrder = new Map<string, number>(
+    (ORCHESTRATION_BUILTIN_ROLES as readonly string[]).map((r, i) => [r, i]),
+  );
+  out.sort((a, b) => {
+    const ao = builtinOrder.has(a.role) ? (builtinOrder.get(a.role) as number) : 1000;
+    const bo = builtinOrder.has(b.role) ? (builtinOrder.get(b.role) as number) : 1000;
+    if (ao !== bo) return ao - bo;
+    return a.role < b.role ? -1 : a.role > b.role ? 1 : 0;
+  });
+  return out;
+}
+
+/**
+ * Read one layer's authoritative role value from an `orchestration.get`
+ * payload (never throws). Returns the layer's own entry when present,
+ * otherwise undefined (no override in that layer — the effective winner
+ * comes from a lower layer). Editors must initialize from this, never
+ * from the merged effective value, so saving the user layer cannot copy
+ * the project winner into it.
+ */
+export function orchestrationLayerValue(
+  payload: unknown,
+  role: string,
+  scope: OrchestrationScope,
+): string | undefined {
+  if (!isPlainRecord(payload) || typeof role !== "string") return undefined;
+  if (scope !== "user" && scope !== "project") return undefined;
+  const layers = (payload as Record<string, unknown>)["layers"];
+  if (!isPlainRecord(layers)) return undefined;
+  const layer = layers[scope];
+  if (!isPlainRecord(layer)) return undefined;
+  const value = (layer as Record<string, unknown>)[role];
+  return typeof value === "string" ? value : undefined;
+}
+
+/** Human layer label for the mapping table. */
+export function describeOrchestrationProvenance(prov: OrchestrationItem["provenance"] | undefined): string {
+  if (prov === "project") return "project (.pi/orchestration.json)";
+  if (prov === "user") return "user/global (orchestration.json)";
+  return "built-in defaults";
+}
+
+/** One-line resolution chain for a role (shown beside every launch preview). */
+export function describeOrchestrationChain(role: string, profile: string): string {
+  return `Role "${role}" → profile "${profile}" → user/project profile layers → effective launch (${ORCHESTRATION_CHAIN_LABEL}).`;
+}
+
+/** Summary line for the mapping table (valid vs invalid before launch). */
+export function orchestrationInvalidSummary(items: readonly OrchestrationItem[]): string {
+  const invalid = items.filter((i) => i.invalid);
+  if (invalid.length === 0) return `all ${items.length} mapping(s) valid (every referenced profile exists).`;
+  return `${invalid.length} invalid reference(s): ${invalid.map((i) => `${i.role}→${i.profile}`).join(", ")} — fix before launch.`;
+}
+
+/**
+ * Map a bridge error for `orchestration.set` onto editor UX.
+ * `conflict` → reload/compare (never silent overwrite). `validation` with a
+ * dotted field → short field (`role`/`profile`/`scope`); everything else →
+ * `_global` with the server message intact.
+ */
+export function mapOrchestrationErrorToField(error: {
+  code?: unknown;
+  message?: unknown;
+  field?: unknown;
+  retryable?: unknown;
+}): MappedBridgeError {
+  const code = typeof error.code === "string" ? error.code : "internal";
+  const message = typeof error.message === "string" && error.message.length > 0 ? error.message : "Request failed.";
+  const kind = (
+    ["validation", "conflict", "unsupported", "auth/setup", "internal", "not-found", "already-exists"] as const
+  ).includes(code as BridgeErrorKind)
+    ? (code as BridgeErrorKind)
+    : "internal";
+  const retryable = error.retryable === true || kind === "conflict";
+  const isConflict = kind === "conflict";
+  let field = "_global";
+  const rawField = typeof error.field === "string" ? error.field : undefined;
+  if (rawField) {
+    const short = rawField.split(".").pop() ?? rawField;
+    if (short === "role" || short === "profile" || short === "scope") field = short;
+    else field = rawField;
+  } else {
+    const match = /role\s+"([^"]+)"|profile\s+"([^"]+)"/i.exec(message);
+    if (match) field = match[1] !== undefined ? "role" : "profile";
+  }
+  return { kind, message, field, retryable, isConflict };
 }

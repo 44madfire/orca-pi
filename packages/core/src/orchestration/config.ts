@@ -82,8 +82,10 @@ export const BUILTIN_ROLE_MAPPING: Readonly<Record<string, string>> = Object.fre
 
 export const ORCHESTRATION_CONFIG_VERSION = 1;
 
-/** Profile-name rule shared with `profile/schema.ts` (no import to keep this module light). */
+/** Role-name rule (narrow, lowercase-hyphen). Profile refs use the canonical Pi profile grammar below. */
 const ROLE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** Canonical Pi profile-name rule, mirrored from `profile/schema.ts` (no import to keep this module light). */
+const PROFILE_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const MAX_NAME_LENGTH = 64;
 const RESERVED = new Set(["__proto__", "prototype", "constructor"]);
 
@@ -98,11 +100,11 @@ function assertValidRole(role: string): void {
 }
 
 function assertValidProfileRef(profile: string, role: string): void {
-  if (typeof profile !== "string" || profile.length === 0 || profile.length > MAX_NAME_LENGTH || !ROLE_PATTERN.test(profile) || RESERVED.has(profile)) {
+  if (typeof profile !== "string" || profile.length === 0 || profile.length > MAX_NAME_LENGTH || !PROFILE_REF_PATTERN.test(profile) || RESERVED.has(profile)) {
     throw new OrchestrationConfigError({
       code: "invalid-profile",
       role,
-      message: `Invalid profile reference ${JSON.stringify(profile)} for role ${JSON.stringify(role)}: use 1-${MAX_NAME_LENGTH} chars matching ${ROLE_PATTERN} (e.g. "worker-fast").`,
+      message: `Invalid profile reference ${JSON.stringify(profile)} for role ${JSON.stringify(role)}: use 1-${MAX_NAME_LENGTH} chars matching ${PROFILE_REF_PATTERN} (e.g. "worker-fast"). Roles stay narrow; profile refs accept the full Pi profile grammar (letters, digits, "_"/"-").`,
     });
   }
 }
@@ -122,6 +124,16 @@ export interface RoleMapping {
   readonly effective: Readonly<Record<string, string>>;
   /** Per-role provenance (`builtin`, `user`, `project`). */
   readonly provenance: Readonly<Record<string, "builtin" | "user" | "project">>;
+  /**
+   * Authoritative per-layer role values (before merge), so editors can
+   * initialize from the selected layer instead of the merged effective
+   * winner. `user`/`project` contain only that file's own `roles` entries
+   * (empty when the file is absent); builtins are not repeated here.
+   */
+  readonly layers: {
+    readonly user: Readonly<Record<string, string>>;
+    readonly project: Readonly<Record<string, string>>;
+  };
   /** Roles whose referenced profile is syntactically valid but missing/invalid at resolve time (filled by callers with profile knowledge). */
   readonly invalidRefs?: readonly string[];
   readonly config: {
@@ -479,6 +491,10 @@ export async function getRoleMapping(
     roles,
     effective: Object.freeze({ ...roles }),
     provenance: Object.freeze({ ...provenance }),
+    layers: Object.freeze({
+      user: Object.freeze({ ...userLayer.roles }),
+      project: Object.freeze({ ...projectLayer.roles }),
+    }),
     ...(invalidRefs !== undefined ? { invalidRefs: Object.freeze([...invalidRefs]) } : {}),
     config: {
       userPath,
