@@ -59,6 +59,16 @@ export interface PiConformanceDriver {
   listModels(sessionId: string): Promise<readonly { id: string; provider?: string }[]>;
   listThinkingLevels(sessionId: string): Promise<readonly string[]>;
   dispatchExpectRejected(sessionId: string, text: string): Promise<string>;
+  /** Image dispatch must be accepted on image-capable models with text-only history (bytes never journaled). */
+  dispatchImage(sessionId: string, text: string): Promise<{ status: string; reason?: string; historyHasBase64: boolean }>;
+  /** Successful option apply must persist provider-confirmed values (not just fail-closed paths). */
+  applyValidThinkingLevel(sessionId: string, level: string): Promise<{ applied: string; confirmed: string }>;
+  /** Ambiguous Pi prompt failure must surface as `unknown` (never `rejected`), preserving retry safety. */
+  dispatchAmbiguous(sessionId: string, text: string): Promise<{ status: string; reason?: string }>;
+  /** Resume via `resumePath` must rebuild only the active branch (abandoned siblings excluded). */
+  resumeActiveBranch(): Promise<{ resumed: boolean; transcript: string; hasAbandoned: boolean; leafId?: string }>;
+  /** Native event boundary must stream turn lifecycle (not only provider-internal history). */
+  observeTurnEvents(sessionId: string, text: string): Promise<{ sawTurnStart: boolean; sawSettled: boolean }>;
   release(sessionId: string): Promise<void>;
   close(sessionId?: string): Promise<void>;
   supportsCreate(location: { executionHostId: string; wslDistro: string | null }, agent: string): boolean;
@@ -71,6 +81,26 @@ export interface PiConformanceScenario {
 }
 
 export const PI_CONFORMANCE_SCENARIOS: readonly PiConformanceScenario[] = [
+  {
+    id: "ambiguous-delivery",
+    title: "Ambiguous delivery preserves unknown",
+    description: "An ambiguous Pi prompt failure surfaces as unknown (never rejected) so callers reconcile via history.",
+  },
+  {
+    id: "images-options-success",
+    title: "Images and successful option apply",
+    description: "Image dispatch is accepted with text-only history; valid thinking levels apply with provider-confirmed values.",
+  },
+  {
+    id: "resume-active-branch",
+    title: "Resume rebuilds only the active branch",
+    description: "acquire{resumePath} reconstructs root→leaf, excludes abandoned siblings, and names the Pi leaf.",
+  },
+  {
+    id: "session-event-boundary",
+    title: "Session-event boundary streams lifecycle",
+    description: "Turn start/settlement streams through the native event boundary, not only provider-internal history.",
+  },
   {
     id: "basic-dispatch-streaming",
     title: "Basic dispatch and text streaming",
@@ -126,6 +156,10 @@ export async function runPiConformanceSuite(
   makeDriver: () => Promise<PiConformanceDriver> | PiConformanceDriver,
 ): Promise<PiConformanceResult[]> {
   const results: PiConformanceResult[] = [];
+  results.push(await scenarioAmbiguousDelivery(makeDriver));
+  results.push(await scenarioImagesOptionsSuccess(makeDriver));
+  results.push(await scenarioResumeActiveBranch(makeDriver));
+  results.push(await scenarioSessionEventBoundary(makeDriver));
   results.push(await scenarioBasicDispatch(makeDriver));
   results.push(await scenarioThinkingTools(makeDriver));
   results.push(await scenarioOptionsPromptsImages(makeDriver));
@@ -133,6 +167,82 @@ export async function runPiConformanceSuite(
   results.push(await scenarioCancelCloseErrors(makeDriver));
   results.push(await scenarioNativeGating(makeDriver));
   return results;
+}
+
+async function scenarioAmbiguousDelivery(
+  makeDriver: () => Promise<PiConformanceDriver> | PiConformanceDriver,
+): Promise<PiConformanceResult> {
+  const id = "ambiguous-delivery";
+  try {
+    const driver = await makeDriver();
+    const acquired = await driver.acquire({ workspaceRoot: "/tmp/pi-conformance-ws" });
+    const res = await driver.dispatchAmbiguous(acquired.sessionId, "ambiguous prompt");
+    if (res.status !== "unknown") return fail(id, `expected unknown, saw ${res.status} (${res.reason ?? ""})`);
+    await driver.release(acquired.sessionId).catch(() => undefined);
+    await driver.close().catch(() => undefined);
+    return ok(id, `${driver.label}: ambiguous Pi failure preserved as unknown`);
+  } catch (error) {
+    return fail(id, error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function scenarioImagesOptionsSuccess(
+  makeDriver: () => Promise<PiConformanceDriver> | PiConformanceDriver,
+): Promise<PiConformanceResult> {
+  const id = "images-options-success";
+  try {
+    const driver = await makeDriver();
+    const acquired = await driver.acquire({ workspaceRoot: "/tmp/pi-conformance-ws" });
+    const img = await driver.dispatchImage(acquired.sessionId, "describe attachment");
+    if (img.status !== "accepted") return fail(id, `image dispatch status=${img.status} (${img.reason ?? ""})`);
+    if (img.historyHasBase64) return fail(id, "image bytes journaled into history");
+    const applied = await driver.applyValidThinkingLevel(acquired.sessionId, "high");
+    if (applied.applied !== "high" || applied.confirmed !== "high") {
+      return fail(id, `thinking apply mismatch (applied=${applied.applied}, confirmed=${applied.confirmed})`);
+    }
+    await driver.release(acquired.sessionId).catch(() => undefined);
+    await driver.close().catch(() => undefined);
+    return ok(id, `${driver.label}: image accepted text-only, thinking level applied`);
+  } catch (error) {
+    return fail(id, error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function scenarioResumeActiveBranch(
+  makeDriver: () => Promise<PiConformanceDriver> | PiConformanceDriver,
+): Promise<PiConformanceResult> {
+  const id = "resume-active-branch";
+  try {
+    const driver = await makeDriver();
+    const res = await driver.resumeActiveBranch();
+    if (!res.resumed) return fail(id, "resume did not report resumed:true");
+    if (res.hasAbandoned) return fail(id, `abandoned sibling leaked (${res.transcript})`);
+    if (!res.transcript.includes("user:hello active") || !res.transcript.includes("assistant:active reply")) {
+      return fail(id, `active branch missing (${res.transcript})`);
+    }
+    if (!res.leafId) return fail(id, "resume did not name the Pi leaf");
+    return ok(id, `${driver.label}: root→leaf rebuilt, abandoned excluded, leaf=${res.leafId}`);
+  } catch (error) {
+    return fail(id, error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function scenarioSessionEventBoundary(
+  makeDriver: () => Promise<PiConformanceDriver> | PiConformanceDriver,
+): Promise<PiConformanceResult> {
+  const id = "session-event-boundary";
+  try {
+    const driver = await makeDriver();
+    const acquired = await driver.acquire({ workspaceRoot: "/tmp/pi-conformance-ws" });
+    const seen = await driver.observeTurnEvents(acquired.sessionId, "event boundary");
+    if (!seen.sawTurnStart) return fail(id, "no turn_start on the event boundary");
+    if (!seen.sawSettled) return fail(id, "no settled on the event boundary");
+    await driver.release(acquired.sessionId).catch(() => undefined);
+    await driver.close().catch(() => undefined);
+    return ok(id, `${driver.label}: turn_start→settled streamed on the event boundary`);
+  } catch (error) {
+    return fail(id, error instanceof Error ? error.message : String(error));
+  }
 }
 
 async function scenarioBasicDispatch(

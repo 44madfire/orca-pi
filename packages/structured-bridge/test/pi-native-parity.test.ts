@@ -5,18 +5,17 @@
  * Parity requirement (from #18): run the same conformance suite against
  * bridge and native paths for basic dispatch/streaming,
  * thinking/tools/errors/lifecycle, options/prompts/images,
- * history/current-branch restore, cancel/close/error classification.
- *
- * Both drivers below use deterministically scripted fake Pi connections (no
- * real Pi, no OS process). The bridge driver goes through `PiBridgeProvider`
- * JSONL (`onLine` + `attachTestTransport`); the native driver goes through
- * `PiNativeProvider` direct calls (which itself drives the SAME
- * `PiBridgeProvider` class in-process, minus the helper OS process). Parity
- * is asserted row-by-row: every scenario must pass on both paths with the
- * same machine-readable verdicts.
+ * history/current-branch restore, cancel/close/error classification —
+ * plus the SNC1.8 additions that close ChatGPT round-1 gaps: ambiguous
+ * delivery preserves `unknown`, images + successful option apply, resume
+ * rebuilds only the active branch, and the session-event boundary streams
+ * lifecycle (not only provider-internal history).
  */
 
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PiBridgeProvider, type PiProviderConnection } from "../src/pi-provider.js";
 import { PiNativeProvider } from "../src/pi-native.js";
 import {
@@ -27,25 +26,42 @@ import {
 import { serializeBridgeLine } from "../src/framing.js";
 import type { ProviderToHostMessage } from "../src/protocol.js";
 import type {
+  PiEntriesData,
   PiModel,
   PiRpcCloseResult,
   PiRpcConnectionOptions,
   PiServerEvent,
   PiState,
+  PiTreeData,
 } from "@orca-pi/pi-rpc";
 
-/** Deterministic fake Pi with live option RPCs (SNC1.6 catalog + SNC1.7 minimal history). */
+function piMsg(id: string, parentId: string | null, role: string, text: string) {
+  return {
+    type: "message",
+    id,
+    parentId,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    message: { role, content: [{ type: "text", text }], timestamp: 1700000000000 },
+  };
+}
+
+/** Deterministic fake Pi with options + history + ambiguous-failure support. */
 class ParityFakePi implements PiProviderConnection {
   readonly seenOpts: PiRpcConnectionOptions;
   readonly prompts: Array<{ message: string }> = [];
   readonly uiResponses: Array<unknown> = [];
   aborts = 0;
   started = false;
+  /** When set, the next `prompt()` throws it (ambiguous vs definite refusal). */
+  failPromptWith: unknown = null;
   models: PiModel[] = [
     { id: "glm-5.3-flash", provider: "opencode-go", input: ["text", "image"] } as PiModel,
     { id: "text-only-model", provider: "opencode-go", input: ["text"] } as PiModel,
   ];
   levels: string[] = ["low", "high", "max"];
+  switchedTo: string[] = [];
+  entries: Array<Record<string, unknown>> = [];
+  leafId = "";
   state: PiState = {
     model: { id: "glm-5.3-flash", provider: "opencode-go" } as PiState["model"],
     thinkingLevel: "low",
@@ -72,6 +88,11 @@ class ParityFakePi implements PiProviderConnection {
 
   async prompt(message: string): Promise<void> {
     this.prompts.push({ message });
+    if (this.failPromptWith) {
+      const err = this.failPromptWith;
+      this.failPromptWith = null;
+      throw err;
+    }
   }
 
   async abort(): Promise<void> {
@@ -141,9 +162,43 @@ class ParityFakePi implements PiProviderConnection {
     void enabled;
   }
 
+  async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
+    this.switchedTo.push(sessionPath);
+    return { cancelled: false };
+  }
+
+  async getEntries(): Promise<PiEntriesData> {
+    return { entries: this.entries as never, leafId: this.leafId };
+  }
+
+  async getTree(): Promise<PiTreeData> {
+    return { tree: [] as never, leafId: this.leafId };
+  }
+
   emit(event: PiServerEvent): void {
     for (const h of [...this.eventHandlers]) h(event);
   }
+}
+
+function seedActiveBranchWithAbandonedSibling(fake: ParityFakePi): void {
+  fake.entries = [
+    piMsg("e1", null, "user", "hello active"),
+    piMsg("e2", "e1", "assistant", "active reply"),
+    // Abandoned fork sibling off e1 (must never render when leaf is e2).
+    piMsg("eX", "e1", "assistant", "abandoned branch"),
+  ];
+  fake.leafId = "e2";
+  fake.state = { ...fake.state, messageCount: 2 };
+}
+
+function seedResumeDir(): { dir: string; resumePath: string } {
+  const dir = mkdtempSync(join(tmpdir(), "snc18-resume-"));
+  const resumePath = join(dir, "ses.jsonl");
+  writeFileSync(
+    resumePath,
+    JSON.stringify({ type: "session", version: 3, id: "x", timestamp: "2026-01-01T00:00:00.000Z", cwd: dir }) + "\n",
+  );
+  return { dir, resumePath };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -189,11 +244,8 @@ function makeBridgeDriver(): PiConformanceDriver & { fakes: ParityFakePi[] } {
     helloDone ??= hello();
     return helloDone;
   };
-  const fakeFor = (sessionId: string): ParityFakePi => {
-    // One session per driver in the conformance suite; the single fake owns it.
-    // Multi-session scenarios are not used here (each scenario is isolated).
-    void sessionId;
-    const fake = fakes[0];
+  const fakeFor = (): ParityFakePi => {
+    const fake = fakes[fakes.length - 1];
     if (!fake) throw new Error("no fake Pi for session");
     return fake;
   };
@@ -229,8 +281,8 @@ function makeBridgeDriver(): PiConformanceDriver & { fakes: ParityFakePi[] } {
       const err = reply as unknown as { error: { code: string; message: string } };
       return { status: "unknown", reason: `${err.error.code}: ${err.error.message}` };
     },
-    async streamText(sessionId, chunks, finalText) {
-      const fake = fakeFor(sessionId);
+    async streamText(_sessionId, chunks, finalText) {
+      const fake = fakeFor();
       fake.emit({ type: "turn_start" } as PiServerEvent);
       fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } } as unknown as PiServerEvent);
       for (const delta of chunks) {
@@ -241,27 +293,22 @@ function makeBridgeDriver(): PiConformanceDriver & { fakes: ParityFakePi[] } {
       fake.emit({ type: "agent_settled" } as PiServerEvent);
       await sleep(20);
     },
-    async streamThinking(sessionId) {
-      const fake = fakeFor(sessionId);
-      // Thinking channel activity ahead of the tool/text below is injected by
-      // the caller interleaved with its own turn; here we only emit the
-      // thinking records (the turn boundaries belong to the surrounding
-      // dispatch's streamText/streamTool calls). Emitting a standalone
-      // thinking record outside a turn is bounded-ignored by design.
+    async streamThinking() {
+      const fake = fakeFor();
       fake.emit({ type: "message_update", assistantMessageEvent: { type: "thinking_start", contentIndex: 0 } } as unknown as PiServerEvent);
       fake.emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "considering" } } as unknown as PiServerEvent);
       fake.emit({ type: "message_update", assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "considering" } } as unknown as PiServerEvent);
       await sleep(10);
     },
-    async streamToolSuccess(sessionId, toolCallId, toolName) {
-      const fake = fakeFor(sessionId);
+    async streamToolSuccess(_sessionId, toolCallId, toolName) {
+      const fake = fakeFor();
       fake.emit({ type: "tool_execution_start", toolCallId, toolName, args: { path: "a" } } as unknown as PiServerEvent);
       fake.emit({ type: "tool_execution_update", toolCallId, partialResult: "tool-output-partial" } as unknown as PiServerEvent);
       fake.emit({ type: "tool_execution_end", toolCallId, result: "tool-output", isError: false } as unknown as PiServerEvent);
       await sleep(10);
     },
-    async streamTurnError(sessionId) {
-      const fake = fakeFor(sessionId);
+    async streamTurnError() {
+      const fake = fakeFor();
       fake.emit({ type: "turn_start" } as PiServerEvent);
       fake.emit({ type: "turn_end", message: { role: "assistant", stopReason: "error", errorMessage: "provider dispatch failed" }, toolResults: [] } as unknown as PiServerEvent);
       fake.emit({ type: "agent_settled" } as PiServerEvent);
@@ -323,7 +370,6 @@ function makeBridgeDriver(): PiConformanceDriver & { fakes: ParityFakePi[] } {
       throw new Error(`${err.error.code}: ${err.error.message}`);
     },
     async listModels() {
-      // Bridge v1 has no catalog response: honest empty (SNC1.8 seam lands natively).
       return [];
     },
     async listThinkingLevels() {
@@ -341,6 +387,128 @@ function makeBridgeDriver(): PiConformanceDriver & { fakes: ParityFakePi[] } {
       }
       const err = reply as unknown as { error: { code: string; message: string } };
       return `${err.error.code}: ${err.error.message}`;
+    },
+    async dispatchImage(sessionId, text) {
+      await ensureHello();
+      const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      const opId = nextOp("dsp");
+      send({ v: 1, kind: "dispatch", opId, sessionId, message: { text, images: [{ data: pngBase64, mimeType: "image/png" }] } });
+      const reply = await waitFor(opId, ["dispatch_ack", "error"]);
+      if (reply.kind !== "dispatch_ack") {
+        const err = reply as unknown as { error: { code: string; message: string } };
+        return { status: "unknown", reason: `${err.error.code}: ${err.error.message}`, historyHasBase64: false };
+      }
+      const ack = reply as unknown as { status: string; reason?: string };
+      if (ack.status !== "accepted") return { status: ack.status, ...(ack.reason ? { reason: ack.reason } : {}), historyHasBase64: false };
+      const fake = fakeFor();
+      fake.emit({ type: "turn_start" } as PiServerEvent);
+      fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "saw image" } } as unknown as PiServerEvent);
+      fake.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake.emit({ type: "agent_settled" } as PiServerEvent);
+      await sleep(20);
+      const hisOp = nextOp("his");
+      send({ v: 1, kind: "get_history", opId: hisOp, sessionId });
+      const his = await waitFor(hisOp, ["history", "error"]);
+      if (his.kind !== "history") return { status: ack.status, historyHasBase64: false };
+      const entries = (his as unknown as { entries: Array<{ text?: string }> }).entries;
+      const blob = JSON.stringify(entries);
+      return { status: ack.status, historyHasBase64: blob.includes(pngBase64.slice(0, 32)) };
+    },
+    async applyValidThinkingLevel(sessionId, level) {
+      await ensureHello();
+      const opId = nextOp("opt");
+      send({ v: 1, kind: "set_options", opId, sessionId, options: { thinkingLevel: level } });
+      const reply = await waitFor(opId, ["options_updated", "error"]);
+      if (reply.kind !== "options_updated") {
+        const err = reply as unknown as { error: { code: string; message: string } };
+        throw new Error(`${err.error.code}: ${err.error.message}`);
+      }
+      const sesOp = nextOp("ses");
+      send({ v: 1, kind: "get_session", opId: sesOp, sessionId });
+      const ses = await waitFor(sesOp, ["session", "error"]);
+      if (ses.kind !== "session") throw new Error("no session after option apply");
+      const confirmed = (ses as unknown as { metadata: { thinkingLevel?: string } }).metadata.thinkingLevel ?? "";
+      return { applied: level, confirmed };
+    },
+    async dispatchAmbiguous(sessionId, text) {
+      await ensureHello();
+      const fake = fakeFor();
+      fake.failPromptWith = Object.assign(new Error("prompt timed out"), { code: "prompt-timeout", ambiguous: true });
+      const opId = nextOp("dsp");
+      send({ v: 1, kind: "dispatch", opId, sessionId, message: { text } });
+      const reply = await waitFor(opId, ["dispatch_ack", "error"]);
+      if (reply.kind === "dispatch_ack") {
+        const ack = reply as unknown as { status: string; reason?: string };
+        return { status: ack.status, ...(ack.reason ? { reason: ack.reason } : {}) };
+      }
+      const err = reply as unknown as { error: { code: string; message: string } };
+      return { status: "unknown", reason: `${err.error.code}: ${err.error.message}` };
+    },
+    async resumeActiveBranch() {
+      const { dir, resumePath } = seedResumeDir();
+      const resumeFakes: ParityFakePi[] = [];
+      const resumeProvider = new PiBridgeProvider({
+        createConnection: (opts) => {
+          const fake = new ParityFakePi(opts);
+          seedActiveBranchWithAbandonedSibling(fake);
+          resumeFakes.push(fake);
+          return fake;
+        },
+      });
+      const resumeOut: ProviderToHostMessage[] = [];
+      resumeProvider.attachTestTransport((msg) => resumeOut.push(msg));
+      const rsend = (obj: unknown): void => {
+        resumeProvider.onLine(typeof obj === "string" ? obj : serializeBridgeLine(obj).trimEnd());
+      };
+      async function rwait(opId: string, kinds: string[]): Promise<ProviderToHostMessage> {
+        const deadline = Date.now() + 5_000;
+        for (;;) {
+          const found = [...resumeOut].reverse().find((m) => (m as { opId?: string }).opId === opId && kinds.includes(m.kind));
+          if (found) return found;
+          if (Date.now() > deadline) throw new Error(`TIMEOUT ${opId}`);
+          await sleep(5);
+        }
+      }
+      rsend({ v: 1, kind: "hello", opId: "hello_r", host: { id: "orca", version: "parity", protocol: 1 }, workspaceRoot: dir });
+      await rwait("hello_r", ["hello_ok"]);
+      rsend({ v: 1, kind: "acquire", opId: "acq_r", workspaceRoot: dir, resumePath });
+      const acquired = await rwait("acq_r", ["acquired", "error"]);
+      if (acquired.kind !== "acquired") {
+        const err = acquired as unknown as { error: { code: string; message: string } };
+        throw new Error(`${err.error.code}: ${err.error.message}`);
+      }
+      const sessionId = (acquired as unknown as { sessionId: string }).sessionId;
+      const resumed = (acquired as unknown as { resumed: boolean }).resumed;
+      rsend({ v: 1, kind: "get_history", opId: "his_r", sessionId });
+      const his = await rwait("his_r", ["history", "error"]);
+      if (his.kind !== "history") throw new Error("no history after resume");
+      const h = his as unknown as { entries: Array<{ role: string; text?: string }>; leafId?: string };
+      const transcript = h.entries.map((e) => `${e.role}:${e.text ?? ""}`).join("|");
+      await resumeProvider.dispose().catch(() => undefined);
+      return {
+        resumed,
+        transcript,
+        hasAbandoned: transcript.includes("abandoned branch"),
+        ...(h.leafId ? { leafId: h.leafId } : {}),
+      };
+    },
+    async observeTurnEvents(sessionId, text) {
+      await ensureHello();
+      const opId = nextOp("dsp");
+      send({ v: 1, kind: "dispatch", opId, sessionId, message: { text } });
+      await waitFor(opId, ["dispatch_ack", "error"]);
+      const fake = fakeFor();
+      fake.emit({ type: "turn_start" } as PiServerEvent);
+      fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "event check" } } as unknown as PiServerEvent);
+      fake.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake.emit({ type: "agent_settled" } as PiServerEvent);
+      await sleep(20);
+      const types = new Set(
+        out
+          .filter((m) => m.kind === "session_event" && (m as { opId?: string }).opId === opId)
+          .map((m) => (m as unknown as { event: { type: string } }).event.type),
+      );
+      return { sawTurnStart: types.has("turn_start"), sawSettled: types.has("settled") };
     },
     async release(sessionId) {
       await ensureHello();
@@ -368,8 +536,12 @@ function makeNativeDriver(): PiConformanceDriver {
       return fake;
     },
   });
+  const events: Array<{ sessionId: string; opId?: string; type: string }> = [];
+  native.onSessionEvent((envelope) => {
+    events.push({ sessionId: envelope.sessionId, ...(envelope.opId ? { opId: envelope.opId } : {}), type: envelope.event.type });
+  });
   const fakeFor = (): ParityFakePi => {
-    const fake = fakes[0];
+    const fake = fakes[fakes.length - 1];
     if (!fake) throw new Error("no fake Pi for session");
     return fake;
   };
@@ -456,6 +628,66 @@ function makeNativeDriver(): PiConformanceDriver {
       if (res.status === "unknown") return (res as { reason?: string }).reason ?? "unknown";
       return `UNEXPECTED_${res.status}`;
     },
+    async dispatchImage(sessionId, text) {
+      const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      const res = await native.dispatch({ sessionId, text, images: [{ data: pngBase64, mimeType: "image/png" }] });
+      if (res.status !== "accepted") return { status: res.status, ...(res.status !== "accepted" ? { reason: (res as { reason?: string }).reason } : {}), historyHasBase64: false };
+      const fake = fakeFor();
+      fake.emit({ type: "turn_start" } as PiServerEvent);
+      fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "saw image" } } as unknown as PiServerEvent);
+      fake.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake.emit({ type: "agent_settled" } as PiServerEvent);
+      await sleep(20);
+      const his = await native.getHistory(sessionId);
+      const blob = JSON.stringify(his.entries);
+      return { status: res.status, historyHasBase64: blob.includes(pngBase64.slice(0, 32)) };
+    },
+    async applyValidThinkingLevel(sessionId, level) {
+      await native.setOptions(sessionId, { thinkingLevel: level });
+      const ses = await native.getSession(sessionId);
+      return { applied: level, confirmed: ses.thinkingLevel ?? "" };
+    },
+    async dispatchAmbiguous(sessionId, text) {
+      const fake = fakeFor();
+      fake.failPromptWith = Object.assign(new Error("prompt timed out"), { code: "prompt-timeout", ambiguous: true });
+      const res = await native.dispatch({ sessionId, text });
+      return { status: res.status, ...(res.status !== "accepted" ? { reason: (res as { reason?: string }).reason } : {}) };
+    },
+    async resumeActiveBranch() {
+      const { dir, resumePath } = seedResumeDir();
+      const resumeNative = new PiNativeProvider({
+        createConnection: (opts) => {
+          const fake = new ParityFakePi(opts);
+          seedActiveBranchWithAbandonedSibling(fake);
+          return fake;
+        },
+      });
+      await resumeNative.ensureHello();
+      const acquired = await resumeNative.acquire({ workspaceRoot: dir, resumePath });
+      const his = await resumeNative.getHistory(acquired.sessionId);
+      const transcript = his.entries.map((e) => `${e.role}:${e.text ?? ""}`).join("|");
+      const leafId = his.leafId;
+      await resumeNative.dispose().catch(() => undefined);
+      return {
+        resumed: acquired.resumed,
+        transcript,
+        hasAbandoned: transcript.includes("abandoned branch"),
+        ...(leafId ? { leafId } : {}),
+      };
+    },
+    async observeTurnEvents(sessionId, text) {
+      events.length = 0;
+      const res = await native.dispatch({ sessionId, text });
+      if (res.status !== "accepted") return { sawTurnStart: false, sawSettled: false };
+      const fake = fakeFor();
+      fake.emit({ type: "turn_start" } as PiServerEvent);
+      fake.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "event check" } } as unknown as PiServerEvent);
+      fake.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake.emit({ type: "agent_settled" } as PiServerEvent);
+      await sleep(20);
+      const types = new Set(events.filter((e) => e.sessionId === sessionId).map((e) => e.type));
+      return { sawTurnStart: types.has("turn_start"), sawSettled: types.has("settled") };
+    },
     async release(sessionId) {
       await native.release(sessionId).catch(() => undefined);
     },
@@ -470,6 +702,10 @@ function makeNativeDriver(): PiConformanceDriver {
 describe("SNC1.8 native parity: same conformance suite on bridge and native paths", () => {
   it("documents the scenario checklist", () => {
     expect(PI_CONFORMANCE_SCENARIOS.map((s) => s.id)).toEqual([
+      "ambiguous-delivery",
+      "images-options-success",
+      "resume-active-branch",
+      "session-event-boundary",
       "basic-dispatch-streaming",
       "thinking-tools-errors-lifecycle",
       "options-prompts-images",
@@ -481,9 +717,6 @@ describe("SNC1.8 native parity: same conformance suite on bridge and native path
 
   it("bridge path passes the full conformance suite", async () => {
     const results = await runPiConformanceSuite(() => makeBridgeDriver());
-    for (const r of results) {
-      expect(`${r.scenarioId}: ${r.detail}`).toBe(`${r.scenarioId}: ${r.detail}`);
-    }
     const failed = results.filter((r) => !r.passed);
     expect(failed.map((r) => `${r.scenarioId}: ${r.detail}`).join("\n")).toBe("");
     expect(results).toHaveLength(PI_CONFORMANCE_SCENARIOS.length);
@@ -496,22 +729,28 @@ describe("SNC1.8 native parity: same conformance suite on bridge and native path
     ]);
     const failedNative = native.filter((r) => !r.passed);
     expect(failedNative.map((r) => `${r.scenarioId}: ${r.detail}`).join("\n")).toBe("");
-    // Parity: same scenarios pass on both paths (no bridge-only or native-only gaps).
     expect(native.map((r) => `${r.scenarioId}:${r.passed ? "pass" : "fail"}`)).toEqual(
       bridge.map((r) => `${r.scenarioId}:${r.passed ? "pass" : "fail"}`),
     );
   }, 30_000);
 
-  it("native runs without a bridge helper process and exposes the catalog seam", async () => {
+  it("native unknown delivery is preserved verbatim (ChatGPT P1 regression)", async () => {
     const driver = makeNativeDriver();
     const acquired = await driver.acquire({ workspaceRoot: "/tmp/pi-native-ws" });
-    // Full catalog (bridge honestly reports [] — native must do better for Orca's option UI).
+    const res = await driver.dispatchAmbiguous(acquired.sessionId, "ambiguous");
+    expect(res.status).toBe("unknown");
+    await driver.release(acquired.sessionId).catch(() => undefined);
+    await driver.close().catch(() => undefined);
+  });
+
+  it("native catalog works on the injected path and gating stays pi-only local-only", async () => {
+    const driver = makeNativeDriver();
+    const acquired = await driver.acquire({ workspaceRoot: "/tmp/pi-native-ws" });
     const models = await driver.listModels(acquired.sessionId);
     expect(models.length).toBeGreaterThan(0);
     expect(models.some((m) => m.id === "glm-5.3-flash")).toBe(true);
     const levels = await driver.listThinkingLevels(acquired.sessionId);
     expect(levels).toContain("low");
-    // Proven gating: pi-only, local-only (Codex/Claude selection untouched).
     expect(driver.supportsCreate({ executionHostId: "local", wslDistro: null }, "pi")).toBe(true);
     expect(driver.supportsCreate({ executionHostId: "local", wslDistro: null }, "codex")).toBe(false);
     expect(driver.supportsCreate({ executionHostId: "remote", wslDistro: null }, "pi")).toBe(false);

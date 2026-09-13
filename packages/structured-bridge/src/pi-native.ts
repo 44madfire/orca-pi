@@ -59,11 +59,7 @@
  *   `agent === "pi"` and never claims `codex`/`claude`/`external` sessions.
  */
 
-import {
-  PiBridgeProvider,
-  type PiBridgeProviderOptions,
-  type PiProviderConnection,
-} from "./pi-provider.js";
+import { PiBridgeProvider, type PiBridgeProviderOptions } from "./pi-provider.js";
 import type {
   BridgeCapabilities,
   BridgeHistoryEntry,
@@ -128,17 +124,12 @@ function nextOpId(prefix: string, seq: { n: number }): string {
   return `${prefix}_${Date.now().toString(36)}_${seq.n}`;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 /**
  * In-process native Pi provider. Drives the proven `PiBridgeProvider`
  * without spawning a bridge helper process.
  */
 export class PiNativeProvider {
   private readonly bridge: PiBridgeProvider;
-  private readonly seen: ProviderToHostMessage[] = [];
   private readonly waiters = new Map<
     string,
     { kinds: ReadonlySet<string>; resolve: (msg: ProviderToHostMessage) => void }
@@ -147,26 +138,14 @@ export class PiNativeProvider {
   private readonly seq = { n: 0 };
   private helloOk: Promise<void> | null = null;
   private helloFailed: string | null = null;
-  /** Captured Pi connections in creation order (for the catalog seam). */
-  private readonly connections: PiProviderConnection[] = [];
-  /** Session id → connection index association (established at acquire). */
-  private readonly connectionBySession = new Map<string, PiProviderConnection>();
-  private pendingConnectionCount = 0;
   private disposed = false;
 
   constructor(opts: PiNativeOptions = {}) {
-    const wrappedCreateConnection = opts.createConnection
-      ? (connOpts: Parameters<NonNullable<PiNativeOptions["createConnection"]>>[0]) => {
-          const conn = opts.createConnection!(connOpts);
-          this.connections.push(conn);
-          this.pendingConnectionCount += 1;
-          return conn;
-        }
-      : undefined;
-    this.bridge = new PiBridgeProvider({
-      ...opts,
-      ...(wrappedCreateConnection ? { createConnection: wrappedCreateConnection } : {}),
-    });
+    // No connection capture here: the catalog seam reads the live Pi
+    // connection per session via `bridge.getPiConnection(sessionId)`, so
+    // both the default production factory and injected test factories are
+    // covered without a global newest-connection heuristic.
+    this.bridge = new PiBridgeProvider({ ...opts });
     this.bridge.attachTestTransport((msg) => this.handleProviderMessage(msg));
   }
 
@@ -236,7 +215,6 @@ export class PiNativeProvider {
       throw new Error("BAD_WORKSPACE: acquire requires a non-empty workspaceRoot");
     }
     const opId = nextOpId("acq", this.seq);
-    const beforeConnections = this.connections.length;
     const pending = this.waitFor(opId, new Set(["acquired", "error"]), PI_NATIVE_REQUEST_TIMEOUT_MS);
     this.send({
       v: 1,
@@ -250,13 +228,6 @@ export class PiNativeProvider {
     const reply = await pending;
     if (reply.kind === "acquired") {
       const acquired = reply as { sessionId: string; resumed: boolean; metadata: BridgeSessionMetadata };
-      // Associate the freshly created Pi connection (if any) with this session
-      // for the catalog seam. Failed acquires create-then-close a connection
-      // without returning `acquired`, so only map on success.
-      if (this.connections.length > beforeConnections) {
-        const newest = this.connections[this.connections.length - 1];
-        if (newest) this.connectionBySession.set(acquired.sessionId, newest);
-      }
       return { sessionId: acquired.sessionId, resumed: acquired.resumed, metadata: { ...acquired.metadata } };
     }
     const err = reply as { error?: { code?: string; message?: string } };
@@ -280,8 +251,17 @@ export class PiNativeProvider {
     });
     const reply = await pending;
     if (reply.kind === "dispatch_ack") {
-      const ack = reply as { sessionId: string; status: "accepted" | "rejected"; reason?: string };
+      const ack = reply as { sessionId: string; status: "accepted" | "rejected" | "unknown"; reason?: string };
+      // Preserve the honest delivery invariant verbatim: `accepted` only
+      // when Pi definitely owns the prompt, `rejected` only for definite
+      // refusal, `unknown` for ambiguous Pi prompt delivery (may have
+      // landed — reconcile via history, never auto-resend). Coercing
+      // `unknown` to `rejected` would let a caller retry as fresh work and
+      // duplicate a landed user turn.
       if (ack.status === "accepted") return { status: "accepted", sessionId: ack.sessionId };
+      if (ack.status === "unknown") {
+        return { status: "unknown", sessionId: ack.sessionId, reason: ack.reason ?? "pi-prompt-ambiguous (reconcile via history; do not auto-resend)" };
+      }
       return { status: "rejected", sessionId: ack.sessionId, reason: ack.reason ?? "rejected" };
     }
     const err = reply as { error?: { code?: string; message?: string }; sessionId?: string };
@@ -393,11 +373,14 @@ export class PiNativeProvider {
 
   /**
    * Full model catalog seam (SNC1.8 — bridge v1 has no catalog response).
-   * Returns live `get_available_models` for the session's Pi connection, or
-   * an empty list when the transport is minimal (honest, never synthesized).
+   * Reads the live `get_available_models` from the session's actual Pi
+   * connection via `bridge.getPiConnection(sessionId)`, so both the default
+   * production factory and injected test factories are covered (keyed by
+   * session, never via a global newest-connection heuristic). Returns an
+   * honest empty list only on minimal transports (never synthesized).
    */
   async listModels(sessionId: string, timeoutMs = 8_000): Promise<PiModel[]> {
-    const conn = this.connectionBySession.get(sessionId);
+    const conn = this.bridge.getPiConnection(sessionId);
     if (!conn || typeof conn.getAvailableModels !== "function") return [];
     try {
       const listed = await conn.getAvailableModels({ timeoutMs });
@@ -410,7 +393,7 @@ export class PiNativeProvider {
 
   /** Live thinking levels for the session's current Pi model (honest empty on minimal transports). */
   async listThinkingLevels(sessionId: string, timeoutMs = 8_000): Promise<string[]> {
-    const conn = this.connectionBySession.get(sessionId);
+    const conn = this.bridge.getPiConnection(sessionId);
     if (!conn || typeof conn.getAvailableThinkingLevels !== "function") return [];
     try {
       const listed = await conn.getAvailableThinkingLevels({ timeoutMs });
@@ -427,7 +410,6 @@ export class PiNativeProvider {
     this.send({ v: 1, kind: "release", opId, sessionId });
     const reply = await pending;
     if (reply.kind === "released") {
-      this.connectionBySession.delete(sessionId);
       return;
     }
     const err = reply as { error?: { code?: string; message?: string } };
@@ -441,8 +423,6 @@ export class PiNativeProvider {
     this.send({ v: 1, kind: "close", opId, mode, ...(sessionId !== undefined ? { sessionId } : {}) });
     const reply = await pending;
     if (reply.kind === "closed") {
-      if (sessionId) this.connectionBySession.delete(sessionId);
-      else this.connectionBySession.clear();
       return;
     }
     const err = reply as { error?: { code?: string; message?: string } };
@@ -455,7 +435,6 @@ export class PiNativeProvider {
     this.disposed = true;
     this.waiters.clear();
     this.eventHandlers.clear();
-    this.connectionBySession.clear();
     await this.bridge.dispose().catch(() => undefined);
   }
 
@@ -466,16 +445,13 @@ export class PiNativeProvider {
   }
 
   private waitFor(opId: string, kinds: ReadonlySet<string>, timeoutMs: number): Promise<ProviderToHostMessage> {
+    // Correlated waiter only: every caller registers `waitFor()` BEFORE
+    // `send()`, so the reply cannot land before subscription and no
+    // reply-history buffer is needed. Deliberately unbounded-free: streaming
+    // `session_event`s and `history` payloads are never retained here (they
+    // go only to `eventHandlers` or the awaiting caller), so a long-lived
+    // Orca process cannot grow this provider without bound.
     return new Promise<ProviderToHostMessage>((resolve, reject) => {
-      // Fast path: the provider answers hello/acquire synchronously enough
-      // that the reply may already be in `seen` before we subscribe.
-      const existing = [...this.seen]
-        .reverse()
-        .find((m) => (m as { opId?: string }).opId === opId && kinds.has(m.kind));
-      if (existing) {
-        resolve(existing);
-        return;
-      }
       const timer = setTimeout(() => {
         this.waiters.delete(opId);
         reject(new Error(`TIMEOUT: native Pi provider timed out waiting for ${[...kinds].join("/")} (op ${opId})`));
@@ -488,22 +464,10 @@ export class PiNativeProvider {
           resolve(msg);
         },
       });
-      // Re-check after subscribing (a reply that landed between the fast
-      // path and subscribe would otherwise hang until timeout).
-      const raced = [...this.seen]
-        .reverse()
-        .find((m) => (m as { opId?: string }).opId === opId && kinds.has(m.kind));
-      if (raced) {
-        clearTimeout(timer);
-        this.waiters.delete(opId);
-        resolve(raced);
-      }
-      void timer;
     });
   }
 
   private handleProviderMessage(msg: ProviderToHostMessage): void {
-    this.seen.push(msg);
     if (msg.kind === "session_event") {
       const envelope: PiNativeSessionEventEnvelope = {
         sessionId: (msg as { sessionId: string }).sessionId,
@@ -532,6 +496,5 @@ export class PiNativeProvider {
     // exits already surface as shaped `turn_end{error}` + `settled` plus
     // `rejected: pi-exited (reacquire)` on the next dispatch, matching the
     // bridge fail-closed semantics Orca relies on for TUI fallback.
-    void sleep(0);
   }
 }

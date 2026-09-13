@@ -412,6 +412,22 @@ export class PiBridgeProvider extends BridgeProvider {
     return this.piRuntimes.size;
   }
 
+  /**
+   * In-process Pi connection for one session (SNC1.8 native catalog seam).
+   *
+   * Returns the live `PiProviderConnection` backing `sessionId`, or
+   * `undefined` when the session is unknown or its Pi child is closed.
+   * For in-process native use only (catalog reads, never over the bridge):
+   * callers must not send credentials or prompt text through it beyond the
+   * typed Pi RPCs the connection already owns. The bridge path never calls
+   * this (bridge v1 has no catalog response by design).
+   */
+  getPiConnection(sessionId: string): PiProviderConnection | undefined {
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!runtime || runtime.conn.isClosed) return undefined;
+    return runtime.conn;
+  }
+
   protected override async onMessage(msg: HostToProviderMessage): Promise<void> {
     switch (msg.kind) {
       case "acquire":
