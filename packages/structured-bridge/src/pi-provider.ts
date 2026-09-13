@@ -119,6 +119,8 @@ import {
   validatePiDispatch,
 } from "./pi-mapping.js";
 import { PiTranslator } from "./pi-translator.js";
+import { open } from "node:fs/promises";
+import path from "node:path";
 import {
   extractActiveBranch,
   extractActiveBranchFromTree,
@@ -274,6 +276,18 @@ interface PiRuntime {
    * attribute exactly this op's rows for Pi re-keying.
    */
   opHistoryBase: number | null;
+  /**
+   * Exposed-leaf high-water marks (P1 review fix, round 2): `leafEnds` maps
+   * every `leafId` ever returned by `get_history` to the transcript length it
+   * was advertised with — "a cursor advertised after a page must denote the
+   * end of that page". This keeps Pi-leaf cursors honest even when the rows
+   * they cover are still unmapped `live-N` rows (fresh-acquire race where the
+   * baseline lookup loses to the first settle, or any documented reconcile
+   * mismatch that advances the leaf without re-keying). Cleared on wholesale
+   * rebuild (ordinals invalidated); re-keying in place never changes lengths,
+   * so recorded ends stay valid across reconciles.
+   */
+  leafEnds: Map<string, number>;
   /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
   cachedModels?: PiModel[];
   /** Shared in-flight catalog lookup (P2: concurrent image dispatches share one Pi RPC). */
@@ -602,6 +616,7 @@ export class PiBridgeProvider extends BridgeProvider {
       historyChainPos: [],
       liveSeq: 0,
       opHistoryBase: null,
+      leafEnds: new Map<string, number>(),
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
@@ -719,6 +734,25 @@ export class PiBridgeProvider extends BridgeProvider {
     // `{cancelled:true}` switch rebinds NOTHING — Pi stays on its previous
     // session — so continuing would rebuild the WRONG history and can emit
     // `acquired{resumed:true}` for a file Pi never loaded. Fail closed.
+    // P1 round-2 (ChatGPT review, verified against the Pi 0.85.1 source and
+    // the on-disk `{"type":"session",...,"cwd":...}` header): `switch_session`
+    // rebinds the runtime cwd to the SESSION FILE's stored cwd
+    // (`SessionManager.open` → `createRuntime({cwd: getCwd()})`, with no
+    // cwdOverride on the RPC path). A resumePath from another/moved workspace
+    // would otherwise yield a lease claiming `workspaceRoot` while Pi tools
+    // execute in the stored cwd — violating the exact-cwd invariant. Validate
+    // the header BEFORE switching (the fresh child has nothing to lose yet).
+    const cwdCheck = await this.checkResumePathCwd(resumePath, msg.workspaceRoot);
+    if (!cwdCheck.ok) {
+      await conn.close(this.piCloseGraceMs).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: { code: cwdCheck.code, message: cwdCheck.message },
+      });
+      return;
+    }
     let switchCancelled = false;
     try {
       const switched = await conn.switchSession(resumePath, { timeoutMs: this.piOptionTimeoutMs });
@@ -802,6 +836,7 @@ export class PiBridgeProvider extends BridgeProvider {
       historyChainPos: [],
       liveSeq: 0,
       opHistoryBase: null,
+      leafEnds: new Map<string, number>(),
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
@@ -999,11 +1034,89 @@ export class PiBridgeProvider extends BridgeProvider {
     session.history.splice(0, dropped, ...history);
     runtime.historyChainPos.splice(0, dropped, ...positions);
     runtime.opHistoryBase = null;
+    runtime.leafEnds.clear();
     session.entryCounter = history.length;
     session.metadata.messageCount = history.filter((e) => e.role === "user" || e.role === "assistant" || e.role === "tool").length;
     runtime.piLeafId = leafId;
     runtime.piChainIds = branch.map((e) => e.id);
     return { ok: true, history: [...history], leafId };
+  }
+
+  /**
+   * Validate a resumePath's session-file header cwd against the
+   * Orca-selected workspaceRoot BEFORE `switch_session` (P1 round-2 fix).
+   * Reads only the first line (bounded 64 KiB — the header is one JSON
+   * object) and compares canonicalized absolute paths (slash direction,
+   * `.`/`..`, trailing separators; case-insensitive on Windows). Diagnostics
+   * never include either path: the stored cwd is Pi-side data that must not
+   * cross the bridge, and the comparison outcome alone is actionable. A
+   * MISSING file is fine (Pi creates it as a new empty session on switch, so
+   * acquire honestly reports `resumed:false`); anything else unreadable, a
+   * header without a usable cwd, or a mismatch fails closed. Limitation
+   * (documented, safe direction): exotic aliasing the normalizer cannot see
+   * through (symlinked roots, 8.3 short names) fails closed as a mismatch —
+   * reacquire with a directly matching file.
+   */
+  private async checkResumePathCwd(
+    resumePath: string,
+    workspaceRoot: string,
+  ): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+    const unreadable = {
+      ok: false as const,
+      code: "PI_RESUME_FAILED",
+      message: "Pi session file is unreadable or incompatible (check the path and retry without resumePath for a fresh session)",
+    };
+    let firstLine: string;
+    try {
+      const fh = await open(resumePath, "r");
+      try {
+        const buf = Buffer.alloc(65536);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        const chunk = buf.toString("utf8", 0, bytesRead);
+        const nl = chunk.indexOf("\n");
+        firstLine = (nl === -1 ? chunk : chunk.slice(0, nl)).replace(/\r$/, "");
+      } finally {
+        await fh.close().catch(() => undefined);
+      }
+    } catch (error) {
+      // Missing file: Pi creates it as a new empty session on switch (per
+      // contract) — not an error here (acquire reports `resumed:false`).
+      if ((error as { code?: unknown })?.code === "ENOENT") return { ok: true };
+      return unreadable;
+    }
+    let storedCwd: unknown;
+    try {
+      const parsed: unknown = JSON.parse(firstLine);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("bad header");
+      storedCwd = (parsed as Record<string, unknown>)["cwd"];
+    } catch {
+      return unreadable;
+    }
+    if (typeof storedCwd !== "string" || storedCwd === "") {
+      return {
+        ok: false,
+        code: "PI_RESUME_FAILED",
+        message: "Pi session file is incompatible (missing session cwd; update Pi or choose another session file)",
+      };
+    }
+    const norm = (value: string): string => {
+      const resolved = path.resolve(value);
+      return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    };
+    let same = false;
+    try {
+      same = norm(storedCwd) === norm(workspaceRoot);
+    } catch {
+      same = false;
+    }
+    if (!same) {
+      return {
+        ok: false,
+        code: "PI_RESUME_CWD_MISMATCH",
+        message: "Pi session belongs to a different workspace (resume refused; reacquire without resumePath for a fresh session or choose a session file from this workspace)",
+      };
+    }
+    return { ok: true };
   }
 
   /**
@@ -1116,14 +1229,17 @@ export class PiBridgeProvider extends BridgeProvider {
 
   /**
    * SNC1.7 `get_history`: serve the rebuilt + live-appended transcript with
-   * the Pi session leaf (never the page end). Cursor resolution is ordinal:
-   * a cursor naming a transcript row returns strictly-after rows; otherwise
-   * it resolves through per-row chain positions (P1 fix — cursors naming Pi
-   * leaves or skipped non-message entries map to the last row at/before that
-   * chain position, so unreconciled live tip rows are included, never
-   * dropped). Unknown cursors return an empty page (same as the base).
-   * `limit` paging and `nextCursor` (last returned id) match the base;
-   * `leafId` is the cached Pi leaf when known, else the transcript leaf.
+   * the Pi session leaf (never the page end). Cursor resolution is ordinal,
+   * in this order: (1) a cursor naming a transcript row returns
+   * strictly-after rows; (2) a cursor naming a previously advertised `leafId`
+   * resumes after the transcript length it was advertised with (P1 round-2
+   * fix — the leaf denotes the end of its page even when the covered rows
+   * are still unmapped `live-N` rows); (3) any other Pi chain id (e.g. a
+   * skipped non-message entry) maps to the last row at/before that chain
+   * position, so unreconciled live tip rows are included, never dropped.
+   * Unknown cursors return an empty page (same as the base). `limit` paging
+   * and `nextCursor` (last returned id) match the base; `leafId` is the
+   * cached Pi leaf when known, else the transcript leaf.
    */
   protected override onGetHistory(opId: string, sessionId: string, cursor?: string, limit?: number): void {
     if (!this.requireHello(opId)) return;
@@ -1145,6 +1261,10 @@ export class PiBridgeProvider extends BridgeProvider {
       const idx = full.findIndex((e) => e.id === cursor);
       if (idx !== -1) {
         start = idx + 1;
+      } else if (runtime.leafEnds.has(cursor)) {
+        // Previously advertised leaf: resume after the page end it denoted
+        // (recorded below when that page was returned).
+        start = Math.min(runtime.leafEnds.get(cursor) as number, full.length);
       } else {
         const chain = runtime.piChainIds;
         const chainIdx = chain ? chain.indexOf(cursor) : -1;
@@ -1163,6 +1283,8 @@ export class PiBridgeProvider extends BridgeProvider {
       }
     }
     const rest = full.slice(start);
+    // The advertised leaf denotes the end of THIS page (P1 round-2 fix).
+    if (leafId) runtime.leafEnds.set(leafId, full.length);
     let entries = rest;
     let nextCursor: string | undefined;
     if (limit !== undefined && rest.length > limit) {

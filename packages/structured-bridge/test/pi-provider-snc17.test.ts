@@ -16,6 +16,9 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PiBridgeProvider, type PiProviderConnection } from "../src/pi-provider.js";
 import type { ProviderToHostMessage } from "../src/protocol.js";
 import { serializeBridgeLine } from "../src/framing.js";
@@ -59,6 +62,12 @@ class FakePi17 implements PiProviderConnection {
   /** Flat entries served by `get_entries` (ignored when failEntriesWith set). */
   entries: Array<Record<string, unknown>> = [];
   leafId = "";
+  /**
+   * Deferred gate for history RPCs (round-2 fresh-race test): when set, every
+   * `getEntries`/`getTree` awaits it, simulating a baseline lookup delayed
+   * past a live turn.
+   */
+  historyGate: Promise<void> | null = null;
   /** Tree served by `get_tree` fallback (defaults to flat-derived single chain). */
   treeOverride: PiTreeData | null = null;
   state: PiState = {
@@ -126,11 +135,13 @@ class FakePi17 implements PiProviderConnection {
 
   async getEntries(): Promise<PiEntriesData> {
     if (this.failEntriesWith) throw this.failEntriesWith;
+    if (this.historyGate) await this.historyGate;
     return { entries: this.entries as never, leafId: this.leafId };
   }
 
   async getTree(): Promise<PiTreeData> {
     if (this.failTreeWith) throw this.failTreeWith;
+    if (this.historyGate) await this.historyGate;
     if (this.treeOverride) return this.treeOverride;
     // Derive a single-chain tree from flat entries (good enough for tests).
     const byId = new Map<string, { entry: unknown; children: unknown[] }>();
@@ -524,6 +535,213 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
     // No duplicate ids anywhere (re-key replaces, never appends).
     const ids = full.entries.map((e) => e.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("refuses resume when the session file belongs to another workspace", async () => {
+    const dirA = mkdtempSync(join(tmpdir(), "snc17-wsA-"));
+    const dirB = mkdtempSync(join(tmpdir(), "snc17-wsB-"));
+    const resumePath = join(dirA, "ses.jsonl");
+    // Header claims workspace B while Orca selected workspace A.
+    writeFileSync(resumePath, JSON.stringify({ type: "session", version: 3, id: "x", timestamp: "2026-01-01T00:00:00.000Z", cwd: dirB }) + "\n");
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => new FakePi17(opts),
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: dirA, resumePath });
+    await new Promise((r) => setTimeout(r, 40));
+    // Fail closed: error (never acquired), child torn down, and neither path
+    // leaks into the diagnostic.
+    expect(out.some((m) => m.kind === "acquired")).toBe(false);
+    expect(lastOfKind(out, "error")).toMatchObject({ opId: "acq_1" });
+    const errText = JSON.stringify(lastOfKind(out, "error"));
+    expect(errText).toContain("PI_RESUME_CWD_MISMATCH");
+    expect(errText).not.toContain("snc17-wsA");
+    expect(errText).not.toContain("snc17-wsB");
+    expect(provider.piSessionCount).toBe(0);
+  });
+
+  it("accepts resume when the session header cwd matches the workspace", async () => {
+    const dirA = mkdtempSync(join(tmpdir(), "snc17-wsA-"));
+    const resumePath = join(dirA, "ses.jsonl");
+    writeFileSync(resumePath, JSON.stringify({ type: "session", version: 3, id: "x", timestamp: "2026-01-01T00:00:00.000Z", cwd: dirA }) + "\n");
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        seedTwoTurnSession(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: dirA, resumePath });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(lastOfKind(out, "acquired")).toMatchObject({ resumed: true });
+  });
+
+  it("fails closed on an unreadable session header (never silent resume)", async () => {
+    const dirA = mkdtempSync(join(tmpdir(), "snc17-wsA-"));
+    const resumePath = join(dirA, "ses.jsonl");
+    writeFileSync(resumePath, "this is not json\n");
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => new FakePi17(opts),
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: dirA, resumePath });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(out.some((m) => m.kind === "acquired")).toBe(false);
+    expect(JSON.stringify(lastOfKind(out, "error"))).toContain("PI_RESUME_FAILED");
+    expect(provider.piSessionCount).toBe(0);
+  });
+
+  it("keeps cursors honest when the baseline lookup loses to the first turn (reviewer round-2 regression)", async () => {
+    // Fresh acquire with history gated past turn A: A's rows stay live-keyed
+    // while the learned Pi leaf is exposed. Capturing A's returned leaf and
+    // paging from it after turn B must return ONLY B (no replay of A).
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseGate = r;
+    });
+    const assistantFor: Record<string, string> = { A: "a-out", B: "b-out" };
+    let seq = 2;
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        fake.entries = [
+          { type: "model_change", id: "e1", parentId: null },
+          { type: "thinking_level_change", id: "e2", parentId: "e1" },
+        ];
+        fake.leafId = "e2";
+        fake.state = { ...fake.state, messageCount: 0, sessionId: "pi_fresh_race" };
+        fake.historyGate = gate;
+        fake.autoJournal = (message: string) => {
+          const u = `e${++seq}`;
+          const a = `e${++seq}`;
+          const anchor = fake.entries.length > 0 ? (fake.entries[fake.entries.length - 1] as { id: string }).id : "e2";
+          fake.entries.push(piMsg(u, anchor, "user", [{ type: "text", text: message }]));
+          fake.entries.push(piMsg(a, u, "assistant", [{ type: "text", text: assistantFor[message] ?? "?" }]));
+          fake.leafId = a;
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 30));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+
+    async function liveTurn(opId: string, text: string, reply: string): Promise<void> {
+      send({ v: 1, kind: "dispatch", opId, sessionId, message: { text } });
+      await new Promise((r) => setTimeout(r, 20));
+      const fake = (provider as unknown as { piRuntimes: Map<string, { conn: FakePi17 }> }).piRuntimes.get(sessionId)?.conn;
+      fake?.emit({ type: "turn_start" } as PiServerEvent);
+      fake?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: reply } } as unknown as PiServerEvent);
+      fake?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake?.emit({ type: "agent_settled" } as PiServerEvent);
+      await new Promise((r) => setTimeout(r, 60));
+    }
+
+    await liveTurn("dsp_A", "A", "a-out");
+    // Release the gated lookup only now: the leaf is learned while A's rows
+    // are already journaled as live-N (the race the reviewer described).
+    releaseGate();
+    await new Promise((r) => setTimeout(r, 80));
+    send({ v: 1, kind: "get_history", opId: "his_A", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const afterA = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    // Pi leaf exposed, rows still live-keyed (mapping window missed).
+    expect(afterA.leafId).toBe("e4");
+    expect(afterA.entries.map((e) => e.id)).toEqual(["live-1", "live-2"]);
+    const leafA = afterA.leafId as string;
+
+    await liveTurn("dsp_B", "B", "b-out");
+    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: leafA });
+    await new Promise((r) => setTimeout(r, 20));
+    const pageB = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+    };
+    // Without the leafEnds fix this replays A together with B.
+    expect(pageB.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "B"],
+      ["assistant", "b-out"],
+    ]);
+  });
+
+  it("keeps cursors honest across a reconcile mismatch (leaf advances, rows stay live)", async () => {
+    // Pi journals DIVERGENT content for turn A (e.g. crash-recovered partial
+    // text differs from what streamed live), so settle reconciliation keeps
+    // A's live rows; the exposed Pi leaf must still page honestly afterwards.
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        fake.entries = [
+          { type: "model_change", id: "e1", parentId: null },
+          { type: "thinking_level_change", id: "e2", parentId: "e1" },
+        ];
+        fake.leafId = "e2";
+        fake.state = { ...fake.state, messageCount: 0, sessionId: "pi_diverged" };
+        fake.autoJournal = (message: string) => {
+          const seq = fake.entries.length;
+          const u = `d${seq + 1}`;
+          const a = `d${seq + 2}`;
+          const anchor = (fake.entries[fake.entries.length - 1] as { id: string }).id;
+          const reply = message === "A" ? "a-DIVERGED" : `${message}-out`;
+          fake.entries.push(piMsg(u, anchor, "user", [{ type: "text", text: message }]));
+          fake.entries.push(piMsg(a, u, "assistant", [{ type: "text", text: reply }]));
+          fake.leafId = a;
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 30));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+
+    async function liveTurn(opId: string, text: string, reply: string): Promise<void> {
+      send({ v: 1, kind: "dispatch", opId, sessionId, message: { text } });
+      await new Promise((r) => setTimeout(r, 20));
+      const fake = (provider as unknown as { piRuntimes: Map<string, { conn: FakePi17 }> }).piRuntimes.get(sessionId)?.conn;
+      fake?.emit({ type: "turn_start" } as PiServerEvent);
+      fake?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: reply } } as unknown as PiServerEvent);
+      fake?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake?.emit({ type: "agent_settled" } as PiServerEvent);
+      await new Promise((r) => setTimeout(r, 80));
+    }
+
+    await liveTurn("dsp_A", "A", "a-out");
+    send({ v: 1, kind: "get_history", opId: "his_A", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const afterA = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    // Mismatch: leaf advanced past A, but A's rows stand as live (Pi's
+    // divergent text is never substituted into the transcript).
+    expect(afterA.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "A"],
+      ["assistant", "a-out"],
+    ]);
+    expect(afterA.entries.every((e) => e.id.startsWith("live-"))).toBe(true);
+    const leafA = afterA.leafId as string;
+    expect(leafA.startsWith("d")).toBe(true);
+
+    await liveTurn("dsp_B", "B", "B-out");
+    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: leafA });
+    await new Promise((r) => setTimeout(r, 20));
+    const pageB = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+    };
+    expect(pageB.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "B"],
+      ["assistant", "B-out"],
+    ]);
   });
 
   it("namespaces live rows so they never collide with Pi entry ids", async () => {

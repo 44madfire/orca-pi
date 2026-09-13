@@ -195,13 +195,24 @@ get_history → rebuilt + live-appended transcript, leafId = Pi leaf
   all roles unknown), `PI_HISTORY_BUSY` (rebuild while streaming).
   Missing-file-creates-empty (Pi contract) returns `resumed:false` honestly,
   not an error.
-- Cursor alignment across live turns (P1 review fix): rebuilt rows carry Pi
-  ids with per-row chain positions; live rows are keyed `live-N`
+- Cursor alignment across live turns (P1 review fixes): rebuilt rows carry
+  Pi ids with per-row chain positions; live rows are keyed `live-N`
   (namespaced — never colliding with Pi ids) and re-keyed to Pi ids at settle
   when the Pi tail converges by exact `(role, text)` sequence (background,
-  bounded, mismatch keeps live ids). `get_history(cursor=<Pi leaf>)`
-  resolves through chain positions, so the transcript stays pageable across
-  resumes and live turns alike.
+  bounded, mismatch keeps live ids). `get_history(cursor=…)` resolves
+  transcript id → previously advertised leaf (which denotes the end of its
+  page, even when the covered rows are still unmapped `live-N` — round-2 fix
+  for the fresh-acquire race and reconcile mismatches) → chain position, so
+  the transcript stays pageable across resumes and live turns alike.
+- Workspace binding on resume (P1 round-2 fix, verified against Pi 0.85.1):
+  `switch_session` rebinds the runtime cwd to the session file's stored cwd
+  with no RPC cwdOverride, so the provider reads the file's
+  `{"type":"session",…,"cwd":…}` header (first line, bounded 64 KiB) BEFORE
+  switching and fails closed (`PI_RESUME_CWD_MISMATCH`, no paths in the
+  diagnostic) when it names another workspace. Missing files stay
+  resume-as-new-empty (`resumed:false`); unreadable/incompatible headers fail
+  closed. Exotic aliasing the normalizer cannot see through fails closed in
+  the safe direction.
 - `get_history{cursor,limit}` pages the transcript; `leafId` always names the
   Pi leaf (never the page end); cursors naming skipped non-message entries
   resolve via the cached Pi chain to strictly-after rows. `leafId`/chain
