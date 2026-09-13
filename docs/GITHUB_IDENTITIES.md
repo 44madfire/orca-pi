@@ -228,6 +228,18 @@ App/bot login, installation id, repository access, permission validation,
 token configured/refreshable + expiry, and whether
 worker/reviewer/ambient actors are distinct.
 
+Control Center (UI1.5) shows the same redacted health without secrets:
+GitHub section via `github.status` (role-scoped refresh per worker/reviewer)
++ `github.doctor` (repo access-test + ambient actor, default
+`44madfire/orca-pi` / `44madfire`) plus mapped Pi profiles from
+`profiles.list` + `orchestration.get`; Diagnostics section via
+`diagnostics.doctor` (orca/pi CLIs + bridge negotiation + versions) +
+`profile.validate` (config) + `worktree.context` (explicit scope).
+`44madfire` renders as the human/ChatGPT review actor (final merge
+authority), never a credential slot. Mint/refresh stays outside the panel
+(`orca-pi github mint`, operator, outside LLM context); CLI remains
+authoritative (`orca-pi doctor`, `orca-pi github auth status`).
+
 ## Manual E2E acceptance (post-merge to main)
 
 1. Pull latest `main`, build/install `orca-pi` (`npm ci && npm run build`).
