@@ -62,10 +62,43 @@ export {
   type PanelSupport,
   type PanelSupportInput,
 } from "./panel.js";
+export {
+  CONTROL_CENTER_BUILTIN_TOOLS,
+  CONTROL_CENTER_COMPAT_PANEL_IDS,
+  CONTROL_CENTER_EDITABLE_FIELDS,
+  CONTROL_CENTER_PANEL_ID,
+  CONTROL_CENTER_SESSION_MODES,
+  CONTROL_CENTER_THINKING_LEVELS,
+  buildMutateParams,
+  builtinGuardText,
+  controlCenterSections,
+  describeArrayInheritanceNote,
+  describeDegradedMode,
+  describeLayer,
+  describeMcpSummary,
+  describeProvenance,
+  isBuiltinProfileName,
+  isBuiltinSaveBlocked,
+  mapBridgeErrorToField,
+  toListItems,
+  validateDraftShape,
+  validateProfileName,
+  type BridgeErrorKind,
+  type ControlCenterDraft,
+  type ControlCenterField,
+  type ControlCenterListItem,
+  type ControlCenterScope,
+  type ControlCenterSection,
+  type ControlCenterSectionId,
+  type DraftIssue,
+  type MappedBridgeError,
+} from "./control-center.js";
 
 /** Canonical install identity: `<publisher>.<id>` (also the install dir name). */
 export const PLUGIN_KEY = "44madfire.orca-pi";
-export const PANEL_ID = "orca-pi-status";
+export const PANEL_ID = "orca-pi-control-center";
+/** Compatibility aliases (same Control Center entry, one UI). */
+export const PANEL_COMPAT_IDS = ["orca-pi-status", "orca-pi-profiles"] as const;
 
 /**
  * Reserved for a later ticket: manifest v1 treats action-less commands as
@@ -102,16 +135,16 @@ export function renderPluginStatus(input: PluginStatusInput): string {
  * Activation record. The worker entry (`dist/worker.js`, manifest `main`)
  * serves the versioned bridge; panels stay declarative sandboxed HTML.
  *
- * UI1.2 adds the bridge worker alongside the status + profiles panels.
+ * UI1.3 owns the single Control Center shell plus compat aliases (one UI).
  * Live data flows through the typed panel↔bridge protocol (request IDs +
  * structured errors), never through `window.__ORCA_PI_PROFILES__` injection
- * (deprecated legacy path, read-only fallback only).
+ * (removed from the Control Center production path).
  */
 export function activate(): { plugin: string; commands: string[]; panels: string[] } {
   return {
     plugin: PLUGIN_KEY,
     // No commands in OP1.1 (see PLUGIN_COMMAND_ID note above).
     commands: [],
-    panels: [PANEL_ID, "orca-pi-profiles"],
+    panels: [PANEL_ID, ...PANEL_COMPAT_IDS],
   };
 }

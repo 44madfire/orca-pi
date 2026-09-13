@@ -152,6 +152,7 @@ export {
   resolveAllProfiles,
   resolveProfile,
   shortenHomeForDisplay,
+  layerForProfile,
   summarizeAllProfiles,
   summarizeResolvedProfile,
   toPanelModel,

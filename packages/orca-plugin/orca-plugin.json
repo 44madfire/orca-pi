@@ -14,14 +14,19 @@
   "contributes": {
     "panels": [
       {
+        "id": "orca-pi-control-center",
+        "title": "Orca-Pi Control Center",
+        "entry": "panel/control-center.html"
+      },
+      {
         "id": "orca-pi-status",
         "title": "Orca-Pi Status",
-        "entry": "panel.html"
+        "entry": "panel/control-center.html"
       },
       {
         "id": "orca-pi-profiles",
         "title": "Orca-Pi Profiles",
-        "entry": "panel/profiles.html"
+        "entry": "panel/control-center.html"
       }
     ],
     "commands": []

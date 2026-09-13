@@ -189,11 +189,11 @@ describe("profiles panel: feature detection and fallback", () => {
     expect(noConsent.fallback).toBe("cli-only");
   });
 
-  it("activates both panels with the bridge worker and minimal capabilities", () => {
+  it("activates the Control Center shell with compat aliases", () => {
     expect(activate()).toEqual({
       plugin: "44madfire.orca-pi",
       commands: [],
-      panels: ["orca-pi-status", "orca-pi-profiles"],
+      panels: ["orca-pi-control-center", "orca-pi-status", "orca-pi-profiles"],
     });
     const manifest = JSON.parse(
       readFileSync(join(here, "..", "orca-plugin.json"), "utf8"),
@@ -216,9 +216,10 @@ describe("profiles panel: feature detection and fallback", () => {
     expect(kinds).not.toContain("notifications:show");
   });
 
-  it("ships both panel entries with bridge client + CLI fallback and no escape hatch", () => {
+  it("ships the Control Center shell with bridge client + CLI fallback and no escape hatch", () => {
     const status = readFileSync(join(here, "..", "panel.html"), "utf8");
     const profiles = readFileSync(join(here, "..", "panel", "profiles.html"), "utf8");
+    const center = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
     expect(status).toContain("Orca–Pi Profiles");
     expect(profiles).toContain("Orca–Pi Profiles");
     expect(profiles).toContain("orca-pi profiles list");
@@ -230,6 +231,18 @@ describe("profiles panel: feature detection and fallback", () => {
     expect(profiles).toContain("profiles.list");
     expect(status).toContain("__ORCA_PI_BRIDGE__");
     expect(status).toContain("bridge.capabilities");
+    // UI1.3: single Control Center shell owns Profiles editing; compat
+    // aliases point at the same entry (one UI, never two independent UIs).
+    expect(center).toContain("Orca-Pi Control Center");
+    expect(center).toContain("__ORCA_PI_BRIDGE__");
+    expect(center).toContain("bridge.capabilities");
+    expect(center).toContain("profiles.list");
+    expect(center).toContain("profile.read");
+    expect(center).toContain("profile.mutate");
+    expect(center).toContain("launch.preview");
+    expect(center).toContain("orca-pi profile validate");
+    expect(center).toContain("terminal.sendText");
+    expect(center).toContain("workspace.readContext");
     // No undocumented bridge: no worker imports, filesystem requires, or fetch.
     expect(profiles).not.toContain("node:child_process");
     expect(profiles).not.toContain("node:fs");
@@ -237,5 +250,11 @@ describe("profiles panel: feature detection and fallback", () => {
     expect(profiles).not.toContain("fetch(");
     expect(status).not.toContain("fetch(");
     expect(status).not.toContain("node:child_process");
+    expect(center).not.toContain("node:child_process");
+    expect(center).not.toContain("node:fs");
+    expect(center).not.toContain('require("fs")');
+    expect(center).not.toContain("fetch(");
+    // Control Center never uses static injection as production data.
+    expect(center).not.toContain("__ORCA_PI_PROFILES__");
   });
 });

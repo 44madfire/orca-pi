@@ -72,11 +72,27 @@ describe("orca-plugin artifact", () => {
     }
   });
 
+  it("ships the Control Center as primary with compat aliases (one UI)", () => {
+    const { manifest } = loadArtifact();
+    const panels = (manifest as { contributes: { panels: { id: string; entry: string }[] } }).contributes.panels;
+    const byId = new Map(panels.map((p) => [p.id, p.entry]));
+    expect(byId.get("orca-pi-control-center")).toBe("panel/control-center.html");
+    // Compat aliases point at the same entry — one UI, never two independent UIs.
+    expect(byId.get("orca-pi-status")).toBe("panel/control-center.html");
+    expect(byId.get("orca-pi-profiles")).toBe("panel/control-center.html");
+    const center = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
+    expect(center).toContain("Orca-Pi Control Center");
+    expect(center).toContain("Profiles");
+    expect(center).toContain("Orchestration");
+    expect(center).toContain("GitHub");
+    expect(center).toContain("Diagnostics");
+  });
+
   it("activates without I/O and renders status from injected doctor data", () => {
     expect(activate()).toEqual({
       plugin: "44madfire.orca-pi",
       commands: [],
-      panels: ["orca-pi-status", "orca-pi-profiles"],
+      panels: ["orca-pi-control-center", "orca-pi-status", "orca-pi-profiles"],
     });
     const text = renderPluginStatus({
       pluginVersion: "0.1.0",
