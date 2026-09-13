@@ -76,16 +76,18 @@ describe("control center: shell + sections", () => {
     expect(describeMcpSummary({ extensionCount: 2, discoverExtensions: true })).not.toContain("ghp_");
   });
 
-  it("guards built-ins against destructive edits (clone allowed)", () => {
+  it("allows user/project overrides for builtin-named profiles (base stays immutable)", () => {
     expect(isBuiltinProfileName("worker")).toBe(true);
     expect(isBuiltinProfileName("scout")).toBe(true);
     expect(isBuiltinProfileName("reviewer")).toBe(true);
     expect(isBuiltinProfileName("worker-fast")).toBe(false);
-    expect(isBuiltinSaveBlocked("worker", "edit")).toBe(true);
+    // P1: patch/set on an effective builtin creates a layer override —
+    // only the compiled base is immutable (server-gated deletes). Never block by name.
+    expect(isBuiltinSaveBlocked("worker", "edit")).toBe(false);
     expect(isBuiltinSaveBlocked("worker", "clone")).toBe(false);
     expect(isBuiltinSaveBlocked("worker-fast", "edit")).toBe(false);
     expect(builtinGuardText("worker")).toContain("immutable");
-    expect(builtinGuardText("worker")).toContain("clone");
+    expect(builtinGuardText("worker")).toContain("override");
   });
 
   it("validates profile names like the backend grammar", () => {
@@ -226,15 +228,18 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     }
     // Production path is the bridge, never static injection.
     expect(html).not.toContain("__ORCA_PI_PROFILES__");
-    // Provenance, conflict, builtin guard, launch compiler reuse, MCP mapping.
+    // Provenance, conflict, builtin override guard, launch compiler reuse, MCP mapping.
     expect(html).toContain("Provenance");
     expect(html).toContain("conflict");
     expect(html).toContain("immutable");
+    expect(html).toContain("override");
     expect(html).toContain("launch.preview");
     expect(html).toContain("MCP");
-    // Dirty + navigation guard + narrow-panel responsiveness + focus.
+    // Dirty + navigation/scope guards (per-layer drafts, no silent retarget) + responsive + focus.
     expect(html).toContain("Unsaved");
     expect(html).toContain("confirm");
+    expect(html).toContain("per-layer");
+    expect(html).toContain("discards");
     expect(html).toContain("@media");
     expect(html).toContain("focus-visible");
   });
@@ -469,7 +474,7 @@ describe("control center: bridge negotiation in the shipped script", () => {
     expect(saveBtn!.disabled).toBe(false);
   });
 
-  it("blocks builtin saves and surfaces conflicts without overwriting", async () => {
+  it("allows builtin overrides and surfaces conflicts without overwriting", async () => {
     const dom = makeControlDom({
       request: (req: { operation: string; requestId: string; params?: unknown }) => {
         if (req.operation === "bridge.capabilities") {
@@ -509,16 +514,73 @@ describe("control center: bridge negotiation in the shipped script", () => {
     await flush(12);
     const items = dom.byId["profiles-list"]!.children;
     expect(items.length).toBe(1);
-    // Builtin row offers Clone/Inspect but no Delete/reset.
+    // Fresh builtin base offers Edit (override) + Clone/Inspect but no Delete/reset (no override yet).
     const labels = findButtons(items[0]!).map((b) => b.textContent);
+    expect(labels).toContain("Edit");
     expect(labels).toContain("Clone");
     expect(labels.some((t) => t.includes("Delete"))).toBe(false);
-    // Open builtin editor: Save stays disabled with guard text.
+    // Open builtin editor: Save stays ENABLED for the layer override with override guard text.
     const editBtn = findButtons(items[0]!).find((b) => b.textContent === "Edit")!;
     for (const fn of editBtn.listeners["click"] ?? []) (fn as () => void)();
     await flush(12);
     const editorText = JSON.stringify(dom.byId["profile-editor"]!.children.map((c) => c.textContent));
     expect(editorText).toContain("immutable");
+    expect(editorText).toContain("override");
+    const saveBtn = (function findSave(node: FakeEl): FakeEl | undefined {
+      if (node.textContent.startsWith("Save") && node.tag === "button") return node;
+      for (const c of node.children) { const found = findSave(c); if (found) return found; }
+      return undefined;
+    })(dom.byId["profile-editor"]!);
+    expect(saveBtn).toBeDefined();
+    expect(saveBtn!.disabled).toBe(false);
+  });
+
+  it("never silently retargets drafts across scopes (confirm + rerender)", async () => {
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "profile.read", "profile.mutate"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { summaries: [{ name: "custom", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["custom"], layer: "project", valid: true }] },
+          });
+        }
+        if (req.operation === "profile.read") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              name: "custom", exists: true, extendsChain: ["custom"],
+              source: { project: { model: "pm" } }, fields: {}, validation: { ok: true },
+              config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+              sourceHash: { project: "p".repeat(64), user: "u".repeat(64) },
+            },
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    // confirm() returns false first (cancel), then true (accept) — scope must not change on cancel.
+    let confirmCalls = 0;
+    (dom.window as Record<string, unknown>).confirm = (() => {
+      confirmCalls += 1;
+      return confirmCalls > 1;
+    }) as never;
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const items = dom.byId["profiles-list"]!.children;
+    const editBtn = findButtons(items[0]!).find((b) => b.textContent === "Edit")!;
+    for (const fn of editBtn.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    // Editor scope selector starts at project (default-scope value).
+    const html = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
+    expect(html).toContain("per-layer");
+    expect(html).toContain("discards");
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {

@@ -496,7 +496,8 @@
               del.addEventListener("click", function () { deleteProfile(p.name, layer); });
               actions.appendChild(del);
             } else {
-              var why = el("span", { class: "muted" }, "built-in: clone to customize");
+              // Fresh builtin base: Edit creates a layer override; Clone makes a new name.
+              var why = el("span", { class: "muted" }, "built-in base: Edit creates an override, Clone copies");
               actions.appendChild(why);
             }
             li.appendChild(actions);
@@ -679,7 +680,10 @@
           var isCreate = state.draftMode === "create";
           var name = isCreate ? (state.draft.name || "") : (state.selected || "");
           var detail = state.detail;
-          var isBuiltin = !isCreate && BUILTIN_PROFILES.indexOf(name) !== -1;
+          // Builtin bases are immutable, but user/project overrides for the
+          // same name are fully supported (patch creates the layer entry).
+          // Never block saves by name; the server gates base deletes.
+          var isBuiltinBase = !isCreate && BUILTIN_PROFILES.indexOf(name) !== -1;
 
           if (!isCreate && !detail) {
             ed.appendChild(el("p", { class: "muted" }, "Select a profile to edit."));
@@ -711,13 +715,29 @@
             o.value = s; if (state.scope === s) o.selected = true;
             scopeSel.appendChild(o);
           });
-          scopeSel.addEventListener("change", function () { state.scope = scopeSel.value; setDirty(true); });
+          scopeSel.addEventListener("change", function () {
+            var next = scopeSel.value;
+            if (next === state.scope) return;
+            // Drafts are scope-targeted: switching layers with unsaved edits
+            // must never silently retarget the pending patch. Confirm,
+            // discard the old layer's draft, and rerender for the new layer.
+            if (state.dirty) {
+              if (!window.confirm("Switch save scope to \"" + next + "\"? Unsaved " + state.scope + " edits will be discarded (drafts are per-layer).")) {
+                scopeSel.value = state.scope;
+                return;
+              }
+              state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
+              setDirty(false);
+            }
+            state.scope = next;
+            renderEditor();
+          });
           nameWrap.appendChild(scopeSel);
           nameWrap.appendChild(el("p", { class: "hint" }, "Writes go only to the selected layer via profile.mutate; the other layer is untouched."));
           ed.appendChild(nameWrap);
 
-          if (isBuiltin) {
-            var guard = el("p", null, 'Built-in "' + name + '" is immutable: clone it to customize. Direct edits are blocked (server enforces this too).');
+          if (isBuiltinBase) {
+            var guard = el("p", null, 'Built-in base "' + name + '" is immutable, but you can customize it here: saving creates/updates only the selected ' + state.scope + ' layer override (builtins < user < project). Clone only when you need a new profile name.');
             guard.setAttribute("role", "note");
             ed.appendChild(guard);
           }
@@ -764,7 +784,7 @@
             inp.id = "f-" + field;
             inp.value = cur == null ? "" : String(cur);
             if (placeholder) inp.setAttribute("placeholder", placeholder);
-            if (isBuiltin && (field !== "displayName" && field !== "description")) inp.disabled = true;
+            // Overrides stay editable even for builtin-named profiles (layer-targeted saves).
             inp.addEventListener("input", function () { state.draft[field] = inp.value; setDirty(true); });
             return inp;
           }
@@ -785,7 +805,7 @@
             if (curExt === p.name) o.selected = true;
             extSel.appendChild(o);
           });
-          if (isBuiltin) extSel.disabled = true;
+          // extends stays editable for overrides (server validates cycles/parents).
           extSel.addEventListener("change", function () { state.draft.extends = extSel.value; setDirty(true); });
           ed.appendChild(fieldRow("extends", "Inheritance (extends)", "Single parent (v1). Cycles and unknown parents are rejected server-side.", extSel, provFor("extends")));
 
@@ -800,7 +820,7 @@
             if (cur === lvl) o.selected = true;
             thinkSel.appendChild(o);
           });
-          if (isBuiltin) thinkSel.disabled = true;
+          // thinking stays editable for overrides.
           thinkSel.addEventListener("change", function () { state.draft.thinking = thinkSel.value; setDirty(true); });
           ed.appendChild(fieldRow("thinking", "Thinking level", "Pi --thinking. Closed set owned by the backend.", thinkSel, provFor("thinking")));
 
@@ -827,7 +847,7 @@
             lab.setAttribute("style", "font-weight:400;margin-right:8px;");
             var r = el("input"); r.type = "radio"; r.name = "prompt-mode"; r.value = m;
             if (promptMode === m) r.checked = true;
-            if (isBuiltin) r.disabled = true;
+            // prompt-mode radios stay enabled for overrides.
             r.addEventListener("change", function () {
               if (m === "none") { state.draft.systemPrompt = ""; state.draft.systemPromptFile = ""; }
               else if (m === "inline") { state.draft.systemPromptFile = ""; if (state.draft.systemPrompt === "" || state.draft.systemPrompt === undefined) state.draft.systemPrompt = (detail && detail.fields && detail.fields.systemPrompt && detail.fields.systemPrompt.effective) || ""; }
@@ -856,7 +876,7 @@
               var lab = el("label", null, " " + t);
               var cb = el("input"); cb.type = "checkbox"; cb.value = t;
               if (curList.indexOf(t) !== -1) cb.checked = true;
-              if (isBuiltin) cb.disabled = true;
+              // Tool checkboxes stay enabled for overrides.
               cb.addEventListener("change", function () {
                 var next = Array.isArray(state.draft[field]) ? state.draft[field].slice() : curList.slice();
                 if (cb.checked && next.indexOf(t) === -1) next.push(t);
@@ -869,7 +889,7 @@
             wrap.appendChild(group);
             var custom = el("input"); custom.type = "text"; custom.setAttribute("placeholder", "custom-tool to add; Enter adds");
             custom.setAttribute("aria-label", labelText + " custom tool");
-            if (isBuiltin) custom.disabled = true;
+            // Custom-tool input stays enabled for overrides.
             custom.addEventListener("keydown", function (ev) {
               if (ev.key === "Enter") {
                 ev.preventDefault();
@@ -892,7 +912,7 @@
                   var next = (Array.isArray(state.draft[field]) ? state.draft[field] : curList.slice()).filter(function (x) { return x !== t; });
                   state.draft[field] = next; setDirty(true); renderEditor();
                 });
-                if (isBuiltin) rm.disabled = true;
+                // Remove stays enabled for overrides.
                 li.appendChild(rm); ul.appendChild(li);
               });
               wrap.appendChild(ul);
@@ -923,7 +943,7 @@
                   var next = (Array.isArray(state.draft[field]) ? state.draft[field] : curList.slice()).filter(function (x) { return x !== v; });
                   state.draft[field] = next; setDirty(true); renderEditor();
                 });
-                if (isBuiltin) rm.disabled = true;
+                // Remove stays enabled for overrides.
                 li.appendChild(rm); ul.appendChild(li);
               });
               wrap.appendChild(ul);
@@ -932,7 +952,7 @@
             }
             var add = el("input"); add.type = "text"; add.setAttribute("placeholder", placeholder);
             add.setAttribute("aria-label", labelText + " add");
-            if (isBuiltin) add.disabled = true;
+            // Add stays enabled for overrides.
             add.addEventListener("keydown", function (ev) {
               if (ev.key === "Enter") {
                 ev.preventDefault();
@@ -961,7 +981,7 @@
             var cb = el("input"); cb.type = "checkbox"; cb.id = "f-" + f;
             var cur = state.draft[f] !== undefined ? state.draft[f] : (detail && detail.fields && detail.fields[f] && detail.fields[f].effective);
             cb.checked = cur === true;
-            if (isBuiltin) cb.disabled = true;
+            // Boolean flags stay enabled for overrides.
             cb.addEventListener("change", function () { state.draft[f] = cb.checked; setDirty(true); });
             lab.insertBefore(cb, lab.firstChild);
             wrap.appendChild(lab);
@@ -977,7 +997,7 @@
             if (cur === s) o.selected = true;
             sessSel.appendChild(o);
           });
-          if (isBuiltin) sessSel.disabled = true;
+          // Session stays editable for overrides.
           sessSel.addEventListener("change", function () { state.draft.session = sessSel.value; setDirty(true); });
           ed.appendChild(fieldRow("session", "Session mode", "ephemeral = Pi --no-session (never resumes).", sessSel, provFor("session")));
 
@@ -1001,12 +1021,14 @@
 
           // Save row.
           var row = el("div", { class: "cc-actions" });
-          var save = el("button", null, isCreate ? "Create profile" : "Save " + state.scope + " layer");
+          var save = el("button", null, isCreate ? "Create profile" : "Save " + state.scope + " layer" + (isBuiltinBase ? " override" : ""));
           save.id = "btn-save";
           save.setAttribute("class", "primary");
-          if (isBuiltin || !state.structured) {
+          // Builtin-named profiles save into the selected layer override;
+          // only an unreachable bridge disables Save (never a name check).
+          if (!state.structured) {
             save.disabled = true;
-            save.title = isBuiltin ? "Built-ins are immutable — clone to customize." : "Structured bridge unreachable — Save disabled.";
+            save.title = "Structured bridge unreachable — Save disabled.";
           }
           save.addEventListener("click", saveDraft);
           var cancel = el("button", null, "Cancel");
@@ -1021,11 +1043,11 @@
           if (!isCreate && state.selected) {
             var resetBtn = el("button", null, "Reset " + state.scope + " override");
             resetBtn.addEventListener("click", function () { resetScope(state.selected); });
-            if (isBuiltin) resetBtn.disabled = false; // reset of an override is allowed even for builtins
+            // Reset of a layer override is always allowed (server gates base deletes).
             row.appendChild(resetBtn);
           }
           ed.appendChild(row);
-          setSaveEnabled(!(isBuiltin || !state.structured), isBuiltin ? "Built-ins are immutable." : undefined);
+          setSaveEnabled(!!state.structured, state.structured ? undefined : "Structured bridge unreachable — Save disabled.");
           setDirty(state.dirty);
         }
 
@@ -1079,11 +1101,8 @@
             if (hash === null) params.expectedAbsent = true;
             else if (typeof hash === "string") params.expectedSourceHash = hash;
           } else {
-            if (BUILTIN_PROFILES.indexOf(name) !== -1) {
-              state.globalError = 'Built-in "' + name + '" is immutable: clone it instead.';
-              renderEditor();
-              return;
-            }
+            // Builtin-named profiles patch the selected layer override;
+            // the server rejects only base deletes with no override.
             params = { action: "patch", name: name, scope: scope, patch: draftPatch() };
             if (hash !== undefined) {
               if (hash === null) params.expectedAbsent = true;
@@ -1211,7 +1230,26 @@
           var create = document.getElementById("btn-create");
           if (create) create.addEventListener("click", startCreate);
           var defScope = document.getElementById("default-scope");
-          if (defScope) defScope.addEventListener("change", function () { state.scope = defScope.value; });
+          if (defScope) defScope.addEventListener("change", function () {
+            var nextDefault = defScope.value;
+            // The default scope seeds future creates/loads; it must never
+            // silently retarget an active editor's pending draft. When an
+            // editor is active, confirm and rerender (discarding the old
+            // layer's draft) so Save always targets the visible layer.
+            var editorActive = !!(state.selected || state.draftMode === "create");
+            if (!editorActive) { state.scope = nextDefault; return; }
+            if (nextDefault === state.scope) return;
+            if (state.dirty) {
+              if (!window.confirm("Change default scope to \"" + nextDefault + "\"? This discards unsaved " + state.scope + " edits and reloads the editor for " + nextDefault + " (drafts are per-layer).")) {
+                defScope.value = state.scope;
+                return;
+              }
+              state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
+              setDirty(false);
+            }
+            state.scope = nextDefault;
+            renderEditor();
+          });
           var lp = document.getElementById("btn-launch-preview");
           if (lp) lp.addEventListener("click", function () { loadLaunchPreview(null); });
           var dr = document.getElementById("btn-diagnostics-reload");

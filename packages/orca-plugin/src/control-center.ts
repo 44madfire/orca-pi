@@ -537,15 +537,27 @@ export function describeDegradedMode(input: {
   };
 }
 
-/** True when the editor must block saves (builtin direct edit). */
-export function isBuiltinSaveBlocked(profileName: string, mode: "edit" | "create" | "clone"): boolean {
-  if (mode !== "edit") return false;
-  return isBuiltinProfileName(profileName);
+/**
+ * Whether the editor must block saves for a builtin-named profile.
+ *
+ * Never blocks: the core mutation contract supports `patch`/`set --scope
+ * <user|project>` on an effective builtin to create/update that layer's
+ * override — only the compiled builtin source itself is immutable (and the
+ * server enforces `builtin-immutable` for deletes with no override plus
+ * `already-exists` for creates that shadow). The UI therefore always
+ * allows saving builtin-named profiles into the selected user/project
+ * layer; destructive base deletes stay server-gated. Kept as a predicate
+ * (always false) so callers cannot reintroduce name-based blocking.
+ */
+export function isBuiltinSaveBlocked(_profileName: string, _mode: "edit" | "create" | "clone"): boolean {
+  void _profileName;
+  void _mode;
+  return false;
 }
 
-/** Guard text for builtins (create/clone allowed, direct edit blocked). */
+/** Guard text for builtins (override semantics, never a Save block). */
 export function builtinGuardText(name: string): string {
-  return `Built-in profile "${name}" is immutable: clone it to a user/project profile to customize, or override individual fields in your layer. Direct edits are blocked; the server enforces this too.`;
+  return `Built-in base "${name}" is immutable, but you can customize it here: saving creates/updates only the selected user/project layer override (builtins < user < project). Clone only when you need a new profile name; the server still rejects deleting the builtin base with no override.`;
 }
 
 /** Validate unknown bridge list payloads into list items (never throws). */
