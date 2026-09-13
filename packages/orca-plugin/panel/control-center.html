@@ -423,6 +423,7 @@
         var ORCH_BUILTINS = ["worker", "scout", "reviewer"];
         var ORCH_CHAIN = "Orchestration role mapping → profile → user/project profile layers → effective launch";
         var ORCH_ROLE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+        var ORCH_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
         // Every user edit bumps draftRev so in-flight saves can tell whether
         // the draft changed after submission (edits-after-save must survive).
@@ -1452,7 +1453,7 @@
         function orchValidateProfile(ref) {
           if (typeof ref !== "string" || !ref) return "expected a Pi profile name (e.g. worker-fast).";
           if (ref === "__proto__" || ref === "constructor" || ref === "prototype") return "reserved name.";
-          if (ref.length > 64 || !ORCH_ROLE_RE.test(ref)) return "use 1-64 chars matching [a-z0-9]+(-[a-z0-9]+)*.";
+          if (ref.length > 64 || !ORCH_PROFILE_RE.test(ref)) return "use 1-64 chars matching [A-Za-z0-9][A-Za-z0-9_-]* (roles stay narrow; profile refs accept full Pi grammar).";
           return null;
         }
         function orchClientErrors(role, profile) {
@@ -1880,10 +1881,16 @@
           for (var i = 0; i < (state.orchItems || []).length; i += 1) {
             if (state.orchItems[i].role === targetRole) found = state.orchItems[i];
           }
-          var profile = (state.orchDraft.profile && state.orchDirty) ? String(state.orchDraft.profile).trim() || (found ? found.profile : null) : (found ? found.profile : null);
+          // Only use the dirty draft when the preview target actually owns it:
+          // the role being edited (never a different row, never __new__ for
+          // an existing role). Otherwise previews leak one role's unsaved
+          // profile into another role's chain label.
+          var ownsDraft = !!state.orchDirty && targetRole === state.orchSelected && state.orchSelected !== "__new__";
+          var profile = ownsDraft && state.orchDraft.profile ? String(state.orchDraft.profile).trim() || (found ? found.profile : null) : (found ? found.profile : null);
           if (!profile) { if (box) box.innerHTML = "<p class=\"muted\">No profile mapped for this role.</p>"; return; }
-          if (found && found.invalid && !state.orchDirty) {
+          if (found && found.invalid && !ownsDraft) {
             if (box) box.innerHTML = "<p><strong>Invalid reference:</strong> role <code>" + esc(targetRole) + "</code> points at missing profile <code>" + esc(profile) + "</code>. Fix the mapping before launch — no launch preview is available for a deleted profile.</p><p class=\"muted\">" + esc(orchChainText(targetRole, profile)) + "</p>";
+            return;
           }
           if (!can("launch.preview")) { if (box) box.innerHTML = "<p class=\"muted\">launch.preview unavailable on this host.</p>"; return; }
           state.orchPreviewToken = (state.orchPreviewToken || 0) + 1;

@@ -651,6 +651,8 @@ export function isBuiltinOrchestrationRole(role: string): boolean {
 }
 
 const ORCH_ROLE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** Canonical Pi profile-name grammar (mirrors core profile/schema.ts); role names stay narrow. */
+const ORCH_PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const ORCH_MAX_NAME = 64;
 const ORCH_RESERVED = new Set(["__proto__", "prototype", "constructor"]);
 
@@ -664,12 +666,12 @@ export function validateOrchestrationRole(role: unknown): string | undefined {
   return undefined;
 }
 
-/** Validate one profile reference (same grammar as roles). */
+/** Validate one profile reference against the canonical Pi profile grammar (letters/digits/_/-). */
 export function validateOrchestrationProfileRef(ref: unknown): string | undefined {
   if (typeof ref !== "string" || ref.length === 0) return "expected a Pi profile name (e.g. \"worker-fast\").";
   if (ORCH_RESERVED.has(ref)) return "reserved name: never use \"__proto__\", \"constructor\", or \"prototype\".";
-  if (ref.length > ORCH_MAX_NAME || !ORCH_ROLE_PATTERN.test(ref)) {
-    return `use 1-${ORCH_MAX_NAME} chars matching [a-z0-9]+(-[a-z0-9]+)* (e.g. "worker-fast").`;
+  if (ref.length > ORCH_MAX_NAME || !ORCH_PROFILE_PATTERN.test(ref)) {
+    return `use 1-${ORCH_MAX_NAME} chars matching [A-Za-z0-9][A-Za-z0-9_-]* (e.g. "worker-fast", "Worker_Fast"). Roles stay narrow; profile refs accept the full Pi grammar.`;
   }
   return undefined;
 }

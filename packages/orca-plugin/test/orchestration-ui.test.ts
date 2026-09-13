@@ -41,16 +41,21 @@ describe("orchestration helpers: roles, validation, params", () => {
     expect(isBuiltinOrchestrationRole("custom-role")).toBe(false);
   });
 
-  it("validates roles and profile refs like the backend grammar", () => {
+  it("validates roles narrowly but profile refs with the full Pi grammar", () => {
     expect(validateOrchestrationRole("worker")).toBeUndefined();
     expect(validateOrchestrationRole("custom-role")).toBeUndefined();
     expect(validateOrchestrationRole("")).toBeDefined();
     expect(validateOrchestrationRole("has space")).toBeDefined();
     expect(validateOrchestrationRole("HasCaps")).toBeDefined();
+    expect(validateOrchestrationRole("with_underscore")).toBeDefined();
     expect(validateOrchestrationRole("__proto__")).toBeDefined();
     expect(validateOrchestrationProfileRef("worker-fast")).toBeUndefined();
+    // Canonical Pi profile grammar accepts uppercase/underscore (Profiles UI can create them).
+    expect(validateOrchestrationProfileRef("Worker_Fast")).toBeUndefined();
+    expect(validateOrchestrationProfileRef("W1")).toBeUndefined();
     expect(validateOrchestrationProfileRef("")).toBeDefined();
     expect(validateOrchestrationProfileRef("bad name!")).toBeDefined();
+    expect(validateOrchestrationProfileRef("__proto__")).toBeDefined();
   });
 
   it("runs client-side draft checks before the bridge", () => {
@@ -206,6 +211,8 @@ describe("orchestration: shipped script honors bridge + ownership contract", () 
       "orch-dirty",
       "expectedSourceHash",
       "clear: true",
+      "ORCH_PROFILE_RE",
+      "ownsDraft",
       "INVALID",
       "Provenance",
       "Orchestration role mapping → profile → user/project profile layers → effective launch",
@@ -577,6 +584,140 @@ describe("orchestration: bridge round-trip in the shipped script", () => {
     expect(dom.byId["orch-preview"]!.innerHTML).toContain("effective launch");
   });
 
+  it("never leaks one role's dirty draft into another role's preview", async () => {
+    const previewedProfiles: string[] = [];
+    const dom = makeOrchDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "orchestration.get", "orchestration.set", "launch.preview", "worktree.context"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { summaries: [
+              { name: "worker", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["worker"], layer: "builtin", valid: true },
+              { name: "worker-draft", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["worker-draft"], layer: "project", valid: true },
+              { name: "reviewer", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["reviewer"], layer: "builtin", valid: true },
+            ] },
+          });
+        }
+        if (req.operation === "orchestration.get") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              effective: { worker: "worker", scout: "scout", reviewer: "reviewer" },
+              provenance: { worker: "builtin", scout: "builtin", reviewer: "builtin" },
+              config: { userPath: "/u", projectPath: "/p", userExists: false, projectExists: false },
+              sourceHash: {},
+            },
+          });
+        }
+        if (req.operation === "launch.preview") {
+          const name = (req.params as { name?: string })?.name ?? "";
+          previewedProfiles.push(name);
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              profile: name,
+              resolved: { model: "m", thinking: "high", tools: [], skills: [], extensions: [], contextFiles: false },
+              launch: { preview: "pi", promptSource: "builtin", spec: { args: [] } },
+              displayOnly: true,
+            },
+          });
+        }
+        if (req.operation === "worktree.context") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { projectRoot: "/repo/p" } });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(14);
+    // Edit worker (first row) so the editor holds a dirty draft for worker.
+    const items = dom.byId["orch-list"]!.children;
+    const workerEdit = findButtons(items[0]!).find((b) => b.textContent === "Edit")!;
+    for (const fn of workerEdit.listeners["click"] ?? []) (fn as () => void)();
+    await flush(6);
+    // Simulate typing a different profile into the worker editor (dirty draft).
+    const findById = (root: FakeEl, id: string): FakeEl | undefined => {
+      if ((root as unknown as Record<string, unknown>).id === id) return root;
+      for (const c of root.children) { const f = findById(c, id); if (f) return f; }
+      return undefined;
+    };
+    // Fake DOM inputs don't carry ids via attrs in this harness; drive the
+    // draft by previewing the reviewer row directly: the reviewer preview
+    // must resolve the persisted reviewer profile, never the worker draft.
+    const reviewerRow = items[2]!;
+    const reviewerPreview = findButtons(reviewerRow).find((b) => b.textContent === "Preview launch")!;
+    // Make the worker draft dirty by editing through the editor's input if present.
+    const profileInput = findById(dom.byId["orch-editor"]!, "orch-profile");
+    if (profileInput) {
+      (profileInput as unknown as Record<string, unknown>).value = "worker-draft";
+      for (const fn of profileInput.listeners["input"] ?? []) (fn as () => void)();
+      await flush(2);
+    }
+    expect(dom.byId["orch-dirty"]!.textContent).toContain("Unsaved");
+    // Cancel the role switch so the worker draft stays dirty while previewing reviewer.
+    (dom.window as Record<string, unknown>).confirm = (() => false) as never;
+    for (const fn of reviewerPreview.listeners["click"] ?? []) (fn as () => void)();
+    await flush(8);
+    // The reviewer preview must use the persisted reviewer profile.
+    expect(previewedProfiles).toContain("reviewer");
+    expect(previewedProfiles).not.toContain("worker-draft");
+    expect(dom.byId["orch-preview"]!.innerHTML).toContain("reviewer");
+  });
+
+  it("never calls launch.preview for a known-invalid persisted mapping", async () => {
+    const calls: string[] = [];
+    const dom = makeOrchDom({
+      request: (req: { operation: string; requestId: string }) => {
+        calls.push(req.operation);
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "orchestration.get", "orchestration.set", "launch.preview", "worktree.context"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { summaries: [{ name: "scout", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["scout"], layer: "builtin", valid: true }] },
+          });
+        }
+        if (req.operation === "orchestration.get") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              effective: { worker: "ghost-profile", scout: "scout" },
+              provenance: { worker: "project", scout: "builtin" },
+              invalidRefs: ["worker"],
+              config: { userPath: "/u", projectPath: "/p", userExists: false, projectExists: true },
+              sourceHash: { project: "p".repeat(64) },
+            },
+          });
+        }
+        if (req.operation === "worktree.context") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { projectRoot: "/repo/p" } });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(14);
+    const items = dom.byId["orch-list"]!.children;
+    const previewBtn = findButtons(items[0]!).find((b) => b.textContent === "Preview launch")!;
+    for (const fn of previewBtn.listeners["click"] ?? []) (fn as () => void)();
+    await flush(8);
+    expect(calls).not.toContain("launch.preview");
+    expect(dom.byId["orch-preview"]!.innerHTML).toContain("Invalid reference");
+    expect(dom.byId["orch-preview"]!.innerHTML).toContain("ghost-profile");
+  });
+
   it("degrades without auto-send and disables mapping saves", async () => {
     const dom = makeOrchDom(undefined);
     const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
@@ -730,6 +871,25 @@ describe("orchestration: authoritative round-trip (bridge host)", () => {
       deps,
     );
     expect(setCustom.ok).toBe(true);
+    // Canonical Pi profile grammar: uppercase/underscore refs are valid.
+    const setUpper = await handleBridgeRequest(
+      {
+        protocolVersion: 1, requestId: "set-upper", operation: "orchestration.set",
+        worktree: { projectRoot: "/repo/p" },
+        params: { role: "scout", profile: "Worker_Fast", scope: "project" },
+      },
+      deps,
+    );
+    expect(setUpper.ok).toBe(true);
+    const afterUpper = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "get-3", operation: "orchestration.get" },
+      deps,
+    );
+    expect(afterUpper.ok).toBe(true);
+    if (afterUpper.ok) {
+      const result = afterUpper.result as { effective: Record<string, string> };
+      expect(result.effective["scout"]).toBe("Worker_Fast");
+    }
   });
 
   it("launch preview reuses the compiler for a mapped profile (display-only)", async () => {
