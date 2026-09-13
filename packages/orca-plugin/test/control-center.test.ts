@@ -256,6 +256,8 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("refreshListOnly");
     expect(html).toContain("draftRevAtStart");
     expect(html).toContain("scopeBefore");
+    expect(html).toContain("previewToken");
+    expect(html).toContain("myPreviewToken");
     // Adoption must advance editor ownership so older saves cannot steal it.
     expect(html).toContain("state.editorGen = (state.editorGen || 0) + 1");
     expect(html).toContain("state.selected = selectAfter");
@@ -993,6 +995,68 @@ describe("control center: bridge negotiation in the shipped script", () => {
     // Static ownership invariant already asserted above; execution proves the
     // deferred save cannot resolve into the adopted editor.
     expect(resolveSaveA).toBeUndefined();
+  });
+
+  it("keeps only the newest launch preview (last-request-wins)", async () => {
+    let resolveSlow: ((v: unknown) => void) | undefined;
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "profile.read", "launch.preview"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              summaries: [
+                { name: "aaa", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["aaa"], layer: "project", valid: true },
+                { name: "bbb", thinking: "low", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: false, extendsChain: ["bbb"], layer: "project", valid: true },
+              ],
+            },
+          });
+        }
+        if (req.operation === "launch.preview") {
+          const name = (req.params as { name?: string })?.name;
+          if (name === "aaa") {
+            return new Promise((resolve) => { resolveSlow = resolve as (v: unknown) => void; });
+          }
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              profile: "bbb", resolved: { name: "bbb", thinking: "low", model: "new", tools: [], skills: [], extensions: [], contextFiles: false },
+              launch: { preview: "preview-bbb-new", spec: { args: [] }, promptSource: "inline" },
+              displayOnly: true,
+            },
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const items = dom.byId["profiles-list"]!.children;
+    const inspectA = findButtons(items[0]!).find((b) => b.textContent === "Inspect")!;
+    const inspectB = findButtons(items[1]!).find((b) => b.textContent === "Inspect")!;
+    for (const fn of inspectA.listeners["click"] ?? []) (fn as () => void)();
+    await flush(2);
+    for (const fn of inspectB.listeners["click"] ?? []) (fn as () => void)();
+    await flush(8);
+    expect(dom.byId["launch-preview"]!.innerHTML).toContain("preview-bbb-new");
+    resolveSlow!({
+      protocolVersion: 1, requestId: "stale-aaa", ok: true,
+      result: {
+        profile: "aaa", resolved: { name: "aaa", thinking: "high", model: "old", tools: [], skills: [], extensions: [], contextFiles: true },
+        launch: { preview: "preview-aaa-stale", spec: { args: [] }, promptSource: "inline" },
+        displayOnly: true,
+      },
+    });
+    await flush(4);
+    expect(dom.byId["launch-preview"]!.innerHTML).toContain("preview-bbb-new");
+    expect(dom.byId["launch-preview"]!.innerHTML).not.toContain("preview-aaa-stale");
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {

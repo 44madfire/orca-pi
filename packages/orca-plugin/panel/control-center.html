@@ -365,6 +365,7 @@
           launch: null,
           detailToken: 0,
           listToken: 0,
+          previewToken: 0,
           editorGen: 0,
           draftRev: 0,
         };
@@ -1336,9 +1337,16 @@
           var target = name || state.selected;
           if (!target) { if (box) box.innerHTML = "<p class=\"muted\">Select a profile first.</p>"; return; }
           if (!can("launch.preview")) { if (box) box.innerHTML = "<p class=\"muted\">launch.preview unavailable on this host.</p>"; return; }
+          // Last-request-wins: concurrent Inspect actions must never let an
+          // older slower preview overwrite a newer one in the shared panel.
+          state.previewToken = (state.previewToken || 0) + 1;
+          var myPreviewToken = state.previewToken;
+          var myPreviewTarget = target;
           if (box) box.innerHTML = "<p class=\"muted\">Loading launch preview via <code>launch.preview</code> (JEF-7 compiler, display-only)…</p>";
           request("launch.preview", { name: target }).then(function (res) {
             if (!box) return;
+            if (myPreviewToken !== state.previewToken) return;
+            if (myPreviewTarget !== (name || state.selected)) return;
             if (res && res.ok && res.result) {
               var r = res.result;
               var resolved = r.resolved || {};
@@ -1357,6 +1365,10 @@
             } else {
               box.innerHTML = "<p><strong>Preview failed.</strong> <span class=\"muted\">" + esc((res && res.error && res.error.code + ": " + res.error.message) || "unavailable") + "</span></p>";
             }
+          }, function () {
+            if (!box) return;
+            if (myPreviewToken !== state.previewToken) return;
+            box.innerHTML = "<p><strong>Preview failed.</strong> <span class=\"muted\">bridge request failed</span></p>";
           });
         }
 
