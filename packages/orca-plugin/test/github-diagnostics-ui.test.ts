@@ -41,6 +41,7 @@ import {
   HUMAN_REVIEW_ACTOR,
   isSecretFreePayload,
   mapGithubErrorToField,
+  mergeGithubStatusSnapshots,
   redactDiagnosticsText,
   REVIEW_ACTOR_NOTE,
   sanitizeDiagnosticsDetail,
@@ -788,6 +789,36 @@ describe("ui1.5/p1: diagnostics detail sanitization (no runner secret crosses)",
     expect(html).not.toContain('esc(cli.pi.detail || "")');
     expect(containsSecretMaterial(html)).toBe(false);
   });
+
+  it("a throwing runner never leaks secret-bearing throw text via error response or payload", async () => {
+    // Synthetic fixtures only — never real credentials.
+    const throwToken = "ghp_thrownsecret0123456789";
+    const throwKey = "-----BEGIN RSA PRIVATE KEY-----\nMIIBthrowkeymaterial\n-----END RSA PRIVATE KEY-----";
+    const throwingRunner = {
+      async run() {
+        throw new Error(`spawn orca failed: helper echoed ${throwToken} and ${throwKey}`);
+      },
+    } as unknown as import("@orca-pi/core").ProcessRunner;
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "throw1", operation: "diagnostics.doctor" },
+      bridgeDeps({ runner: throwingRunner }),
+    );
+    // Collapsed to a degraded success — never an `internal` error carrying
+    // the verbatim throw text (the Diagnostics DOM renders error messages).
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const text = JSON.stringify(res.result);
+      expect(text).not.toContain(throwToken);
+      expect(text).not.toContain("BEGIN RSA PRIVATE KEY");
+      expect(text).not.toContain("MIIBthrowkeymaterial");
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(isSecretFreePayload(res.result)).toBe(true);
+      // Actionable non-secret fallback survives: explicit CLI fallback.
+      expect(text).toContain("orca-pi doctor");
+      const cli = (res.result as Record<string, unknown>)["cli"];
+      expect(typeof cli).toBe("string");
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -905,5 +936,76 @@ describe("ui1.5/p2: diagnostics headline never claims ready without validation",
     expect(html).not.toContain("res.result.ok !== false && invalid === 0");
     // Rejected validate requests fail closed and still update the headline.
     expect(html).toContain("profile validation failed (bridge request failed)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 scoped-refresh merge: partial github.status never hides the sibling
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/p2: scoped status merges into the panel snapshot", () => {
+  const fullSnapshot = {
+    identities: {
+      worker: { identity: "worker", configured: true, sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN", expired: false },
+      reviewer: { identity: "reviewer", configured: true, sourceLabel: "ORCA_PI_GITHUB_REVIEWER_TOKEN", expired: false },
+    },
+    redacted: true,
+  };
+  const workerOnly = {
+    identities: {
+      worker: { identity: "worker", configured: true, sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN", expiresAt: "2030-01-01T00:00:00.000Z", expired: false },
+    },
+    redacted: true,
+  };
+  const reviewerOnly = {
+    identities: {
+      reviewer: { identity: "reviewer", configured: false, sourceLabel: "ORCA_PI_GITHUB_REVIEWER_TOKEN" },
+    },
+    redacted: true,
+  };
+
+  it("Refresh worker preserves Reviewer (scoped next wins per identity)", () => {
+    const merged = mergeGithubStatusSnapshots(fullSnapshot, workerOnly);
+    const items = toGithubStatusItems(merged);
+    expect(items.map((i) => i.identity).sort()).toEqual(["reviewer", "worker"]);
+    // Fresh worker fields land; reviewer snapshot untouched.
+    expect(items.find((i) => i.identity === "worker")!.expiresAt).toContain("2030");
+    expect(items.find((i) => i.identity === "reviewer")!.configured).toBe(true);
+    expect(isSecretFreePayload(merged)).toBe(true);
+  });
+
+  it("Refresh reviewer preserves Worker", () => {
+    const merged = mergeGithubStatusSnapshots(fullSnapshot, reviewerOnly);
+    const items = toGithubStatusItems(merged);
+    expect(items.map((i) => i.identity).sort()).toEqual(["reviewer", "worker"]);
+    expect(items.find((i) => i.identity === "reviewer")!.configured).toBe(false);
+    expect(items.find((i) => i.identity === "worker")!.configured).toBe(true);
+  });
+
+  it("sequential scoped refreshes converge (worker then reviewer)", () => {
+    const afterWorker = mergeGithubStatusSnapshots(fullSnapshot, workerOnly);
+    const afterBoth = mergeGithubStatusSnapshots(afterWorker, reviewerOnly);
+    const items = toGithubStatusItems(afterBoth);
+    expect(items.find((i) => i.identity === "worker")!.expiresAt).toContain("2030");
+    expect(items.find((i) => i.identity === "reviewer")!.configured).toBe(false);
+  });
+
+  it("never throws on malformed snapshots and drops non-record entries", () => {
+    expect(mergeGithubStatusSnapshots(null, workerOnly)).toEqual(workerOnly);
+    expect(toGithubStatusItems(mergeGithubStatusSnapshots(fullSnapshot, null))).toHaveLength(2);
+    const poisoned = mergeGithubStatusSnapshots(fullSnapshot, {
+      identities: { worker: { configured: true, sourceLabel: "x" }, evil: 42, "": { configured: true } },
+    });
+    const identities = (poisoned.identities as Record<string, unknown>);
+    expect(Object.keys(identities).sort()).toEqual(["reviewer", "worker"]);
+    expect(isSecretFreePayload(poisoned)).toBe(true);
+  });
+
+  it("panel merges scoped results before rendering", () => {
+    const html = controlHtml();
+    expect(html).toContain("mergeGithubStatus");
+    expect(html).toContain("state.githubStatus = mergeGithubStatus(state.githubStatus, res.result)");
+    expect(html).toContain("renderGithubStatus(state.githubStatus)");
+    expect(html).not.toContain("state.githubStatus = res.result;");
   });
 });

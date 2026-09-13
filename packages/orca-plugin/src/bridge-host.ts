@@ -678,10 +678,27 @@ async function githubDoctorResult(request: BridgeRequest, deps: BridgeHostDeps):
 
 async function diagnosticsDoctorResult(request: BridgeRequest, deps: BridgeHostDeps): Promise<unknown> {
   const core = await import("@orca-pi/core");
-  let cli: DoctorReport | undefined;
+  const secrets = core.collectSecretsFromEnv(deps.env ?? process.env);
+  let cli: DoctorReport | string | undefined;
   if (deps.runner) {
-    const raw = await core.doctor(deps.runner);
-    cli = sanitizeDoctorReportForBridge(raw, core.collectSecretsFromEnv(deps.env ?? process.env));
+    try {
+      const raw = await core.doctor(deps.runner);
+      cli = sanitizeDoctorReportForBridge(raw, secrets);
+    } catch (error) {
+      // The runner itself threw (not a normal probe detail): core rethrows
+      // non-ENOENT runner failures, and the generic bridge error path
+      // would return `error.message` verbatim. Collapse to a sanitized
+      // degraded note instead so secret-bearing throw text can never
+      // cross the bridge via the error response (or reach the DOM
+      // through the panel's error rendering). Actionable non-secret text
+      // survives redaction/bounding; the CLI fallback stays explicit.
+      const detail = sanitizeDiagnosticsDetail(
+        error instanceof Error ? error.message : String(error),
+        DIAGNOSTICS_DETAIL_LIMIT,
+        secrets,
+      );
+      cli = `(CLI probes failed: ${detail} — run \`orca-pi doctor\` for live orca/pi versions)`;
+    }
   }
   const negotiation = negotiateBridgeCapabilities(deps.hostInfo);
   const result = {

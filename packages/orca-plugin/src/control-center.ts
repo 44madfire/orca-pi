@@ -979,6 +979,39 @@ export function toGithubStatusItems(payload: unknown): GithubStatusItem[] {
   return out;
 }
 
+/**
+ * Merge a (possibly role-scoped/partial) `github.status` payload into the
+ * existing panel snapshot (never throws). `github.status({identity})`
+ * intentionally returns only that identity; the panel must fold the
+ * partial map into the previous snapshot so a scoped refresh never hides
+ * the sibling identity. `next` wins per identity; other identities,
+ * `redacted`, and `note` carry over when `next` omits them. Only
+ * allowlisted redacted entry shapes survive (identity-keyed records) —
+ * anything else is dropped, never rendered.
+ */
+export function mergeGithubStatusSnapshots(prev: unknown, next: unknown): Record<string, unknown> {
+  const prevRec = isPlainRecord(prev) ? (prev as Record<string, unknown>) : {};
+  const nextRec = isPlainRecord(next) ? (next as Record<string, unknown>) : {};
+  const prevIdentities = isPlainRecord(prevRec["identities"]) ? (prevRec["identities"] as Record<string, unknown>) : {};
+  const nextIdentities = isPlainRecord(nextRec["identities"]) ? (nextRec["identities"] as Record<string, unknown>) : {};
+  const merged: Record<string, unknown> = {};
+  const put = (identity: string, entry: unknown): void => {
+    if (typeof identity !== "string" || identity.length === 0 || identity.length > 64) return;
+    if (!isPlainRecord(entry)) return;
+    merged[identity] = entry;
+  };
+  for (const [identity, entry] of Object.entries(prevIdentities)) put(identity, entry);
+  for (const [identity, entry] of Object.entries(nextIdentities)) put(identity, entry);
+  const out: Record<string, unknown> = { identities: merged };
+  const redacted = nextRec["redacted"] !== undefined ? nextRec["redacted"] : prevRec["redacted"];
+  if (typeof redacted === "boolean") out["redacted"] = redacted;
+  const note = typeof nextRec["note"] === "string" ? nextRec["note"] : prevRec["note"];
+  if (typeof note === "string" && note.length > 0) out["note"] = note;
+  const profile = typeof nextRec["profile"] === "string" ? nextRec["profile"] : undefined;
+  if (profile !== undefined) out["profile"] = profile;
+  return out;
+}
+
 function toExpectedPermissions(value: unknown): GithubDoctorItem["expectedPermissions"] {
   const fallback = { contents: "?", pullRequests: "?", checks: "?", metadata: "read" };
   if (!isPlainRecord(value)) return fallback;

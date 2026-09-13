@@ -331,6 +331,7 @@ function makeControlDom(bridge?: unknown): {
     "profile-editor", "launch-preview-wrap", "launch-preview",
     "btn-launch-preview", "raw-patch-view", "orchestration-summary",
     "github-summary", "diagnostics-summary", "btn-diagnostics-reload",
+    "btn-github-refresh", "btn-github-worker", "btn-github-reviewer",
   ];
   for (const id of ids) {
     const e = makeEl(id.startsWith("btn-") ? "button" : "div");
@@ -1100,5 +1101,54 @@ describe("control center: bridge negotiation in the shipped script", () => {
     await flush(12);
     expect(previewParams).toMatchObject({ name: "worker" });
     expect(dom.byId["launch-preview"]!.innerHTML).toContain("pi --model");
+  });
+
+  it("scoped github.status refreshes merge (worker keeps reviewer, reviewer keeps worker)", async () => {
+    const statusFor = (identity?: string): Record<string, unknown> => {
+      const all: Record<string, Record<string, unknown>> = {
+        worker: { identity: "worker", configured: true, sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN", expired: false },
+        reviewer: { identity: "reviewer", configured: true, sourceLabel: "ORCA_PI_GITHUB_REVIEWER_TOKEN", expired: false },
+      };
+      const identities = identity ? { [identity]: all[identity] } : all;
+      return { identities, redacted: true };
+    };
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: { identity?: string } }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "github.status"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { summaries: [] } });
+        }
+        if (req.operation === "github.status") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: statusFor(req.params?.identity),
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const summary = (): string => dom.byId["github-summary"]!.innerHTML;
+    // Boot full refresh shows both identity rows (row headers use <code>;
+    // the footer hint text also mentions both names, so match the rows).
+    expect(summary()).toContain("<code>worker</code>");
+    expect(summary()).toContain("<code>reviewer</code>");
+    // Role-scoped "Refresh worker" returns worker-only but must preserve Reviewer.
+    for (const fn of dom.byId["btn-github-worker"]!.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    expect(summary()).toContain("<code>worker</code>");
+    expect(summary()).toContain("<code>reviewer</code>");
+    // And vice versa: "Refresh reviewer" preserves Worker.
+    for (const fn of dom.byId["btn-github-reviewer"]!.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    expect(summary()).toContain("<code>worker</code>");
+    expect(summary()).toContain("<code>reviewer</code>");
   });
 });

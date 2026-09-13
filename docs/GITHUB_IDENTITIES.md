@@ -240,6 +240,14 @@ authority), never a credential slot. Mint/refresh stays outside the panel
 (`orca-pi github mint`, operator, outside LLM context); CLI remains
 authoritative (`orca-pi doctor`, `orca-pi github auth status`).
 
+UI1.5 scope decision vs #32: the panel intentionally offers no token
+mint/refresh button — short-lived credential minting stays a CLI-only
+operator workflow so raw secrets never enter panel/LLM context. #32's
+"refresh short-lived credentials from the UI" criterion is therefore met
+as redacted `github.status` refresh (full or role-scoped per
+worker/reviewer) plus the operator `orca-pi github mint` step surfaced in
+the panel's setup guidance, not as a typed mint operation.
+
 ## Manual E2E acceptance (post-merge to main)
 
 1. Pull latest `main`, build/install `orca-pi` (`npm ci && npm run build`).

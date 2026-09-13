@@ -2291,6 +2291,30 @@
           html += "</ul>";
           box.innerHTML = html;
         }
+        // Merge a (possibly role-scoped/partial) github.status payload into
+        // the existing snapshot: scoped refreshes return only that identity,
+        // so fold the partial map into state.githubStatus before rendering —
+        // a worker-only refresh must never hide the reviewer row, and vice
+        // versa. Mirrors control-center.ts mergeGithubStatusSnapshots.
+        function mergeGithubStatus(prev, next) {
+          var prevIds = (prev && typeof prev === "object" && !Array.isArray(prev) && prev.identities && typeof prev.identities === "object" && !Array.isArray(prev.identities)) ? prev.identities : {};
+          var nextIds = (next && typeof next === "object" && !Array.isArray(next) && next.identities && typeof next.identities === "object" && !Array.isArray(next.identities)) ? next.identities : {};
+          var merged = {};
+          var put = function (identity, entry) {
+            if (typeof identity !== "string" || !identity || identity.length > 64) return;
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
+            merged[identity] = entry;
+          };
+          for (var p in prevIds) { if (Object.prototype.hasOwnProperty.call(prevIds, p)) put(p, prevIds[p]); }
+          for (var n in nextIds) { if (Object.prototype.hasOwnProperty.call(nextIds, n)) put(n, nextIds[n]); }
+          var out = { identities: merged };
+          var redacted = (next && typeof next.redacted === "boolean") ? next.redacted : (prev && typeof prev.redacted === "boolean" ? prev.redacted : undefined);
+          if (typeof redacted === "boolean") out.redacted = redacted;
+          var note = (next && typeof next.note === "string" && next.note) ? next.note : (prev && typeof prev.note === "string" ? prev.note : undefined);
+          if (typeof note === "string" && note) out.note = note;
+          if (next && typeof next.profile === "string") out.profile = next.profile;
+          return out;
+        }
         function loadGithubStatus(identity) {
           var box = document.getElementById("github-summary");
           if (!state.structured || !can("github.status")) {
@@ -2304,10 +2328,10 @@
           return request("github.status", params).then(function (res) {
             if (myTok !== state.githubStatusToken) return null;
             if (res && res.ok && res.result) {
-              state.githubStatus = res.result;
-              renderGithubStatus(res.result);
+              state.githubStatus = mergeGithubStatus(state.githubStatus, res.result);
+              renderGithubStatus(state.githubStatus);
               renderGithubMapped();
-              return res.result;
+              return state.githubStatus;
             }
             var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
             if (box) box.innerHTML = "<p><strong>Could not load GitHub status.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";

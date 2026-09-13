@@ -110,6 +110,7 @@ export {
   mapBridgeErrorToField,
   mapGithubErrorToField,
   mapOrchestrationErrorToField,
+  mergeGithubStatusSnapshots,
   orchestrationInvalidSummary,
   orchestrationLayerValue,
   redactDiagnosticsText,
