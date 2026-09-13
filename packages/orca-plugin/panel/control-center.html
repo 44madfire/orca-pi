@@ -599,16 +599,21 @@
             if (ed) ed.innerHTML = "<p class=\"muted\">profile.read unavailable on this host.</p>";
             return;
           }
-          // Preserve the live scope when reloading over a dirty draft (conflict
-          // recovery or background refresh): never silently retarget layers.
+          // Scope/draft guard: a read that starts clean must not retarget edits
+          // made while it is in flight. Snapshot revision at start; on response,
+          // any newer draft (or a currently-dirty editor) keeps the live scope
+          // and is never replaced by a stale load error.
           var scopeBefore = state.scope;
-          var dirtyBefore = state.dirty;
+          var revBefore = state.draftRev || 0;
           request("profile.read", { name: name }).then(function (res) {
             if (!res || res.requestId === undefined) return;
             if (myToken !== state.detailToken || name !== state.selected) return;
+            var dirtyNow = !!state.dirty;
+            var revAdvanced = (state.draftRev || 0) !== revBefore;
+            var preserveLive = dirtyNow || revAdvanced;
             if (res.ok && res.result) {
               state.detail = res.result;
-              if (dirtyBefore) {
+              if (preserveLive) {
                 state.scope = scopeBefore;
               } else {
                 var hasProject = !!(res.result.source && res.result.source.project);
@@ -619,11 +624,22 @@
               renderEditor();
             } else {
               if (myToken !== state.detailToken || name !== state.selected) return;
-              var msg = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
-              if (ed) ed.innerHTML = "<p><strong>Could not load profile.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+              if (preserveLive) {
+                var msg = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
+                state.globalError = "Refresh failed (" + msg + ") — your unsaved edits are preserved.";
+                renderEditor();
+                return;
+              }
+              var msg2 = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
+              if (ed) ed.innerHTML = "<p><strong>Could not load profile.</strong> <span class=\"muted\">" + esc(msg2) + "</span></p>";
             }
           }, function () {
             if (myToken !== state.detailToken || name !== state.selected) return;
+            if (!!state.dirty || (state.draftRev || 0) !== revBefore) {
+              state.globalError = "Refresh failed (bridge request failed) — your unsaved edits are preserved.";
+              renderEditor();
+              return;
+            }
             if (ed) ed.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
           });
         }

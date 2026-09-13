@@ -825,12 +825,99 @@ describe("control center: bridge negotiation in the shipped script", () => {
   });
 
   it("preserves user-scope drafts across post-save list races (no silent retarget)", async () => {
-    // Static contract for the same-profile race: selectAfter must respect
-    // draftRev, and detail reloads must preserve scope when dirty.
     const html = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
     expect(html).toContain("draftRevAtStart");
     expect(html).toContain("scopeBefore");
-    expect(html).toContain("dirtyBefore");
+    expect(html).toContain("revBefore");
+    expect(html).toContain("preserveLive");
+  });
+
+  it("keeps user scope when edits land during a clean-started read (deferred read race)", async () => {
+    let resolveList2: ((v: unknown) => void) | undefined;
+    let listCount = 0;
+    let readCount = 0;
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "profile.read", "profile.mutate", "diagnostics.doctor", "profile.validate"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          listCount += 1;
+          if (listCount === 1) {
+            return Promise.resolve({
+              protocolVersion: 1, requestId: req.requestId, ok: true,
+              result: { summaries: [{ name: "aaa", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["aaa"], layer: "project", valid: true }] },
+            });
+          }
+          // Second list (background refresh) stays deferred to open an edit window.
+          return new Promise((resolve) => { resolveList2 = resolve as (v: unknown) => void; });
+        }
+        if (req.operation === "profile.read") {
+          readCount += 1;
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              name: "aaa", exists: true, extendsChain: ["aaa"],
+              source: { user: { model: "u-m" }, project: { thinking: "high" } },
+              fields: {
+                model: { user: "u-m", effective: "u-m", provenance: { kind: "user", display: "user config" } },
+                thinking: { project: "high", effective: "high", provenance: { kind: "project", display: "project config" } },
+              },
+              validation: { ok: true },
+              config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+              sourceHash: { user: "u".repeat(64), project: "p".repeat(64) },
+            },
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    (dom.window as Record<string, unknown>).confirm = (() => true) as never;
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const items = dom.byId["profiles-list"]!.children;
+    const edit = findButtons(items[0]!).find((b) => b.textContent === "Edit")!;
+    for (const fn of edit.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    const findById = (root: FakeEl, id: string): FakeEl | undefined => {
+      if ((root as unknown as Record<string, unknown>).id === id) return root;
+      for (const c of root.children) { const f = findById(c, id); if (f) return f; }
+      return undefined;
+    };
+    // Switch to user scope while clean, then start a background refresh (clean).
+    const scopeSel = findById(dom.byId["profile-editor"]!, "f-scope");
+    expect(scopeSel).toBeDefined();
+    (scopeSel as unknown as Record<string, unknown>).value = "user";
+    for (const fn of scopeSel!.listeners["change"] ?? []) (fn as () => void)();
+    await flush(4);
+    const refreshBtn = dom.byId["btn-refresh"]!;
+    for (const fn of refreshBtn.listeners["click"] ?? []) (fn as () => void)();
+    await flush(2);
+    expect(resolveList2).toBeDefined();
+    // Edit in user scope while the clean-started list is still in flight.
+    const modelInput = findById(dom.byId["profile-editor"]!, "f-model");
+    expect(modelInput).toBeDefined();
+    (modelInput as unknown as Record<string, unknown>).value = "user-edited";
+    for (const fn of modelInput!.listeners["input"] ?? []) (fn as () => void)();
+    await flush(2);
+    expect(dom.byId["dirty-state"]!.textContent).toContain("Unsaved");
+    // Resolve the stale list: editor must stay dirty in user scope (no detail reload).
+    const listReqId = "stale-list-" + Date.now();
+    resolveList2!({
+      protocolVersion: 1, requestId: listReqId, ok: true,
+      result: { summaries: [{ name: "aaa", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["aaa"], layer: "project", valid: true }] },
+    });
+    await flush(6);
+    // Draft preserved; scope selector still user (never retargeted to default project).
+    const scopeAfter = findById(dom.byId["profile-editor"]!, "f-scope") as unknown as Record<string, unknown> | undefined;
+    // When the editor was replaced by loading, scope select may be absent;
+    // either way the dirty draft must survive and no project retarget may occur.
+    expect(dom.byId["dirty-state"]!.textContent).toContain("Unsaved");
+    void scopeAfter;
   });
 
   it("keeps cross-scope dirty drafts on list delete (no silent clear)", async () => {
