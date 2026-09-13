@@ -1,5 +1,5 @@
 /**
- * `@orca-pi/structured-bridge` barrel (SNC1.3 + SNC1.4 + SNC1.5 + SNC1.6).
+ * `@orca-pi/structured-bridge` barrel (SNC1.3 + SNC1.4 + SNC1.5 + SNC1.6 + SNC1.7).
  *
  * Hot-swappable external structured-session bridge: versioned local IPC
  * (Orca-side host + external provider + mock) plus Pi-specific translation
@@ -93,3 +93,14 @@ export {
   type TranslatorJournalEntry,
   type TranslatorToolState,
 } from "./pi-translator.js";
+export {
+  extractActiveBranch,
+  extractActiveBranchFromTree,
+  extractPiTextContent,
+  translatePiBranchToBridgeHistory,
+  translatePiEntryToBridgeEntries,
+  type ActiveBranchResult,
+  type HistoryReconstructionError,
+  type PiHistoryEntryLike,
+  type PiHistoryTreeNodeLike,
+} from "./pi-history.js";

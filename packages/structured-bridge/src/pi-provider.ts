@@ -1,5 +1,5 @@
 /**
- * Pi-backed external provider (SNC1.4 + SNC1.5 + SNC1.6, orca-pi owned).
+ * Pi-backed external provider (SNC1.4 + SNC1.5 + SNC1.6 + SNC1.7, orca-pi owned).
  *
  * Combines the production SNC1.2 `PiRpcConnection` transport with the SNC1.3
  * external structured-session bridge to run the first real Pi structured
@@ -7,7 +7,7 @@
  * the fork vendors only `framing.ts` + `protocol.ts` + `host.ts`
  * (provider-neutral). Everything Pi stays here plus `pi-mapping.ts`.
  *
- * Capabilities (per #14 + #15 + #16):
+ * Capabilities (per #14 + #15 + #16 + #17):
  * - spawn/acquire `pi --mode rpc` in the exact Orca-selected workspace/cwd;
  * - apply compatible transport-neutral resolved Pi profile configuration
  *   (callers pass a `buildPiLaunch()` spec via `resolvePiSpec`; TUI-only
@@ -65,10 +65,14 @@
  * journaling with assistant/tool separation, abort fidelity, secret-safe error
  * shaping, and bounded unknown handling with no retained transient on settle.
  * SNC1.6 owns model/thinking controls, interactive prompts, and structured
- * images (this file + `pi-mapping.ts`); history/branch/resume is SNC1.7.
+ * images (this file + `pi-mapping.ts`); SNC1.7 owns history/current-branch/
+ * resume (this file + `pi-history.ts`): `acquire{resumePath}` switches into
+ * the Pi session file and rebuilds only root -> leaf (abandoned siblings
+ * excluded) through the same mapping as live, with wholesale replace (no
+ * duplication) and fail-closed diagnostics.
  * `set_options` applies live to Pi and acks provider-confirmed values;
- * `get_history` serves the live-turn journal (Pi tree reconstruction lands in
- * SNC1.7); `get_session` refreshes provider-confirmed model/thinking
+ * `get_history` serves the rebuilt + live-appended transcript with the Pi
+ * leaf (never the page end); `get_session` refreshes provider-confirmed model/thinking
  * best-effort. Immediate `/` extension commands run without a turn (no
  * journal entries, per the Pi contract) and stay honestly rejected while busy
  * to avoid concurrent attribution without queue evidence.
@@ -79,6 +83,7 @@ import {
   redactSecrets,
   resolvePiRpcEnv,
   toPiRpcProcessSpec,
+  type PiEntriesData,
   type PiImageAttachment,
   type PiModel,
   type PiRpcCloseOptions,
@@ -89,6 +94,7 @@ import {
   type PiSessionStats,
   type PiState,
   type PiStreamingBehavior,
+  type PiTreeData,
   type ResolvedPiSpecLike,
 } from "@orca-pi/pi-rpc";
 import {
@@ -97,6 +103,7 @@ import {
   type AcquireRequest,
   type AnswerPromptRequest,
   type BridgeCapabilities,
+  type BridgeHistoryEntry,
   type BridgeSessionMetadata,
   type BridgeSessionOptions,
   type DispatchRequest,
@@ -112,6 +119,14 @@ import {
   validatePiDispatch,
 } from "./pi-mapping.js";
 import { PiTranslator } from "./pi-translator.js";
+import { open } from "node:fs/promises";
+import path from "node:path";
+import {
+  extractActiveBranch,
+  extractActiveBranchFromTree,
+  translatePiEntryToBridgeEntries,
+  type PiHistoryEntryLike,
+} from "./pi-history.js";
 
 /** Minimal Pi connection surface used by the bridge (real `PiRpcConnection` satisfies it).
  *
@@ -142,6 +157,10 @@ export interface PiProviderConnection {
   getAvailableThinkingLevels?(opts?: { timeoutMs?: number }): Promise<{ levels: string[] }>;
   setThinkingLevel?(level: string, opts?: { timeoutMs?: number }): Promise<void>;
   setAutoCompaction?(enabled: boolean, opts?: { timeoutMs?: number }): Promise<void>;
+  /** SNC1.7 history/branch/resume RPCs (optional so SNC1.4 minimal fakes keep working). */
+  getEntries?(since?: string, opts?: { timeoutMs?: number }): Promise<PiEntriesData>;
+  getTree?(opts?: { timeoutMs?: number }): Promise<PiTreeData>;
+  switchSession?(sessionPath: string, opts?: { timeoutMs?: number }): Promise<{ cancelled: boolean }>;
   readonly isClosed: boolean;
 }
 
@@ -223,6 +242,61 @@ interface PiRuntime {
    * separator). Cleared/retired together with `pendingPrompts`.
    */
   promptPiIds: Map<string, string>;
+  /**
+   * SNC1.7 resume state (opaque Pi ids only, never paths — secret hygiene):
+   * `piLeafId` always names the Pi session leaf (never the page end), even
+   * when the leaf is a skipped non-message entry (e.g. trailing
+   * `session_info`). `piChainIds` is the full active-branch id order
+   * (root → leaf, including skipped non-message entries) so `get_history`
+   * cursors naming skipped entries (e.g. bootstrap `thinking_level_change`)
+   * still resolve to strictly-after transcript rows instead of an empty page.
+   * Refreshed at acquire-resume and best-effort after each settle (background,
+   * never blocking the turn); `get_history` serves the cache fast.
+   */
+  piLeafId?: string;
+  piChainIds?: string[];
+  /**
+   * SNC1.7 cursor-alignment state (P1 review fix): `historyChainPos[i]`
+   * parallels `session.history[i]` with that row's position in the Pi active
+   * chain, or `null` for live rows not yet reconciled to Pi ids. Lets
+   * `get_history(cursor=<Pi leaf>)` resolve through the chain even after live
+   * turns appended synthetic ids. Reset wholesale on rebuild, appended for
+   * live rows, re-keyed by `reconcileSettledTurn`.
+   */
+  historyChainPos: (number | null)[];
+  /**
+   * Synthetic live-row id sequence. Live rows are keyed `live-<n>`,
+   * namespaced so they can never collide with Pi entry ids — a rebuilt Pi
+   * `e5` plus a live `e5` would corrupt cursor resolution (same P1).
+   */
+  liveSeq: number;
+  /**
+   * `session.history.length` when the current op took the turn (its rows are
+   * contiguous from here); cleared at settle. Lets `reconcileSettledTurn`
+   * attribute exactly this op's rows for Pi re-keying.
+   */
+  opHistoryBase: number | null;
+  /**
+   * Exposed-leaf high-water marks (P1 review fix, round 2): `leafEnds` maps
+   * every `leafId` ever returned by `get_history` to the transcript length it
+   * was advertised with — "a cursor advertised after a page must denote the
+   * end of that page". This keeps Pi-leaf cursors honest even when the rows
+   * they cover are still unmapped `live-N` rows (fresh-acquire race where the
+   * baseline lookup loses to the first settle, or any documented reconcile
+   * mismatch that advances the leaf without re-keying). Cleared on wholesale
+   * rebuild (ordinals invalidated); re-keying in place never changes lengths,
+   * so recorded ends stay valid across reconciles.
+   */
+  leafEnds: Map<string, number>;
+  /**
+   * Re-key tombstones (P1 round-3 fix): `live-N` id → Pi entry id for every
+   * settled row that `reconcileSettledTurn` re-keyed in place. Re-keying
+   * retires the live id from the transcript, but already-returned
+   * `nextCursor` values may still name it — resolving through the tombstone
+   * keeps those cursors positional-stable (the Pi row never moves). Cleared
+   * on wholesale rebuild (ids from the old transcript are meaningless).
+   */
+  rekeyedFrom: Map<string, string>;
   /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
   cachedModels?: PiModel[];
   /** Shared in-flight catalog lookup (P2: concurrent image dispatches share one Pi RPC). */
@@ -305,13 +379,12 @@ export class PiBridgeProvider extends BridgeProvider {
   private readonly resolvePiSpec?: PiSpecResolver;
 
   constructor(opts: PiBridgeProviderOptions = {}) {
-    // SNC1.6 truthfulness: model/thinking/image/prompt controls are live
-    // (see `onPiSetOptions` / `onPiAnswerPrompt` / image-aware dispatch),
-    // so `options` is true and Orca may expose its shared Native Chat option
-    // controls with no renderer fork. History/branch/resume stays false until
-    // SNC1.7 reconstructs from Pi `get_entries`/`get_tree` — otherwise Orca
-    // would expose resume paths that silently diverge from Pi child state.
-    const snc16Capabilities: BridgeCapabilities = { ...piBridgeCapabilities(), options: true, resume: false };
+    // SNC1.7 truthfulness: history/branch/resume is live (see `pi-history.ts`
+    // + `onPiAcquire` resumePath handling below), so `resume` is true and
+    // Orca may expose its shared Native Chat resume paths. `options` stays
+    // true (SNC1.6 live model/thinking/prompt/image controls). Both rest on
+    // provider-confirmed Pi RPC (never diverging hints).
+    const snc16Capabilities: BridgeCapabilities = { ...piBridgeCapabilities(), options: true, resume: true };
     super({
       providerId: opts.providerId ?? "pi",
       providerVersion: opts.providerVersion ?? "0.1.0",
@@ -492,6 +565,18 @@ export class PiBridgeProvider extends BridgeProvider {
       return;
     }
 
+    // SNC1.7 resume: `acquire{resumePath}` restores an existing Pi session file
+    // into this fresh child via typed `switch_session` (never CLI pickers),
+    // then reconstructs only root -> current leaf (see `pi-history.ts`). The
+    // host owns `resumePath` for handoff; the provider never echoes it back
+    // (secret hygiene: no absolute paths over the bridge).
+    const resumePath =
+      typeof msg.resumePath === "string" && msg.resumePath.trim() !== "" ? msg.resumePath : undefined;
+    if (resumePath !== undefined) {
+      await this.onPiAcquireResume({ conn, sessionId, resumePath, msg });
+      return;
+    }
+
     const piSessionId = typeof state.sessionId === "string" && state.sessionId !== "" ? state.sessionId : sessionId;
     // SNC1.6: persist canonical qualified refs where the provider is known
     // (duplicate bare ids like `gpt-5.6-luna` exist under two providers in
@@ -537,6 +622,11 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompts: new Map<string, string>(),
       promptPiIds: new Map<string, string>(),
       pendingImmediate: null,
+      historyChainPos: [],
+      liveSeq: 0,
+      opHistoryBase: null,
+      leafEnds: new Map<string, number>(),
+      rekeyedFrom: new Map<string, string>(),
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
@@ -583,6 +673,14 @@ export class PiBridgeProvider extends BridgeProvider {
         return;
       }
     }
+    // SNC1.7: establish the Pi leaf baseline best-effort for fresh sessions
+    // (bootstrap leaf when Pi is history-capable; ignored for minimal fakes
+    // so SNC1.4 tests keep working). Background, never blocks `acquired`:
+    // a history RPC must not delay the lease or hang acquire on minimal
+    // transports. Failures never fail a fresh acquire — only `resumePath`
+    // rebuilds are required (fail-closed); fresh history is empty by
+    // construction. Stored as opaque ids only (never paths).
+    void this.refreshPiLeafBestEffort(sessionId).catch(() => undefined);
     const confirmed = this.sessions.get(sessionId);
     this.send({
       v: 1,
@@ -591,6 +689,676 @@ export class PiBridgeProvider extends BridgeProvider {
       sessionId,
       resumed: false,
       metadata: { ...(confirmed ? confirmed.metadata : metadata) },
+    });
+  }
+
+  // -- SNC1.7 history/current-branch/resume (see `pi-history.ts`) -----------
+  //
+  // Resume = spawn a fresh `pi --mode rpc` child in the Orca-selected cwd,
+  // `switch_session{resumePath}` into the existing Pi session file, apply
+  // acquire-time options live (so the rebuilt leaf includes them), then
+  // reconstruct only root -> current leaf (abandoned fork siblings excluded)
+  // and translate through the same semantic mapping as live events. The host
+  // owns `resumePath` for handoff; the provider never echoes paths back over
+  // the bridge (only opaque `providerSessionId`/`leafId` cross it).
+  //
+  // Fail-closed (actionable, secret-safe, no prompt text or paths):
+  // - missing `switch_session`/`get_entries`/`get_tree` support ->
+  //   PI_RESUME_UNSUPPORTED (minimal transports stay on TUI);
+  // - `switch_session` transport failure -> PI_RESUME_FAILED;
+  // - empty/unavailable entries, unknown leaf, broken parent chain, or cycle
+  //   -> PI_HISTORY_EMPTY / PI_HISTORY_LEAF_MISSING / PI_HISTORY_CHAIN_BROKEN
+  //   / PI_HISTORY_CYCLE (never a silent truncated transcript);
+  // - Pi reports messages but translation yields zero rows (unknown future
+  //   roles) -> PI_HISTORY_INCOMPATIBLE.
+  // A `resumePath` that names a missing file succeeds per the Pi contract as
+  // a new empty session (fresh bootstrap, `messageCount: 0`): it returns
+  // `acquired{resumed: false}` with empty history (honest new, not a silent
+  // resume). Only a non-empty rebuilt transcript returns `resumed: true`.
+  // Partial/aborted last turns recover honestly: a trailing user without a
+  // following assistant stays a lone user (no fabricated completion); an
+  // aborted assistant still journals its text (same as live aborts).
+
+  private async onPiAcquireResume(ctx: {
+    conn: PiProviderConnection;
+    sessionId: string;
+    resumePath: string;
+    msg: AcquireRequest;
+  }): Promise<void> {
+    const { conn, sessionId, resumePath, msg } = ctx;
+    const opId = msg.opId;
+    if (typeof conn.switchSession !== "function") {
+      await conn.close(this.piCloseGraceMs).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: {
+          code: "PI_RESUME_UNSUPPORTED",
+          message: "Pi connection does not support session resume (reacquire without resumePath or update Pi)",
+        },
+      });
+      return;
+    }
+    // P1 (ChatGPT review): honor `session_before_switch` vetoes. A
+    // `{cancelled:true}` switch rebinds NOTHING — Pi stays on its previous
+    // session — so continuing would rebuild the WRONG history and can emit
+    // `acquired{resumed:true}` for a file Pi never loaded. Fail closed.
+    // P1 round-2 (ChatGPT review, verified against the Pi 0.85.1 source and
+    // the on-disk `{"type":"session",...,"cwd":...}` header): `switch_session`
+    // rebinds the runtime cwd to the SESSION FILE's stored cwd
+    // (`SessionManager.open` → `createRuntime({cwd: getCwd()})`, with no
+    // cwdOverride on the RPC path). A resumePath from another/moved workspace
+    // would otherwise yield a lease claiming `workspaceRoot` while Pi tools
+    // execute in the stored cwd — violating the exact-cwd invariant. Validate
+    // the header BEFORE switching (the fresh child has nothing to lose yet).
+    const cwdCheck = await this.checkResumePathCwd(resumePath, msg.workspaceRoot);
+    if (!cwdCheck.ok) {
+      await conn.close(this.piCloseGraceMs).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: { code: cwdCheck.code, message: cwdCheck.message },
+      });
+      return;
+    }
+    let switchCancelled = false;
+    try {
+      const switched = await conn.switchSession(resumePath, { timeoutMs: this.piOptionTimeoutMs });
+      switchCancelled = switched?.cancelled === true;
+    } catch (error) {
+      await conn.close(this.piCloseGraceMs).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: { code: "PI_RESUME_FAILED", message: sanitizeCode(`Pi session resume failed: ${this.shortPiError(error)}`) },
+      });
+      return;
+    }
+    if (switchCancelled) {
+      await conn.close(this.piCloseGraceMs).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: {
+          code: "PI_RESUME_CANCELLED",
+          message: "Pi refused the session switch (vetoed by an extension). Retry without resumePath for a fresh session or choose another session file.",
+        },
+      });
+      return;
+    }
+    let state: PiState;
+    try {
+      state = await conn.getState({ timeoutMs: this.piOptionTimeoutMs });
+    } catch (error) {
+      await conn.close(this.piCloseGraceMs).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: { code: "PI_STATE_FAILED", message: sanitizeCode(`Pi resumed but get_state failed: ${this.shortPiError(error)}`) },
+      });
+      return;
+    }
+    const piSessionId = typeof state.sessionId === "string" && state.sessionId !== "" ? state.sessionId : sessionId;
+    const stateModel = state.model;
+    const qualifiedStateModel =
+      typeof stateModel?.id === "string" && stateModel.id !== ""
+        ? typeof stateModel?.provider === "string" && stateModel.provider !== ""
+          ? `${stateModel.provider}/${stateModel.id}`
+          : stateModel.id
+        : undefined;
+    const model = qualifiedStateModel ?? msg.options?.model;
+    const thinkingLevel = typeof state.thinkingLevel === "string" ? state.thinkingLevel : msg.options?.thinkingLevel;
+    const metadata: BridgeSessionMetadata = {
+      sessionId,
+      providerSessionId: piSessionId,
+      workspaceRoot: msg.workspaceRoot,
+      messageCount: 0,
+      isStreaming: false,
+      createdAt: nowIso(),
+      ...(model ? { model } : {}),
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+    };
+    this.sessions.set(sessionId, {
+      metadata,
+      history: [],
+      options: { ...(msg.options ?? {}) },
+      activeOpId: null,
+      queue: [],
+      cancelledOps: new Set<string>(),
+      pendingPrompt: null,
+      entryCounter: 0,
+    });
+    const runtime: PiRuntime = {
+      conn,
+      unsubs: [],
+      translator: new PiTranslator(),
+      activeText: "",
+      piSessionId,
+      pendingUserText: null,
+      pendingPrompts: new Map<string, string>(),
+      promptPiIds: new Map<string, string>(),
+      pendingImmediate: null,
+      historyChainPos: [],
+      liveSeq: 0,
+      opHistoryBase: null,
+      leafEnds: new Map<string, number>(),
+      rekeyedFrom: new Map<string, string>(),
+    };
+    this.piRuntimes.set(sessionId, runtime);
+    const session = this.sessions.get(sessionId);
+    if (session) this.attachPiStreaming(sessionId, session, runtime);
+    void this.fetchCatalogShared(sessionId, 3000).catch(() => null);
+    try {
+      runtime.unsubs.push(conn.onExit((info) => this.onPiExit(sessionId, info)));
+    } catch {
+      // Minimal fakes may omit onExit (same as fresh path).
+    }
+    if (msg.options && (msg.options.model !== undefined || msg.options.thinkingLevel !== undefined || msg.options.autoCompaction !== undefined)) {
+      const applied = await this.applyPiOptions(sessionId, msg.options);
+      if (!applied.ok) {
+        await this.teardownPiRuntime(sessionId).catch(() => undefined);
+        this.sessions.delete(sessionId);
+        this.send({
+          v: BRIDGE_PROTOCOL_VERSION,
+          kind: "error",
+          opId,
+          error: { code: applied.code, message: applied.message },
+        });
+        return;
+      }
+    }
+    const rebuilt = await this.rebuildHistoryFromPi(sessionId);
+    if (!rebuilt.ok) {
+      await this.teardownPiRuntime(sessionId).catch(() => undefined);
+      this.sessions.delete(sessionId);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: { code: rebuilt.code, message: rebuilt.message },
+      });
+      return;
+    }
+    const current = this.sessions.get(sessionId);
+    if (!current) {
+      await this.teardownPiRuntime(sessionId).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: { code: "UNKNOWN_SESSION", message: "unknown session" },
+      });
+      return;
+    }
+    // Missing-file-creates-empty (Pi contract): empty transcript + idle Pi
+    // reports a new session, not a resume — return resumed:false honestly so
+    // Orca never mistakes a fresh bootstrap for restored history.
+    const resumed = rebuilt.history.length > 0;
+    this.send({
+      v: 1,
+      kind: "acquired",
+      opId,
+      sessionId,
+      resumed,
+      metadata: { ...current.metadata },
+    });
+  }
+
+  /**
+   * Rebuild one idle session's bridge history from Pi's active branch
+   * (required path for `resumePath`; replaces wholesale — Pi is the source
+   * of truth after `switch_session`, so replacement never duplicates: live
+   * rows already landed in Pi converge by identical `(role, text)` order and
+   * only re-id from live `eN` to stable Pi entry ids). Must only run when
+   * idle (no `activeOpId`): live owns streaming turns and is never rebuilt
+   * mid-turn.
+   */
+  /**
+   * Fetch Pi's active branch (root → leaf, inclusive): flat `get_entries` +
+   * leaf walk first (single RPC), `get_tree` fallback when entries are
+   * unavailable or the flat chain is broken (same walk over the flattened
+   * tree, so both converge). Shared by `rebuildHistoryFromPi` (fail-closed
+   * resume) and `reconcileSettledTurn` (best-effort re-key). Fail-closed
+   * codes distinguish empty/unavailable entries, unknown leaf, broken parent
+   * chain, and cycles — never a silent truncated transcript.
+   */
+  private async fetchPiActiveBranch(
+    conn: PiProviderConnection,
+    timeoutMs: number,
+  ): Promise<
+    | { ok: true; branch: PiHistoryEntryLike[]; leafId: string }
+    | { ok: false; code: string; message: string }
+  > {
+    // Both history RPCs are optional on the minimal fake surface: absent
+    // history support fails closed for resume (honest PI_RESUME_UNSUPPORTED,
+    // never silent empty).
+    const canEntries = typeof conn.getEntries === "function";
+    const canTree = typeof conn.getTree === "function";
+    if (!canEntries && !canTree) {
+      return { ok: false, code: "PI_RESUME_UNSUPPORTED", message: "Pi connection does not support history resume (update Pi)" };
+    }
+    let branch: PiHistoryEntryLike[] | null = null;
+    let leafId: string | undefined;
+    let entriesError: string | null = null;
+    if (canEntries) {
+      try {
+        const bound = conn.getEntries?.bind(conn);
+        if (typeof bound !== "function") throw new Error("getEntries unavailable");
+        const data = await bound(undefined, { timeoutMs });
+        const entries = (data?.entries ?? []) as unknown as PiHistoryEntryLike[];
+        leafId = typeof data?.leafId === "string" ? (data.leafId as string) : undefined;
+        if (!leafId) {
+          return { ok: false, code: "PI_HISTORY_LEAF_MISSING", message: "Pi history has no current leaf (reacquire the session)" };
+        }
+        const active = extractActiveBranch(entries, leafId);
+        if (active.ok) {
+          branch = [...active.branch];
+        } else {
+          entriesError = active.code;
+          // Fall through to tree when the flat chain is broken and tree exists.
+          if (!canTree) {
+            return { ok: false, code: active.code, message: active.message };
+          }
+        }
+      } catch (error) {
+        entriesError = this.shortPiError(error);
+        if (!canTree) {
+          return { ok: false, code: "PI_HISTORY_EMPTY", message: sanitizeCode(`Pi history unavailable: ${entriesError}`) };
+        }
+      }
+    }
+    if (branch === null && canTree) {
+      try {
+        const boundTree = conn.getTree?.bind(conn);
+        if (typeof boundTree !== "function") throw new Error("getTree unavailable");
+        const treeData = await boundTree({ timeoutMs });
+        const tree = (treeData?.tree ?? []) as unknown as Parameters<typeof extractActiveBranchFromTree>[0];
+        const treeLeaf = typeof treeData?.leafId === "string" ? (treeData.leafId as string) : leafId;
+        if (!treeLeaf) {
+          return { ok: false, code: "PI_HISTORY_LEAF_MISSING", message: "Pi history has no current leaf (reacquire the session)" };
+        }
+        leafId = treeLeaf;
+        const active = extractActiveBranchFromTree(tree, treeLeaf);
+        if (!active.ok) return { ok: false, code: active.code, message: active.message };
+        branch = [...active.branch];
+      } catch (error) {
+        const detail = this.shortPiError(error);
+        void entriesError;
+        return { ok: false, code: "PI_HISTORY_EMPTY", message: sanitizeCode(`Pi history unavailable: ${detail}`) };
+      }
+    }
+    if (branch === null || leafId === undefined) {
+      return { ok: false, code: "PI_HISTORY_EMPTY", message: "Pi history is empty or unavailable (reacquire the session)" };
+    }
+    return { ok: true, branch, leafId };
+  }
+
+  private async rebuildHistoryFromPi(
+    sessionId: string,
+  ): Promise<{ ok: true; history: BridgeHistoryEntry[]; leafId: string } | { ok: false; code: string; message: string }> {
+    const session = this.sessions.get(sessionId);
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!session || !runtime) return { ok: false, code: "UNKNOWN_SESSION", message: "unknown session" };
+    if (session.activeOpId !== null) {
+      return { ok: false, code: "PI_HISTORY_BUSY", message: "cannot rebuild history while a turn streams (wait for idle or cancel)" };
+    }
+    const conn = runtime.conn;
+    if (runtime.conn.isClosed) return { ok: false, code: "PI_EXITED", message: "pi-exited (reacquire the session)" };
+    const fetched = await this.fetchPiActiveBranch(conn, this.piOptionTimeoutMs);
+    if (!fetched.ok) return { ok: false, code: fetched.code, message: fetched.message };
+    const branch = fetched.branch;
+    const leafId = fetched.leafId;
+    // Per-entry translation WITH chain positions (P1 cursor-alignment fix):
+    // `positions[i]` is the chain index that produced `history[i]`, so later
+    // `get_history(cursor=<Pi id>)` resolves through the chain even for
+    // cursors naming skipped non-message entries.
+    const history: BridgeHistoryEntry[] = [];
+    const positions: (number | null)[] = [];
+    branch.forEach((entry, chainIdx) => {
+      for (const row of translatePiEntryToBridgeEntries(entry)) {
+        history.push(row);
+        positions.push(chainIdx);
+      }
+    });
+    // Incompatible-shape guard: Pi reports messages on the active branch but
+    // translation yields zero rows (all unknown future roles) — fail closed
+    // rather than silently returning an empty transcript for a non-empty Pi
+    // session.
+    const branchHasMessages = branch.some((e) => e.type === "message");
+    if (branchHasMessages && history.length === 0) {
+      return {
+        ok: false,
+        code: "PI_HISTORY_INCOMPATIBLE",
+        message: "Pi history uses unsupported message roles (incompatible history; update orca-pi)",
+      };
+    }
+    // Wholesale replace (idle only, see above): stable Pi ids verbatim for
+    // exact handoff metadata (`id`/`parentId`/`timestamp` + `leafId`), plus
+    // their chain positions for cursor alignment. Live rows use namespaced
+    // `live-N` ids (see `appendLiveRow`), so no rebuilt id can collide.
+    const dropped = session.history.length;
+    session.history.splice(0, dropped, ...history);
+    runtime.historyChainPos.splice(0, dropped, ...positions);
+    runtime.opHistoryBase = null;
+    runtime.leafEnds.clear();
+    runtime.rekeyedFrom.clear();
+    session.entryCounter = history.length;
+    session.metadata.messageCount = history.filter((e) => e.role === "user" || e.role === "assistant" || e.role === "tool").length;
+    runtime.piLeafId = leafId;
+    runtime.piChainIds = branch.map((e) => e.id);
+    return { ok: true, history: [...history], leafId };
+  }
+
+  /**
+   * Validate a resumePath's session-file header cwd against the
+   * Orca-selected workspaceRoot BEFORE `switch_session` (P1 round-2 fix).
+   * Reads only the first line (bounded 64 KiB — the header is one JSON
+   * object) and compares canonicalized absolute paths (slash direction,
+   * `.`/`..`, trailing separators; case-insensitive on Windows). Diagnostics
+   * never include either path: the stored cwd is Pi-side data that must not
+   * cross the bridge, and the comparison outcome alone is actionable. A
+   * MISSING file is fine (Pi creates it as a new empty session on switch, so
+   * acquire honestly reports `resumed:false`); anything else unreadable, a
+   * header without a usable cwd, or a mismatch fails closed. Limitation
+   * (documented, safe direction): exotic aliasing the normalizer cannot see
+   * through (symlinked roots, 8.3 short names) fails closed as a mismatch —
+   * reacquire with a directly matching file.
+   */
+  private async checkResumePathCwd(
+    resumePath: string,
+    workspaceRoot: string,
+  ): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+    const unreadable = {
+      ok: false as const,
+      code: "PI_RESUME_FAILED",
+      message: "Pi session file is unreadable or incompatible (check the path and retry without resumePath for a fresh session)",
+    };
+    let firstLine: string;
+    try {
+      const fh = await open(resumePath, "r");
+      try {
+        const buf = Buffer.alloc(65536);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        const chunk = buf.toString("utf8", 0, bytesRead);
+        const nl = chunk.indexOf("\n");
+        firstLine = (nl === -1 ? chunk : chunk.slice(0, nl)).replace(/\r$/, "");
+      } finally {
+        await fh.close().catch(() => undefined);
+      }
+    } catch (error) {
+      // Missing file: Pi creates it as a new empty session on switch (per
+      // contract) — not an error here (acquire reports `resumed:false`).
+      if ((error as { code?: unknown })?.code === "ENOENT") return { ok: true };
+      return unreadable;
+    }
+    let storedCwd: unknown;
+    try {
+      const parsed: unknown = JSON.parse(firstLine);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("bad header");
+      storedCwd = (parsed as Record<string, unknown>)["cwd"];
+    } catch {
+      return unreadable;
+    }
+    if (typeof storedCwd !== "string" || storedCwd === "") {
+      return {
+        ok: false,
+        code: "PI_RESUME_FAILED",
+        message: "Pi session file is incompatible (missing session cwd; update Pi or choose another session file)",
+      };
+    }
+    const norm = (value: string): string => {
+      const resolved = path.resolve(value);
+      return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    };
+    let same = false;
+    try {
+      same = norm(storedCwd) === norm(workspaceRoot);
+    } catch {
+      same = false;
+    }
+    if (!same) {
+      return {
+        ok: false,
+        code: "PI_RESUME_CWD_MISMATCH",
+        message: "Pi session belongs to a different workspace (resume refused; reacquire without resumePath for a fresh session or choose a session file from this workspace)",
+      };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Reconcile one settled op's live rows to Pi ids (P1 cursor-alignment fix).
+   * Background, bounded, never fails the turn: fetches the active chain,
+   * always advances `piLeafId`/`piChainIds`, and re-keys this op's rows
+   * (`history[opHistoryBase:opEnd)`, captured synchronously at settle so a
+   * racing next turn cannot widen the range) to the Pi tail's translated rows
+   * when they match exactly by `(role, text)` sequence — the convergence
+   * `pi-history.ts` guarantees for landed turns. On any mismatch (diverged or
+   * aborted edge, chain moved under us, fetch failure) the live `live-N` rows
+   * stand and only the leaf/chain advance; cursor resolution falls back to
+   * ordinal order for unmapped rows (see `onGetHistory`). Never synthesizes
+   * rows: an empty Pi tail with live rows (or vice versa) is a mismatch.
+   */
+  private async reconcileSettledTurn(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!session || !runtime || runtime.conn.isClosed) return;
+    const conn = runtime.conn;
+    if (typeof conn.getEntries !== "function" && typeof conn.getTree !== "function") {
+      runtime.opHistoryBase = null;
+      return;
+    }
+    const base = runtime.opHistoryBase;
+    const end = session.history.length;
+    runtime.opHistoryBase = null;
+    const fetched = await this.fetchPiActiveBranch(conn, 3000);
+    if (!fetched.ok) return;
+    const oldLeaf = runtime.piLeafId;
+    runtime.piLeafId = fetched.leafId;
+    runtime.piChainIds = fetched.branch.map((e) => e.id);
+    if (base === null || base === undefined || base >= end) return;
+    const liveRows = session.history.slice(base, end);
+    if (liveRows.length === 0) return;
+    // No anchor (leaf never learned, e.g. minimal history that appeared
+    // mid-session): leaf/chain learned above, rows stay live-keyed.
+    if (oldLeaf === undefined) return;
+    const anchorIdx = fetched.branch.findIndex((e) => e.id === oldLeaf);
+    if (anchorIdx === -1) return;
+    const tail = fetched.branch.slice(anchorIdx + 1);
+    const expected: BridgeHistoryEntry[] = [];
+    const tailPos: number[] = [];
+    tail.forEach((entry, i) => {
+      for (const row of translatePiEntryToBridgeEntries(entry)) {
+        expected.push(row);
+        tailPos.push(anchorIdx + 1 + i);
+      }
+    });
+    if (expected.length !== liveRows.length) return;
+    for (let i = 0; i < expected.length; i++) {
+      const a = liveRows[i];
+      const b = expected[i];
+      if (!a || !b || a.role !== b.role || (a.text ?? "") !== (b.text ?? "")) return;
+    }
+    // Converged: re-key in place (order + content identical, Pi ids win for
+    // exact handoff metadata and cursor stability). Record tombstones so
+    // cursors emitted under the retired live ids keep resolving.
+    for (let i = 0; i < expected.length; i++) {
+      const row = expected[i];
+      const prev = session.history[base + i];
+      if (row !== undefined) session.history[base + i] = row;
+      const pos = tailPos[i];
+      if (pos !== undefined) runtime.historyChainPos[base + i] = pos;
+      if (prev !== undefined && row !== undefined && prev.id !== row.id) {
+        runtime.rekeyedFrom.set(prev.id, row.id);
+      }
+    }
+  }
+
+  /**
+   * Best-effort Pi leaf/chain refresh (never fails acquire/history/session):
+   * updates `piLeafId`/`piChainIds` from `get_entries` (fallback `get_tree`)
+   * with a short bounded deadline. Used for the fresh-acquire baseline and as
+   * a background refresh after each settle so `get_history{leafId}` stays
+   * close to Pi without blocking turns on history RPCs. Minimal transports
+   * without history RPCs are silently skipped (SNC1.4 back-compat).
+   */
+  private async refreshPiLeafBestEffort(sessionId: string): Promise<void> {
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!runtime || runtime.conn.isClosed) return;
+    const conn = runtime.conn;
+    if (typeof conn.getEntries !== "function" && typeof conn.getTree !== "function") return;
+    const timeoutMs = 3000;
+    try {
+      if (typeof conn.getEntries === "function") {
+        const bound = conn.getEntries.bind(conn);
+        const data = await bound(undefined, { timeoutMs });
+        if (typeof data?.leafId === "string" && data.leafId !== "") {
+          runtime.piLeafId = data.leafId;
+          const entries = (data?.entries ?? []) as unknown as PiHistoryEntryLike[];
+          const active = extractActiveBranch(entries, data.leafId);
+          if (active.ok) runtime.piChainIds = active.branch.map((e) => e.id);
+          return;
+        }
+      }
+    } catch {
+      // Fall through to tree.
+    }
+    try {
+      if (typeof conn.getTree === "function") {
+        const boundTree = conn.getTree.bind(conn);
+        const treeData = await boundTree({ timeoutMs });
+        if (typeof treeData?.leafId === "string" && treeData.leafId !== "") {
+          runtime.piLeafId = treeData.leafId;
+          const tree = (treeData?.tree ?? []) as unknown as Parameters<typeof extractActiveBranchFromTree>[0];
+          const active = extractActiveBranchFromTree(tree, treeData.leafId);
+          if (active.ok) runtime.piChainIds = active.branch.map((e) => e.id);
+        }
+      }
+    } catch {
+      // Best-effort: keep the last known leaf.
+    }
+  }
+
+  /**
+   * SNC1.7 `get_history`: serve the rebuilt + live-appended transcript with
+   * the Pi session leaf (never the page end). Cursor resolution is ordinal,
+   * in this order: (1) retired live ids translate through re-key tombstones
+   * (P1 round-3 fix — re-keyed rows keep old cursors positional-stable);
+   * (2) a cursor naming a previously advertised `leafId` resumes after the
+   * transcript length it was advertised with (write-once: a token's meaning
+   * is immutable); (3) a cursor naming a transcript row returns
+   * strictly-after rows; (4) any other Pi chain id (e.g. a skipped
+   * non-message entry) maps to the last row at/before that chain position.
+   * Unknown cursors return an empty page (same as the base). `limit` paging
+   * and `nextCursor` (last returned id) match the base. The cached Pi leaf is
+   * advertised only when EVERY transcript row is mapped at/before its chain
+   * position (P1 round-3/4/5 fixes — a stale/reused leaf is suppressed rather
+   * than re-advertised with a new meaning, and NO synthetic transcript-tail
+   * id is ever substituted: the contract promises `leafId` always names the
+   * session leaf, never the page end, and only opaque Pi `providerSessionId`/
+   * `leafId` stay stable across helper restart). A single unmapped hole
+   * ANYWHERE (not just the tip) suppresses the leaf: a later reconciled turn
+   * must not make the leaf look cover-clean while an earlier mismatch is
+   * still unreconciled, otherwise a restart could rebuild that hole's content
+   * invisibly under an already-advertised leaf. Callers page with
+   * `nextCursor` (row ids never move) until every hole is mapped.
+   */
+  protected override onGetHistory(opId: string, sessionId: string, cursor?: string, limit?: number): void {
+    if (!this.requireHello(opId)) return;
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      this.send({ v: 1, kind: "error", opId, sessionId, error: { code: "BAD_LIMIT", message: "limit must be a positive integer" } });
+      return;
+    }
+    const session = this.sessions.get(sessionId);
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!session || !runtime) {
+      this.send({ v: 1, kind: "error", opId, sessionId, error: { code: "UNKNOWN_SESSION", message: "unknown session" } });
+      return;
+    }
+    const full = session.history;
+    const pos = runtime.historyChainPos;
+    const effectiveCursor = cursor ? (runtime.rekeyedFrom.get(cursor) ?? cursor) : undefined;
+    let start = 0;
+    if (effectiveCursor) {
+      const idx = full.findIndex((e) => e.id === effectiveCursor);
+      if (idx !== -1) {
+        start = idx + 1;
+      } else if (runtime.leafEnds.has(effectiveCursor)) {
+        // Previously advertised leaf: resume after the page end it denoted
+        // (recorded below when that page was returned; write-once, so the
+        // meaning is immutable).
+        start = Math.min(runtime.leafEnds.get(effectiveCursor) as number, full.length);
+      } else {
+        const chain = runtime.piChainIds;
+        const chainIdx = chain ? chain.indexOf(effectiveCursor) : -1;
+        if (chainIdx === -1) {
+          start = full.length;
+        } else {
+          // Last row mapped at/before the cursor's chain position; rows
+          // after it (mapped later, or unmapped live tip rows) follow.
+          let ord = -1;
+          for (let i = 0; i < full.length; i++) {
+            const p = pos[i];
+            if (p !== null && p !== undefined && p <= chainIdx) ord = i;
+          }
+          start = ord + 1;
+        }
+      }
+    }
+    const rest = full.slice(start);
+    let entries = rest;
+    let nextCursor: string | undefined;
+    if (limit !== undefined && rest.length > limit) {
+      entries = rest.slice(0, limit);
+      nextCursor = entries.length > 0 ? entries[entries.length - 1]?.id : undefined;
+    }
+    // Advertise the cached Pi leaf only when EVERY transcript row is mapped
+    // at/before its chain position (P1 round-5 fix — the earlier max-index
+    // cover only detected unmapped rows at the tip, hiding a diverged hole
+    // as soon as a later turn reconciled). Any unmapped (`null`) row
+    // ANYWHERE, any row mapped past the leaf, or a length-misaligned
+    // position array suppresses the leaf: re-advertising it (or substituting
+    // a synthetic tail id, P1 round-4) would promise coverage the transcript
+    // cannot keep across a restart rebuild. Callers page with `nextCursor`
+    // (row ids never move) until every hole is mapped. Empty transcripts are
+    // vacuously clean (bootstrap leaves stay advertised).
+    let leafId: string | undefined;
+    const cached = runtime.piLeafId;
+    if (cached !== undefined) {
+      const chain = runtime.piChainIds;
+      const li = chain ? chain.indexOf(cached) : -1;
+      if (li !== -1 && pos.length === full.length) {
+        let clean = true;
+        for (let i = 0; i < full.length; i++) {
+          const q = pos[i];
+          if (q === null || q === undefined || q > li) {
+            clean = false;
+            break;
+          }
+        }
+        if (clean) leafId = cached;
+      }
+    }
+    // Record advertised Pi leaves write-once (first end wins — a token's
+    // meaning is immutable); transcript-tail fallbacks are positional-stable
+    // by construction (rows never move) and need no record. Only complete
+    // pages (no `nextCursor`) define a leaf's page end.
+    if (leafId && leafId === cached && nextCursor === undefined) {
+      if (!runtime.leafEnds.has(leafId)) runtime.leafEnds.set(leafId, full.length);
+    }
+    this.send({
+      v: 1,
+      kind: "history",
+      opId,
+      sessionId,
+      entries,
+      ...(nextCursor ? { nextCursor } : {}),
+      ...(leafId ? { leafId } : {}),
     });
   }
 
@@ -1130,9 +1898,31 @@ export class PiBridgeProvider extends BridgeProvider {
   //   on the same op until `agent_settled`);
   // - unknown/suppressed chrome maps to `[]` and changes no state.
 
+  /**
+   * Append one live-transcript row with a namespaced synthetic id and no
+   * chain position (P1 cursor-alignment fix; see `reconcileSettledTurn`). ALL
+   * live journaling funnels through here so `historyChainPos` parallels
+   * `session.history` exactly. Never call the base `appendHistory` directly
+   * for Pi live rows: bare `eN` ids could collide with Pi entry ids from a
+   * rebuild (e.g. rebuilt Pi `e5` + live `e5`), corrupting cursor resolution.
+   */
+  private appendLiveRow(
+    session: ProviderSession,
+    runtime: PiRuntime,
+    entry: { role: "user" | "assistant" | "tool"; text: string },
+  ): void {
+    runtime.liveSeq += 1;
+    this.appendHistory(session, { id: `live-${runtime.liveSeq}`, role: entry.role, text: entry.text });
+    runtime.historyChainPos.push(null);
+    session.metadata.messageCount = session.history.filter(
+      (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
+    ).length;
+  }
+
   /** Journal translator entries into bridge history (user → tools → assistant order). */
   private journalTranslatorEntries(
     session: ProviderSession,
+    runtime: PiRuntime,
     entries: Array<{ role: "user" | "assistant" | "tool"; text: string }>,
   ): void {
     for (const entry of entries) {
@@ -1140,12 +1930,7 @@ export class PiBridgeProvider extends BridgeProvider {
       // (never prose); `assistant` carries reconciled text finals (never tool
       // output); `user` carries the confirmed prompt. All three are needed so
       // `unknown`-dispatch reconciliation sees faithful evidence.
-      this.appendHistory(session, { role: entry.role, text: entry.text });
-    }
-    if (entries.length > 0) {
-      session.metadata.messageCount = session.history.filter(
-        (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-      ).length;
+      this.appendLiveRow(session, runtime, { role: entry.role, text: entry.text });
     }
   }
 
@@ -1278,12 +2063,9 @@ export class PiBridgeProvider extends BridgeProvider {
           if (currentOp && runtime.translator.pendingUser !== null) {
             const user = runtime.translator.pendingUser;
             if (user !== null) {
-              this.appendHistory(session, { role: "user", text: user });
+              this.appendLiveRow(session, runtime, { role: "user", text: user });
               runtime.translator.clearPendingUser();
               this.syncRuntimeMirrors(runtime);
-              session.metadata.messageCount = session.history.filter(
-                (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-              ).length;
             }
           }
           const opForEvent = session.activeOpId ?? currentOp;
@@ -1310,7 +2092,7 @@ export class PiBridgeProvider extends BridgeProvider {
             // cancellation retirement — late answers after settle are stale
             // refusals, never forwarded to Pi).
             const entries = runtime.translator.settle();
-            this.journalTranslatorEntries(session, entries);
+            this.journalTranslatorEntries(session, runtime, entries);
             this.syncRuntimeMirrors(runtime);
             session.cancelledOps.delete(currentOp);
             this.retirePromptsForOp(session, runtime, currentOp);
@@ -1320,7 +2102,14 @@ export class PiBridgeProvider extends BridgeProvider {
             // this op via per-`turn_end` drains above.
             if (session.activeOpId === currentOp) {
               this.finishTurn(session, currentOp);
-              if (session.activeOpId === null) session.metadata.isStreaming = false;
+              if (session.activeOpId === null) {
+                session.metadata.isStreaming = false;
+                // SNC1.7: background settle reconciliation (never blocks the
+                // turn): advances the cached Pi leaf/chain and re-keys this
+                // op's live rows to Pi ids when they converge (P1 fix).
+                // Failures keep live ids and the last known leaf.
+                void this.reconcileSettledTurn(sessionId).catch(() => undefined);
+              }
             }
           }
           continue;
@@ -1341,7 +2130,7 @@ export class PiBridgeProvider extends BridgeProvider {
             // tool stdout never becomes assistant prose). Text finals
             // reconcile (never duplicate deltas) via the translator.
             const entries = runtime.translator.drainTurnEnd();
-            this.journalTranslatorEntries(session, entries);
+            this.journalTranslatorEntries(session, runtime, entries);
             this.syncRuntimeMirrors(runtime);
             // No promotion: hold the single active turn until Pi's
             // authoritative `agent_settled` completes it (see above). Queued
@@ -1407,6 +2196,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // dialog, and Pi can never answer it either).
     if (runtime) {
       runtime.translator.resetAll();
+      runtime.opHistoryBase = null;
       runtime.pendingUserText = null;
       runtime.activeText = "";
       this.retireAllPrompts(session, runtime);
@@ -1611,6 +2401,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // received. Definite refusal clears everything below (Pi made no change);
     // success journals immediately; ambiguity reconciles against Pi state.
     session.activeOpId = msg.opId;
+    runtime.opHistoryBase = session.history.length;
     session.metadata.isStreaming = true;
     // Fresh agent: clear ALL prior translator state (not just per-turn text)
     // so a late event that raced `settle()` can never leak into the new turn
@@ -1699,10 +2490,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // its own `settled` (which journaled user→tools→assistant) — skip the
     // duplicate. SNC1.5: translator is authoritative; mirrors kept in sync.
     if (session.activeOpId === msg.opId && runtime.translator.pendingUser !== null) {
-      this.appendHistory(session, { role: "user", text: msg.message.text });
-      session.metadata.messageCount = session.history.filter(
-        (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-      ).length;
+      this.appendLiveRow(session, runtime, { role: "user", text: msg.message.text });
       runtime.translator.clearPendingUser();
       runtime.pendingUserText = null;
     } else {
@@ -1746,10 +2534,8 @@ export class PiBridgeProvider extends BridgeProvider {
     }
     // Journal the queued user turn; Pi events will settle it.
     // `finishTurn` set activeOpId before calling here; keep it.
-    this.appendHistory(live, { role: "user", text: msg.message.text });
-    live.metadata.messageCount = live.history.filter(
-      (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-    ).length;
+    runtime.opHistoryBase = live.history.length;
+    this.appendLiveRow(live, runtime, { role: "user", text: msg.message.text });
     runtime.translator.resetTurn();
     runtime.activeText = "";
     this.syncRuntimeMirrors(runtime);

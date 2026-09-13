@@ -1232,16 +1232,17 @@ describe("PiBridgeProvider acceptance hardening (PR #37 fifth review + SNC1.6)",
     expect(lastOfKind(out, "closed")).toMatchObject({ exit: { code: null, signal: null } });
   });
 
-  it("advertises the capabilities SNC1.6 honestly implements", async () => {
-    // SNC1.6 model/thinking/prompt/image controls are live; history/branch/
-    // resume stays false until SNC1.7 reconstructs from Pi get_entries/tree.
+  it("advertises the capabilities SNC1.6+SNC1.7 honestly implements", async () => {
+    // SNC1.6 model/thinking/prompt/image controls are live; SNC1.7
+    // history/branch/resume is live via Pi get_entries/get_tree (see
+    // pi-history.ts), so resume is true.
     const provider = new PiBridgeProvider({ createConnection: (opts) => new FakePi(opts) });
     const { out, hello } = drive(provider);
     hello();
     await new Promise((r) => setTimeout(r, 10));
     expect(lastOfKind(out, "hello_ok")).toMatchObject({
       provider: { id: "pi" },
-      capabilities: { textStreaming: true, cancel: true, options: true, resume: false },
+      capabilities: { textStreaming: true, cancel: true, options: true, resume: true },
     });
   });
 
