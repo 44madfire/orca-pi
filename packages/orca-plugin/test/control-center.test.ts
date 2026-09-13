@@ -251,7 +251,9 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("intentPatch");
     expect(html).toContain("intentInitial");
     expect(html).toContain("myGen");
-    expect(html).toContain("refreshAll(null)");
+    expect(html).toContain("draftRev");
+    expect(html).toContain("touchDraft");
+    expect(html).toContain("refreshListOnly");
     expect(html).toContain("@media");
     expect(html).toContain("focus-visible");
   });

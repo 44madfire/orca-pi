@@ -366,7 +366,15 @@
           detailToken: 0,
           listToken: 0,
           editorGen: 0,
+          draftRev: 0,
         };
+
+        // Every user edit bumps draftRev so in-flight saves can tell whether
+        // the draft changed after submission (edits-after-save must survive).
+        function touchDraft() {
+          state.draftRev = (state.draftRev || 0) + 1;
+          setDirty(true);
+        }
 
         function setDirty(dirty) {
           state.dirty = dirty;
@@ -740,7 +748,7 @@
           if (isCreate) {
             var nameInput = el("input"); nameInput.type = "text"; nameInput.id = "f-name"; nameInput.value = state.draft.name || "";
             nameInput.setAttribute("placeholder", "worker-fast"); nameInput.setAttribute("aria-label", "New profile name");
-            nameInput.addEventListener("input", function () { state.draft.name = nameInput.value; setDirty(true); });
+            nameInput.addEventListener("input", function () { state.draft.name = nameInput.value; touchDraft(); });
             nameWrap.appendChild(nameInput);
             nameWrap.appendChild(el("p", { class: "hint" }, "1-64 chars, letters/digits/_/-. Validated server-side."));
           } else {
@@ -831,7 +839,7 @@
             inp.value = cur == null ? "" : String(cur);
             if (placeholder) inp.setAttribute("placeholder", placeholder);
             // Overrides stay editable even for builtin-named profiles (layer-targeted saves).
-            inp.addEventListener("input", function () { state.draft[field] = inp.value; setDirty(true); });
+            inp.addEventListener("input", function () { state.draft[field] = inp.value; touchDraft(); });
             return inp;
           }
 
@@ -852,7 +860,7 @@
             extSel.appendChild(o);
           });
           // extends stays editable for overrides (server validates cycles/parents).
-          extSel.addEventListener("change", function () { state.draft.extends = extSel.value; setDirty(true); });
+          extSel.addEventListener("change", function () { state.draft.extends = extSel.value; touchDraft(); });
           ed.appendChild(fieldRow("extends", "Inheritance (extends)", "Single parent (v1). Cycles and unknown parents are rejected server-side.", extSel, provFor("extends")));
 
           ed.appendChild(fieldRow("provider", "Provider", "Pi --provider (e.g. anthropic, openai-codex). Optional.", textControl("provider", "anthropic"), provFor("provider")));
@@ -867,7 +875,7 @@
             thinkSel.appendChild(o);
           });
           // thinking stays editable for overrides.
-          thinkSel.addEventListener("change", function () { state.draft.thinking = thinkSel.value; setDirty(true); });
+          thinkSel.addEventListener("change", function () { state.draft.thinking = thinkSel.value; touchDraft(); });
           ed.appendChild(fieldRow("thinking", "Thinking level", "Pi --thinking. Closed set owned by the backend.", thinkSel, provFor("thinking")));
 
           // systemPrompt / systemPromptFile (mutually exclusive).
@@ -898,7 +906,7 @@
               if (m === "none") { state.draft.systemPrompt = ""; state.draft.systemPromptFile = ""; }
               else if (m === "inline") { state.draft.systemPromptFile = ""; if (state.draft.systemPrompt === "" || state.draft.systemPrompt === undefined) state.draft.systemPrompt = (detail && detail.fields && detail.fields.systemPrompt && detail.fields.systemPrompt.effective) || ""; }
               else { state.draft.systemPrompt = ""; if (state.draft.systemPromptFile === "" || state.draft.systemPromptFile === undefined) state.draft.systemPromptFile = (detail && detail.fields && detail.fields.systemPromptFile && detail.fields.systemPromptFile.effective) || ""; }
-              setDirty(true); renderEditor();
+              touchDraft(); renderEditor();
             });
             lab.insertBefore(r, lab.firstChild);
             modeWrap.appendChild(lab);
@@ -927,7 +935,7 @@
                 var next = Array.isArray(state.draft[field]) ? state.draft[field].slice() : curList.slice();
                 if (cb.checked && next.indexOf(t) === -1) next.push(t);
                 if (!cb.checked) next = next.filter(function (x) { return x !== t; });
-                state.draft[field] = next; setDirty(true);
+                state.draft[field] = next; touchDraft();
               });
               lab.insertBefore(cb, lab.firstChild);
               group.appendChild(lab);
@@ -944,7 +952,7 @@
                 if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(v)) { window.alert("Invalid tool name."); return; }
                 var next = Array.isArray(state.draft[field]) ? state.draft[field].slice() : curList.slice();
                 if (next.indexOf(v) === -1) next.push(v);
-                state.draft[field] = next; setDirty(true); renderEditor();
+                state.draft[field] = next; touchDraft(); renderEditor();
               }
             });
             wrap.appendChild(custom);
@@ -956,7 +964,7 @@
                 var rm = el("button", null, "remove");
                 rm.addEventListener("click", function () {
                   var next = (Array.isArray(state.draft[field]) ? state.draft[field] : curList.slice()).filter(function (x) { return x !== t; });
-                  state.draft[field] = next; setDirty(true); renderEditor();
+                  state.draft[field] = next; touchDraft(); renderEditor();
                 });
                 // Remove stays enabled for overrides.
                 li.appendChild(rm); ul.appendChild(li);
@@ -987,7 +995,7 @@
                 var rm = el("button", null, "remove");
                 rm.addEventListener("click", function () {
                   var next = (Array.isArray(state.draft[field]) ? state.draft[field] : curList.slice()).filter(function (x) { return x !== v; });
-                  state.draft[field] = next; setDirty(true); renderEditor();
+                  state.draft[field] = next; touchDraft(); renderEditor();
                 });
                 // Remove stays enabled for overrides.
                 li.appendChild(rm); ul.appendChild(li);
@@ -1006,7 +1014,7 @@
                 if (!v) return;
                 var next = Array.isArray(state.draft[field]) ? state.draft[field].slice() : curList.slice();
                 if (next.indexOf(v) === -1) next.push(v);
-                state.draft[field] = next; setDirty(true); renderEditor();
+                state.draft[field] = next; touchDraft(); renderEditor();
               }
             });
             wrap.appendChild(add);
@@ -1028,7 +1036,7 @@
             var cur = state.draft[f] !== undefined ? state.draft[f] : (detail && detail.fields && detail.fields[f] && detail.fields[f].effective);
             cb.checked = cur === true;
             // Boolean flags stay enabled for overrides.
-            cb.addEventListener("change", function () { state.draft[f] = cb.checked; setDirty(true); });
+            cb.addEventListener("change", function () { state.draft[f] = cb.checked; touchDraft(); });
             lab.insertBefore(cb, lab.firstChild);
             wrap.appendChild(lab);
             var prov = provFor(f);
@@ -1044,7 +1052,7 @@
             sessSel.appendChild(o);
           });
           // Session stays editable for overrides.
-          sessSel.addEventListener("change", function () { state.draft.session = sessSel.value; setDirty(true); });
+          sessSel.addEventListener("change", function () { state.draft.session = sessSel.value; touchDraft(); });
           ed.appendChild(fieldRow("session", "Session mode", "ephemeral = Pi --no-session (never resumes).", sessSel, provFor("session")));
 
           var ghCtl = textControl("githubIdentity", "worker / reviewer / custom (never a secret)");
@@ -1098,9 +1106,8 @@
         }
 
         function resetScope(name) {
-          // Reset = delete the scope's override — snapshot generation so an
-          // in-flight reset never clears a newer draft after navigation.
           var myGen = state.editorGen || 0;
+          var myRev = state.draftRev || 0;
           var scopeAtSubmit = state.scope;
           if (!window.confirm("Reset " + scopeAtSubmit + " override for \"" + name + "\"? This deletes the " + scopeAtSubmit + " layer entry.")) return;
           var hash = currentHashFor(scopeAtSubmit);
@@ -1112,7 +1119,7 @@
           if (hash === null) { window.alert("No " + scopeAtSubmit + " override exists to reset."); return; }
           var params = { action: "delete", name: name, scope: scopeAtSubmit, expectedSourceHash: hash };
           request("profile.mutate", params).then(function (res) {
-            if (myGen !== (state.editorGen || 0)) { refreshAll(null); return; }
+            if (myGen !== (state.editorGen || 0) || (state.draftRev || 0) !== myRev) { refreshListOnly(); return; }
             if (res && res.ok) { state.draft = {}; setDirty(false); refreshAll(name); }
             else {
               var mapped = mapError(res && res.error);
@@ -1120,7 +1127,7 @@
               renderEditor();
             }
           }, function () {
-            if (myGen !== (state.editorGen || 0)) { refreshAll(null); return; }
+            if (myGen !== (state.editorGen || 0) || (state.draftRev || 0) !== myRev) { refreshListOnly(); return; }
             state.globalError = "Bridge request failed.";
             renderEditor();
           });
@@ -1149,18 +1156,19 @@
           }
           var scope = state.scope;
           // Snapshot the full mutation intent synchronously: name/scope/patch
-          // or initial plus the editor generation. Async receipt fetches below
-          // must never recompute the patch from a later draft.
+          // or initial plus editor generation AND draft revision. Async receipt
+          // fetches below must never recompute the patch from a later draft,
+          // and callbacks must not clear edits made after submission.
           var myGen = state.editorGen || 0;
+          var myDraftRev = state.draftRev || 0;
           if (isCreate) {
             var intentInitial = draftPatch();
             var intentName = name;
             var intentScope = scope;
-            // Versioned create: fetch a fresh receipt for the scope file so
-            // concurrent creators conflict instead of silently replacing.
             freshHashFor(state.profiles.length ? state.profiles[0].name : intentName, intentScope).then(function (receipt) {
-              if (myGen !== (state.editorGen || 0)) return;
+              if (myGen !== (state.editorGen || 0) || (state.draftRev || 0) !== myDraftRev) { refreshListOnly(); return; }
               if (receipt.hash === undefined && state.profiles.length) {
+                if ((state.draftRev || 0) !== myDraftRev) { refreshListOnly(); return; }
                 state.globalError = "Create aborted: " + (receipt.error || "no fresh version") + ". Refresh, then retry.";
                 renderEditor();
                 return;
@@ -1169,7 +1177,7 @@
               if (receipt.hash === null || !state.profiles.length) {
                 if (receipt.hash === null || !state.profiles.length) params.expectedAbsent = true;
               } else if (typeof receipt.hash === "string") params.expectedSourceHash = receipt.hash;
-              submitMutate(params, intentName, myGen);
+              submitMutate(params, intentName, myGen, myDraftRev);
             });
             return;
           } else {
@@ -1183,18 +1191,20 @@
             var patchParams = { action: "patch", name: name, scope: scope, patch: intentPatch };
             if (hash === null) patchParams.expectedAbsent = true;
             else patchParams.expectedSourceHash = hash;
-            submitMutate(patchParams, name, myGen);
+            submitMutate(patchParams, name, myGen, myDraftRev);
             return;
           }
-          function submitMutate(params, targetName, gen) {
+          function submitMutate(params, targetName, gen, draftRevAtSubmit) {
           var myMutGen = gen !== undefined ? gen : (state.editorGen || 0);
+          var myMutRev = draftRevAtSubmit !== undefined ? draftRevAtSubmit : (state.draftRev || 0);
           var ed = document.getElementById("profile-editor");
           request("profile.mutate", params).then(function (res) {
-            // Isolate in-flight mutations: when the user navigated or started
-            // a new draft while this save was pending, preserve the live
-            // editor and refresh list data without stealing selection.
-            if (myMutGen !== (state.editorGen || 0)) {
-              refreshAll(null);
+            // Isolate in-flight mutations: navigation OR edits-after-submit
+            // (same editor, newer draftRev) must survive. Only the owning
+            // generation+revision may clear/render; otherwise refresh list
+            // metadata only and never reload a dirty editor.
+            if (myMutGen !== (state.editorGen || 0) || (state.draftRev || 0) !== myMutRev) {
+              refreshListOnly();
               return;
             }
             if (res && res.ok) {
@@ -1216,7 +1226,7 @@
               }
             }
           }, function () {
-            if (myMutGen !== (state.editorGen || 0)) { refreshAll(null); return; }
+            if (myMutGen !== (state.editorGen || 0) || (state.draftRev || 0) !== myMutRev) { refreshListOnly(); return; }
             state.globalError = "Bridge request failed.";
             renderEditor();
           });
@@ -1252,15 +1262,29 @@
           });
         }
 
+        // List-only refresh for stale/background paths: updates the profile
+        // list + placeholders without touching a dirty editor (never calls
+        // loadDetail while dirty, so scope can never be silently retargeted).
+        function refreshListOnly() {
+          if (!state.structured) return Promise.resolve([]);
+          state.listToken = (state.listToken || 0) + 1;
+          var myTok = state.listToken;
+          if (!can("profiles.list")) return Promise.resolve([]);
+          return request("profiles.list").then(function (res) {
+            if (myTok !== state.listToken) return;
+            if (!res || !res.ok || !res.result) return;
+            state.profiles = toListItems(res.result);
+            renderList();
+          });
+        }
+
         function refreshAll(selectAfter) {
           if (!state.structured) return Promise.resolve([]);
-          // Generation guard: a stale list response must never retarget a
-          // live selection/draft. Capture selection + dirty at request time
-          // and only restore selectAfter when nothing changed meanwhile.
           state.listToken = (state.listToken || 0) + 1;
           var myListToken = state.listToken;
           var selectionAtStart = state.selected;
           var dirtyAtStart = state.dirty;
+          var draftRevAtStart = state.draftRev || 0;
           var ops = [];
           if (can("profiles.list")) {
             ops.push(request("profiles.list").then(function (res) {
@@ -1287,9 +1311,11 @@
                 renderList();
                 loadDetail(selectAfter, state.detailToken);
               } else if (state.selected) {
-                // Plain refresh: reload current selection only when it is
-                // still selected and no newer detail request superseded us.
                 if (state.selected !== selectionAtStart) return;
+                // Never reload a dirty editor from a background refresh:
+                // list metadata is fresh, but the live draft keeps its scope
+                // and values. Explicit selection changes reload via selectProfile.
+                if (state.dirty || (state.draftRev || 0) !== draftRevAtStart) return;
                 loadDetail(state.selected, state.detailToken);
               }
             }));
