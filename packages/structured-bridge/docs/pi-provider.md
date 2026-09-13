@@ -187,11 +187,21 @@ get_history → rebuilt + live-appended transcript, leafId = Pi leaf
   `user` (no fabricated completion); `aborted` assistants still journal text.
 - Fail-closed (actionable, secret-safe, no prompt text or paths):
   `PI_RESUME_UNSUPPORTED` (minimal transport), `PI_RESUME_FAILED`
-  (switch failure), `PI_HISTORY_EMPTY` / `PI_HISTORY_LEAF_MISSING` /
-  `PI_HISTORY_CHAIN_BROKEN` / `PI_HISTORY_CYCLE` (never silent truncation),
-  `PI_HISTORY_INCOMPATIBLE` (messages exist but all roles unknown),
-  `PI_HISTORY_BUSY` (rebuild while streaming). Missing-file-creates-empty
-  (Pi contract) returns `resumed:false` honestly, not an error.
+  (switch failure), `PI_RESUME_CANCELLED` (Pi vetoed the switch via
+  `session_before_switch` — the switch rebinds nothing, so continuing would
+  rebuild the WRONG history), `PI_HISTORY_EMPTY` /
+  `PI_HISTORY_LEAF_MISSING` / `PI_HISTORY_CHAIN_BROKEN` / `PI_HISTORY_CYCLE`
+  (never silent truncation), `PI_HISTORY_INCOMPATIBLE` (messages exist but
+  all roles unknown), `PI_HISTORY_BUSY` (rebuild while streaming).
+  Missing-file-creates-empty (Pi contract) returns `resumed:false` honestly,
+  not an error.
+- Cursor alignment across live turns (P1 review fix): rebuilt rows carry Pi
+  ids with per-row chain positions; live rows are keyed `live-N`
+  (namespaced — never colliding with Pi ids) and re-keyed to Pi ids at settle
+  when the Pi tail converges by exact `(role, text)` sequence (background,
+  bounded, mismatch keeps live ids). `get_history(cursor=<Pi leaf>)`
+  resolves through chain positions, so the transcript stays pageable across
+  resumes and live turns alike.
 - `get_history{cursor,limit}` pages the transcript; `leafId` always names the
   Pi leaf (never the page end); cursors naming skipped non-message entries
   resolve via the cached Pi chain to strictly-after rows. `leafId`/chain

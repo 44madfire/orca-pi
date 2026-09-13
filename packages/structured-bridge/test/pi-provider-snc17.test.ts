@@ -43,6 +43,14 @@ class FakePi17 implements PiProviderConnection {
   readonly seenOpts: PiRpcConnectionOptions;
   readonly prompts: string[] = [];
   switchedTo: string[] = [];
+  /** When true, `switchSession` reports `{cancelled:true}` (extension veto). */
+  switchCancelled = false;
+  /**
+   * Hook run on every `prompt()`: appends Pi journal entries for the turn
+   * (lets tests simulate Pi journaling live turns so settle reconciliation
+   * can re-key them). Receives the prompt text.
+   */
+  autoJournal: ((message: string) => void) | null = null;
   started = false;
   closes = 0;
   failSwitchWith: unknown = null;
@@ -79,6 +87,7 @@ class FakePi17 implements PiProviderConnection {
 
   async prompt(message: string): Promise<void> {
     this.prompts.push(message);
+    if (this.autoJournal) this.autoJournal(message);
   }
 
   async abort(): Promise<void> {}
@@ -112,7 +121,7 @@ class FakePi17 implements PiProviderConnection {
   async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
     this.switchedTo.push(sessionPath);
     if (this.failSwitchWith) throw this.failSwitchWith;
-    return { cancelled: false };
+    return { cancelled: this.switchCancelled };
   }
 
   async getEntries(): Promise<PiEntriesData> {
@@ -408,5 +417,145 @@ describe("PiBridgeProvider SNC1.7 resume (history/current-branch)", () => {
     const history = lastOfKind(out, "history") as unknown as { entries: unknown[]; leafId?: string };
     expect(history.entries).toHaveLength(0);
     expect(history.leafId).toBe("e2");
+  });
+
+  it("fails closed when Pi vetoes the switch (cancelled:true tears down, never resumes)", async () => {
+    const fakes: FakePi17[] = [];
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        seedTwoTurnSession(fake);
+        fake.switchCancelled = true;
+        fakes.push(fake);
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws", resumePath: "/tmp/pi/ses.jsonl" });
+    await new Promise((r) => setTimeout(r, 40));
+    // Vetoed switch never becomes a lease: error (not acquired), child torn
+    // down, and no path leaks into the diagnostic.
+    expect(out.some((m) => m.kind === "acquired")).toBe(false);
+    expect(lastOfKind(out, "error")).toMatchObject({ opId: "acq_1" });
+    expect(JSON.stringify(lastOfKind(out, "error"))).toContain("PI_RESUME_CANCELLED");
+    expect(JSON.stringify(lastOfKind(out, "error"))).not.toContain("/tmp/pi/ses.jsonl");
+    expect(provider.piSessionCount).toBe(0);
+    void fakes;
+  });
+
+  it("keeps leafId cursors valid across live turns (reviewer P1 regression)", async () => {
+    // acquire/resume → live turn A → capture leafId → live turn B →
+    // get_history(cursor=<A leaf>) must return B's rows.
+    const assistantFor: Record<string, string> = { A: "a-out", B: "b-out" };
+    let seq = 6;
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        seedTwoTurnSession(fake);
+        fake.autoJournal = (message: string) => {
+          const u = `e${++seq}`;
+          const a = `e${++seq}`;
+          fake.entries.push(piMsg(u, fake.leafId, "user", [{ type: "text", text: message }]));
+          fake.entries.push(
+            piMsg(a, u, "assistant", [
+              { type: "thinking", thinking: `reasoning for ${message}` },
+              { type: "text", text: assistantFor[message] ?? `${message}-out` },
+            ]),
+          );
+          fake.leafId = a;
+        };
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws", resumePath: "/tmp/pi/ses.jsonl" });
+    await new Promise((r) => setTimeout(r, 40));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+
+    async function liveTurn(opId: string, text: string, reply: string): Promise<void> {
+      send({ v: 1, kind: "dispatch", opId, sessionId, message: { text } });
+      await new Promise((r) => setTimeout(r, 20));
+      const fake = (provider as unknown as { piRuntimes: Map<string, { conn: FakePi17 }> }).piRuntimes.get(sessionId)?.conn;
+      fake?.emit({ type: "turn_start" } as PiServerEvent);
+      fake?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: reply } } as unknown as PiServerEvent);
+      fake?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+      fake?.emit({ type: "agent_settled" } as PiServerEvent);
+      // Settle reconciliation is background: give the bounded refresh time.
+      await new Promise((r) => setTimeout(r, 80));
+    }
+
+    await liveTurn("dsp_A", "A", "a-out");
+    send({ v: 1, kind: "get_history", opId: "his_A", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const afterA = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    // Turn A re-keyed to Pi ids (stable, thinking never leaked).
+    expect(afterA.entries.slice(-2).map((e) => [e.role, e.text])).toEqual([
+      ["user", "A"],
+      ["assistant", "a-out"],
+    ]);
+    expect(afterA.entries.slice(-2).map((e) => e.id)).toEqual(["e7", "e8"]);
+    expect(afterA.leafId).toBe("e8");
+    const leafA = afterA.leafId as string;
+
+    await liveTurn("dsp_B", "B", "b-out");
+    send({ v: 1, kind: "get_history", opId: "his_AB", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const full = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+      leafId?: string;
+    };
+    expect(full.leafId).toBe("e10");
+    // The P1 hole would return [] here (chain filter looks for Pi ids while
+    // rows still carry synthetic ids). It must return B's rows.
+    send({ v: 1, kind: "get_history", opId: "his_B", sessionId, cursor: leafA });
+    await new Promise((r) => setTimeout(r, 20));
+    const pageB = lastOfKind(out, "history") as unknown as {
+      entries: Array<{ id: string; role: string; text?: string }>;
+    };
+    expect(pageB.entries.map((e) => [e.role, e.text])).toEqual([
+      ["user", "B"],
+      ["assistant", "b-out"],
+    ]);
+    // No duplicate ids anywhere (re-key replaces, never appends).
+    const ids = full.entries.map((e) => e.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("namespaces live rows so they never collide with Pi entry ids", async () => {
+    const provider = new PiBridgeProvider({
+      createConnection: (opts) => {
+        const fake = new FakePi17(opts);
+        fake.entries = [
+          { type: "model_change", id: "e1", parentId: null },
+          { type: "thinking_level_change", id: "e2", parentId: "e1" },
+        ];
+        fake.leafId = "e2";
+        fake.state = { ...fake.state, messageCount: 0, sessionId: "pi_live_1" };
+        // Pi journals nothing for this turn (keeps live-N ids by design).
+        return fake;
+      },
+    });
+    const { out, send, hello } = drive(provider);
+    hello();
+    send({ v: 1, kind: "acquire", opId: "acq_1", workspaceRoot: "/tmp/ws" });
+    await new Promise((r) => setTimeout(r, 30));
+    const sessionId = (lastOfKind(out, "acquired") as unknown as { sessionId: string }).sessionId;
+    send({ v: 1, kind: "dispatch", opId: "dsp_1", sessionId, message: { text: "hi" } });
+    await new Promise((r) => setTimeout(r, 20));
+    const fake = (provider as unknown as { piRuntimes: Map<string, { conn: FakePi17 }> }).piRuntimes.get(sessionId)?.conn;
+    fake?.emit({ type: "turn_start" } as PiServerEvent);
+    fake?.emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "yo" } } as unknown as PiServerEvent);
+    fake?.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop" }, toolResults: [] } as unknown as PiServerEvent);
+    fake?.emit({ type: "agent_settled" } as PiServerEvent);
+    await new Promise((r) => setTimeout(r, 80));
+    send({ v: 1, kind: "get_history", opId: "his_1", sessionId });
+    await new Promise((r) => setTimeout(r, 20));
+    const history = lastOfKind(out, "history") as unknown as { entries: Array<{ id: string; role: string }> };
+    expect(history.entries.map((e) => e.id)).toEqual(["live-1", "live-2"]);
   });
 });

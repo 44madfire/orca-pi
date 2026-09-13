@@ -122,7 +122,7 @@ import { PiTranslator } from "./pi-translator.js";
 import {
   extractActiveBranch,
   extractActiveBranchFromTree,
-  translatePiBranchToBridgeHistory,
+  translatePiEntryToBridgeEntries,
   type PiHistoryEntryLike,
 } from "./pi-history.js";
 
@@ -253,6 +253,27 @@ interface PiRuntime {
    */
   piLeafId?: string;
   piChainIds?: string[];
+  /**
+   * SNC1.7 cursor-alignment state (P1 review fix): `historyChainPos[i]`
+   * parallels `session.history[i]` with that row's position in the Pi active
+   * chain, or `null` for live rows not yet reconciled to Pi ids. Lets
+   * `get_history(cursor=<Pi leaf>)` resolve through the chain even after live
+   * turns appended synthetic ids. Reset wholesale on rebuild, appended for
+   * live rows, re-keyed by `reconcileSettledTurn`.
+   */
+  historyChainPos: (number | null)[];
+  /**
+   * Synthetic live-row id sequence. Live rows are keyed `live-<n>`,
+   * namespaced so they can never collide with Pi entry ids — a rebuilt Pi
+   * `e5` plus a live `e5` would corrupt cursor resolution (same P1).
+   */
+  liveSeq: number;
+  /**
+   * `session.history.length` when the current op took the turn (its rows are
+   * contiguous from here); cleared at settle. Lets `reconcileSettledTurn`
+   * attribute exactly this op's rows for Pi re-keying.
+   */
+  opHistoryBase: number | null;
   /** Last `get_available_models` result for image-gating + model refs (best-effort cache). */
   cachedModels?: PiModel[];
   /** Shared in-flight catalog lookup (P2: concurrent image dispatches share one Pi RPC). */
@@ -578,6 +599,9 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompts: new Map<string, string>(),
       promptPiIds: new Map<string, string>(),
       pendingImmediate: null,
+      historyChainPos: [],
+      liveSeq: 0,
+      opHistoryBase: null,
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
@@ -691,8 +715,14 @@ export class PiBridgeProvider extends BridgeProvider {
       });
       return;
     }
+    // P1 (ChatGPT review): honor `session_before_switch` vetoes. A
+    // `{cancelled:true}` switch rebinds NOTHING — Pi stays on its previous
+    // session — so continuing would rebuild the WRONG history and can emit
+    // `acquired{resumed:true}` for a file Pi never loaded. Fail closed.
+    let switchCancelled = false;
     try {
-      await conn.switchSession(resumePath, { timeoutMs: this.piOptionTimeoutMs });
+      const switched = await conn.switchSession(resumePath, { timeoutMs: this.piOptionTimeoutMs });
+      switchCancelled = switched?.cancelled === true;
     } catch (error) {
       await conn.close(this.piCloseGraceMs).catch(() => undefined);
       this.send({
@@ -700,6 +730,19 @@ export class PiBridgeProvider extends BridgeProvider {
         kind: "error",
         opId,
         error: { code: "PI_RESUME_FAILED", message: sanitizeCode(`Pi session resume failed: ${this.shortPiError(error)}`) },
+      });
+      return;
+    }
+    if (switchCancelled) {
+      await conn.close(this.piCloseGraceMs).catch(() => undefined);
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId,
+        error: {
+          code: "PI_RESUME_CANCELLED",
+          message: "Pi refused the session switch (vetoed by an extension). Retry without resumePath for a fresh session or choose another session file.",
+        },
       });
       return;
     }
@@ -756,6 +799,9 @@ export class PiBridgeProvider extends BridgeProvider {
       pendingPrompts: new Map<string, string>(),
       promptPiIds: new Map<string, string>(),
       pendingImmediate: null,
+      historyChainPos: [],
+      liveSeq: 0,
+      opHistoryBase: null,
     };
     this.piRuntimes.set(sessionId, runtime);
     const session = this.sessions.get(sessionId);
@@ -826,23 +872,25 @@ export class PiBridgeProvider extends BridgeProvider {
    * idle (no `activeOpId`): live owns streaming turns and is never rebuilt
    * mid-turn.
    */
-  private async rebuildHistoryFromPi(
-    sessionId: string,
-  ): Promise<{ ok: true; history: BridgeHistoryEntry[]; leafId: string } | { ok: false; code: string; message: string }> {
-    const session = this.sessions.get(sessionId);
-    const runtime = this.piRuntimes.get(sessionId);
-    if (!session || !runtime) return { ok: false, code: "UNKNOWN_SESSION", message: "unknown session" };
-    if (session.activeOpId !== null) {
-      return { ok: false, code: "PI_HISTORY_BUSY", message: "cannot rebuild history while a turn streams (wait for idle or cancel)" };
-    }
-    const conn = runtime.conn;
-    if (runtime.conn.isClosed) return { ok: false, code: "PI_EXITED", message: "pi-exited (reacquire the session)" };
-    const timeoutMs = this.piOptionTimeoutMs;
-    // Primary: flat `get_entries` + leaf walk (single RPC). Fallback: `get_tree`
-    // when entries are unavailable or the flat chain is broken (same walk over
-    // the flattened tree, so both converge). Both are optional on the minimal
-    // fake surface: absent history RPCs fail closed for resume (honest
-    // PI_RESUME_UNSUPPORTED, never silent empty).
+  /**
+   * Fetch Pi's active branch (root → leaf, inclusive): flat `get_entries` +
+   * leaf walk first (single RPC), `get_tree` fallback when entries are
+   * unavailable or the flat chain is broken (same walk over the flattened
+   * tree, so both converge). Shared by `rebuildHistoryFromPi` (fail-closed
+   * resume) and `reconcileSettledTurn` (best-effort re-key). Fail-closed
+   * codes distinguish empty/unavailable entries, unknown leaf, broken parent
+   * chain, and cycles — never a silent truncated transcript.
+   */
+  private async fetchPiActiveBranch(
+    conn: PiProviderConnection,
+    timeoutMs: number,
+  ): Promise<
+    | { ok: true; branch: PiHistoryEntryLike[]; leafId: string }
+    | { ok: false; code: string; message: string }
+  > {
+    // Both history RPCs are optional on the minimal fake surface: absent
+    // history support fails closed for resume (honest PI_RESUME_UNSUPPORTED,
+    // never silent empty).
     const canEntries = typeof conn.getEntries === "function";
     const canTree = typeof conn.getTree === "function";
     if (!canEntries && !canTree) {
@@ -901,7 +949,36 @@ export class PiBridgeProvider extends BridgeProvider {
     if (branch === null || leafId === undefined) {
       return { ok: false, code: "PI_HISTORY_EMPTY", message: "Pi history is empty or unavailable (reacquire the session)" };
     }
-    const history = translatePiBranchToBridgeHistory(branch);
+    return { ok: true, branch, leafId };
+  }
+
+  private async rebuildHistoryFromPi(
+    sessionId: string,
+  ): Promise<{ ok: true; history: BridgeHistoryEntry[]; leafId: string } | { ok: false; code: string; message: string }> {
+    const session = this.sessions.get(sessionId);
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!session || !runtime) return { ok: false, code: "UNKNOWN_SESSION", message: "unknown session" };
+    if (session.activeOpId !== null) {
+      return { ok: false, code: "PI_HISTORY_BUSY", message: "cannot rebuild history while a turn streams (wait for idle or cancel)" };
+    }
+    const conn = runtime.conn;
+    if (runtime.conn.isClosed) return { ok: false, code: "PI_EXITED", message: "pi-exited (reacquire the session)" };
+    const fetched = await this.fetchPiActiveBranch(conn, this.piOptionTimeoutMs);
+    if (!fetched.ok) return { ok: false, code: fetched.code, message: fetched.message };
+    const branch = fetched.branch;
+    const leafId = fetched.leafId;
+    // Per-entry translation WITH chain positions (P1 cursor-alignment fix):
+    // `positions[i]` is the chain index that produced `history[i]`, so later
+    // `get_history(cursor=<Pi id>)` resolves through the chain even for
+    // cursors naming skipped non-message entries.
+    const history: BridgeHistoryEntry[] = [];
+    const positions: (number | null)[] = [];
+    branch.forEach((entry, chainIdx) => {
+      for (const row of translatePiEntryToBridgeEntries(entry)) {
+        history.push(row);
+        positions.push(chainIdx);
+      }
+    });
     // Incompatible-shape guard: Pi reports messages on the active branch but
     // translation yields zero rows (all unknown future roles) — fail closed
     // rather than silently returning an empty transcript for a non-empty Pi
@@ -915,15 +992,81 @@ export class PiBridgeProvider extends BridgeProvider {
       };
     }
     // Wholesale replace (idle only, see above): stable Pi ids verbatim for
-    // exact handoff metadata (`id`/`parentId`/`timestamp` + `leafId`). Live
-    // `eN` ids never collide with Pi hex ids, but reset the counter anyway so
-    // future live rows continue after the rebuilt transcript length.
-    session.history.splice(0, session.history.length, ...history);
+    // exact handoff metadata (`id`/`parentId`/`timestamp` + `leafId`), plus
+    // their chain positions for cursor alignment. Live rows use namespaced
+    // `live-N` ids (see `appendLiveRow`), so no rebuilt id can collide.
+    const dropped = session.history.length;
+    session.history.splice(0, dropped, ...history);
+    runtime.historyChainPos.splice(0, dropped, ...positions);
+    runtime.opHistoryBase = null;
     session.entryCounter = history.length;
     session.metadata.messageCount = history.filter((e) => e.role === "user" || e.role === "assistant" || e.role === "tool").length;
     runtime.piLeafId = leafId;
     runtime.piChainIds = branch.map((e) => e.id);
     return { ok: true, history: [...history], leafId };
+  }
+
+  /**
+   * Reconcile one settled op's live rows to Pi ids (P1 cursor-alignment fix).
+   * Background, bounded, never fails the turn: fetches the active chain,
+   * always advances `piLeafId`/`piChainIds`, and re-keys this op's rows
+   * (`history[opHistoryBase:opEnd)`, captured synchronously at settle so a
+   * racing next turn cannot widen the range) to the Pi tail's translated rows
+   * when they match exactly by `(role, text)` sequence — the convergence
+   * `pi-history.ts` guarantees for landed turns. On any mismatch (diverged or
+   * aborted edge, chain moved under us, fetch failure) the live `live-N` rows
+   * stand and only the leaf/chain advance; cursor resolution falls back to
+   * ordinal order for unmapped rows (see `onGetHistory`). Never synthesizes
+   * rows: an empty Pi tail with live rows (or vice versa) is a mismatch.
+   */
+  private async reconcileSettledTurn(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    const runtime = this.piRuntimes.get(sessionId);
+    if (!session || !runtime || runtime.conn.isClosed) return;
+    const conn = runtime.conn;
+    if (typeof conn.getEntries !== "function" && typeof conn.getTree !== "function") {
+      runtime.opHistoryBase = null;
+      return;
+    }
+    const base = runtime.opHistoryBase;
+    const end = session.history.length;
+    runtime.opHistoryBase = null;
+    const fetched = await this.fetchPiActiveBranch(conn, 3000);
+    if (!fetched.ok) return;
+    const oldLeaf = runtime.piLeafId;
+    runtime.piLeafId = fetched.leafId;
+    runtime.piChainIds = fetched.branch.map((e) => e.id);
+    if (base === null || base === undefined || base >= end) return;
+    const liveRows = session.history.slice(base, end);
+    if (liveRows.length === 0) return;
+    // No anchor (leaf never learned, e.g. minimal history that appeared
+    // mid-session): leaf/chain learned above, rows stay live-keyed.
+    if (oldLeaf === undefined) return;
+    const anchorIdx = fetched.branch.findIndex((e) => e.id === oldLeaf);
+    if (anchorIdx === -1) return;
+    const tail = fetched.branch.slice(anchorIdx + 1);
+    const expected: BridgeHistoryEntry[] = [];
+    const tailPos: number[] = [];
+    tail.forEach((entry, i) => {
+      for (const row of translatePiEntryToBridgeEntries(entry)) {
+        expected.push(row);
+        tailPos.push(anchorIdx + 1 + i);
+      }
+    });
+    if (expected.length !== liveRows.length) return;
+    for (let i = 0; i < expected.length; i++) {
+      const a = liveRows[i];
+      const b = expected[i];
+      if (!a || !b || a.role !== b.role || (a.text ?? "") !== (b.text ?? "")) return;
+    }
+    // Converged: re-key in place (order + content identical, Pi ids win for
+    // exact handoff metadata and cursor stability).
+    for (let i = 0; i < expected.length; i++) {
+      const row = expected[i];
+      if (row !== undefined) session.history[base + i] = row;
+      const pos = tailPos[i];
+      if (pos !== undefined) runtime.historyChainPos[base + i] = pos;
+    }
   }
 
   /**
@@ -973,12 +1116,14 @@ export class PiBridgeProvider extends BridgeProvider {
 
   /**
    * SNC1.7 `get_history`: serve the rebuilt + live-appended transcript with
-   * the Pi session leaf (never the page end). Cursor resolution first checks
-   * the transcript, then the full Pi chain (so cursors naming skipped
-   * non-message entries still resolve to strictly-after rows); unknown
-   * cursors return an empty page (same as the base). `limit` paging and
-   * `nextCursor` (last returned id) match the base; `leafId` is the cached Pi
-   * leaf when known, else the transcript leaf (base behavior).
+   * the Pi session leaf (never the page end). Cursor resolution is ordinal:
+   * a cursor naming a transcript row returns strictly-after rows; otherwise
+   * it resolves through per-row chain positions (P1 fix — cursors naming Pi
+   * leaves or skipped non-message entries map to the last row at/before that
+   * chain position, so unreconciled live tip rows are included, never
+   * dropped). Unknown cursors return an empty page (same as the base).
+   * `limit` paging and `nextCursor` (last returned id) match the base;
+   * `leafId` is the cached Pi leaf when known, else the transcript leaf.
    */
   protected override onGetHistory(opId: string, sessionId: string, cursor?: string, limit?: number): void {
     if (!this.requireHello(opId)) return;
@@ -993,27 +1138,31 @@ export class PiBridgeProvider extends BridgeProvider {
       return;
     }
     const full = session.history;
+    const pos = runtime.historyChainPos;
     const leafId = runtime.piLeafId ?? (full.length > 0 ? full[full.length - 1]?.id : undefined);
-    let rest = full;
+    let start = 0;
     if (cursor) {
-      const idx = rest.findIndex((e) => e.id === cursor);
+      const idx = full.findIndex((e) => e.id === cursor);
       if (idx !== -1) {
-        rest = rest.slice(idx + 1);
+        start = idx + 1;
       } else {
         const chain = runtime.piChainIds;
-        if (chain) {
-          const chainIdx = chain.indexOf(cursor);
-          if (chainIdx !== -1) {
-            const afterIds = new Set(chain.slice(chainIdx + 1));
-            rest = rest.filter((e) => afterIds.has(e.id));
-          } else {
-            rest = [];
-          }
+        const chainIdx = chain ? chain.indexOf(cursor) : -1;
+        if (chainIdx === -1) {
+          start = full.length;
         } else {
-          rest = [];
+          // Last row mapped at/before the cursor's chain position; rows
+          // after it (mapped later, or unmapped live tip rows) follow.
+          let ord = -1;
+          for (let i = 0; i < full.length; i++) {
+            const p = pos[i];
+            if (p !== null && p !== undefined && p <= chainIdx) ord = i;
+          }
+          start = ord + 1;
         }
       }
     }
+    const rest = full.slice(start);
     let entries = rest;
     let nextCursor: string | undefined;
     if (limit !== undefined && rest.length > limit) {
@@ -1567,9 +1716,31 @@ export class PiBridgeProvider extends BridgeProvider {
   //   on the same op until `agent_settled`);
   // - unknown/suppressed chrome maps to `[]` and changes no state.
 
+  /**
+   * Append one live-transcript row with a namespaced synthetic id and no
+   * chain position (P1 cursor-alignment fix; see `reconcileSettledTurn`). ALL
+   * live journaling funnels through here so `historyChainPos` parallels
+   * `session.history` exactly. Never call the base `appendHistory` directly
+   * for Pi live rows: bare `eN` ids could collide with Pi entry ids from a
+   * rebuild (e.g. rebuilt Pi `e5` + live `e5`), corrupting cursor resolution.
+   */
+  private appendLiveRow(
+    session: ProviderSession,
+    runtime: PiRuntime,
+    entry: { role: "user" | "assistant" | "tool"; text: string },
+  ): void {
+    runtime.liveSeq += 1;
+    this.appendHistory(session, { id: `live-${runtime.liveSeq}`, role: entry.role, text: entry.text });
+    runtime.historyChainPos.push(null);
+    session.metadata.messageCount = session.history.filter(
+      (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
+    ).length;
+  }
+
   /** Journal translator entries into bridge history (user → tools → assistant order). */
   private journalTranslatorEntries(
     session: ProviderSession,
+    runtime: PiRuntime,
     entries: Array<{ role: "user" | "assistant" | "tool"; text: string }>,
   ): void {
     for (const entry of entries) {
@@ -1577,12 +1748,7 @@ export class PiBridgeProvider extends BridgeProvider {
       // (never prose); `assistant` carries reconciled text finals (never tool
       // output); `user` carries the confirmed prompt. All three are needed so
       // `unknown`-dispatch reconciliation sees faithful evidence.
-      this.appendHistory(session, { role: entry.role, text: entry.text });
-    }
-    if (entries.length > 0) {
-      session.metadata.messageCount = session.history.filter(
-        (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-      ).length;
+      this.appendLiveRow(session, runtime, { role: entry.role, text: entry.text });
     }
   }
 
@@ -1715,12 +1881,9 @@ export class PiBridgeProvider extends BridgeProvider {
           if (currentOp && runtime.translator.pendingUser !== null) {
             const user = runtime.translator.pendingUser;
             if (user !== null) {
-              this.appendHistory(session, { role: "user", text: user });
+              this.appendLiveRow(session, runtime, { role: "user", text: user });
               runtime.translator.clearPendingUser();
               this.syncRuntimeMirrors(runtime);
-              session.metadata.messageCount = session.history.filter(
-                (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-              ).length;
             }
           }
           const opForEvent = session.activeOpId ?? currentOp;
@@ -1747,7 +1910,7 @@ export class PiBridgeProvider extends BridgeProvider {
             // cancellation retirement — late answers after settle are stale
             // refusals, never forwarded to Pi).
             const entries = runtime.translator.settle();
-            this.journalTranslatorEntries(session, entries);
+            this.journalTranslatorEntries(session, runtime, entries);
             this.syncRuntimeMirrors(runtime);
             session.cancelledOps.delete(currentOp);
             this.retirePromptsForOp(session, runtime, currentOp);
@@ -1759,10 +1922,11 @@ export class PiBridgeProvider extends BridgeProvider {
               this.finishTurn(session, currentOp);
               if (session.activeOpId === null) {
                 session.metadata.isStreaming = false;
-                // SNC1.7: background Pi leaf refresh (never blocks the turn):
-                // keeps `get_history{leafId}` close to Pi without a history
-                // RPC on the fast path. Failures keep the last known leaf.
-                void this.refreshPiLeafBestEffort(sessionId).catch(() => undefined);
+                // SNC1.7: background settle reconciliation (never blocks the
+                // turn): advances the cached Pi leaf/chain and re-keys this
+                // op's live rows to Pi ids when they converge (P1 fix).
+                // Failures keep live ids and the last known leaf.
+                void this.reconcileSettledTurn(sessionId).catch(() => undefined);
               }
             }
           }
@@ -1784,7 +1948,7 @@ export class PiBridgeProvider extends BridgeProvider {
             // tool stdout never becomes assistant prose). Text finals
             // reconcile (never duplicate deltas) via the translator.
             const entries = runtime.translator.drainTurnEnd();
-            this.journalTranslatorEntries(session, entries);
+            this.journalTranslatorEntries(session, runtime, entries);
             this.syncRuntimeMirrors(runtime);
             // No promotion: hold the single active turn until Pi's
             // authoritative `agent_settled` completes it (see above). Queued
@@ -2054,6 +2218,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // received. Definite refusal clears everything below (Pi made no change);
     // success journals immediately; ambiguity reconciles against Pi state.
     session.activeOpId = msg.opId;
+    runtime.opHistoryBase = session.history.length;
     session.metadata.isStreaming = true;
     // Fresh agent: clear ALL prior translator state (not just per-turn text)
     // so a late event that raced `settle()` can never leak into the new turn
@@ -2142,10 +2307,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // its own `settled` (which journaled user→tools→assistant) — skip the
     // duplicate. SNC1.5: translator is authoritative; mirrors kept in sync.
     if (session.activeOpId === msg.opId && runtime.translator.pendingUser !== null) {
-      this.appendHistory(session, { role: "user", text: msg.message.text });
-      session.metadata.messageCount = session.history.filter(
-        (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-      ).length;
+      this.appendLiveRow(session, runtime, { role: "user", text: msg.message.text });
       runtime.translator.clearPendingUser();
       runtime.pendingUserText = null;
     } else {
@@ -2189,10 +2351,8 @@ export class PiBridgeProvider extends BridgeProvider {
     }
     // Journal the queued user turn; Pi events will settle it.
     // `finishTurn` set activeOpId before calling here; keep it.
-    this.appendHistory(live, { role: "user", text: msg.message.text });
-    live.metadata.messageCount = live.history.filter(
-      (e) => e.role === "user" || e.role === "assistant" || e.role === "tool",
-    ).length;
+    runtime.opHistoryBase = live.history.length;
+    this.appendLiveRow(live, runtime, { role: "user", text: msg.message.text });
     runtime.translator.resetTurn();
     runtime.activeText = "";
     this.syncRuntimeMirrors(runtime);
