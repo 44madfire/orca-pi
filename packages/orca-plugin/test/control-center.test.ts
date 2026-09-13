@@ -256,6 +256,8 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("refreshListOnly");
     expect(html).toContain("draftRevAtStart");
     expect(html).toContain("scopeBefore");
+    expect(html).toContain("scopeAtClick");
+    expect(html).toContain("myMutRev");
     expect(html).toContain('if (name === state.selected)');
     expect(html).toContain('if (p.name !== state.selected) selectProfile');
     expect(html).toContain('state.draftMode = "edit"');
@@ -826,6 +828,20 @@ describe("control center: bridge negotiation in the shipped script", () => {
     expect(html).toContain("draftRevAtStart");
     expect(html).toContain("scopeBefore");
     expect(html).toContain("dirtyBefore");
+  });
+
+  it("keeps cross-scope dirty drafts on list delete (no silent clear)", async () => {
+    const html = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
+    expect(html).toContain("scopeAtClick");
+    expect(html).toContain("stillOwner");
+    expect(html).toContain("only the ");
+  });
+
+  it("adopts creates into edit mode preserving newer edits (next save patches)", async () => {
+    const html = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
+    expect(html).toContain("isCreateMut");
+    expect(html).toContain('state.draftMode = "edit"');
+    expect(html).toContain('delete state.draft.name');
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {

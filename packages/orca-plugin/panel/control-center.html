@@ -694,20 +694,52 @@
 
         function deleteProfile(name, layer) {
           var scope = layer === "project" || layer === "user" ? layer : ((document.getElementById("default-scope") || {}).value || "project");
-          // Fresh receipt first so the confirm names the exact versioned target.
+          // Snapshot editor ownership at click time so a successful delete of
+          // one scope can never silently discard a dirty draft from another
+          // scope or a newer revision submitted after this click.
+          var myGen = state.editorGen || 0;
+          var myRev = state.draftRev || 0;
+          var selectedAtClick = state.selected;
+          var scopeAtClick = state.scope;
+          var dirtyAtClick = state.dirty;
           freshHashFor(name, scope).then(function (receipt) {
             if (receipt.hash === undefined) {
               window.alert("Delete aborted: " + (receipt.error || "no fresh version") + ". Open the profile first, then retry — never deleting unversioned.");
               return;
             }
-            if (!window.confirm("Delete " + scope + " override/profile \"" + name + "\"? Built-ins are never deleted; this removes only the " + scope + " layer entry.")) return;
+            // When the editor holds unsaved edits for the same profile but a
+            // different scope, warn that only the list scope is deleted while
+            // the draft is preserved (never silently cleared).
+            if (state.selected === name && state.scope !== scope && state.dirty) {
+              if (!window.confirm("Delete " + scope + " override for \"" + name + "\"? Your unsaved " + state.scope + " edits will be preserved (only the " + scope + " layer is deleted). Continue?")) return;
+            } else {
+              if (!window.confirm("Delete " + scope + " override/profile \"" + name + "\"? Built-ins are never deleted; this removes only the " + scope + " layer entry.")) return;
+            }
             var params = { action: "delete", name: name, scope: scope };
             if (receipt.hash === null) params.expectedAbsent = true;
             else params.expectedSourceHash = receipt.hash;
             request("profile.mutate", params).then(function (res) {
               if (res && res.ok) {
-                if (state.selected === name) { state.detailToken = (state.detailToken || 0) + 1; state.selected = null; state.detail = null; state.draft = {}; setDirty(false); }
-                refreshAll(null);
+                // Only clear the editor when it still owns the deleted scope
+                // with an unchanged generation/revision; otherwise preserve
+                // the live draft and refresh list metadata only.
+                var stillOwner = state.selected === name && state.scope === scope && selectedAtClick === name && scopeAtClick === scope && (state.editorGen || 0) === myGen && (state.draftRev || 0) === myRev && !dirtyAtClick;
+                if (stillOwner) {
+                  state.detailToken = (state.detailToken || 0) + 1;
+                  state.editorGen = (state.editorGen || 0) + 1;
+                  state.selected = null; state.detail = null; state.draft = {}; setDirty(false);
+                  refreshAll(null);
+                } else if ((state.editorGen || 0) !== myGen || (state.draftRev || 0) !== myRev) {
+                  refreshListOnly();
+                } else {
+                  // Same generation/revision but dirty in another scope (or
+                  // clean editor on another scope): preserve draft, list only.
+                  refreshListOnly();
+                  if (state.selected === name) {
+                    state.detailToken = (state.detailToken || 0) + 1;
+                    loadDetail(name, state.detailToken);
+                  }
+                }
               } else {
                 var mapped = mapError(res && res.error);
                 window.alert("Delete failed (" + mapped.kind + "): " + mapped.message);
@@ -1213,23 +1245,49 @@
           function submitMutate(params, targetName, gen, draftRevAtSubmit) {
           var myMutGen = gen !== undefined ? gen : (state.editorGen || 0);
           var myMutRev = draftRevAtSubmit !== undefined ? draftRevAtSubmit : (state.draftRev || 0);
+          var isCreateMut = !!(params && params.action === "create");
           var ed = document.getElementById("profile-editor");
           request("profile.mutate", params).then(function (res) {
-            // Isolate in-flight mutations: navigation OR edits-after-submit
-            // (same editor, newer draftRev) must survive. Only the owning
-            // generation+revision may clear/render; otherwise refresh list
-            // metadata only and never reload a dirty editor.
-            if (myMutGen !== (state.editorGen || 0) || (state.draftRev || 0) !== myMutRev) {
+            // Navigation away (generation changed) always preserves the live
+            // editor: refresh list metadata only.
+            if (myMutGen !== (state.editorGen || 0)) {
+              refreshListOnly();
+              return;
+            }
+            // Same editor but newer edits made while this mutation was in
+            // flight. For create, adopt the new profile into edit mode while
+            // preserving those newer edits so the next Save patches (never
+            // a second create); for patch, preserve the draft and refresh
+            // detail to obtain a fresh hash without clearing.
+            if ((state.draftRev || 0) !== myMutRev) {
+              if (res && res.ok && isCreateMut) {
+                state.draftMode = "edit";
+                state.selected = targetName;
+                if (state.draft && typeof state.draft === "object" && "name" in state.draft) delete state.draft.name;
+                state.fieldErrors = {}; state.globalError = null; state.conflict = null;
+                // Keep dirty=true (newer edits preserved); refresh list +
+                // detail (scope preserved because dirty) for the next patch.
+                state.detailToken = (state.detailToken || 0) + 1;
+                renderList();
+                loadDetail(targetName, state.detailToken);
+                refreshListOnly();
+                renderEditor();
+                return;
+              }
+              if (res && res.ok) {
+                refreshListOnly();
+                if (state.selected) {
+                  state.detailToken = (state.detailToken || 0) + 1;
+                  loadDetail(state.selected, state.detailToken);
+                }
+                return;
+              }
               refreshListOnly();
               return;
             }
             if (res && res.ok) {
               state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
               setDirty(false);
-              // A successful create adopts the new profile as an edit form;
-              // without this the editor would stay in create mode and issue
-              // another create instead of patching. Clone paths refresh via
-              // refreshAll which also normalizes to edit (see below).
               if (params && params.action === "create") state.draftMode = "edit";
               refreshAll(targetName);
             } else {
