@@ -503,7 +503,9 @@
             var clone = el("button", null, "Clone");
             clone.addEventListener("click", function () { cloneProfile(p.name); });
             var preview = el("button", null, "Inspect");
-            preview.addEventListener("click", function () { selectProfile(p.name); loadLaunchPreview(p.name); });
+            // Inspect never disturbs a live editor: only select when changing
+            // profiles, then load the preview in both cases.
+            preview.addEventListener("click", function () { if (p.name !== state.selected) selectProfile(p.name); loadLaunchPreview(p.name); });
             actions.appendChild(edit); actions.appendChild(clone); actions.appendChild(preview);
             if (layer !== "builtin") {
               var del = el("button", null, "Delete/reset");
@@ -562,11 +564,19 @@
         }
 
         function selectProfile(name) {
-          if (state.dirty && state.selected !== name) {
+          // Re-selecting the current profile must never silently discard its
+          // dirty draft (Edit/Inspect on the same row). Preserve the live
+          // editor when already selected; Refresh remains the explicit reload.
+          if (name === state.selected) {
+            if (state.dirty) return;
+            // Clean re-select: refresh detail without clearing (no draft to lose).
+            state.detailToken = (state.detailToken || 0) + 1;
+            loadDetail(name, state.detailToken);
+            return;
+          }
+          if (state.dirty) {
             if (!window.confirm("Unsaved changes will be lost. Switch profiles anyway?")) return;
           }
-          // Invalidate any in-flight detail/mutation so a slow earlier
-          // response can never render under or clear a newer selection.
           state.detailToken = (state.detailToken || 0) + 1;
           state.editorGen = (state.editorGen || 0) + 1;
           state.selected = name;
@@ -1216,6 +1226,11 @@
             if (res && res.ok) {
               state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
               setDirty(false);
+              // A successful create adopts the new profile as an edit form;
+              // without this the editor would stay in create mode and issue
+              // another create instead of patching. Clone paths refresh via
+              // refreshAll which also normalizes to edit (see below).
+              if (params && params.action === "create") state.draftMode = "edit";
               refreshAll(targetName);
             } else {
               var mapped = mapError(res && res.error);
@@ -1315,6 +1330,9 @@
                 }
                 state.detailToken = (state.detailToken || 0) + 1;
                 state.selected = selectAfter;
+                // Adopted profiles always render as edit forms (create and
+                // clone-to-destination must never leave a stale create mode).
+                state.draftMode = "edit";
                 renderList();
                 loadDetail(selectAfter, state.detailToken);
               } else if (state.selected) {
