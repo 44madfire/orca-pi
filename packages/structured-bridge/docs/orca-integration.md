@@ -220,3 +220,20 @@ catalog, text-only dispatch):
 Packaged Orca still falls back to Pi TUI when the bridge is
 missing/incompatible; these mappings change no renderer, only the
 dev-only adapter delegation.
+
+## SNC1.8 native port (no helper process)
+
+SNC1.8 ports the proven bridge provider into a native in-process Orca
+`PiStructuredSessionAdapter` (closes `44madfire/orca-pi#18`, blocks SNC1.9).
+The orca-pi core is `packages/structured-bridge/src/pi-native.ts`
+(`PiNativeProvider` — same `PiBridgeProvider` class in-process, no
+`pi-provider-cli.js` helper) + `src/pi-conformance.ts` shared suite +
+`test/pi-native-parity.test.ts` (same suite, bridge vs native, identical
+verdicts) + `docs/native-adapter.md` (vendoring map, router/create-support/
+capability/TUI-fallback/process-wrapper/fencing/journal/option-persistence/
+record/client-capability/no-renderer-fork contract). The native catalog seam
+(`listModels()`/`listThinkingLevels()` over live Pi RPC) replaces the honest
+`models:[]` temp above. Fork-side `PiStructuredSessionAdapter` must pass the
+same conformance suite before the upstream PR to `stablyai/orca` lands;
+Codex/Claude selection stays unchanged (native claims only `agent pi` on
+proven local locations).

@@ -1,5 +1,5 @@
 /**
- * `@orca-pi/structured-bridge` barrel (SNC1.3 + SNC1.4 + SNC1.5 + SNC1.6 + SNC1.7).
+ * `@orca-pi/structured-bridge` barrel (SNC1.3 + SNC1.4 + SNC1.5 + SNC1.6 + SNC1.7 + SNC1.8).
  *
  * Hot-swappable external structured-session bridge: versioned local IPC
  * (Orca-side host + external provider + mock) plus Pi-specific translation
@@ -104,3 +104,21 @@ export {
   type PiHistoryEntryLike,
   type PiHistoryTreeNodeLike,
 } from "./pi-history.js";
+export {
+  PiNativeProvider,
+  PI_NATIVE_AGENT,
+  PI_NATIVE_LOCAL_HOST_ID,
+  type PiNativeAcquireInput,
+  type PiNativeAcquireResult,
+  type PiNativeDispatchInput,
+  type PiNativeDispatchResult,
+  type PiNativeLocation,
+  type PiNativeOptions,
+  type PiNativeSessionEventEnvelope,
+} from "./pi-native.js";
+export {
+  runPiConformanceSuite,
+  type PiConformanceDriver,
+  type PiConformanceResult,
+  type PiConformanceScenario,
+} from "./pi-conformance.js";
