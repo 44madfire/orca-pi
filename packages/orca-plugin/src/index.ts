@@ -90,6 +90,7 @@ export {
   mapBridgeErrorToField,
   mapOrchestrationErrorToField,
   orchestrationInvalidSummary,
+  orchestrationLayerValue,
   toListItems,
   toOrchestrationItems,
   validateDraftShape,

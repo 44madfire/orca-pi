@@ -1543,6 +1543,26 @@
         function orchKnownProfiles() {
           return (state.profiles || []).map(function (p) { return p.name; });
         }
+        // Authoritative per-layer value for one role (never the merged winner).
+        // Returns the layer's own entry when present, else undefined (no override).
+        function orchLayerValue(role, scope) {
+          if (!state.orchMapping || !state.orchMapping.layers) return undefined;
+          var layer = state.orchMapping.layers[scope];
+          if (!layer || typeof layer !== "object" || Array.isArray(layer)) return undefined;
+          var v = layer[role];
+          return typeof v === "string" ? v : undefined;
+        }
+        // Toolbar default scope (visible #orch-scope). New selections seed from
+        // here so the visible default and the actual target never disagree.
+        function orchToolbarDefault() {
+          var def = document.getElementById("orch-scope");
+          var v = def ? def.value : null;
+          return v === "user" || v === "project" ? v : state.orchScope;
+        }
+        function syncOrchToolbar(scope) {
+          var def = document.getElementById("orch-scope");
+          if (def && (scope === "user" || scope === "project")) def.value = scope;
+        }
         function orchCurrentHash(scope) {
           if (!state.orchMapping || !state.orchMapping.sourceHash) return undefined;
           var h = state.orchMapping.sourceHash[scope];
@@ -1658,7 +1678,16 @@
           });
           profWrap.appendChild(dl);
           profWrap.appendChild(el("p", { class: "hint" }, "Model/thinking come from the profile — never duplicated here. Unknown names are flagged INVALID before launch."));
-          if (item) profWrap.appendChild(el("p", { class: "prov" }, orchChainText(item.role, curProfile || item.profile)));
+          if (item) {
+            profWrap.appendChild(el("p", { class: "prov" }, orchChainText(item.role, curProfile || item.profile)));
+            // Per-layer visibility: the editor edits exactly one layer; show
+            // both layers plus the effective winner so user/project divergence
+            // is never hidden (builtins < user < project).
+            var userVal = orchLayerValue(item.role, "user");
+            var projectVal = orchLayerValue(item.role, "project");
+            var layersText = "Layers: user=" + (userVal !== undefined ? JSON.stringify(userVal) : "(no override)") + " | project=" + (projectVal !== undefined ? JSON.stringify(projectVal) : "(no override)") + " | effective=" + JSON.stringify(item.profile) + ". Editing " + state.orchScope + " layer" + (orchLayerValue(item.role, state.orchScope) === undefined ? " (no " + state.orchScope + " override yet — saving creates it)" : " (override exists — saving updates it)") + ".";
+            profWrap.appendChild(el("p", { class: "prov" }, layersText));
+          }
           var roleErr = state.orchFieldErrors.role;
           var profErr = state.orchFieldErrors.profile;
           if (roleErr) profWrap.appendChild(el("p", { class: "error" }, "role: " + roleErr));
@@ -1682,12 +1711,19 @@
                 scopeSel.value = state.orchScope;
                 return;
               }
-              state.orchDraft = { role: isNew ? "" : item.role, profile: item ? item.profile : "" };
               state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
               setOrchDirty(false);
             }
             state.orchSaveGen = (state.orchSaveGen || 0) + 1;
             state.orchScope = next;
+            syncOrchToolbar(next);
+            // Re-init the draft from the newly selected layer's own value
+            // (never the merged effective winner) so switching to user can
+            // never silently stage the project winner for overwrite.
+            if (!isNew && item) {
+              var layerVal = orchLayerValue(item.role, next);
+              state.orchDraft = { role: item.role, profile: layerVal !== undefined ? layerVal : item.profile };
+            }
             renderOrchEditor();
           });
           scopeWrap.appendChild(scopeSel);
@@ -1745,11 +1781,18 @@
           }
           state.orchSaveGen = (state.orchSaveGen || 0) + 1;
           state.orchSelected = role;
+          // Seed each new selection from the visible toolbar default so the
+          // shown default and the actual target never disagree.
+          state.orchScope = orchToolbarDefault();
+          syncOrchToolbar(state.orchScope);
           var found = null;
           for (var i = 0; i < (state.orchItems || []).length; i += 1) {
             if (state.orchItems[i].role === role) found = state.orchItems[i];
           }
-          state.orchDraft = { role: role, profile: found ? found.profile : "" };
+          // Initialize from the selected layer's own value, never the merged
+          // effective winner: saving user scope must not copy a project win.
+          var layerVal = orchLayerValue(role, state.orchScope);
+          state.orchDraft = { role: role, profile: layerVal !== undefined ? layerVal : (found ? found.profile : "") };
           state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
           setOrchDirty(false);
           renderOrchList();
@@ -1776,6 +1819,10 @@
           if (state.orchDirty && !window.confirm("Unsaved mapping changes will be lost. Clone anyway?")) return;
           state.orchSaveGen = (state.orchSaveGen || 0) + 1;
           state.orchSelected = "__new__";
+          // Clones seed from the visible toolbar default like Add (never a
+          // stale editor-local scope left behind by a prior role).
+          state.orchScope = orchToolbarDefault();
+          syncOrchToolbar(state.orchScope);
           state.orchDraft = { role: dest, profile: sourceProfile };
           state.orchFieldErrors = {}; state.orchGlobalError = null; state.orchConflict = null;
           setOrchDirty(true);

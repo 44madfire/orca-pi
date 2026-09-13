@@ -124,6 +124,16 @@ export interface RoleMapping {
   readonly effective: Readonly<Record<string, string>>;
   /** Per-role provenance (`builtin`, `user`, `project`). */
   readonly provenance: Readonly<Record<string, "builtin" | "user" | "project">>;
+  /**
+   * Authoritative per-layer role values (before merge), so editors can
+   * initialize from the selected layer instead of the merged effective
+   * winner. `user`/`project` contain only that file's own `roles` entries
+   * (empty when the file is absent); builtins are not repeated here.
+   */
+  readonly layers: {
+    readonly user: Readonly<Record<string, string>>;
+    readonly project: Readonly<Record<string, string>>;
+  };
   /** Roles whose referenced profile is syntactically valid but missing/invalid at resolve time (filled by callers with profile knowledge). */
   readonly invalidRefs?: readonly string[];
   readonly config: {
@@ -481,6 +491,10 @@ export async function getRoleMapping(
     roles,
     effective: Object.freeze({ ...roles }),
     provenance: Object.freeze({ ...provenance }),
+    layers: Object.freeze({
+      user: Object.freeze({ ...userLayer.roles }),
+      project: Object.freeze({ ...projectLayer.roles }),
+    }),
     ...(invalidRefs !== undefined ? { invalidRefs: Object.freeze([...invalidRefs]) } : {}),
     config: {
       userPath,

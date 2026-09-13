@@ -782,6 +782,29 @@ export function toOrchestrationItems(payload: unknown, knownProfiles?: readonly 
   return out;
 }
 
+/**
+ * Read one layer's authoritative role value from an `orchestration.get`
+ * payload (never throws). Returns the layer's own entry when present,
+ * otherwise undefined (no override in that layer — the effective winner
+ * comes from a lower layer). Editors must initialize from this, never
+ * from the merged effective value, so saving the user layer cannot copy
+ * the project winner into it.
+ */
+export function orchestrationLayerValue(
+  payload: unknown,
+  role: string,
+  scope: OrchestrationScope,
+): string | undefined {
+  if (!isPlainRecord(payload) || typeof role !== "string") return undefined;
+  if (scope !== "user" && scope !== "project") return undefined;
+  const layers = (payload as Record<string, unknown>)["layers"];
+  if (!isPlainRecord(layers)) return undefined;
+  const layer = layers[scope];
+  if (!isPlainRecord(layer)) return undefined;
+  const value = (layer as Record<string, unknown>)[role];
+  return typeof value === "string" ? value : undefined;
+}
+
 /** Human layer label for the mapping table. */
 export function describeOrchestrationProvenance(prov: OrchestrationItem["provenance"] | undefined): string {
   if (prov === "project") return "project (.pi/orchestration.json)";

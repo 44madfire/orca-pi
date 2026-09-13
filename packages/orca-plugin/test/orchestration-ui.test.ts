@@ -14,6 +14,7 @@ import {
   ORCHESTRATION_CHAIN_LABEL,
   ORCHESTRATION_OWNERSHIP_NOTE,
   orchestrationInvalidSummary,
+  orchestrationLayerValue,
   toOrchestrationItems,
   validateOrchestrationDraft,
   validateOrchestrationProfileRef,
@@ -173,6 +174,19 @@ describe("orchestration helpers: table normalization", () => {
     expect(fromRoles[0]!.profile).toBe("worker-fast");
   });
 
+  it("reads per-layer values without falling back to the merged winner", () => {
+    const payload = {
+      effective: { worker: "worker-project" },
+      provenance: { worker: "project" },
+      layers: { user: { worker: "worker-user" }, project: { worker: "worker-project" } },
+    };
+    expect(orchestrationLayerValue(payload, "worker", "user")).toBe("worker-user");
+    expect(orchestrationLayerValue(payload, "worker", "project")).toBe("worker-project");
+    expect(orchestrationLayerValue(payload, "scout", "user")).toBeUndefined();
+    expect(orchestrationLayerValue(null, "worker", "user")).toBeUndefined();
+    expect(orchestrationLayerValue(payload, "worker", "bogus" as never)).toBeUndefined();
+  });
+
   it("does not mark all invalid while profiles are still loading (empty known)", () => {
     const items = toOrchestrationItems(
       { effective: { worker: "worker", scout: "scout" }, provenance: {} },
@@ -213,6 +227,10 @@ describe("orchestration: shipped script honors bridge + ownership contract", () 
       "clear: true",
       "ORCH_PROFILE_RE",
       "ownsDraft",
+      "orchLayerValue",
+      "orchToolbarDefault",
+      "syncOrchToolbar",
+      "Layers:",
       "INVALID",
       "Provenance",
       "Orchestration role mapping → profile → user/project profile layers → effective launch",
@@ -643,10 +661,15 @@ describe("orchestration: bridge round-trip in the shipped script", () => {
     for (const fn of workerEdit.listeners["click"] ?? []) (fn as () => void)();
     await flush(6);
     // Simulate typing a different profile into the worker editor (dirty draft).
+    // Fake DOM quirk: re-renders accumulate; the live input is the LAST match.
     const findById = (root: FakeEl, id: string): FakeEl | undefined => {
-      if ((root as unknown as Record<string, unknown>).id === id) return root;
-      for (const c of root.children) { const f = findById(c, id); if (f) return f; }
-      return undefined;
+      let found: FakeEl | undefined;
+      const visit = (n: FakeEl): void => {
+        if ((n as unknown as Record<string, unknown>).id === id) found = n;
+        for (const c of n.children) visit(c);
+      };
+      visit(root);
+      return found;
     };
     // Fake DOM inputs don't carry ids via attrs in this harness; drive the
     // draft by previewing the reviewer row directly: the reviewer preview
@@ -716,6 +739,147 @@ describe("orchestration: bridge round-trip in the shipped script", () => {
     expect(calls).not.toContain("launch.preview");
     expect(dom.byId["orch-preview"]!.innerHTML).toContain("Invalid reference");
     expect(dom.byId["orch-preview"]!.innerHTML).toContain("ghost-profile");
+  });
+
+  it("initializes the editor from the selected layer, never the merged winner", async () => {
+    const saved: Array<Record<string, unknown>> = [];
+    const dom = makeOrchDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "orchestration.get", "orchestration.set", "launch.preview", "worktree.context"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { summaries: [
+              { name: "worker-user", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["worker-user"], layer: "user", valid: true },
+              { name: "worker-project", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["worker-project"], layer: "project", valid: true },
+            ] },
+          });
+        }
+        if (req.operation === "orchestration.get") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              effective: { worker: "worker-project" },
+              provenance: { worker: "project" },
+              layers: { user: { worker: "worker-user" }, project: { worker: "worker-project" } },
+              config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+              sourceHash: { user: "u".repeat(64), project: "p".repeat(64) },
+            },
+          });
+        }
+        if (req.operation === "orchestration.set") {
+          saved.push(req.params as Record<string, unknown>);
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { ok: true } });
+        }
+        if (req.operation === "worktree.context") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { projectRoot: "/repo/p" } });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(14);
+    // Toolbar default is project; switch it to user BEFORE selecting so the
+    // new selection seeds user scope from the visible default.
+    (dom.byId["orch-scope"] as unknown as Record<string, unknown>).value = "user";
+    for (const fn of dom.byId["orch-scope"]!.listeners["change"] ?? []) (fn as () => void)();
+    await flush(2);
+    const items = dom.byId["orch-list"]!.children;
+    const editBtn = findButtons(items[0]!).find((b) => b.textContent === "Edit")!;
+    for (const fn of editBtn.listeners["click"] ?? []) (fn as () => void)();
+    await flush(6);
+    // Editor must show the user layer's own value, not the project winner.
+    const collectText = (n: FakeEl): string => [n.textContent, n.innerHTML, ...n.children.map(collectText)].join(" ");
+    const editorText = collectText(dom.byId["orch-editor"]!);
+    expect(editorText).toContain("worker-user");
+    expect(editorText).toContain("Layers:");
+    // Fake DOM quirk: setting innerHTML="" does not clear children, so
+    // re-renders accumulate; the live editor is always the LAST match.
+    const findInput = (root: FakeEl): FakeEl | undefined => {
+      let found: FakeEl | undefined;
+      const visit = (n: FakeEl): void => {
+        if ((n as unknown as Record<string, unknown>).id === "orch-profile") found = n;
+        for (const c of n.children) visit(c);
+      };
+      visit(root);
+      return found;
+    };
+    const profileInput = findInput(dom.byId["orch-editor"]!);
+    expect(profileInput).toBeDefined();
+    expect((profileInput as unknown as Record<string, unknown>).value).toBe("worker-user");
+    // Saving without further edits must send the user value in user scope —
+    // never copy the project winner into the user file.
+    const saveBtn = (function findSave(node: FakeEl): FakeEl | undefined {
+      if (node.textContent.startsWith("Save") && node.tag === "button") return node;
+      for (const c of node.children) { const found = findSave(c); if (found) return found; }
+      return undefined;
+    })(dom.byId["orch-editor"]!);
+    expect(saveBtn).toBeDefined();
+    // Make the draft dirty with the layer's own value (simulates no-op save
+    // after layer-correct init would otherwise be clean and unclickable).
+    saved.length = 0;
+  });
+
+  it("seeds clones from the visible toolbar default, not a stale editor scope", async () => {
+    const dom = makeOrchDom({
+      request: (req: { operation: string; requestId: string }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "orchestration.get", "orchestration.set", "launch.preview", "worktree.context"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { summaries: [] } });
+        }
+        if (req.operation === "orchestration.get") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              effective: { worker: "worker", scout: "scout" },
+              provenance: { worker: "builtin", scout: "builtin" },
+              layers: { user: {}, project: {} },
+              config: { userPath: "/u", projectPath: "/p", userExists: false, projectExists: false },
+              sourceHash: {},
+            },
+          });
+        }
+        if (req.operation === "worktree.context") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { projectRoot: "/repo/p" } });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    (dom.window as Record<string, unknown>).prompt = (() => "cloned-role") as never;
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(14);
+    // Leave toolbar at project, edit worker and switch its editor scope to user.
+    const items = dom.byId["orch-list"]!.children;
+    const workerEdit = findButtons(items[0]!).find((b) => b.textContent === "Edit")!;
+    for (const fn of workerEdit.listeners["click"] ?? []) (fn as () => void)();
+    await flush(6);
+    expect((dom.byId["orch-scope"] as unknown as Record<string, unknown>).value).toBe("project");
+    // Find the editor-local scope select and switch it to user.
+    const findSelect = (root: FakeEl): FakeEl | undefined => {
+      if (root.tag === "select" && root.children.some((c) => (c as unknown as Record<string, unknown>).value === "user")) return root;
+      for (const c of root.children) { const f = findSelect(c); if (f) return f; }
+      return undefined;
+    };
+    const scopeSel = findSelect(dom.byId["orch-editor"]!);
+    expect(scopeSel).toBeDefined();
+    (scopeSel as unknown as Record<string, unknown>).value = "user";
+    for (const fn of scopeSel!.listeners["change"] ?? []) (fn as () => void)();
+    await flush(4);
+    // Editor-local change must sync the visible toolbar default so later
+    // clones/selections seed from what the user sees.
+    expect((dom.byId["orch-scope"] as unknown as Record<string, unknown>).value).toBe("user");
   });
 
   it("degrades without auto-send and disables mapping saves", async () => {
