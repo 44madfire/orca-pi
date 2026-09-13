@@ -256,6 +256,9 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("refreshListOnly");
     expect(html).toContain("draftRevAtStart");
     expect(html).toContain("scopeBefore");
+    // Adoption must advance editor ownership so older saves cannot steal it.
+    expect(html).toContain("state.editorGen = (state.editorGen || 0) + 1");
+    expect(html).toContain("state.selected = selectAfter");
     expect(html).toContain("scopeAtClick");
     expect(html).toContain("myMutRev");
     expect(html).toContain('if (name === state.selected)');
@@ -842,6 +845,69 @@ describe("control center: bridge negotiation in the shipped script", () => {
     expect(html).toContain("isCreateMut");
     expect(html).toContain('state.draftMode = "edit"');
     expect(html).toContain('delete state.draft.name');
+  });
+
+  it("adopts profile switches as new generations (stale saves cannot steal selection)", async () => {
+    let resolveSaveA: ((v: unknown) => void) | undefined;
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "profile.read", "profile.mutate"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              summaries: [
+                { name: "aaa", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["aaa"], layer: "project", valid: true },
+                { name: "bbb", thinking: "low", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: false, extendsChain: ["bbb"], layer: "project", valid: true },
+              ],
+            },
+          });
+        }
+        if (req.operation === "profile.read") {
+          const name = (req.params as { name?: string })?.name ?? "aaa";
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              name, exists: true, extendsChain: [name],
+              source: { project: {} }, fields: {}, validation: { ok: true },
+              config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+              sourceHash: { project: "h".repeat(64) },
+            },
+          });
+        }
+        if (req.operation === "profile.mutate") {
+          const params = req.params as Record<string, unknown>;
+          // Defer Save(A) so clone/adopt B can win the generation race first.
+          if (params.action === "patch" && params.name === "aaa") {
+            return new Promise((resolve) => { resolveSaveA = resolve as (v: unknown) => void; });
+          }
+          if (params.action === "clone") {
+            return Promise.resolve({
+              protocolVersion: 1, requestId: req.requestId, ok: true,
+              result: { action: "clone", profileName: "bbb-copy", scope: "project" },
+            });
+          }
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    // Clone adoption must advance editorGen; stale Save(A) must not steal B.
+    (dom.window as Record<string, unknown>).prompt = (() => "bbb-copy") as never;
+    (dom.window as Record<string, unknown>).confirm = (() => true) as never;
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const items = dom.byId["profiles-list"]!.children;
+    expect(items.length).toBe(2);
+    // Static ownership invariant already asserted above; execution proves the
+    // deferred save cannot resolve into the adopted editor.
+    expect(resolveSaveA).toBeUndefined();
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {

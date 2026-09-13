@@ -1261,6 +1261,9 @@
             // detail to obtain a fresh hash without clearing.
             if ((state.draftRev || 0) !== myMutRev) {
               if (res && res.ok && isCreateMut) {
+                // Adopting a new profile identity is a new editor generation
+                // even though the form never navigated away.
+                state.editorGen = (state.editorGen || 0) + 1;
                 state.draftMode = "edit";
                 state.selected = targetName;
                 if (state.draft && typeof state.draft === "object" && "name" in state.draft) delete state.draft.name;
@@ -1386,10 +1389,15 @@
                   state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
                   setDirty(false);
                 }
+                // Committed profile-identity transitions are new editor
+                // generations: bump ownership before assigning so older
+                // in-flight saves cannot steal the newly-adopted editor.
+                if (state.selected !== selectAfter) {
+                  state.editorGen = (state.editorGen || 0) + 1;
+                  state.draftRev = (state.draftRev || 0) + 1;
+                }
                 state.detailToken = (state.detailToken || 0) + 1;
                 state.selected = selectAfter;
-                // Adopted profiles always render as edit forms (create and
-                // clone-to-destination must never leave a stale create mode).
                 state.draftMode = "edit";
                 renderList();
                 loadDetail(selectAfter, state.detailToken);
