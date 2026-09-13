@@ -1,13 +1,14 @@
-# Pi Provider — Real Pi Structured Chat (SNC1.4 + SNC1.5 + SNC1.6)
+# Pi Provider — Real Pi Structured Chat (SNC1.4 + SNC1.5 + SNC1.6 + SNC1.7)
 
 > Status: SNC1.4 basic text chat plus SNC1.5 thinking/tools/errors/lifecycle
 > translation plus SNC1.6 model/thinking controls, interactive prompts, and
-> structured images, implemented in `packages/structured-bridge/src/pi-provider.ts`
-> (+ `pi-provider-cli.js`) with fixture-driven mapping in `pi-mapping.ts` and
-> the pure, fixture-testable turn translator in `src/pi-translator.ts`
-> (`test/pi-translator.test.ts` replays real SNC1.1 fixtures with no Orca/Pi;
-> `test/pi-provider-snc16.test.ts` pins SNC1.6 with a fake Pi option RPC).
-> Proves #14, #15, and #16 without touching Orca core: the fork vendors only
+> structured images plus SNC1.7 history/current-branch/resume, implemented in
+> `packages/structured-bridge/src/pi-provider.ts` (+ `pi-provider-cli.js`)
+> with fixture-driven mapping in `pi-mapping.ts`, the pure turn translator in
+> `src/pi-translator.ts`, and the pure history reconstructor in
+> `src/pi-history.ts` (`test/pi-history.test.ts` + `test/pi-provider-snc17.test.ts`
+> pin #17 with no Orca/Pi).
+> Proves #14, #15, #16, and #17 without touching Orca core: the fork vendors only
 > `framing.ts` + `protocol.ts` + `host.ts`; `pi-provider.ts` (+ `pi-mapping.ts`
 > + `pi-translator.ts`) stays in `orca-pi` like `provider.ts` +
 > `mock-provider-cli.js`.
@@ -23,10 +24,10 @@ spawn-only never the bridge); TUI-only flags are rejected fail-closed via
 `toPiRpcProcessSpec`; `--mode rpc` is appended idempotently. No terminal
 keystroke injection anywhere on this path.
 
-- `hello` → `hello_ok{provider:{id:"pi"},capabilities}` with SNC1.6-truthful
+- `hello` → `hello_ok{provider:{id:"pi"},capabilities}` with SNC1.7-truthful
   flags (`options:true` — model/thinking/prompt/image controls are live —
-  `resume:false`: history/branch/resume is SNC1.7, so Orca never exposes
-  diverging resume paths)
+  `resume:true`: history/branch/resume is live via Pi `get_entries`/`get_tree`,
+  so Orca may expose its shared Native Chat resume paths)
 - `acquire{workspaceRoot,options?}` → spawn + `start()` + `get_state` + live
   `applyPiOptions(model/thinking/autoCompaction)` →
   `acquired{metadata{sessionId,providerSessionId,workspaceRoot,model?,thinkingLevel?,messageCount,isStreaming:false}}`
@@ -150,6 +151,52 @@ cancelled-op + pending-prompt state so settled turns retain nothing
 (`hasTransient()===false`). Unknown/suppressed chrome maps to `[]` with no
 state change and never terminates a session.
 
+
+## 3b. History / current branch / resume (SNC1.7)
+
+`src/pi-history.ts` (pure, fixture-testable) + `PiBridgeProvider`
+`acquire{resumePath}` / `get_history{leafId}` (see `test/pi-history.test.ts`
++ `test/pi-provider-snc17.test.ts`, no Orca/Pi):
+
+```text
+acquire{resumePath} → switch_session → get_entries(+leafId)/get_tree fallback
+  → active branch root→leaf (abandoned fork siblings excluded)
+  → translate (same mapping as live) → acquired{resumed, metadata}
+get_history → rebuilt + live-appended transcript, leafId = Pi leaf
+```
+
+- Active branch only: flat `get_entries` + `leafId` parent walk is primary
+  (single RPC); `get_tree` flattened to the same walk is the fallback when
+  the flat chain is broken. Both converge; abandoned siblings never render.
+- Convergent translation: user text → `user` (image bytes never journaled);
+  assistant text → `assistant` (thinking never prose; tool-only assistants
+  journal nothing); `toolResult`/`bashExecution` → `tool` (tool stdout never
+  assistant prose); `model_change`/`thinking_level_change`/`session_info`/
+  `compaction_*`/`summary`/`custom`/unknown → skipped for the transcript but
+  kept for chain continuity (same bounded-ignore as live `[]`).
+- Reconciliation without duplication: rebuilt rows use Pi entry `id` verbatim
+  (stable across restarts) with Pi `parentId` preserved for handoff metadata;
+  resume replaces wholesale when idle (Pi is the source of truth after
+  `switch_session`; landed live rows converge by identical `(role, text)`
+  order). Streaming turns are never rebuilt mid-turn (live owns them).
+- Same-session resume after helper/provider restart: new provider + same
+  `resumePath` → identical transcript + stable ids + Pi leaf (Orca owns
+  `resumePath` for handoff; the provider never echoes paths — only opaque
+  `providerSessionId`/`leafId` cross the bridge).
+- Partial/aborted recovery: trailing `user` without `assistant` stays lone
+  `user` (no fabricated completion); `aborted` assistants still journal text.
+- Fail-closed (actionable, secret-safe, no prompt text or paths):
+  `PI_RESUME_UNSUPPORTED` (minimal transport), `PI_RESUME_FAILED`
+  (switch failure), `PI_HISTORY_EMPTY` / `PI_HISTORY_LEAF_MISSING` /
+  `PI_HISTORY_CHAIN_BROKEN` / `PI_HISTORY_CYCLE` (never silent truncation),
+  `PI_HISTORY_INCOMPATIBLE` (messages exist but all roles unknown),
+  `PI_HISTORY_BUSY` (rebuild while streaming). Missing-file-creates-empty
+  (Pi contract) returns `resumed:false` honestly, not an error.
+- `get_history{cursor,limit}` pages the transcript; `leafId` always names the
+  Pi leaf (never the page end); cursors naming skipped non-message entries
+  resolve via the cached Pi chain to strictly-after rows. `leafId`/chain
+  refresh best-effort in the background after each settle (never blocking).
+
 ## 4. Failures (secret-safe, actionable)
 
 - Missing Pi binary → `PI_STARTUP_FAILED` (spawn-failed hint).
@@ -202,8 +249,6 @@ thinking fail closed with actionable codes; prompts are exactly-once with
 stable identity and acquisition-fenced retirement. Queued `steer`/`followUp`
 while busy stays honestly rejected (Pi-owned queue fidelity needs
 `queue_update`/retry/compaction evidence beyond turn boundaries — still
-deferred, not guessed). History/branch/resume is SNC1.7 (which will
-reconstruct from Pi `get_entries`/`get_tree` instead of the live-turn journal
-used here). `get_history` serves live-turn state (user + tools + assistant,
+deferred, not guessed). History/branch/resume is SNC1.7 (which reconstructs from Pi `get_entries`/`get_tree` via `pi-history.ts` instead of the live-turn journal alone). `get_history` serves live-turn state (user + tools + assistant,
 text only — image bytes never journaled); `get_session` serves
 provider-confirmed lease state.
