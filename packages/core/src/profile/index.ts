@@ -105,6 +105,7 @@ export {
   formatPromptForDisplay,
   formatValidationReport,
   getFieldProvenance,
+  layerForProfile,
   normalizeLaunchPreview,
   sanitizeLaunchPreviewForDisplay,
   shortenHomeForDisplay,

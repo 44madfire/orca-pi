@@ -277,15 +277,43 @@ Fork-side injection contract (`window.__ORCA_PI_BRIDGE__`):
   `window.__ORCA_PI_BRIDGE__.request` (future seam) with explicit degraded
   CLI fallback otherwise. Panels never scrape terminal output or YAML.
 
+## Control Center shell (UI1.3)
+
+- Single entry `panel/control-center.html` (`orca-pi-control-center`) owns
+  the Orca-native shell (Profiles · Orchestration · GitHub · Diagnostics)
+  plus structured Profiles editing. `orca-pi-status` / `orca-pi-profiles`
+  remain only as compatibility aliases pointing at the same entry — one
+  UI, never two independent panels.
+- Profiles list shows builtin/user/project source, extends parent,
+  effective model/thinking, tool count, skills/extensions (MCP surface),
+  GitHub identity, and validity via `profiles.list` (enriched summaries)
+  plus `profile.read` provenance. Editor covers all v1 schema fields with
+  structured controls (never a YAML textarea); raw patch JSON is
+  display-only. v1 has no dedicated `mcp` field — MCP maps to
+  `extensions` + `discoverExtensions` (per-project, redacted, never
+  secrets).
+- Save lifecycle: draft → client shape checks → `profile.mutate` with
+  explicit scope + source hash → core validate + atomic write →
+  authoritative round-trip (`profile.read` + `profiles.list`). Dirty state
+  is visible; navigation confirms; validation maps to fields; `conflict`
+  prompts reload/compare (never silent overwrite); built-ins block direct
+  saves (clone instead). Launch previews use `launch.preview` (JEF-7
+  compiler, sanitized, display-only — never rebuilt argv in the UI).
+- Pure helpers live in `packages/orca-plugin/src/control-center.ts`
+  (tested in `test/control-center.test.ts` alongside the shipped script).
+
 ## Manifest / consent
 
 - File `packages/orca-plugin/orca-plugin.json` (`main:
   "worker-entry.mjs"`, the ESM Orca entry default-exporting
-  `activate(orca)`): declares **only** the capabilities the shipped
+  `activate(orca)`): contributes `orca-pi-control-center` plus
+  `orca-pi-status` / `orca-pi-profiles` compat aliases (same entry) and
+  declares **only** the capabilities the shipped
   panels genuinely call — `workspace:read` (fallback terminal target via
   `workspace.readContext`) and `terminal:send` (ONE explicit
   user-gesture `terminal.sendText` of an allowlisted read-only command;
-  verified end-to-end by `panel-actions.test.ts` against the shipped
+  verified end-to-end by `panel-actions.test.ts` and
+  `control-center.test.ts` against the shipped
   scripts). No `storage` / `secrets` / `settings:own` / `events:subscribe`
   / `notifications:show` — nothing unused is declared, so consent stays
   minimal and honest.

@@ -1,0 +1,1256 @@
+<!doctype html>
+<!--
+  Orca-Pi Control Center (UI1.3).
+  Single Orca-native shell + structured Profiles editor over the versioned
+  Orca↔Orca-Pi bridge (protocol 1, bridge 1.0.0). Live data flows through
+  window.__ORCA_PI_BRIDGE__.request with stable request IDs and
+  validation/conflict/unsupported/auth-setup/internal errors. The panel never
+  scrapes terminal output or YAML, never stores a second copy of profiles in
+  settings/storage, and never uses legacy static profile injection.
+  Mutations route through the authoritative core service (#28) via
+  profile.mutate with explicit user/project scope + source hash; launch
+  previews reuse the JEF-7 compiler via launch.preview (display-only).
+  Degraded hosts show explicit read-only CLI fallback with a real
+  user-triggered terminal.sendText action (explicit terminalId from
+  workspace.readContext, never auto-sent, never parsed).
+  Required capabilities (honest consent — every one is called below):
+  workspace:read (fallback terminal target), terminal:send (explicit
+  user-triggered fallback only).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orca-Pi Control Center</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --cc-bg: var(--background, #ffffff);
+        --cc-fg: var(--foreground, #1a1a1a);
+        --cc-card: var(--card, #f6f6f8);
+        --cc-border: var(--border, rgba(127,127,127,.35));
+        --cc-muted: var(--muted-foreground, #6b7280);
+        --cc-accent: var(--primary, #2da44e);
+        --cc-warn: #d29922;
+        --cc-danger: #cf222e;
+        --cc-focus: var(--ring, #0969da);
+        --cc-radius: 8px;
+        --cc-gap: 12px;
+        --cc-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --cc-bg: var(--background, #1e1e1e);
+          --cc-fg: var(--foreground, #e6e6e6);
+          --cc-card: var(--card, #252526);
+          --cc-muted: var(--muted-foreground, #9ca3af);
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        font-family: var(--cc-font);
+        margin: 0;
+        padding: 12px;
+        background: var(--cc-bg);
+        color: var(--cc-fg);
+        line-height: 1.5;
+        font-size: 13px;
+      }
+      .cc-shell { max-width: 960px; margin: 0 auto; }
+      .cc-header { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+      .cc-header h1 { font-size: 18px; margin: 0; }
+      .cc-header .muted { color: var(--cc-muted); font-size: 12px; }
+      .cc-badge {
+        display: inline-block; padding: 2px 8px; border-radius: 999px;
+        border: 1px solid var(--cc-border); font-size: 12px;
+      }
+      .cc-badge.ok { border-left: 4px solid var(--cc-accent); }
+      .cc-badge.degraded { border-left: 4px solid var(--cc-warn); }
+      .cc-tabs {
+        display: flex; gap: 4px; margin: 12px 0;
+        border-bottom: 1px solid var(--cc-border);
+        overflow-x: auto;
+      }
+      .cc-tab {
+        font: inherit; padding: 6px 12px; border: 1px solid transparent;
+        border-bottom: none; border-radius: 6px 6px 0 0;
+        background: transparent; color: inherit; cursor: pointer;
+        white-space: nowrap;
+      }
+      .cc-tab[aria-selected="true"] {
+        background: var(--cc-card); border-color: var(--cc-border);
+        font-weight: 600;
+      }
+      .cc-tab:focus-visible, button:focus-visible, input:focus-visible,
+      select:focus-visible, textarea:focus-visible, a:focus-visible {
+        outline: 2px solid var(--cc-focus); outline-offset: 2px;
+      }
+      .cc-card {
+        border: 1px solid var(--cc-border); border-radius: var(--cc-radius);
+        background: var(--cc-card); padding: 12px; margin-bottom: var(--cc-gap);
+      }
+      body:not(.cc-has-card-tokens) .cc-card { background: transparent; }
+      .cc-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+      .cc-toolbar .spacer { flex: 1; }
+      button {
+        font: inherit; padding: 4px 10px; border-radius: 6px;
+        border: 1px solid var(--cc-border); background: transparent;
+        color: inherit; cursor: pointer;
+      }
+      button:disabled { opacity: .5; cursor: default; }
+      button.primary { background: var(--cc-accent); color: #fff; border-color: transparent; }
+      button.danger { border-color: var(--cc-danger); color: var(--cc-danger); }
+      input, select, textarea {
+        font: inherit; padding: 4px 8px; border-radius: 6px;
+        border: 1px solid var(--cc-border); background: var(--cc-bg); color: inherit;
+        max-width: 100%;
+      }
+      textarea { width: 100%; min-height: 64px; resize: vertical; }
+      code { background: rgba(127,127,127,.15); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+      pre { background: rgba(127,127,127,.12); padding: 8px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+      .muted { color: var(--cc-muted); }
+      .cc-grid { display: grid; gap: var(--cc-gap); }
+      @media (min-width: 720px) {
+        .cc-grid.two { grid-template-columns: 320px 1fr; align-items: start; }
+      }
+      @media (max-width: 719px) {
+        .cc-grid.two { grid-template-columns: 1fr; }
+        body { padding: 8px; }
+      }
+      .cc-profile-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+      .cc-profile-item {
+        border: 1px solid var(--cc-border); border-radius: var(--cc-radius);
+        padding: 8px 10px; background: transparent;
+      }
+      .cc-profile-item[aria-selected="true"] { border-color: var(--cc-accent); border-width: 2px; }
+      .cc-profile-item h3 { margin: 0 0 4px; font-size: 14px; }
+      .cc-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; }
+      .cc-meta .muted { font-size: 12px; }
+      .cc-pill {
+        display: inline-block; padding: 0 6px; border-radius: 999px;
+        border: 1px solid var(--cc-border); font-size: 11px;
+      }
+      .cc-pill.invalid { border-color: var(--cc-danger); color: var(--cc-danger); }
+      .cc-pill.builtin { opacity: .85; }
+      .cc-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+      .cc-field { margin-bottom: 10px; }
+      .cc-field label { display: block; font-weight: 600; margin-bottom: 2px; }
+      .cc-field .hint { font-size: 12px; color: var(--cc-muted); margin: 2px 0; }
+      .cc-field .prov { font-size: 11px; color: var(--cc-muted); margin-top: 2px; }
+      .cc-field .error { font-size: 12px; color: var(--cc-danger); margin-top: 2px; }
+      .cc-checkbox-group { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+      .cc-checkbox-group label { font-weight: 400; display: inline-flex; gap: 4px; align-items: center; }
+      .cc-list-editor { display: grid; gap: 4px; }
+      .cc-list-editor ul { margin: 4px 0; padding-left: 1.2em; }
+      .cc-dirty { font-weight: 700; color: var(--cc-warn); }
+      .cc-conflict { border: 1px solid var(--cc-danger); border-radius: var(--cc-radius); padding: 8px; margin: 8px 0; }
+      .cc-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+      details { border: 1px solid var(--cc-border); border-radius: 6px; padding: 6px 10px; margin: 8px 0; }
+      summary { cursor: pointer; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div class="cc-shell">
+      <div class="cc-header">
+        <h1>Orca-Pi Control Center</h1>
+        <span class="muted">Profiles · Orchestration · GitHub · Diagnostics</span>
+      </div>
+      <div id="bridge-state" aria-live="polite"><p class="muted">Bridge: negotiating structured support (protocol 1, bridge 1.0.0)…</p></div>
+
+      <nav class="cc-tabs" role="tablist" aria-label="Orca-Pi sections" id="cc-tabs">
+        <button class="cc-tab" role="tab" id="tab-profiles" aria-controls="section-profiles" aria-selected="true">Profiles</button>
+        <button class="cc-tab" role="tab" id="tab-orchestration" aria-controls="section-orchestration" aria-selected="false" tabindex="-1">Orchestration</button>
+        <button class="cc-tab" role="tab" id="tab-github" aria-controls="section-github" aria-selected="false" tabindex="-1">GitHub</button>
+        <button class="cc-tab" role="tab" id="tab-diagnostics" aria-controls="section-diagnostics" aria-selected="false" tabindex="-1">Diagnostics</button>
+      </nav>
+
+      <main>
+        <section id="section-profiles" role="tabpanel" aria-labelledby="tab-profiles">
+          <div class="cc-toolbar">
+            <button id="btn-refresh" type="button">Refresh</button>
+            <button id="btn-create" type="button">Create profile</button>
+            <label class="muted" for="default-scope">Default save scope
+              <select id="default-scope">
+                <option value="project" selected>project</option>
+                <option value="user">user</option>
+              </select>
+            </label>
+            <span class="spacer"></span>
+            <span id="dirty-state" class="muted" aria-live="polite"></span>
+          </div>
+          <div id="profiles-summary" aria-live="polite">
+            <p><strong>No live data yet.</strong> Confirming bridge support…</p>
+          </div>
+          <div class="cc-grid two">
+            <div>
+              <h2>Profiles</h2>
+              <ul id="profiles-list" class="cc-profile-list" aria-label="Pi profiles"></ul>
+            </div>
+            <div>
+              <h2>Profile editor</h2>
+              <div id="profile-editor" aria-live="polite"><p class="muted">Select a profile to edit, or create one. Saves use <code>profile.mutate</code> with explicit scope + source hash; built-ins are immutable.</p></div>
+              <details id="launch-preview-wrap">
+                <summary>Resolved launch / Inspect (reuses launch compiler)</summary>
+                <div id="launch-preview"><p class="muted">Select a profile, then load its sanitized launch preview via <code>launch.preview</code>. Display-only — never executed.</p></div>
+                <button id="btn-launch-preview" type="button">Load launch preview</button>
+              </details>
+              <details>
+                <summary>Advanced: raw patch JSON</summary>
+                <p class="muted">Structured editing is primary; this shows the exact <code>profile.mutate</code> patch that Save sends (no YAML textarea).</p>
+                <pre id="raw-patch-view"><code>{}</code></pre>
+              </details>
+            </div>
+          </div>
+        </section>
+
+        <section id="section-orchestration" role="tabpanel" aria-labelledby="tab-orchestration" hidden>
+          <div class="cc-card">
+            <h2>Orchestration</h2>
+            <p class="muted">UI1.4 owns full role→profile mapping UI. This shell reserves the section and shows live read-only mapping when the bridge supports it (Orca owns task/DAG/worktree/run lifecycle; Orca-Pi owns only role→profile policy).</p>
+            <div id="orchestration-summary"><p class="muted">Loading orchestration mapping…</p></div>
+          </div>
+        </section>
+
+        <section id="section-github" role="tabpanel" aria-labelledby="tab-github" hidden>
+          <div class="cc-card">
+            <h2>GitHub identities</h2>
+            <p class="muted">UI1.5 owns full identity health UI. Redacted status only — no token or private key is ever returned to the panel.</p>
+            <div id="github-summary"><p class="muted">Loading GitHub status…</p></div>
+          </div>
+        </section>
+
+        <section id="section-diagnostics" role="tabpanel" aria-labelledby="tab-diagnostics" hidden>
+          <div class="cc-card">
+            <h2>Diagnostics</h2>
+            <p class="muted">Bridge, capability, and CLI health via <code>diagnostics.doctor</code> and <code>profile.validate</code>. Full hardening lands with UI1.5/UI1.6.</p>
+            <div id="diagnostics-summary"><p class="muted">Loading diagnostics…</p></div>
+            <button id="btn-diagnostics-reload" type="button">Reload diagnostics</button>
+          </div>
+        </section>
+      </main>
+
+      <p class="muted">Targets Orca app 1.4.196+ (pluginApi 1, Host API v0 re-audited 2026-09-11). See docs/ORCA_PLUGIN_API.md. No manual CLI/YAML editing is required for normal profile customization.</p>
+    </div>
+    <script>
+      // Control Center client (UI1.3). Structured by design: every live call
+      // goes through window.__ORCA_PI_BRIDGE__.request with protocol 1 and
+      // stable request IDs. No fetch, no filesystem, no shell, no static
+      // injection. Degraded path uses real Host API calls over postMessage
+      // (workspace.readContext for explicit terminalId, then ONE
+      // user-gesture terminal.sendText of an allowlisted read-only command).
+      (function () {
+        var PROTOCOL_VERSION = 1;
+        var BRIDGE_VERSION = "1.0.0";
+        var PANEL_ACTION_REQUEST_TYPE = "orca-panel-action";
+        var PANEL_ACTION_RESULT_TYPE = "orca-panel-action-result";
+        var HOST_CALL_TIMEOUT_MS = 8000;
+        var FALLBACK_CLI_TEXT = "orca-pi profile validate";
+        var THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+        var BUILTIN_TOOLS = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
+        var BUILTIN_PROFILES = ["scout", "worker", "reviewer"];
+        var counter = 0;
+
+        function newRequestId(prefix) {
+          counter += 1;
+          return prefix + "-" + Date.now().toString(36) + "-" + counter + "-" + Math.random().toString(36).slice(2, 10);
+        }
+        function esc(s) {
+          return String(s == null ? "" : s)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+        }
+        function el(tag, attrs, text) {
+          var e = document.createElement(tag);
+          if (attrs) for (var k in attrs) {
+            if (k === "class") e.setAttribute("class", attrs[k]);
+            else if (k === "html") e.innerHTML = attrs[k];
+            else e.setAttribute(k, attrs[k]);
+          }
+          if (text != null) e.textContent = text;
+          return e;
+        }
+
+        // Tabs: roving tabindex + arrow keys, accessible.
+        function initTabs() {
+          var tabs = Array.prototype.slice.call(document.querySelectorAll('#cc-tabs [role="tab"]'));
+          if (!tabs.length) return;
+          function select(tab, focus) {
+            for (var i = 0; i < tabs.length; i += 1) {
+              var t = tabs[i];
+              var selected = t === tab;
+              t.setAttribute("aria-selected", selected ? "true" : "false");
+              t.tabIndex = selected ? 0 : -1;
+              var panel = document.getElementById(t.getAttribute("aria-controls"));
+              if (panel) { if (selected) panel.removeAttribute("hidden"); else panel.setAttribute("hidden", ""); }
+              if (selected && focus) { try { t.focus(); } catch (e) {} }
+            }
+          }
+          tabs.forEach(function (tab, idx) {
+            tab.addEventListener("click", function () {
+              if (state.dirty && !window.confirm("Unsaved profile changes will be lost. Switch sections anyway?")) return;
+              select(tab, false);
+            });
+            tab.addEventListener("keydown", function (ev) {
+              var next = -1;
+              if (ev.key === "ArrowRight") next = (idx + 1) % tabs.length;
+              else if (ev.key === "ArrowLeft") next = (idx - 1 + tabs.length) % tabs.length;
+              else if (ev.key === "Home") next = 0;
+              else if (ev.key === "End") next = tabs.length - 1;
+              if (next !== -1) { ev.preventDefault(); select(tabs[next], true); }
+            });
+          });
+        }
+
+        // Host API fallback over postMessage.
+        function hostAction(action, params) {
+          return new Promise(function (resolve) {
+            var requestId = newRequestId("host");
+            var settled = false;
+            function done(value) {
+              if (settled) return; settled = true;
+              try { window.removeEventListener("message", onMessage); } catch (e) {}
+              resolve(value);
+            }
+            function onMessage(event) {
+              var data = event && event.data;
+              if (!data || data.type !== PANEL_ACTION_RESULT_TYPE) return;
+              if (data.requestId !== requestId) return;
+              done(data);
+            }
+            try { window.addEventListener("message", onMessage); }
+            catch (e) { done({ ok: false, requestId: requestId, error: "cannot listen" }); return; }
+            setTimeout(function () { done({ ok: false, requestId: requestId, error: "host call timed out" }); }, HOST_CALL_TIMEOUT_MS);
+            try { window.parent.postMessage({ type: PANEL_ACTION_REQUEST_TYPE, requestId: requestId, action: action, params: params }, "*"); }
+            catch (e) { done({ ok: false, requestId: requestId, error: "cannot reach host" }); }
+          });
+        }
+        function offerTerminalFallback(into) {
+          var wrap = el("div"); var btn = el("button", null, "Run `" + FALLBACK_CLI_TEXT + "` in a visible terminal");
+          var note = el("p", { class: "muted" }, "Explicit action only: reads your focused worktree's terminal list, then runs one read-only command. Output is never read back.");
+          btn.addEventListener("click", function () {
+            btn.disabled = true; note.textContent = "Reading focused worktree terminals (workspace.readContext)…";
+            hostAction("workspace.readContext").then(function (ctx) {
+              var value = ctx && ctx.ok ? ctx.value : null;
+              var terminals = (value && value.terminals) || [];
+              if (!terminals.length) { note.textContent = "No visible terminal in the focused worktree — open one, then try again."; btn.disabled = false; return; }
+              var terminalId = terminals[0].id;
+              note.textContent = "Running in terminal " + terminalId + " (explicit target)…";
+              hostAction("terminal.sendText", { terminalId: terminalId, text: FALLBACK_CLI_TEXT, enter: true }).then(function (sent) {
+                var accepted = sent && sent.ok && sent.value && sent.value.accepted;
+                if (accepted) note.textContent = "Sent to terminal " + terminalId + ". Check the terminal — output is never read back here.";
+                else { note.textContent = "Terminal send failed (" + esc((sent && (sent.error || (sent.value && sent.value.error))) || "unavailable") + ")."; btn.disabled = false; }
+              });
+            });
+          });
+          wrap.appendChild(btn); wrap.appendChild(note); into.appendChild(wrap);
+        }
+
+        var state = {
+          structured: false,
+          supportedOps: [],
+          capabilities: null,
+          profiles: [],
+          selected: null,
+          detail: null,
+          draft: {},
+          draftMode: "edit",
+          scope: "project",
+          dirty: false,
+          fieldErrors: {},
+          globalError: null,
+          conflict: null,
+          launch: null,
+        };
+
+        function setDirty(dirty) {
+          state.dirty = dirty;
+          var badge = document.getElementById("dirty-state");
+          if (badge) {
+            badge.textContent = dirty ? "● Unsaved changes" : "";
+            if (dirty) badge.setAttribute("class", "cc-dirty");
+            else badge.setAttribute("class", "muted");
+          }
+          var raw = document.getElementById("raw-patch-view");
+          if (raw) {
+            try { raw.innerHTML = "<code>" + esc(JSON.stringify(draftPatch(), null, 2)) + "</code>"; }
+            catch (e) {}
+          }
+        }
+
+        function bridge() { return window.__ORCA_PI_BRIDGE__; }
+        function can(op) { return state.supportedOps.indexOf(op) !== -1; }
+
+        function request(op, params) {
+          var b = bridge();
+          var req = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId("cc"), operation: op };
+          if (params !== undefined) req.params = params;
+          // Worktree scope is stamped host-side by the seam adapter/sidecar:
+          // panels omit filesystem paths (readContext carries none).
+          return b.request(req);
+        }
+
+        function showBridgeState(html, degraded) {
+          var s = document.getElementById("bridge-state");
+          if (!s) return;
+          s.innerHTML = '<div class="' + (degraded ? "cc-badge degraded" : "cc-badge ok") + '"><p>' + html + "</p></div>";
+        }
+        function showDegraded(reason) {
+          var s = document.getElementById("bridge-state");
+          if (s) {
+            s.innerHTML = '<div class="cc-badge degraded"><p><strong>Degraded (read-only CLI fallback).</strong> <span class="muted">' + esc(reason) + " Mutations stay disabled.</span></p></div>";
+            offerTerminalFallback(s);
+          }
+          var ed = document.getElementById("profile-editor");
+          if (ed && !state.detail) {
+            var p = el("p", { class: "muted" }, "Save is disabled on this host: the structured bridge is unreachable. Use the explicit terminal action above for read-only CLI commands.");
+            ed.appendChild(p);
+          }
+          setSaveEnabled(false, "Structured bridge unreachable — Save disabled.");
+        }
+        function setSaveEnabled(enabled, why) {
+          var btn = document.getElementById("btn-save");
+          if (btn) {
+            btn.disabled = !enabled;
+            if (why) btn.title = why; else btn.removeAttribute("title");
+          }
+        }
+
+        function toListItems(payload) {
+          var raw = [];
+          if (payload && payload.summaries && Array.isArray(payload.summaries)) raw = payload.summaries;
+          else if (payload && payload.profiles && Array.isArray(payload.profiles)) raw = payload.profiles;
+          else if (payload && payload.panel && Array.isArray(payload.panel.profiles)) raw = payload.panel.profiles;
+          var out = [];
+          for (var i = 0; i < raw.length; i += 1) {
+            var r = raw[i] || {};
+            if (typeof r.name !== "string") continue;
+            out.push({
+              name: r.name,
+              displayName: typeof r.displayName === "string" ? r.displayName : undefined,
+              provider: typeof r.provider === "string" ? r.provider : undefined,
+              model: typeof r.model === "string" ? r.model : undefined,
+              thinking: typeof r.thinking === "string" ? r.thinking : "medium",
+              toolCount: typeof r.toolCount === "number" ? r.toolCount : undefined,
+              tools: Array.isArray(r.tools) ? r.tools : undefined,
+              skillNames: Array.isArray(r.skillNames) ? r.skillNames : [],
+              skillCount: typeof r.skillCount === "number" ? r.skillCount : 0,
+              extensionCount: typeof r.extensionCount === "number" ? r.extensionCount : 0,
+              contextFiles: r.contextFiles === true,
+              extendsChain: Array.isArray(r.extendsChain) ? r.extendsChain : [],
+              extends: typeof r.extends === "string" ? r.extends : undefined,
+              githubIdentity: typeof r.githubIdentity === "string" ? r.githubIdentity : undefined,
+              layer: r.layer === "user" || r.layer === "project" ? r.layer : "builtin",
+              valid: r.valid !== false,
+              validationError: typeof r.validationError === "string" ? r.validationError : undefined,
+            });
+          }
+          out.sort(function (a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+          return out;
+        }
+
+        function renderList() {
+          var root = document.getElementById("profiles-list");
+          var summary = document.getElementById("profiles-summary");
+          if (!root) return;
+          root.innerHTML = "";
+          if (!state.profiles.length) {
+            if (summary) summary.innerHTML = "<p><strong>No Pi profiles found.</strong> Run <code>orca-pi profile path</code> to locate configuration.</p>";
+            return;
+          }
+          if (summary) {
+            var invalid = state.profiles.filter(function (p) { return !p.valid; }).length;
+            summary.innerHTML = invalid
+              ? "<p><strong>Validation: " + invalid + " invalid profile(s).</strong> Run <code>orca-pi profile validate</code> for diagnostics.</p>"
+              : "<p>Validation: all " + state.profiles.length + " profile(s) valid. Live via <code>profiles.list</code>.</p>";
+          }
+          state.profiles.forEach(function (p) {
+            var li = el("li", { class: "cc-profile-item" });
+            li.setAttribute("aria-selected", state.selected === p.name ? "true" : "false");
+            var title = p.displayName ? p.name + " — " + p.displayName : p.name;
+            var h = el("h3", null, title);
+            li.appendChild(h);
+            var meta = el("div", { class: "cc-meta" });
+            var layer = p.layer || "builtin";
+            var parent = p.extends || (p.extendsChain.length >= 2 ? p.extendsChain[p.extendsChain.length - 2] : null);
+            var tools = p.toolCount !== undefined ? p.toolCount + " tools" : "default tools";
+            var mcp = p.extensionCount + " ext (MCP)";
+            meta.innerHTML =
+              "<span class=\"cc-pill" + (p.valid ? "" : " invalid") + "\">" + esc(layer) + "</span>" +
+              (p.valid ? "" : "<span class=\"cc-pill invalid\">INVALID</span>") +
+              "<span>" + esc(p.model || "(no model)") + " / " + esc(p.thinking) + "</span>" +
+              "<span>" + esc(tools) + "</span>" +
+              "<span>" + p.skillCount + " skills, " + esc(mcp) + "</span>" +
+              (p.githubIdentity ? "<span>id:" + esc(p.githubIdentity) + "</span>" : "") +
+              (parent ? "<span>extends:" + esc(parent) + "</span>" : "");
+            li.appendChild(meta);
+            var actions = el("div", { class: "cc-actions" });
+            var edit = el("button", null, "Edit");
+            edit.addEventListener("click", function () { selectProfile(p.name); });
+            var clone = el("button", null, "Clone");
+            clone.addEventListener("click", function () { cloneProfile(p.name); });
+            var preview = el("button", null, "Inspect");
+            preview.addEventListener("click", function () { selectProfile(p.name); loadLaunchPreview(p.name); });
+            actions.appendChild(edit); actions.appendChild(clone); actions.appendChild(preview);
+            if (layer !== "builtin") {
+              var del = el("button", null, "Delete/reset");
+              del.addEventListener("click", function () { deleteProfile(p.name, layer); });
+              actions.appendChild(del);
+            } else {
+              var why = el("span", { class: "muted" }, "built-in: clone to customize");
+              actions.appendChild(why);
+            }
+            li.appendChild(actions);
+            root.appendChild(li);
+          });
+        }
+
+        function fieldProvenance(detail, field) {
+          if (!detail || !detail.fields || !detail.fields[field]) return null;
+          return detail.fields[field].provenance || null;
+        }
+        function provText(prov) {
+          if (!prov) return "built-in";
+          if (typeof prov.display === "string" && prov.display) return prov.display;
+          return prov.kind || "built-in";
+        }
+
+        function draftPatch() {
+          var patch = {};
+          var fields = ["extends","provider","model","thinking","systemPrompt","systemPromptFile","tools","excludeTools","skills","extensions","contextFiles","discoverSkills","discoverExtensions","session","githubIdentity","displayName","description"];
+          for (var i = 0; i < fields.length; i += 1) {
+            var f = fields[i];
+            var v = state.draft[f];
+            if (v === undefined) continue;
+            patch[f] = v === "" ? null : v;
+          }
+          return patch;
+        }
+
+        function clientShapeErrors() {
+          var errs = {};
+          var d = state.draft;
+          if (d.extends !== undefined && d.extends !== "" && d.extends !== null) {
+            if (typeof d.extends !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(d.extends)) errs.extends = "expected a parent profile name.";
+            else if (d.extends === state.selected && state.draftMode === "edit") errs.extends = "a profile cannot extend itself.";
+          }
+          if (d.model !== undefined && d.model !== "" && d.model !== null) {
+            if (typeof d.model !== "string" || !/^[A-Za-z0-9._/:@+~-]+$/.test(d.model)) errs.model = "invalid model ID (custom IDs allowed; no whitespace/shell chars).";
+            else if (/:(off|minimal|low|medium|high|xhigh|max)$/.test(d.model)) errs.model = "remove the :<thinking> suffix; use thinking instead.";
+          }
+          if (d.thinking !== undefined && d.thinking !== "" && d.thinking !== null) {
+            if (THINKING_LEVELS.indexOf(d.thinking) === -1) errs.thinking = "expected one of " + THINKING_LEVELS.join(", ") + ".";
+          }
+          var hasPrompt = d.systemPrompt !== undefined && d.systemPrompt !== "" && d.systemPrompt !== null;
+          var hasFile = d.systemPromptFile !== undefined && d.systemPromptFile !== "" && d.systemPromptFile !== null;
+          if (hasPrompt && hasFile) errs.systemPrompt = "systemPrompt and systemPromptFile are mutually exclusive.";
+          return errs;
+        }
+
+        function selectProfile(name) {
+          if (state.dirty && state.selected !== name) {
+            if (!window.confirm("Unsaved changes will be lost. Switch profiles anyway?")) return;
+          }
+          state.selected = name;
+          state.draftMode = "edit";
+          state.draft = {};
+          state.fieldErrors = {};
+          state.globalError = null;
+          state.conflict = null;
+          setDirty(false);
+          renderList();
+          loadDetail(name);
+        }
+
+        function loadDetail(name) {
+          var ed = document.getElementById("profile-editor");
+          if (ed) ed.innerHTML = "<p class=\"muted\">Loading <code>" + esc(name) + "</code> via <code>profile.read</code>…</p>";
+          if (!can("profile.read")) {
+            if (ed) ed.innerHTML = "<p class=\"muted\">profile.read unavailable on this host.</p>";
+            return;
+          }
+          request("profile.read", { name: name }).then(function (res) {
+            if (!res || res.requestId === undefined) return;
+            if (res.ok && res.result) {
+              state.detail = res.result;
+              // Seed scope default: prefer project when it exists, else user.
+              var hasProject = !!(res.result.source && res.result.source.project);
+              var hasUser = !!(res.result.source && res.result.source.user);
+              var def = document.getElementById("default-scope");
+              state.scope = def ? def.value : (hasProject ? "project" : hasUser ? "user" : "project");
+              renderEditor();
+            } else {
+              var msg = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
+              if (ed) ed.innerHTML = "<p><strong>Could not load profile.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+            }
+          }, function () {
+            if (ed) ed.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
+          });
+        }
+
+        function startCreate() {
+          if (state.dirty && !window.confirm("Unsaved changes will be lost. Start a new profile anyway?")) return;
+          state.selected = null;
+          state.detail = null;
+          state.draftMode = "create";
+          state.draft = {};
+          state.fieldErrors = {};
+          state.globalError = null;
+          state.conflict = null;
+          setDirty(false);
+          renderList();
+          renderEditor();
+        }
+
+        function cloneProfile(source) {
+          var dest = null;
+          try { dest = window.prompt("Clone \"" + source + "\" to new profile name (e.g. worker-fast):", source + "-copy"); } catch (e) {}
+          if (!dest) return;
+          dest = String(dest).trim();
+          if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(dest) || dest.length > 64) {
+            window.alert("Invalid profile name: use 1-64 chars matching [A-Za-z0-9][A-Za-z0-9_-]*.");
+            return;
+          }
+          var scopeEl = document.getElementById("default-scope");
+          var scope = scopeEl ? scopeEl.value : "project";
+          var hash = currentHashFor(scope);
+          var params = { action: "clone", source: source, dest: dest, scope: scope };
+          if (hash !== undefined) {
+            if (hash === null) params.expectedAbsent = true;
+            else params.expectedSourceHash = hash;
+          }
+          request("profile.mutate", params).then(function (res) {
+            if (res && res.ok) { refreshAll(dest); }
+            else {
+              var mapped = mapError(res && res.error);
+              window.alert("Clone failed (" + mapped.kind + "): " + mapped.message);
+            }
+          });
+        }
+
+        function deleteProfile(name, layer) {
+          var scope = layer === "project" || layer === "user" ? layer : ((document.getElementById("default-scope") || {}).value || "project");
+          if (!window.confirm("Delete " + scope + " override/profile \"" + name + "\"? Built-ins are never deleted; this removes only the " + scope + " layer entry.")) return;
+          var hash = currentHashFor(scope);
+          var params = { action: "delete", name: name, scope: scope };
+          if (hash !== undefined) {
+            if (hash === null) params.expectedAbsent = true;
+            else params.expectedSourceHash = hash;
+          }
+          request("profile.mutate", params).then(function (res) {
+            if (res && res.ok) {
+              if (state.selected === name) { state.selected = null; state.detail = null; state.draft = {}; setDirty(false); }
+              refreshAll(null);
+            } else {
+              var mapped = mapError(res && res.error);
+              window.alert("Delete failed (" + mapped.kind + "): " + mapped.message);
+            }
+          });
+        }
+
+        function currentHashFor(scope) {
+          if (!state.detail || !state.detail.sourceHash) return undefined;
+          var h = state.detail.sourceHash[scope];
+          if (typeof h === "string") return h;
+          // No file for this scope yet: assert absence so concurrent creators conflict instead of overwriting.
+          return null;
+        }
+
+        function mapError(err) {
+          var code = (err && err.code) || "internal";
+          var message = (err && err.message) || "Request failed.";
+          var field = (err && err.field) || "_global";
+          if (typeof field === "string" && field.indexOf(".") !== -1) {
+            var parts = field.split(".");
+            field = parts[parts.length - 1];
+          }
+          var known = ["extends","provider","model","thinking","systemPrompt","systemPromptFile","tools","excludeTools","skills","extensions","contextFiles","discoverSkills","discoverExtensions","session","githubIdentity","displayName","description"];
+          if (known.indexOf(field) === -1) {
+            var m = /profiles\.[^.]+\.([A-Za-z]+)/.exec(message);
+            if (m && known.indexOf(m[1]) !== -1) field = m[1];
+            else field = "_global";
+          }
+          return { kind: code, message: message, field: field, isConflict: code === "conflict" };
+        }
+
+        function renderEditor() {
+          var ed = document.getElementById("profile-editor");
+          if (!ed) return;
+          ed.innerHTML = "";
+          var isCreate = state.draftMode === "create";
+          var name = isCreate ? (state.draft.name || "") : (state.selected || "");
+          var detail = state.detail;
+          var isBuiltin = !isCreate && BUILTIN_PROFILES.indexOf(name) !== -1;
+
+          if (!isCreate && !detail) {
+            ed.appendChild(el("p", { class: "muted" }, "Select a profile to edit."));
+            return;
+          }
+
+          // Name + scope row.
+          var nameWrap = el("div", { class: "cc-field" });
+          nameWrap.appendChild(el("label", null, "Profile name"));
+          if (isCreate) {
+            var nameInput = el("input"); nameInput.type = "text"; nameInput.id = "f-name"; nameInput.value = state.draft.name || "";
+            nameInput.setAttribute("placeholder", "worker-fast"); nameInput.setAttribute("aria-label", "New profile name");
+            nameInput.addEventListener("input", function () { state.draft.name = nameInput.value; setDirty(true); });
+            nameWrap.appendChild(nameInput);
+            nameWrap.appendChild(el("p", { class: "hint" }, "1-64 chars, letters/digits/_/-. Validated server-side."));
+          } else {
+            nameWrap.appendChild(el("p", null, name + (detail && detail.displayName ? " — " + detail.displayName : "")));
+            if (detail && detail.extendsChain && detail.extendsChain.length) {
+              nameWrap.appendChild(el("p", { class: "prov" }, "Extends chain: " + detail.extendsChain.join(" → ")));
+            }
+          }
+          // Scope selector (always explicit for writes).
+          var scopeLabel = el("label", null, "Save scope (required)");
+          scopeLabel.setAttribute("for", "f-scope");
+          nameWrap.appendChild(scopeLabel);
+          var scopeSel = el("select"); scopeSel.id = "f-scope";
+          ["project", "user"].forEach(function (s) {
+            var o = el("option", null, s + (s === "project" ? " (.pi/profiles.yaml)" : " (global)"));
+            o.value = s; if (state.scope === s) o.selected = true;
+            scopeSel.appendChild(o);
+          });
+          scopeSel.addEventListener("change", function () { state.scope = scopeSel.value; setDirty(true); });
+          nameWrap.appendChild(scopeSel);
+          nameWrap.appendChild(el("p", { class: "hint" }, "Writes go only to the selected layer via profile.mutate; the other layer is untouched."));
+          ed.appendChild(nameWrap);
+
+          if (isBuiltin) {
+            var guard = el("p", null, 'Built-in "' + name + '" is immutable: clone it to customize. Direct edits are blocked (server enforces this too).');
+            guard.setAttribute("role", "note");
+            ed.appendChild(guard);
+          }
+
+          // Helper to make a field row with provenance + control.
+          function fieldRow(field, labelText, hint, control, prov) {
+            var wrap = el("div", { class: "cc-field" });
+            var lab = el("label", null, labelText);
+            lab.setAttribute("for", "f-" + field);
+            wrap.appendChild(lab);
+            wrap.appendChild(control);
+            if (hint) wrap.appendChild(el("p", { class: "hint" }, hint));
+            if (prov) {
+              var eff = prov.effective !== undefined ? " Effective: " + JSON.stringify(prov.effective) : "";
+              wrap.appendChild(el("p", { class: "prov" }, "Provenance: " + provText(prov) + "." + eff));
+              var layers = [];
+              if (prov.builtin !== undefined) layers.push("built-in=" + JSON.stringify(prov.builtin));
+              if (prov.user !== undefined) layers.push("user=" + JSON.stringify(prov.user));
+              if (prov.project !== undefined) layers.push("project=" + JSON.stringify(prov.project));
+              if (layers.length) wrap.appendChild(el("p", { class: "prov" }, "Layers: " + layers.join(" | ")));
+            }
+            var err = state.fieldErrors[field];
+            if (err) wrap.appendChild(el("p", { class: "error" }, err));
+            return wrap;
+          }
+          function provFor(f) {
+            if (detail && detail.fields && detail.fields[f]) {
+              var entry = detail.fields[f];
+              return {
+                display: entry.provenance && entry.provenance.display,
+                kind: entry.provenance && entry.provenance.kind,
+                definedIn: entry.provenance && entry.provenance.definedIn,
+                inherited: entry.provenance && entry.provenance.inherited,
+                effective: entry.effective,
+                builtin: entry.builtin, user: entry.user, project: entry.project,
+              };
+            }
+            return null;
+          }
+          function textControl(field, placeholder, isTextArea) {
+            var cur = state.draft[field] !== undefined ? state.draft[field] : (detail && detail.fields && detail.fields[field] && detail.fields[field][state.scope] !== undefined ? detail.fields[field][state.scope] : "");
+            var inp = isTextArea ? el("textarea") : el("input");
+            if (!isTextArea) inp.type = "text";
+            inp.id = "f-" + field;
+            inp.value = cur == null ? "" : String(cur);
+            if (placeholder) inp.setAttribute("placeholder", placeholder);
+            if (isBuiltin && (field !== "displayName" && field !== "description")) inp.disabled = true;
+            inp.addEventListener("input", function () { state.draft[field] = inp.value; setDirty(true); });
+            return inp;
+          }
+
+          // displayName, description, extends, provider, model, thinking.
+          ed.appendChild(fieldRow("displayName", "Display name", "Display-only; never affects launch.", textControl("displayName", "Worker (fast)"), provFor("displayName")));
+          var descCtl = textControl("description", "What this profile is for", true);
+          ed.appendChild(fieldRow("description", "Description", "Display-only.", descCtl, provFor("description")));
+
+          // extends select.
+          var extSel = el("select"); extSel.id = "f-extends";
+          var noneOpt = el("option", null, "(none)"); noneOpt.value = "";
+          extSel.appendChild(noneOpt);
+          state.profiles.forEach(function (p) {
+            if (!isCreate && p.name === name) return;
+            var o = el("option", null, p.name); o.value = p.name;
+            var curExt = state.draft.extends !== undefined ? state.draft.extends : (detail && detail.source && detail.source[state.scope] && detail.source[state.scope].extends) || (detail && detail.effective && detail.effective.extendsChain && detail.effective.extendsChain.length >= 2 ? detail.effective.extendsChain[detail.effective.extendsChain.length - 2] : "");
+            if (curExt === p.name) o.selected = true;
+            extSel.appendChild(o);
+          });
+          if (isBuiltin) extSel.disabled = true;
+          extSel.addEventListener("change", function () { state.draft.extends = extSel.value; setDirty(true); });
+          ed.appendChild(fieldRow("extends", "Inheritance (extends)", "Single parent (v1). Cycles and unknown parents are rejected server-side.", extSel, provFor("extends")));
+
+          ed.appendChild(fieldRow("provider", "Provider", "Pi --provider (e.g. anthropic, openai-codex). Optional.", textControl("provider", "anthropic"), provFor("provider")));
+          var modelCtl = textControl("model", "anthropic/claude-sonnet (custom IDs allowed; validated server-side)");
+          ed.appendChild(fieldRow("model", "Model", "Pi --model. No hard-coded list: custom IDs allowed, backend validates. Avoid :<thinking> suffixes.", modelCtl, provFor("model")));
+
+          var thinkSel = el("select"); thinkSel.id = "f-thinking";
+          THINKING_LEVELS.forEach(function (lvl) {
+            var o = el("option", null, lvl); o.value = lvl;
+            var cur = state.draft.thinking !== undefined ? state.draft.thinking : (detail && detail.fields && detail.fields.thinking && detail.fields.thinking.effective) || "medium";
+            if (cur === lvl) o.selected = true;
+            thinkSel.appendChild(o);
+          });
+          if (isBuiltin) thinkSel.disabled = true;
+          thinkSel.addEventListener("change", function () { state.draft.thinking = thinkSel.value; setDirty(true); });
+          ed.appendChild(fieldRow("thinking", "Thinking level", "Pi --thinking. Closed set owned by the backend.", thinkSel, provFor("thinking")));
+
+          // systemPrompt / systemPromptFile (mutually exclusive).
+          var promptMode = "none";
+          if (state.draft.systemPrompt !== undefined && state.draft.systemPrompt !== "" && state.draft.systemPrompt !== null) promptMode = "inline";
+          else if (state.draft.systemPromptFile !== undefined && state.draft.systemPromptFile !== "" && state.draft.systemPromptFile !== null) promptMode = "file";
+          else if (detail && detail.fields) {
+            var sc = detail.fields.systemPrompt; var sf = detail.fields.systemPromptFile;
+            var hasInline = sc && (sc[state.scope] !== undefined || sc.effective !== undefined);
+            var hasFileV = sf && (sf[state.scope] !== undefined || sf.effective !== undefined);
+            if (hasInline && ((sc[state.scope] !== undefined && sc[state.scope] !== null && sc[state.scope] !== "") || (sc[state.scope] === undefined && sc.effective))) promptMode = promptMode === "none" ? "inline" : promptMode;
+            if (hasFileV && ((sf[state.scope] !== undefined && sf[state.scope] !== null && sf[state.scope] !== "") || (sf[state.scope] === undefined && sf.effective))) promptMode = promptMode === "inline" ? promptMode : "file";
+            // If both effective? Server forbids in one entry, but inheritance could mix — prefer explicit layer.
+            if (detail.source && detail.source[state.scope]) {
+              if (detail.source[state.scope].systemPrompt) promptMode = "inline";
+              else if (detail.source[state.scope].systemPromptFile) promptMode = "file";
+            }
+          }
+          var modeWrap = el("div", { class: "cc-field" });
+          modeWrap.appendChild(el("label", null, "System prompt"));
+          ["none", "inline", "file"].forEach(function (m) {
+            var lab = el("label", null, " " + m);
+            lab.setAttribute("style", "font-weight:400;margin-right:8px;");
+            var r = el("input"); r.type = "radio"; r.name = "prompt-mode"; r.value = m;
+            if (promptMode === m) r.checked = true;
+            if (isBuiltin) r.disabled = true;
+            r.addEventListener("change", function () {
+              if (m === "none") { state.draft.systemPrompt = ""; state.draft.systemPromptFile = ""; }
+              else if (m === "inline") { state.draft.systemPromptFile = ""; if (state.draft.systemPrompt === "" || state.draft.systemPrompt === undefined) state.draft.systemPrompt = (detail && detail.fields && detail.fields.systemPrompt && detail.fields.systemPrompt.effective) || ""; }
+              else { state.draft.systemPrompt = ""; if (state.draft.systemPromptFile === "" || state.draft.systemPromptFile === undefined) state.draft.systemPromptFile = (detail && detail.fields && detail.fields.systemPromptFile && detail.fields.systemPromptFile.effective) || ""; }
+              setDirty(true); renderEditor();
+            });
+            lab.insertBefore(r, lab.firstChild);
+            modeWrap.appendChild(lab);
+          });
+          modeWrap.appendChild(el("p", { class: "hint" }, "Inline prompt vs prompt file are mutually exclusive. Files are project-relative (e.g. .pi/agents/scout.md)."));
+          ed.appendChild(modeWrap);
+          if (promptMode === "inline") {
+            ed.appendChild(fieldRow("systemPrompt", "Inline system prompt", "Maps to Pi --system-prompt.", textControl("systemPrompt", "You are…", true), provFor("systemPrompt")));
+          } else if (promptMode === "file") {
+            ed.appendChild(fieldRow("systemPromptFile", "Prompt file", "Project-relative path; read at launch time.", textControl("systemPromptFile", ".pi/agents/scout.md"), provFor("systemPromptFile")));
+          }
+
+          // tools + excludeTools checkboxes + custom.
+          function toolsEditor(field, labelText) {
+            var wrap = el("div", { class: "cc-field" });
+            wrap.appendChild(el("label", null, labelText));
+            var group = el("div", { class: "cc-checkbox-group" });
+            var curList = state.draft[field] !== undefined ? state.draft[field] : (detail && detail.fields && detail.fields[field] && detail.fields[field][state.scope] !== undefined ? detail.fields[field][state.scope] : (detail && detail.fields && detail.fields[field] && detail.fields[field].effective) || []);
+            if (!Array.isArray(curList)) curList = [];
+            BUILTIN_TOOLS.forEach(function (t) {
+              var lab = el("label", null, " " + t);
+              var cb = el("input"); cb.type = "checkbox"; cb.value = t;
+              if (curList.indexOf(t) !== -1) cb.checked = true;
+              if (isBuiltin) cb.disabled = true;
+              cb.addEventListener("change", function () {
+                var next = Array.isArray(state.draft[field]) ? state.draft[field].slice() : curList.slice();
+                if (cb.checked && next.indexOf(t) === -1) next.push(t);
+                if (!cb.checked) next = next.filter(function (x) { return x !== t; });
+                state.draft[field] = next; setDirty(true);
+              });
+              lab.insertBefore(cb, lab.firstChild);
+              group.appendChild(lab);
+            });
+            wrap.appendChild(group);
+            var custom = el("input"); custom.type = "text"; custom.setAttribute("placeholder", "custom-tool to add; Enter adds");
+            custom.setAttribute("aria-label", labelText + " custom tool");
+            if (isBuiltin) custom.disabled = true;
+            custom.addEventListener("keydown", function (ev) {
+              if (ev.key === "Enter") {
+                ev.preventDefault();
+                var v = custom.value.trim();
+                if (!v) return;
+                if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(v)) { window.alert("Invalid tool name."); return; }
+                var next = Array.isArray(state.draft[field]) ? state.draft[field].slice() : curList.slice();
+                if (next.indexOf(v) === -1) next.push(v);
+                state.draft[field] = next; setDirty(true); renderEditor();
+              }
+            });
+            wrap.appendChild(custom);
+            var cur = state.draft[field] !== undefined ? state.draft[field] : curList;
+            if (Array.isArray(cur) && cur.length) {
+              var ul = el("ul");
+              cur.forEach(function (t) {
+                var li = el("li", null, t + " ");
+                var rm = el("button", null, "remove");
+                rm.addEventListener("click", function () {
+                  var next = (Array.isArray(state.draft[field]) ? state.draft[field] : curList.slice()).filter(function (x) { return x !== t; });
+                  state.draft[field] = next; setDirty(true); renderEditor();
+                });
+                if (isBuiltin) rm.disabled = true;
+                li.appendChild(rm); ul.appendChild(li);
+              });
+              wrap.appendChild(ul);
+            }
+            var prov = provFor(field);
+            if (prov) wrap.appendChild(el("p", { class: "prov" }, "Provenance: " + provText(prov) + ". Arrays replace parents (never merge)."));
+            var err = state.fieldErrors[field];
+            if (err) wrap.appendChild(el("p", { class: "error" }, err));
+            return wrap;
+          }
+          ed.appendChild(toolsEditor("tools", "Tools (allowlist)"));
+          ed.appendChild(toolsEditor("excludeTools", "Excluded tools (denylist)"));
+
+          // skills / extensions (+ MCP note).
+          function listEditor(field, labelText, placeholder, mcpNote) {
+            var wrap = el("div", { class: "cc-field" });
+            wrap.appendChild(el("label", null, labelText));
+            if (mcpNote) wrap.appendChild(el("p", { class: "hint" }, mcpNote));
+            var curList = state.draft[field] !== undefined ? state.draft[field] : (detail && detail.fields && detail.fields[field] && detail.fields[field][state.scope] !== undefined ? detail.fields[field][state.scope] : (detail && detail.fields && detail.fields[field] && detail.fields[field].effective) || []);
+            if (!Array.isArray(curList)) curList = [];
+            var cur = state.draft[field] !== undefined ? state.draft[field] : curList;
+            if (Array.isArray(cur) && cur.length) {
+              var ul = el("ul");
+              cur.forEach(function (v) {
+                var li = el("li", null, String(v) + " ");
+                var rm = el("button", null, "remove");
+                rm.addEventListener("click", function () {
+                  var next = (Array.isArray(state.draft[field]) ? state.draft[field] : curList.slice()).filter(function (x) { return x !== v; });
+                  state.draft[field] = next; setDirty(true); renderEditor();
+                });
+                if (isBuiltin) rm.disabled = true;
+                li.appendChild(rm); ul.appendChild(li);
+              });
+              wrap.appendChild(ul);
+            } else {
+              wrap.appendChild(el("p", { class: "muted" }, "(none)"));
+            }
+            var add = el("input"); add.type = "text"; add.setAttribute("placeholder", placeholder);
+            add.setAttribute("aria-label", labelText + " add");
+            if (isBuiltin) add.disabled = true;
+            add.addEventListener("keydown", function (ev) {
+              if (ev.key === "Enter") {
+                ev.preventDefault();
+                var v = add.value.trim();
+                if (!v) return;
+                var next = Array.isArray(state.draft[field]) ? state.draft[field].slice() : curList.slice();
+                if (next.indexOf(v) === -1) next.push(v);
+                state.draft[field] = next; setDirty(true); renderEditor();
+              }
+            });
+            wrap.appendChild(add);
+            var prov = provFor(field);
+            if (prov) wrap.appendChild(el("p", { class: "prov" }, "Provenance: " + provText(prov) + "."));
+            var err = state.fieldErrors[field];
+            if (err) wrap.appendChild(el("p", { class: "error" }, err));
+            return wrap;
+          }
+          ed.appendChild(listEditor("skills", "Skills", ".pi/skills/repo-search; Enter adds", "Explicit skill sources (repeatable Pi --skill); names and source/path shown."));
+          ed.appendChild(listEditor("extensions", "Extensions (MCP surface)", ".pi/extensions/example.ts; Enter adds", "v1 has no dedicated mcp field: MCP maps to extensions here. Per-project enable/disable via discoverExtensions + this list; never paste secrets (redacted references only)."));
+
+          // booleans + session + githubIdentity.
+          [["contextFiles", "Context files (AGENTS.md/CLAUDE.md discovery)"], ["discoverSkills", "Discover ambient skills (--no-skills when off)"], ["discoverExtensions", "Discover ambient extensions incl. MCP (--no-extensions when off)"]].forEach(function (pair) {
+            var f = pair[0], labelText = pair[1];
+            var wrap = el("div", { class: "cc-field" });
+            var lab = el("label", null, " " + labelText);
+            var cb = el("input"); cb.type = "checkbox"; cb.id = "f-" + f;
+            var cur = state.draft[f] !== undefined ? state.draft[f] : (detail && detail.fields && detail.fields[f] && detail.fields[f].effective);
+            cb.checked = cur === true;
+            if (isBuiltin) cb.disabled = true;
+            cb.addEventListener("change", function () { state.draft[f] = cb.checked; setDirty(true); });
+            lab.insertBefore(cb, lab.firstChild);
+            wrap.appendChild(lab);
+            var prov = provFor(f);
+            if (prov) wrap.appendChild(el("p", { class: "prov" }, "Provenance: " + provText(prov) + "."));
+            ed.appendChild(wrap);
+          });
+
+          var sessSel = el("select"); sessSel.id = "f-session";
+          ["ephemeral", "fresh"].forEach(function (s) {
+            var o = el("option", null, s); o.value = s;
+            var cur = state.draft.session !== undefined ? state.draft.session : (detail && detail.fields && detail.fields.session && detail.fields.session.effective) || "ephemeral";
+            if (cur === s) o.selected = true;
+            sessSel.appendChild(o);
+          });
+          if (isBuiltin) sessSel.disabled = true;
+          sessSel.addEventListener("change", function () { state.draft.session = sessSel.value; setDirty(true); });
+          ed.appendChild(fieldRow("session", "Session mode", "ephemeral = Pi --no-session (never resumes).", sessSel, provFor("session")));
+
+          var ghCtl = textControl("githubIdentity", "worker / reviewer / custom (never a secret)");
+          ed.appendChild(fieldRow("githubIdentity", "GitHub identity", "Logical credential slot; redacted status only.", ghCtl, provFor("githubIdentity")));
+
+          // Global error + conflict.
+          if (state.globalError) ed.appendChild(el("p", { class: "error" }, state.globalError));
+          if (state.conflict) {
+            var c = el("div", { class: "cc-conflict" });
+            c.appendChild(el("p", null, "Stale write conflict: the file changed since you loaded it. No data was overwritten."));
+            c.appendChild(el("p", { class: "muted" }, state.conflict));
+            var reloadBtn = el("button", null, "Reload latest and compare");
+            reloadBtn.addEventListener("click", function () {
+              state.conflict = null; state.fieldErrors = {}; state.globalError = null;
+              if (state.selected) loadDetail(state.selected); else refreshAll(null);
+            });
+            c.appendChild(reloadBtn);
+            ed.appendChild(c);
+          }
+
+          // Save row.
+          var row = el("div", { class: "cc-actions" });
+          var save = el("button", null, isCreate ? "Create profile" : "Save " + state.scope + " layer");
+          save.id = "btn-save";
+          save.setAttribute("class", "primary");
+          if (isBuiltin || !state.structured) {
+            save.disabled = true;
+            save.title = isBuiltin ? "Built-ins are immutable — clone to customize." : "Structured bridge unreachable — Save disabled.";
+          }
+          save.addEventListener("click", saveDraft);
+          var cancel = el("button", null, "Cancel");
+          cancel.addEventListener("click", function () {
+            if (state.dirty && !window.confirm("Discard unsaved changes?")) return;
+            state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
+            setDirty(false);
+            if (!isCreate && state.selected) loadDetail(state.selected);
+            else renderEditor();
+          });
+          row.appendChild(save); row.appendChild(cancel);
+          if (!isCreate && state.selected) {
+            var resetBtn = el("button", null, "Reset " + state.scope + " override");
+            resetBtn.addEventListener("click", function () { resetScope(state.selected); });
+            if (isBuiltin) resetBtn.disabled = false; // reset of an override is allowed even for builtins
+            row.appendChild(resetBtn);
+          }
+          ed.appendChild(row);
+          setSaveEnabled(!(isBuiltin || !state.structured), isBuiltin ? "Built-ins are immutable." : undefined);
+          setDirty(state.dirty);
+        }
+
+        function resetScope(name) {
+          // Reset = delete the scope's override (unset all fields) — server decides removal vs empty.
+          if (!window.confirm("Reset " + state.scope + " override for \"" + name + "\"? This deletes the " + state.scope + " layer entry.")) return;
+          var hash = currentHashFor(state.scope);
+          var params = { action: "delete", name: name, scope: state.scope };
+          if (hash !== undefined) {
+            if (hash === null) { window.alert("No " + state.scope + " override exists to reset."); return; }
+            params.expectedSourceHash = hash;
+          }
+          request("profile.mutate", params).then(function (res) {
+            if (res && res.ok) { state.draft = {}; setDirty(false); refreshAll(name); }
+            else {
+              var mapped = mapError(res && res.error);
+              state.globalError = mapped.message;
+              renderEditor();
+            }
+          });
+        }
+
+        function saveDraft() {
+          state.fieldErrors = {}; state.globalError = null; state.conflict = null;
+          var shape = clientShapeErrors();
+          if (Object.keys(shape).length) {
+            state.fieldErrors = shape;
+            state.globalError = "Fix the highlighted fields, then save again. Server validation still applies.";
+            renderEditor();
+            return;
+          }
+          var isCreate = state.draftMode === "create";
+          var name = isCreate ? String(state.draft.name || "").trim() : state.selected;
+          if (!name || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name) || name.length > 64) {
+            state.globalError = "Invalid profile name: use 1-64 chars matching [A-Za-z0-9][A-Za-z0-9_-]*.";
+            renderEditor();
+            return;
+          }
+          if (name === "__proto__" || name === "constructor" || name === "prototype") {
+            state.globalError = "Reserved profile name.";
+            renderEditor();
+            return;
+          }
+          var scope = state.scope;
+          var hash = isCreate ? undefined : currentHashFor(scope);
+          var params;
+          if (isCreate) {
+            var initial = draftPatch();
+            params = { action: "create", name: name, scope: scope, initial: initial };
+            // Fresh installs often have no file for the scope: assert absence explicitly when known.
+            if (hash === null) params.expectedAbsent = true;
+            else if (typeof hash === "string") params.expectedSourceHash = hash;
+          } else {
+            if (BUILTIN_PROFILES.indexOf(name) !== -1) {
+              state.globalError = 'Built-in "' + name + '" is immutable: clone it instead.';
+              renderEditor();
+              return;
+            }
+            params = { action: "patch", name: name, scope: scope, patch: draftPatch() };
+            if (hash !== undefined) {
+              if (hash === null) params.expectedAbsent = true;
+              else params.expectedSourceHash = hash;
+            }
+          }
+          var ed = document.getElementById("profile-editor");
+          request("profile.mutate", params).then(function (res) {
+            if (res && res.ok) {
+              // Round-trip authoritative state: refresh list + detail from returned state.
+              state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
+              setDirty(false);
+              refreshAll(name);
+            } else {
+              var mapped = mapError(res && res.error);
+              if (mapped.isConflict) {
+                state.conflict = mapped.message + " Reload to compare; never silently overwriting.";
+                renderEditor();
+              } else if (mapped.field !== "_global") {
+                state.fieldErrors[mapped.field] = mapped.message;
+                state.globalError = "Server validation failed — see the highlighted field.";
+                renderEditor();
+              } else {
+                state.globalError = "(" + mapped.kind + ") " + mapped.message;
+                renderEditor();
+              }
+            }
+          }, function () {
+            state.globalError = "Bridge request failed.";
+            renderEditor();
+          });
+        }
+
+        function loadLaunchPreview(name) {
+          var box = document.getElementById("launch-preview");
+          var target = name || state.selected;
+          if (!target) { if (box) box.innerHTML = "<p class=\"muted\">Select a profile first.</p>"; return; }
+          if (!can("launch.preview")) { if (box) box.innerHTML = "<p class=\"muted\">launch.preview unavailable on this host.</p>"; return; }
+          if (box) box.innerHTML = "<p class=\"muted\">Loading launch preview via <code>launch.preview</code> (JEF-7 compiler, display-only)…</p>";
+          request("launch.preview", { name: target }).then(function (res) {
+            if (!box) return;
+            if (res && res.ok && res.result) {
+              var r = res.result;
+              var resolved = r.resolved || {};
+              var launch = r.launch || {};
+              var html = "<p><strong>Effective profile:</strong> " + esc(target) + "</p>";
+              html += "<p>Model/thinking: " + esc(resolved.model || "(no model)") + " / " + esc(resolved.thinking || "") + "</p>";
+              var tools = resolved.tools ? resolved.tools.join(", ") : "(defaults)";
+              html += "<p>Tools/skills/extensions/context: " + esc(tools) + " / " + esc((resolved.skills || []).join(", ") || "(none)") + " / " + esc((resolved.extensions || []).join(", ") || "(none)") + " / context " + (resolved.contextFiles ? "on" : "off") + "</p>";
+              html += "<p>Prompt source: " + esc((launch && launch.promptSource) || (r.promptSource) || "(see preview)") + "</p>";
+              var preview = (launch && launch.preview) || r.preview || "";
+              html += "<pre><code>" + esc(preview).slice(0, 4000) + "</code></pre>";
+              if (launch && launch.spec && launch.spec.args) {
+                html += "<p class=\"muted\">Sanitized argv (display-only, never executed):</p><pre><code>" + esc(JSON.stringify(launch.spec.args).slice(0, 2000)) + "</code></pre>";
+              }
+              box.innerHTML = html;
+            } else {
+              box.innerHTML = "<p><strong>Preview failed.</strong> <span class=\"muted\">" + esc((res && res.error && res.error.code + ": " + res.error.message) || "unavailable") + "</span></p>";
+            }
+          });
+        }
+
+        function refreshAll(selectAfter) {
+          if (!state.structured) return;
+          var ops = [];
+          if (can("profiles.list")) {
+            ops.push(request("profiles.list").then(function (res) {
+              if (res && res.ok && res.result) {
+                state.profiles = toListItems(res.result);
+                if (selectAfter) state.selected = selectAfter;
+                renderList();
+                if (state.selected) loadDetail(state.selected);
+              }
+            }));
+          }
+          if (can("orchestration.get")) {
+            request("orchestration.get").then(function (res) {
+              var box = document.getElementById("orchestration-summary");
+              if (!box) return;
+              if (res && res.ok) box.innerHTML = "<pre><code>" + esc(JSON.stringify(res.result).slice(0, 3000)) + "</code></pre><p class=\"muted\">Full mapping UI lands in UI1.4.</p>";
+              else box.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "unavailable") + "</p>";
+            });
+          } else {
+            var ob = document.getElementById("orchestration-summary");
+            if (ob) ob.innerHTML = "<p class=\"muted\">orchestration.get unavailable on this host. Full UI in UI1.4.</p>";
+          }
+          if (can("github.status")) {
+            request("github.status").then(function (res) {
+              var box = document.getElementById("github-summary");
+              if (!box) return;
+              if (res && res.ok) box.innerHTML = "<pre><code>" + esc(JSON.stringify(res.result).slice(0, 3000)) + "</code></pre><p class=\"muted\">Redacted only. Full health UI in UI1.5.</p>";
+              else box.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "unavailable") + "</p>";
+            });
+          } else {
+            var gb = document.getElementById("github-summary");
+            if (gb) gb.innerHTML = "<p class=\"muted\">github.status unavailable on this host. Full UI in UI1.5.</p>";
+          }
+          loadDiagnostics();
+          return Promise.all(ops);
+        }
+
+        function loadDiagnostics() {
+          var box = document.getElementById("diagnostics-summary");
+          if (!box) return;
+          if (!can("diagnostics.doctor")) { box.innerHTML = "<p class=\"muted\">diagnostics.doctor unavailable on this host.</p>"; return; }
+          box.innerHTML = "<p class=\"muted\">Loading diagnostics…</p>";
+          request("diagnostics.doctor").then(function (res) {
+            if (res && res.ok) box.innerHTML = "<pre><code>" + esc(JSON.stringify(res.result, null, 2).slice(0, 5000)) + "</code></pre>";
+            else box.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "unavailable") + "</p>";
+          });
+          if (can("profile.validate")) {
+            request("profile.validate").then(function (res) {
+              if (res && res.ok) box.innerHTML += "<p>Profile validation: " + esc(JSON.stringify(res.result).slice(0, 2000)) + "</p>";
+            });
+          }
+        }
+
+        function boot() {
+          initTabs();
+          var refresh = document.getElementById("btn-refresh");
+          if (refresh) refresh.addEventListener("click", function () {
+            if (state.dirty && !window.confirm("Unsaved changes will be lost. Refresh anyway?")) return;
+            state.draft = {}; setDirty(false); refreshAll(state.selected);
+          });
+          var create = document.getElementById("btn-create");
+          if (create) create.addEventListener("click", startCreate);
+          var defScope = document.getElementById("default-scope");
+          if (defScope) defScope.addEventListener("change", function () { state.scope = defScope.value; });
+          var lp = document.getElementById("btn-launch-preview");
+          if (lp) lp.addEventListener("click", function () { loadLaunchPreview(null); });
+          var dr = document.getElementById("btn-diagnostics-reload");
+          if (dr) dr.addEventListener("click", loadDiagnostics);
+
+          var b = bridge();
+          var st = document.getElementById("bridge-state");
+          if (!b || typeof b.request !== "function") {
+            showDegraded("Structured bridge seam not present; live editing requires the bridge worker.");
+            var sum = document.getElementById("profiles-summary");
+            if (sum) sum.innerHTML = "<p><strong>No live data in the panel.</strong></p><p>Run in a terminal for live diagnostics (read-only):</p><pre><code>orca-pi profiles list\norca-pi profile show &lt;name&gt;\norca-pi profile validate</code></pre>";
+            return;
+          }
+          if (st) st.innerHTML = '<div class="cc-badge"><p class="muted">Bridge: confirming structured support (<code>bridge.capabilities</code>, protocol 1)…</p></div>';
+          var capReq = { protocolVersion: PROTOCOL_VERSION, requestId: newRequestId("cc"), operation: "bridge.capabilities" };
+          var pending = b.request(capReq);
+          if (!pending || typeof pending.then !== "function") { showDegraded("Bridge request failed."); return; }
+          pending.then(function (capRes) {
+            try {
+              if (!capRes || capRes.requestId !== capReq.requestId) return;
+              var ops = (capRes.ok && capRes.result && capRes.result.supportedOperations) || [];
+              var structured = !!(capRes.ok && capRes.result && capRes.result.structured === true && ops.indexOf("profiles.list") !== -1);
+              state.structured = structured;
+              state.supportedOps = ops;
+              state.capabilities = capRes.ok ? capRes.result : null;
+              if (!structured) {
+                var why = capRes.ok ? "structured support not negotiated (versions/consent unverified)" : ((capRes.error && capRes.error.code + ": " + capRes.error.message) || "unavailable");
+                showDegraded(why + ". Mutations stay disabled.");
+                return;
+              }
+              showBridgeState("Bridge: live (<code>profiles.list</code> ok, bridge " + BRIDGE_VERSION + ").", false);
+              setSaveEnabled(true);
+              refreshAll(null);
+            } catch (e) {}
+          }, function () { showDegraded("Bridge capabilities check failed."); });
+        }
+
+        try { boot(); } catch (e) {}
+      })();
+    </script>
+  </body>
+</html>

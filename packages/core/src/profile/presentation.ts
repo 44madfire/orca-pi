@@ -187,6 +187,7 @@ export interface ProfileLayerContext {
 export interface ProfileSummary {
   name: string;
   displayName?: string;
+  provider?: string;
   model?: string;
   thinking: ThinkingLevel;
   /** Undefined when the profile leaves tools to Pi defaults. */
@@ -200,6 +201,18 @@ export interface ProfileSummary {
   discoverExtensions: boolean;
   session: SessionMode;
   extendsChain: readonly string[];
+  /** Immediate parent (`extends`) when the profile inherits, else undefined. */
+  extends?: string;
+  /** Logical GitHub identity slot (`worker`, `reviewer`, custom) when set. */
+  githubIdentity?: string;
+  /**
+   * Authoritative layer that last defines this profile name.
+   * `builtin` = shipped default with no user/project override,
+   * `user` = user/global override wins (no project override),
+   * `project` = project override wins. Mirrors merge precedence
+   * builtins < user < project for the Control Center list.
+   */
+  layer?: "builtin" | "user" | "project";
   sourceLabel?: string;
   valid: boolean;
   validationError?: string;
@@ -447,13 +460,23 @@ export function getFieldProvenance(
 /** Build a metadata-only summary from an already-resolved profile. */
 export function summarizeResolvedProfile(
   resolved: ResolvedPiProfile,
-  options?: { sourceLabel?: string; valid?: boolean; validationError?: string },
+  options?: {
+    sourceLabel?: string;
+    valid?: boolean;
+    validationError?: string;
+    layer?: "builtin" | "user" | "project";
+  },
 ): ProfileSummary {
+  const parent =
+    resolved.extendsChain.length >= 2
+      ? resolved.extendsChain[resolved.extendsChain.length - 2]
+      : undefined;
   return {
     name: resolved.name,
     ...(resolved.displayName !== undefined
       ? { displayName: resolved.displayName }
       : {}),
+    ...(resolved.provider !== undefined ? { provider: resolved.provider } : {}),
     ...(resolved.model !== undefined ? { model: resolved.model } : {}),
     thinking: resolved.thinking,
     ...(resolved.tools !== undefined
@@ -467,6 +490,11 @@ export function summarizeResolvedProfile(
     discoverExtensions: resolved.discoverExtensions,
     session: resolved.session,
     extendsChain: resolved.extendsChain,
+    ...(parent !== undefined ? { extends: parent } : {}),
+    ...(resolved.githubIdentity !== undefined
+      ? { githubIdentity: resolved.githubIdentity }
+      : {}),
+    ...(options?.layer !== undefined ? { layer: options.layer } : {}),
     ...(options?.sourceLabel !== undefined
       ? { sourceLabel: options.sourceLabel }
       : {}),
@@ -564,10 +592,25 @@ export function validateAllProfiles(
   });
 }
 
+/**
+ * Layer that last defines `name` (builtins < user < project).
+ * Used by the Control Center list so builtin/user/project source is
+ * visible at a glance without flattening provenance.
+ */
+export function layerForProfile(
+  name: string,
+  layers: Pick<ProfileLayerContext, "builtinDoc" | "userDoc" | "projectDoc">,
+): "builtin" | "user" | "project" {
+  if (layers.projectDoc && Object.hasOwn(layers.projectDoc.profiles, name)) return "project";
+  if (layers.userDoc && Object.hasOwn(layers.userDoc.profiles, name)) return "user";
+  return "builtin";
+}
+
 /** Summarize every profile, marking unresolvable ones invalid (no throw). */
 export function summarizeAllProfiles(layers: ProfileLayerContext): ProfileSummary[] {
   const names = Object.keys(layers.mergedDoc.profiles).sort();
   return names.map((name) => {
+    const layer = layerForProfile(name, layers);
     try {
       const resolved = resolveProfile(name, layers.mergedDoc);
       const entry = Object.hasOwn(layers.mergedDoc.profiles, name)
@@ -577,24 +620,40 @@ export function summarizeAllProfiles(layers: ProfileLayerContext): ProfileSummar
         ...(entry?.sourceLabel !== undefined
           ? { sourceLabel: entry.sourceLabel }
           : {}),
+        layer,
         valid: true,
       });
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
       // Unresolvable profiles still appear in lists so `validate` can point
       // at the exact bad field/source; execution defaults fill the rest.
+      // Surface raw merged values when available so the list still shows
+      // model/provider/identity/parent for broken hand-edited configs.
+      const raw = Object.hasOwn(layers.mergedDoc.profiles, name)
+        ? layers.mergedDoc.profiles[name]
+        : undefined;
       return {
         name,
-        thinking: BUILTIN_PROFILE_DEFAULTS.thinking,
-        skillNames: [],
-        skillCount: 0,
-        extensionCount: 0,
-        contextFiles: BUILTIN_PROFILE_DEFAULTS.contextFiles,
-        discoverSkills: BUILTIN_PROFILE_DEFAULTS.discoverSkills,
-        discoverExtensions: BUILTIN_PROFILE_DEFAULTS.discoverExtensions,
-        session: BUILTIN_PROFILE_DEFAULTS.session,
+        ...(raw?.displayName !== undefined ? { displayName: raw.displayName } : {}),
+        ...(raw?.provider !== undefined ? { provider: raw.provider } : {}),
+        ...(raw?.model !== undefined ? { model: raw.model } : {}),
+        thinking: raw?.thinking ?? BUILTIN_PROFILE_DEFAULTS.thinking,
+        ...(raw?.tools !== undefined
+          ? { toolCount: raw.tools.length, tools: [...raw.tools] }
+          : {}),
+        skillNames: raw?.skills !== undefined ? [...raw.skills] : [],
+        skillCount: raw?.skills?.length ?? 0,
+        extensionCount: raw?.extensions?.length ?? 0,
+        contextFiles: raw?.contextFiles ?? BUILTIN_PROFILE_DEFAULTS.contextFiles,
+        discoverSkills: raw?.discoverSkills ?? BUILTIN_PROFILE_DEFAULTS.discoverSkills,
+        discoverExtensions:
+          raw?.discoverExtensions ?? BUILTIN_PROFILE_DEFAULTS.discoverExtensions,
+        session: raw?.session ?? BUILTIN_PROFILE_DEFAULTS.session,
         extendsChain: [],
+        ...(raw?.extends !== undefined ? { extends: raw.extends } : {}),
+        ...(raw?.githubIdentity !== undefined ? { githubIdentity: raw.githubIdentity } : {}),
+        layer,
+        ...(raw?.sourceLabel !== undefined ? { sourceLabel: raw.sourceLabel } : {}),
         valid: false,
         validationError: message,
       };
