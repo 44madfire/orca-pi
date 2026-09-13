@@ -285,18 +285,21 @@
               if (selected && focus) { try { t.focus(); } catch (e) {} }
             }
           }
+          // Single guarded entry for both mouse and keyboard activation:
+          // dirty editors confirm before leaving Profiles (acceptance criteria).
+          function guardedSelect(tab, focus) {
+            if (state.dirty && !window.confirm("Unsaved profile changes will be lost. Switch sections anyway?")) return;
+            select(tab, focus);
+          }
           tabs.forEach(function (tab, idx) {
-            tab.addEventListener("click", function () {
-              if (state.dirty && !window.confirm("Unsaved profile changes will be lost. Switch sections anyway?")) return;
-              select(tab, false);
-            });
+            tab.addEventListener("click", function () { guardedSelect(tab, false); });
             tab.addEventListener("keydown", function (ev) {
               var next = -1;
               if (ev.key === "ArrowRight") next = (idx + 1) % tabs.length;
               else if (ev.key === "ArrowLeft") next = (idx - 1 + tabs.length) % tabs.length;
               else if (ev.key === "Home") next = 0;
               else if (ev.key === "End") next = tabs.length - 1;
-              if (next !== -1) { ev.preventDefault(); select(tabs[next], true); }
+              if (next !== -1) { ev.preventDefault(); guardedSelect(tabs[next], true); }
             });
           });
         }
@@ -551,18 +554,23 @@
           if (state.dirty && state.selected !== name) {
             if (!window.confirm("Unsaved changes will be lost. Switch profiles anyway?")) return;
           }
+          // Invalidate any in-flight detail request so a slow earlier
+          // response can never render under a newer selection.
+          state.detailToken = (state.detailToken || 0) + 1;
           state.selected = name;
           state.draftMode = "edit";
           state.draft = {};
           state.fieldErrors = {};
           state.globalError = null;
           state.conflict = null;
+          state.detail = null;
           setDirty(false);
           renderList();
-          loadDetail(name);
+          loadDetail(name, state.detailToken);
         }
 
-        function loadDetail(name) {
+        function loadDetail(name, token) {
+          var myToken = token !== undefined ? token : ((state.detailToken = (state.detailToken || 0) + 1));
           var ed = document.getElementById("profile-editor");
           if (ed) ed.innerHTML = "<p class=\"muted\">Loading <code>" + esc(name) + "</code> via <code>profile.read</code>…</p>";
           if (!can("profile.read")) {
@@ -571,6 +579,8 @@
           }
           request("profile.read", { name: name }).then(function (res) {
             if (!res || res.requestId === undefined) return;
+            // Stale guard: ignore responses for a superseded selection/request.
+            if (myToken !== state.detailToken || name !== state.selected) return;
             if (res.ok && res.result) {
               state.detail = res.result;
               // Seed scope default: prefer project when it exists, else user.
@@ -580,16 +590,19 @@
               state.scope = def ? def.value : (hasProject ? "project" : hasUser ? "user" : "project");
               renderEditor();
             } else {
+              if (myToken !== state.detailToken || name !== state.selected) return;
               var msg = (res.error && res.error.code + ": " + res.error.message) || "unavailable";
               if (ed) ed.innerHTML = "<p><strong>Could not load profile.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
             }
           }, function () {
+            if (myToken !== state.detailToken || name !== state.selected) return;
             if (ed) ed.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
           });
         }
 
         function startCreate() {
           if (state.dirty && !window.confirm("Unsaved changes will be lost. Start a new profile anyway?")) return;
+          state.detailToken = (state.detailToken || 0) + 1;
           state.selected = null;
           state.detail = null;
           state.draftMode = "create";

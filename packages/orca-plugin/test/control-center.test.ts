@@ -240,6 +240,9 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("confirm");
     expect(html).toContain("per-layer");
     expect(html).toContain("discards");
+    expect(html).toContain("guardedSelect");
+    expect(html).toContain("detailToken");
+    expect(html).toContain("myToken");
     expect(html).toContain("@media");
     expect(html).toContain("focus-visible");
   });
@@ -581,6 +584,73 @@ describe("control center: bridge negotiation in the shipped script", () => {
     const html = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
     expect(html).toContain("per-layer");
     expect(html).toContain("discards");
+  });
+
+  it("ignores stale profile.read responses (selection race safe)", async () => {
+    let resolveA: ((v: unknown) => void) | undefined;
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "profile.read"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              summaries: [
+                { name: "aaa", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["aaa"], layer: "project", valid: true },
+                { name: "bbb", thinking: "low", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: false, extendsChain: ["bbb"], layer: "project", valid: true },
+              ],
+            },
+          });
+        }
+        if (req.operation === "profile.read") {
+          const name = (req.params as { name?: string })?.name;
+          if (name === "aaa") {
+            return new Promise((resolve) => { resolveA = resolve as (v: unknown) => void; });
+          }
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              name: "bbb", exists: true, extendsChain: ["bbb"], displayName: "Bee",
+              source: {}, fields: {}, validation: { ok: true },
+              config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+              sourceHash: {},
+            },
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const items = dom.byId["profiles-list"]!.children;
+    expect(items.length).toBe(2);
+    const editA = findButtons(items[0]!).find((b) => b.textContent === "Edit")!;
+    const editB = findButtons(items[1]!).find((b) => b.textContent === "Edit")!;
+    for (const fn of editA.listeners["click"] ?? []) (fn as () => void)();
+    await flush(2);
+    for (const fn of editB.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    // B's fast response wins; A's slow response must be ignored when it arrives.
+    const textOf = (): string => JSON.stringify(dom.byId["profile-editor"]!.children.map((c) => c.textContent + JSON.stringify(c.children.map((k) => k.textContent))));
+    expect(textOf()).toContain("bbb");
+    resolveA!({
+      protocolVersion: 1, requestId: "stale-aaa", ok: true,
+      result: {
+        name: "aaa", exists: true, extendsChain: ["aaa"], displayName: "Stale-A",
+        source: {}, fields: {}, validation: { ok: true },
+        config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+        sourceHash: {},
+      },
+    });
+    await flush(4);
+    expect(textOf()).toContain("bbb");
+    expect(textOf()).not.toContain("Stale-A");
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {
