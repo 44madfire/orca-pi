@@ -589,17 +589,23 @@
             if (ed) ed.innerHTML = "<p class=\"muted\">profile.read unavailable on this host.</p>";
             return;
           }
+          // Preserve the live scope when reloading over a dirty draft (conflict
+          // recovery or background refresh): never silently retarget layers.
+          var scopeBefore = state.scope;
+          var dirtyBefore = state.dirty;
           request("profile.read", { name: name }).then(function (res) {
             if (!res || res.requestId === undefined) return;
-            // Stale guard: ignore responses for a superseded selection/request.
             if (myToken !== state.detailToken || name !== state.selected) return;
             if (res.ok && res.result) {
               state.detail = res.result;
-              // Seed scope default: prefer project when it exists, else user.
-              var hasProject = !!(res.result.source && res.result.source.project);
-              var hasUser = !!(res.result.source && res.result.source.user);
-              var def = document.getElementById("default-scope");
-              state.scope = def ? def.value : (hasProject ? "project" : hasUser ? "user" : "project");
+              if (dirtyBefore) {
+                state.scope = scopeBefore;
+              } else {
+                var hasProject = !!(res.result.source && res.result.source.project);
+                var hasUser = !!(res.result.source && res.result.source.user);
+                var def = document.getElementById("default-scope");
+                state.scope = def ? def.value : (hasProject ? "project" : hasUser ? "user" : "project");
+              }
               renderEditor();
             } else {
               if (myToken !== state.detailToken || name !== state.selected) return;
@@ -1293,14 +1299,15 @@
               state.profiles = toListItems(res.result);
               renderList();
               if (selectAfter) {
-                // Explicit post-save target: only restore when the user did
-                // not move on or dirty another draft meanwhile; never steal
-                // a live dirty editor without the discard guard.
-                var moved = state.selected !== selectionAtStart || state.dirty !== dirtyAtStart;
-                if (moved) {
-                  if (state.dirty && state.selected !== selectAfter) return;
-                  if (state.selected !== selectionAtStart) return;
+                // Post-save target: never reload over a newer dirty same-profile
+                // draft. If the editor became dirty or its revision advanced
+                // after this refresh began, keep list metadata only — even when
+                // the selected name still matches — so scope + draft survive.
+                if ((state.draftRev || 0) !== draftRevAtStart || state.dirty !== dirtyAtStart) {
+                  return;
                 }
+                var moved = state.selected !== selectionAtStart;
+                if (moved) return;
                 if (state.dirty && state.selected !== selectAfter) {
                   if (!window.confirm("Refresh wants to show \"" + selectAfter + "\" but you have unsaved changes. Discard them and switch?")) return;
                   state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;

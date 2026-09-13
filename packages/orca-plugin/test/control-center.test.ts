@@ -254,6 +254,8 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("draftRev");
     expect(html).toContain("touchDraft");
     expect(html).toContain("refreshListOnly");
+    expect(html).toContain("draftRevAtStart");
+    expect(html).toContain("scopeBefore");
     expect(html).toContain("@media");
     expect(html).toContain("focus-visible");
   });
@@ -764,6 +766,15 @@ describe("control center: bridge negotiation in the shipped script", () => {
     expect(html).toContain("editorGen");
     expect(html).toContain("intentPatch");
     expect(resolveMutate).toBeUndefined();
+  });
+
+  it("preserves user-scope drafts across post-save list races (no silent retarget)", async () => {
+    // Static contract for the same-profile race: selectAfter must respect
+    // draftRev, and detail reloads must preserve scope when dirty.
+    const html = readFileSync(join(here, "..", "panel", "control-center.html"), "utf8");
+    expect(html).toContain("draftRevAtStart");
+    expect(html).toContain("scopeBefore");
+    expect(html).toContain("dirtyBefore");
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {
