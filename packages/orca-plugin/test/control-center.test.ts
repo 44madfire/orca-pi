@@ -243,6 +243,9 @@ describe("control center: shipped script honors bridge + fallback contract", () 
     expect(html).toContain("guardedSelect");
     expect(html).toContain("detailToken");
     expect(html).toContain("myToken");
+    expect(html).toContain("listToken");
+    expect(html).toContain("freshHashFor");
+    expect(html).toContain("unversioned");
     expect(html).toContain("@media");
     expect(html).toContain("focus-visible");
   });
@@ -651,6 +654,59 @@ describe("control center: bridge negotiation in the shipped script", () => {
     await flush(4);
     expect(textOf()).toContain("bbb");
     expect(textOf()).not.toContain("Stale-A");
+  });
+
+  it("versions list deletes via fresh receipts (never unversioned)", async () => {
+    const calls: Array<{ op: string; params?: unknown }> = [];
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: unknown }) => {
+        calls.push({ op: req.operation, params: req.params });
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "profile.read", "profile.mutate"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { summaries: [{ name: "custom", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["custom"], layer: "project", valid: true }] },
+          });
+        }
+        if (req.operation === "profile.read") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              name: "custom", exists: true, extendsChain: ["custom"],
+              source: { project: { model: "m" } }, fields: {}, validation: { ok: true },
+              config: { userPath: "/u", projectPath: "/p", userExists: true, projectExists: true },
+              sourceHash: { project: "f".repeat(64) },
+            },
+          });
+        }
+        if (req.operation === "profile.mutate") {
+          const params = req.params as Record<string, unknown>;
+          expect(params.action).toBe("delete");
+          // Versioned: fresh receipt hash required, never omitted.
+          expect(params.expectedSourceHash).toBe("f".repeat(64));
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { action: "delete", profileName: "custom", scope: "project" },
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const items = dom.byId["profiles-list"]!.children;
+    const del = findButtons(items[0]!).find((b) => b.textContent.includes("Delete"))!;
+    expect(del).toBeDefined();
+    for (const fn of del.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    expect(calls.some((c) => c.op === "profile.read")).toBe(true);
+    expect(calls.some((c) => c.op === "profile.mutate")).toBe(true);
   });
 
   it("loads launch previews display-only via the compiler (never argv)", async () => {

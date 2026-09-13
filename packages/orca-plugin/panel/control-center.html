@@ -615,6 +615,24 @@
           renderEditor();
         }
 
+        // Fetch a fresh read receipt for versioned writes initiated outside
+        // the editor (list rows). Never mutate unversioned: a missing receipt
+        // aborts instead of deleting newer unseen overrides without conflict.
+        function freshHashFor(name, scope) {
+          if (!can("profile.read")) return Promise.resolve({ hash: undefined, error: "profile.read unavailable" });
+          return request("profile.read", { name: name }).then(function (res) {
+            if (res && res.ok && res.result && res.result.sourceHash) {
+              var h = res.result.sourceHash[scope];
+              if (typeof h === "string") return { hash: h };
+              // File missing for this scope: assert absence so concurrent
+              // creators conflict instead of silently replacing.
+              return { hash: null };
+            }
+            var msg = (res && res.error && res.error.code + ": " + res.error.message) || "could not read fresh version";
+            return { hash: undefined, error: msg };
+          }, function () { return { hash: undefined, error: "bridge request failed" }; });
+        }
+
         function cloneProfile(source) {
           var dest = null;
           try { dest = window.prompt("Clone \"" + source + "\" to new profile name (e.g. worker-fast):", source + "-copy"); } catch (e) {}
@@ -626,38 +644,46 @@
           }
           var scopeEl = document.getElementById("default-scope");
           var scope = scopeEl ? scopeEl.value : "project";
-          var hash = currentHashFor(scope);
-          var params = { action: "clone", source: source, dest: dest, scope: scope };
-          if (hash !== undefined) {
-            if (hash === null) params.expectedAbsent = true;
-            else params.expectedSourceHash = hash;
-          }
-          request("profile.mutate", params).then(function (res) {
-            if (res && res.ok) { refreshAll(dest); }
-            else {
-              var mapped = mapError(res && res.error);
-              window.alert("Clone failed (" + mapped.kind + "): " + mapped.message);
+          // Versioned clone: fetch a fresh receipt for the scope file first.
+          freshHashFor(source, scope).then(function (receipt) {
+            if (receipt.hash === undefined) {
+              window.alert("Clone aborted: " + (receipt.error || "no fresh version") + ". Open the profile first, then retry.");
+              return;
             }
+            var params = { action: "clone", source: source, dest: dest, scope: scope };
+            if (receipt.hash === null) params.expectedAbsent = true;
+            else params.expectedSourceHash = receipt.hash;
+            request("profile.mutate", params).then(function (res) {
+              if (res && res.ok) { refreshAll(dest); }
+              else {
+                var mapped = mapError(res && res.error);
+                window.alert("Clone failed (" + mapped.kind + "): " + mapped.message);
+              }
+            });
           });
         }
 
         function deleteProfile(name, layer) {
           var scope = layer === "project" || layer === "user" ? layer : ((document.getElementById("default-scope") || {}).value || "project");
-          if (!window.confirm("Delete " + scope + " override/profile \"" + name + "\"? Built-ins are never deleted; this removes only the " + scope + " layer entry.")) return;
-          var hash = currentHashFor(scope);
-          var params = { action: "delete", name: name, scope: scope };
-          if (hash !== undefined) {
-            if (hash === null) params.expectedAbsent = true;
-            else params.expectedSourceHash = hash;
-          }
-          request("profile.mutate", params).then(function (res) {
-            if (res && res.ok) {
-              if (state.selected === name) { state.selected = null; state.detail = null; state.draft = {}; setDirty(false); }
-              refreshAll(null);
-            } else {
-              var mapped = mapError(res && res.error);
-              window.alert("Delete failed (" + mapped.kind + "): " + mapped.message);
+          // Fresh receipt first so the confirm names the exact versioned target.
+          freshHashFor(name, scope).then(function (receipt) {
+            if (receipt.hash === undefined) {
+              window.alert("Delete aborted: " + (receipt.error || "no fresh version") + ". Open the profile first, then retry — never deleting unversioned.");
+              return;
             }
+            if (!window.confirm("Delete " + scope + " override/profile \"" + name + "\"? Built-ins are never deleted; this removes only the " + scope + " layer entry.")) return;
+            var params = { action: "delete", name: name, scope: scope };
+            if (receipt.hash === null) params.expectedAbsent = true;
+            else params.expectedSourceHash = receipt.hash;
+            request("profile.mutate", params).then(function (res) {
+              if (res && res.ok) {
+                if (state.selected === name) { state.detailToken = (state.detailToken || 0) + 1; state.selected = null; state.detail = null; state.draft = {}; setDirty(false); }
+                refreshAll(null);
+              } else {
+                var mapped = mapError(res && res.error);
+                window.alert("Delete failed (" + mapped.kind + "): " + mapped.message);
+              }
+            });
           });
         }
 
@@ -1105,30 +1131,49 @@
             return;
           }
           var scope = state.scope;
-          var hash = isCreate ? undefined : currentHashFor(scope);
-          var params;
           if (isCreate) {
-            var initial = draftPatch();
-            params = { action: "create", name: name, scope: scope, initial: initial };
-            // Fresh installs often have no file for the scope: assert absence explicitly when known.
-            if (hash === null) params.expectedAbsent = true;
-            else if (typeof hash === "string") params.expectedSourceHash = hash;
+            // Versioned create: fetch a fresh receipt for the scope file so
+            // concurrent creators conflict instead of silently replacing.
+            freshHashFor(state.profiles.length ? state.profiles[0].name : name, scope).then(function (receipt) {
+              if (receipt.hash === undefined && state.profiles.length) {
+                state.globalError = "Create aborted: " + (receipt.error || "no fresh version") + ". Refresh, then retry.";
+                renderEditor();
+                return;
+              }
+              var initial = draftPatch();
+              var params = { action: "create", name: name, scope: scope, initial: initial };
+              if (receipt.hash === null || !state.profiles.length) {
+                // No file for this scope yet (or empty list): assert absence.
+                if (receipt.hash === null || !state.profiles.length) params.expectedAbsent = true;
+              } else if (typeof receipt.hash === "string") params.expectedSourceHash = receipt.hash;
+              submitMutate(params, name);
+            });
+            return;
           } else {
+            var hash = currentHashFor(scope);
+            // Editor patch is versioned from the loaded detail receipt;
+            // a missing receipt aborts instead of mutating unversioned.
+            if (hash === undefined) {
+              state.globalError = "Save aborted: no fresh version for this scope. Reload the profile, then retry — never saving unversioned.";
+              renderEditor();
+              return;
+            }
             // Builtin-named profiles patch the selected layer override;
             // the server rejects only base deletes with no override.
-            params = { action: "patch", name: name, scope: scope, patch: draftPatch() };
-            if (hash !== undefined) {
-              if (hash === null) params.expectedAbsent = true;
-              else params.expectedSourceHash = hash;
-            }
+            var patchParams = { action: "patch", name: name, scope: scope, patch: draftPatch() };
+            if (hash === null) patchParams.expectedAbsent = true;
+            else patchParams.expectedSourceHash = hash;
+            submitMutate(patchParams, name);
+            return;
           }
+          function submitMutate(params, targetName) {
           var ed = document.getElementById("profile-editor");
           request("profile.mutate", params).then(function (res) {
             if (res && res.ok) {
               // Round-trip authoritative state: refresh list + detail from returned state.
               state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
               setDirty(false);
-              refreshAll(name);
+              refreshAll(targetName);
             } else {
               var mapped = mapError(res && res.error);
               if (mapped.isConflict) {
@@ -1147,6 +1192,7 @@
             state.globalError = "Bridge request failed.";
             renderEditor();
           });
+          }
         }
 
         function loadLaunchPreview(name) {
@@ -1179,15 +1225,44 @@
         }
 
         function refreshAll(selectAfter) {
-          if (!state.structured) return;
+          if (!state.structured) return Promise.resolve([]);
+          // Generation guard: a stale list response must never retarget a
+          // live selection/draft. Capture selection + dirty at request time
+          // and only restore selectAfter when nothing changed meanwhile.
+          state.listToken = (state.listToken || 0) + 1;
+          var myListToken = state.listToken;
+          var selectionAtStart = state.selected;
+          var dirtyAtStart = state.dirty;
           var ops = [];
           if (can("profiles.list")) {
             ops.push(request("profiles.list").then(function (res) {
-              if (res && res.ok && res.result) {
-                state.profiles = toListItems(res.result);
-                if (selectAfter) state.selected = selectAfter;
+              if (myListToken !== state.listToken) return;
+              if (!res || !res.ok || !res.result) return;
+              state.profiles = toListItems(res.result);
+              renderList();
+              if (selectAfter) {
+                // Explicit post-save target: only restore when the user did
+                // not move on or dirty another draft meanwhile; never steal
+                // a live dirty editor without the discard guard.
+                var moved = state.selected !== selectionAtStart || state.dirty !== dirtyAtStart;
+                if (moved) {
+                  if (state.dirty && state.selected !== selectAfter) return;
+                  if (state.selected !== selectionAtStart) return;
+                }
+                if (state.dirty && state.selected !== selectAfter) {
+                  if (!window.confirm("Refresh wants to show \"" + selectAfter + "\" but you have unsaved changes. Discard them and switch?")) return;
+                  state.draft = {}; state.fieldErrors = {}; state.globalError = null; state.conflict = null;
+                  setDirty(false);
+                }
+                state.detailToken = (state.detailToken || 0) + 1;
+                state.selected = selectAfter;
                 renderList();
-                if (state.selected) loadDetail(state.selected);
+                loadDetail(selectAfter, state.detailToken);
+              } else if (state.selected) {
+                // Plain refresh: reload current selection only when it is
+                // still selected and no newer detail request superseded us.
+                if (state.selected !== selectionAtStart) return;
+                loadDetail(state.selected, state.detailToken);
               }
             }));
           }
