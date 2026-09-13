@@ -248,6 +248,13 @@ as redacted `github.status` refresh (full or role-scoped per
 worker/reviewer) plus the operator `orca-pi github mint` step surfaced in
 the panel's setup guidance, not as a typed mint operation.
 
+> **Coordinator note:** #32's acceptance criteria still list "User can
+> run identity doctor and refresh short-lived credentials from the UI
+> through typed backend operations." Please update that criterion to the
+> CLI-mint workflow described above rather than requesting a panel mint
+> operation — minting inside the panel would put short-lived secrets in
+> panel/LLM context and violate #32's own secret hygiene.
+
 ## Manual E2E acceptance (post-merge to main)
 
 1. Pull latest `main`, build/install `orca-pi` (`npm ci && npm run build`).

@@ -25,6 +25,7 @@ import {
   containsSecretMaterial,
   controlCenterSections,
   describeConfigHealth,
+  describeConfigPaths,
   describeDiagnosticsCli,
   describeGithubDoctorItem,
   describeGithubStatusItem,
@@ -32,6 +33,7 @@ import {
   describeTokenFreshness,
   describeWorktreeHealth,
   diagnosticsHeadline,
+  diagnosticsOverviewRows,
   DIAGNOSTICS_DETAIL_LIMIT,
   GITHUB_DEFAULT_AMBIENT,
   GITHUB_DEFAULT_REPO,
@@ -48,6 +50,7 @@ import {
   toDiagnosticsBridgeHealth,
   toDiagnosticsCliHealth,
   toDiagnosticsConfigHealth,
+  toDiagnosticsConfigPaths,
   toDiagnosticsWorktreeHealth,
   toGithubActorSummary,
   toGithubDoctorItems,
@@ -376,8 +379,8 @@ describe("ui1.5: diagnostics display", () => {
     expect(config.invalidCount).toBe(1);
     expect(describeConfigHealth(config)).toContain("1 invalid");
     expect(describeConfigHealth({ ok: true, invalidCount: 0, total: 3 })).toContain("all 3 valid");
-    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: true } })).toContain("ready");
-    expect(diagnosticsHeadline({ cli: { ok: false }, bridge: { structured: false }, config: { ok: false } })).toContain("action needed");
+    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } })).toContain("ready");
+    expect(diagnosticsHeadline({ cli: { ok: false }, bridge: { structured: false }, config: { ok: false }, worktree: { ok: false } })).toContain("action needed");
   });
 });
 
@@ -888,24 +891,37 @@ describe("ui1.5/p2: mapped profiles stay fresh regardless of response order", ()
 // ---------------------------------------------------------------------------
 
 describe("ui1.5/p2: diagnostics headline never claims ready without validation", () => {
+  const healthy = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } };
   it("requires explicit ok:true on every leg for ready", () => {
     expect(
-      diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: true } }),
+      diagnosticsHeadline(healthy),
     ).toContain("ready");
     // Unknown (pending/unavailable/malformed/failed) legs are action-needed.
-    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: undefined })).toContain(
+    expect(diagnosticsHeadline({ ...healthy, config: undefined })).toContain(
       "action needed",
     );
-    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: undefined })).toMatch(
+    expect(diagnosticsHeadline({ ...healthy, config: undefined })).toMatch(
       /pending\/unavailable/,
     );
-    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true } })).toContain("action needed");
+    expect(diagnosticsHeadline({ cli: healthy.cli, bridge: healthy.bridge, worktree: healthy.worktree })).toContain("action needed");
     expect(
-      diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: false } }),
+      diagnosticsHeadline({ ...healthy, config: { ok: false } }),
     ).toContain("action needed");
     expect(
-      diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: false } }),
+      diagnosticsHeadline({ ...healthy, config: { ok: false } }),
     ).toMatch(/profiles need attention/);
+  });
+
+  it("requires an explicit healthy worktree result (pending/unavailable/failed never ready)", () => {
+    const cliBridgeConfig = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true } };
+    // Regression: CLI, bridge, and config all healthy, but worktree.context
+    // rejects (pending) or fails — the headline must stay action-needed.
+    expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: undefined })).toContain("action needed");
+    expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: undefined })).toMatch(/worktree scope pending\/unavailable/);
+    expect(diagnosticsHeadline({ ...cliBridgeConfig })).toContain("action needed");
+    expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: { ok: false } })).toContain("action needed");
+    expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: { ok: false } })).toMatch(/worktree scope unavailable/);
+    expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: { ok: true } })).toContain("ready");
   });
 
   it("treats malformed/unavailable validate payloads as unknown (never valid)", () => {
@@ -1007,5 +1023,131 @@ describe("ui1.5/p2: scoped status merges into the panel snapshot", () => {
     expect(html).toContain("state.githubStatus = mergeGithubStatus(state.githubStatus, res.result)");
     expect(html).toContain("renderGithubStatus(state.githubStatus)");
     expect(html).not.toContain("state.githubStatus = res.result;");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UI1.5 Diagnostics: one-place redacted overview (runtime/bridge/worktree/
+// profiles+paths/roles/launch/GitHub) + worktree-gated headline wiring
+// ---------------------------------------------------------------------------
+
+describe("ui1.5: diagnostics one-place overview rows", () => {
+  const fullInput = {
+    diagnostics: {
+      orcaPiVersion: "0.1.0",
+      bridgeVersion: "1.0.0",
+      protocolVersion: 1,
+      cli: {
+        orca: { executable: "orca", found: true, version: "1.4.196", detail: "orca 1.4.196" },
+        pi: { executable: "pi", found: true, version: "0.84.4", detail: "pi 0.84.4" },
+        ok: true,
+      },
+      bridge: { structured: true, degraded: false, versionsOk: true, consentOk: true, seamHandshake: true, supportedOperations: ["profiles.list", "launch.preview"], reasons: [] },
+    },
+    validate: { entries: [{ name: "worker", valid: true }], ok: true },
+    profilesList: {
+      summaries: [{ name: "worker", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["worker"], valid: true }],
+      panel: {
+        profiles: [],
+        validation: { ok: true, invalidCount: 0 },
+        config: { userPath: "/home/u/.pi/profiles.yaml", projectPath: "/repo/p/.pi/profiles.yaml", userExists: true, projectExists: false },
+      },
+    },
+    orchestration: {
+      effective: { worker: "worker", reviewer: "reviewer" },
+      provenance: { worker: "builtin", reviewer: "builtin" },
+    },
+    knownProfiles: ["worker", "reviewer"],
+    githubStatus: {
+      identities: {
+        worker: { configured: true, sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN", expired: false },
+        reviewer: { configured: true, sourceLabel: "ORCA_PI_GITHUB_REVIEWER_TOKEN", expired: false },
+      },
+      redacted: true,
+    },
+    githubDoctor: {
+      workerLogin: "orca-pi-worker[bot]",
+      reviewerLogin: "orca-pi-reviewer[bot]",
+      ambientLogin: "44madfire",
+      distinctWorkerReviewer: true,
+      distinctFromAmbient: true,
+      distinctDetail: "orca-pi-worker[bot] != orca-pi-reviewer[bot] != 44madfire : distinct (ok)",
+      setupNeeded: [],
+      ok: true,
+    },
+    launchPreviewSupported: true,
+    worktree: { projectRoot: "/repo/p", explicit: true },
+  };
+
+  it("reports all required health in row order without secrets", () => {
+    const rows = diagnosticsOverviewRows(fullInput);
+    expect(rows.map((r) => r.label)).toEqual([
+      "Runtime", "Bridge", "Worktree", "Profiles", "Roles", "Launch", "GitHub status", "GitHub doctor",
+    ]);
+    const byLabel = new Map(rows.map((r) => [r.label, r.detail]));
+    expect(byLabel.get("Runtime")).toContain("orca 1.4.196");
+    expect(byLabel.get("Runtime")).toContain("orca-pi 0.1.0");
+    expect(byLabel.get("Bridge")).toContain("structured");
+    expect(byLabel.get("Worktree")).toContain("/repo/p");
+    expect(byLabel.get("Profiles")).toContain("all 1 valid");
+    expect(byLabel.get("Profiles")).toContain("/home/u/.pi/profiles.yaml (present)");
+    expect(byLabel.get("Profiles")).toContain("/repo/p/.pi/profiles.yaml (absent)");
+    expect(byLabel.get("Roles")).toContain("worker→worker");
+    expect(byLabel.get("Roles")).toContain("reviewer→reviewer");
+    expect(byLabel.get("Launch")).toContain("launch.preview");
+    expect(byLabel.get("GitHub status")).toContain("worker: configured");
+    expect(byLabel.get("GitHub doctor")).toContain("distinct (ok)");
+    for (const row of rows) {
+      expect(containsSecretMaterial(row.detail)).toBe(false);
+      expect(isSecretFreePayload({ detail: row.detail })).toBe(true);
+    }
+  });
+
+  it("renders missing legs as pending/unavailable, never healthy", () => {
+    const rows = diagnosticsOverviewRows({});
+    expect(rows).toHaveLength(8);
+    const text = rows.map((r) => `${r.label}: ${r.detail}`).join("\n");
+    expect(text).toMatch(/unavailable|pending|not loaded|not run|no mappings/);
+    expect(text).not.toMatch(/— ready/);
+    expect(text).not.toContain("distinct (ok)");
+    expect(text).not.toMatch(/all [1-9]\d* valid/);
+    expect(text).not.toMatch(/all [1-9]\d* mapping/);
+    for (const row of rows) expect(containsSecretMaterial(row.detail)).toBe(false);
+  });
+
+  it("extracts config paths allowlist-only (never values)", () => {
+    expect(toDiagnosticsConfigPaths(null)).toBeUndefined();
+    expect(toDiagnosticsConfigPaths({})).toBeUndefined();
+    expect(toDiagnosticsConfigPaths({ panel: {} })).toBeUndefined();
+    const paths = toDiagnosticsConfigPaths(fullInput.profilesList)!;
+    expect(paths.userPath).toBe("/home/u/.pi/profiles.yaml");
+    expect(paths.projectExists).toBe(false);
+    expect(describeConfigPaths(undefined)).toContain("unavailable");
+    expect(describeConfigPaths(paths)).toContain("absent");
+    expect(isSecretFreePayload(paths)).toBe(true);
+  });
+
+  it("panel tracks the worktree leg and renders the one-place overview", () => {
+    const html = controlHtml();
+    // Four-leg headline with explicit worktree gating.
+    expect(html).toContain("renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk)");
+    expect(html).toContain("worktree scope pending/unavailable");
+    expect(html).toContain("worktree scope unavailable");
+    expect(html).toContain("worktree scope confirmed");
+    // worktree.context failure/rejection can never leave a ready headline.
+    expect(html).toContain("worktreeOk = false");
+    expect(html).toContain("worktree context failed (bridge request failed)");
+    // Raw typed payloads feed the overview (in-memory state only).
+    expect(html).toContain("state.profilesRaw");
+    expect(html).toContain("state.diagnosticsValidate");
+    expect(html).toContain("state.diagnosticsWorktree");
+    // One-place surface with all required rows, sanitized before esc().
+    expect(html).toContain('id="diagnostics-overview"');
+    expect(html).toContain("function renderDiagnosticsOverview()");
+    for (const label of ["Runtime", "Bridge", "Worktree", "Profiles", "Roles", "Launch", "GitHub status", "GitHub doctor"]) {
+      expect(html).toContain(`"${label}"`);
+    }
+    expect(html).toContain("sanitizeDiagnosticsDetail(rows[i][1])");
+    expect(containsSecretMaterial(html)).toBe(false);
   });
 });

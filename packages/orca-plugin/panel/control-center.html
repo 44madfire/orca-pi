@@ -275,6 +275,7 @@
             <h2>Diagnostics</h2>
             <p class="muted">Runtime, plugin, Pi, orca-pi, config, bridge, and worktree health via <code>diagnostics.doctor</code>, <code>profile.validate</code>, <code>worktree.context</code>, and <code>orchestration.get</code>. CLI remains authoritative (<code>orca-pi doctor</code>).</p>
             <div id="diagnostics-summary" aria-live="polite"><p class="muted">Loading diagnostics…</p></div>
+            <div id="diagnostics-overview" aria-live="polite"></div>
             <div id="diagnostics-runtime" aria-live="polite"></div>
             <div id="diagnostics-bridge" aria-live="polite"></div>
             <div id="diagnostics-config" aria-live="polite"></div>
@@ -448,6 +449,11 @@
           githubDoctorToken: 0,
           diagnostics: null,
           diagnosticsToken: 0,
+          // Raw typed payloads backing the one-place overview (in-memory
+          // panel state only — never persisted; stale-guarded by tokens).
+          profilesRaw: null,
+          diagnosticsValidate: null,
+          diagnosticsWorktree: null,
         };
         var ORCH_BUILTINS = ["worker", "scout", "reviewer"];
         var ORCH_CHAIN = "Orchestration role mapping → profile → user/project profile layers → effective launch";
@@ -2077,6 +2083,7 @@
             renderOrchList();
             loadOrchContext();
             renderGithubMapped();
+            renderDiagnosticsOverview();
           });
         }
         // -----------------------------------------------------------------
@@ -2331,6 +2338,7 @@
               state.githubStatus = mergeGithubStatus(state.githubStatus, res.result);
               renderGithubStatus(state.githubStatus);
               renderGithubMapped();
+              renderDiagnosticsOverview();
               return state.githubStatus;
             }
             var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
@@ -2372,6 +2380,7 @@
               renderGithubDoctor(res.result);
               renderGithubActor(res.result);
               renderGithubSetup(res.result);
+              renderDiagnosticsOverview();
               return res.result;
             }
             var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
@@ -2412,6 +2421,7 @@
               renderOrchList();
               loadOrchContext();
               renderGithubMapped();
+              renderDiagnosticsOverview();
               if (selectAfter && !wasDirty && (state.orchDraftRev || 0) === revBefore) {
                 state.orchSelected = selectAfter;
                 // Centralized helper: post-save/refresh drafts come from the
@@ -2444,6 +2454,7 @@
           return request("profiles.list").then(function (res) {
             if (myTok !== state.listToken) return;
             if (!res || !res.ok || !res.result) return;
+            state.profilesRaw = res.result;
             state.profiles = toListItems(res.result);
             renderList();
             // Keep role→profile→identity fresh: profiles.list success
@@ -2455,6 +2466,7 @@
               renderOrchList();
             }
             renderGithubMapped();
+            renderDiagnosticsOverview();
           });
         }
 
@@ -2470,6 +2482,7 @@
             ops.push(request("profiles.list").then(function (res) {
               if (myListToken !== state.listToken) return;
               if (!res || !res.ok || !res.result) return;
+              state.profilesRaw = res.result;
               state.profiles = toListItems(res.result);
               renderList();
               // Recompute orchestration invalid flags with fresh profile names
@@ -2482,6 +2495,7 @@
               // Rerender mapped role→profile→identity after every
               // profiles.list update (both response orders stay fresh).
               renderGithubMapped();
+              renderDiagnosticsOverview();
               if (selectAfter) {
                 // Post-save target: never reload over a newer dirty same-profile
                 // draft. If the editor became dirty or its revision advanced
@@ -2558,21 +2572,95 @@
           if (out.length <= DIAGNOSTICS_DETAIL_LIMIT) return out;
           return out.slice(0, DIAGNOSTICS_DETAIL_LIMIT) + "… [truncated]";
         }
-        function renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk) {
+        function renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk) {
           var box = document.getElementById("diagnostics-summary");
           if (!box) return;
-          // Unknown config (unavailable/pending/malformed/failed) is never
+          // Unknown legs (unavailable/pending/malformed/failed) are never
           // ready — fail closed to pending/unavailable, never "ready".
-          if (cliOk && bridgeStructured && configOk === true) {
-            box.innerHTML = "<p><strong>Diagnostics: ready</strong> <span class=\"muted\">— CLIs available, structured bridge reachable, config valid. CLI remains authoritative (<code>orca-pi doctor</code>).</span></p>";
+          // The worktree leg must be an explicit healthy worktree.context
+          // result: no confirmed project/worktree scope, no ready headline.
+          if (cliOk && bridgeStructured && configOk === true && worktreeOk === true) {
+            box.innerHTML = "<p><strong>Diagnostics: ready</strong> <span class=\"muted\">— CLIs available, structured bridge reachable, config valid, worktree scope confirmed. CLI remains authoritative (<code>orca-pi doctor</code>).</span></p>";
           } else {
             var parts = [];
             if (!cliOk) parts.push("CLIs need attention (run <code>orca-pi doctor</code>)");
             if (!bridgeStructured) parts.push("bridge degraded (explicit CLI fallback)");
             if (configOk === undefined) parts.push("profiles validation pending/unavailable (run <code>orca-pi profile validate</code>)");
             else if (configOk !== true) parts.push("profiles need attention (run <code>orca-pi profile validate</code>)");
+            if (worktreeOk === undefined) parts.push("worktree scope pending/unavailable (requires <code>worktree.context</code> over the structured bridge)");
+            else if (worktreeOk !== true) parts.push("worktree scope unavailable (requires <code>worktree.context</code> over the structured bridge)");
             box.innerHTML = "<p><strong>Diagnostics: action needed</strong> <span class=\"muted\">— " + parts.join("; ") + ".</span></p>";
           }
+        }
+
+        // One-place redacted overview: runtime, bridge, worktree, profiles
+        // (+ config paths), roles, launch compiler, GitHub status/doctor —
+        // composed from allowlisted typed state only (never CLI scraping,
+        // never secrets; details sanitized + bounded before esc()).
+        // Mirrors control-center.ts diagnosticsOverviewRows.
+        function renderDiagnosticsOverview() {
+          var box = document.getElementById("diagnostics-overview");
+          if (!box) return;
+          var rows = [];
+          var d = state.diagnostics;
+          if (d && typeof d === "object" && !Array.isArray(d) && d.cli && typeof d.cli === "object" && d.cli.orca && d.cli.pi) {
+            var oL = d.cli.orca.version ? ("orca " + d.cli.orca.version) : (d.cli.orca.found ? "orca (version unknown)" : "orca missing");
+            var pL = d.cli.pi.version ? ("pi " + d.cli.pi.version) : (d.cli.pi.found ? "pi (version unknown)" : "pi missing");
+            rows.push(["Runtime", oL + ", " + pL + (d.cli.ok === true ? " — ready." : " — action needed.") +
+              " orca-pi " + (d.orcaPiVersion || "(unknown)") + " / bridge " + (d.bridgeVersion || "(unknown)") + " / protocol " + String(d.protocolVersion !== undefined ? d.protocolVersion : "(unknown)") + "."]);
+          } else {
+            rows.push(["Runtime", "CLI health unavailable — run `orca-pi doctor` for live orca/pi versions."]);
+          }
+          var b = (d && typeof d === "object" && !Array.isArray(d)) ? d.bridge : null;
+          if (b && typeof b === "object" && !Array.isArray(b)) {
+            var bOps = Array.isArray(b.supportedOperations) ? b.supportedOperations.length : 0;
+            rows.push(["Bridge", (b.structured === true ? "structured" : "degraded (read-only CLI fallback)") + " · " + bOps + " supported operation(s)."]);
+          } else {
+            rows.push(["Bridge", "bridge negotiation unavailable in this response."]);
+          }
+          var w = state.diagnosticsWorktree;
+          if (w && typeof w === "object" && !Array.isArray(w) && typeof w.projectRoot === "string" && w.projectRoot) {
+            rows.push(["Worktree", w.projectRoot + (w.explicit === true ? " (explicit scope)" : " (implicit scope; mutations need explicit worktree.projectRoot)") + "."]);
+          } else {
+            rows.push(["Worktree", "worktree scope pending/unavailable (requires `worktree.context`)."]);
+          }
+          var v = state.diagnosticsValidate;
+          var vEntries = (v && typeof v === "object" && Array.isArray(v.entries)) ? v.entries : null;
+          var vInvalid = 0;
+          if (vEntries) { for (var vi = 0; vi < vEntries.length; vi += 1) { if (vEntries[vi] && vEntries[vi].valid === false) vInvalid += 1; } }
+          var vLine = (vEntries && v.ok === true && vInvalid === 0)
+            ? ("all " + vEntries.length + " profile(s) valid")
+            : (vEntries ? (vInvalid + " invalid of " + vEntries.length) : "validation pending/unavailable");
+          var raw = state.profilesRaw;
+          var cfg = (raw && typeof raw === "object" && raw.panel && typeof raw.panel === "object" && raw.panel.config && typeof raw.panel.config === "object") ? raw.panel.config : null;
+          var paths = (cfg && typeof cfg.userPath === "string" && typeof cfg.projectPath === "string")
+            ? ("user " + cfg.userPath + " (" + (cfg.userExists ? "present" : "absent") + "); project " + cfg.projectPath + " (" + (cfg.projectExists ? "present" : "absent") + ")")
+            : "config paths unavailable (refresh profiles)";
+          rows.push(["Profiles", vLine + ". " + paths + "."]);
+          var items = state.orchItems || [];
+          var inv = items.filter(function (it) { return it.invalid; });
+          var mapLine = items.length ? items.map(function (it) { return it.role + "→" + it.profile; }).join(", ") : "(no mappings loaded)";
+          rows.push(["Roles", (inv.length ? (inv.length + " invalid reference(s) — fix before launch.") : ("all " + items.length + " mapping(s) valid.")) + " " + mapLine + "."]);
+          rows.push(["Launch", can("launch.preview")
+            ? "compiler available: sanitized display-only previews via `launch.preview` (never executed)."
+            : "compiler unavailable on this host (needs `launch.preview`)."]);
+          var sItems = toGithubStatusItems(state.githubStatus);
+          rows.push(["GitHub status", sItems.length ? sItems.map(statusLineFor).join(" ") : "not loaded (refresh via `github.status`; redacted, no mint in panel)."]);
+          var doc = state.githubDoctor;
+          if (doc && typeof doc === "object" && !Array.isArray(doc) && (doc.workerLogin || doc.reviewerLogin || doc.distinctDetail)) {
+            var dLine = (doc.ok === true ? "actors distinct (ok)" : "actor attention needed") + " — " + (doc.distinctDetail || "see doctor");
+            var setup = (Array.isArray(doc.setupNeeded) ? doc.setupNeeded : []).filter(function (s) { return typeof s === "string" && s; }).slice(0, 3);
+            if (setup.length) dLine += " Next: " + setup.join(" ");
+            rows.push(["GitHub doctor", dLine]);
+          } else {
+            rows.push(["GitHub doctor", "not run yet (run `github.doctor` with a repo access-test; redacted)."]);
+          }
+          var html = "<p><strong>Overview</strong> <span class=\"muted\">(one-place redacted health; CLI remains authoritative)</span></p><ul class=\"cc-profile-list\">";
+          for (var i = 0; i < rows.length; i += 1) {
+            html += "<li class=\"cc-profile-item\"><div class=\"cc-meta\"><span><strong>" + esc(rows[i][0]) + ":</strong> " + esc(sanitizeDiagnosticsDetail(rows[i][1])) + "</span></div></li>";
+          }
+          html += "</ul>";
+          box.innerHTML = html;
         }
 
         function loadDiagnostics() {
@@ -2602,7 +2690,10 @@
           var cliOk = false;
           var bridgeStructured = false;
           var configOk = undefined;
-          var done = function () { renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk); };
+          // Worktree leg: pending until an explicit healthy worktree.context
+          // result lands; rejected/failed/malformed stays not-ready.
+          var worktreeOk = undefined;
+          var done = function () { renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk); renderDiagnosticsOverview(); };
           var main = request("diagnostics.doctor").then(function (res) {
             if (myTok !== state.diagnosticsToken) return null;
             if (res && res.ok && res.result) {
@@ -2650,6 +2741,7 @@
               if (myTok !== state.diagnosticsToken) return;
               if (!configBox) return;
               if (res && res.ok && res.result) {
+                state.diagnosticsValidate = res.result;
                 var entries = Array.isArray(res.result.entries) ? res.result.entries : [];
                 var invalid = 0;
                 for (var i = 0; i < entries.length; i += 1) { if (entries[i] && entries[i].valid === false) invalid += 1; }
@@ -2660,6 +2752,7 @@
                   ? "<p><strong>Config:</strong> all " + entries.length + " profile(s) valid (authoritative YAML; no second store).</p>"
                   : "<p><strong>Config:</strong> " + invalid + " invalid of " + entries.length + " — run <code>orca-pi profile validate</code> for file/source/field diagnostics.</p>";
               } else {
+                state.diagnosticsValidate = null;
                 configOk = false;
                 configBox.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "validation unavailable") + "</p>";
               }
@@ -2668,6 +2761,7 @@
               if (myTok !== state.diagnosticsToken) return;
               if (!configBox) return;
               // Rejected validate (bridge failure) is not-ready, never ready.
+              state.diagnosticsValidate = null;
               configOk = false;
               configBox.innerHTML = "<p class=\"muted\">profile validation failed (bridge request failed) — run <code>orca-pi profile validate</code>.</p>";
               done();
@@ -2679,14 +2773,28 @@
             request("worktree.context").then(function (res) {
               if (myTok !== state.diagnosticsToken) return;
               if (!worktreeBox) return;
-              if (res && res.ok && res.result) {
-                var root = res.result.projectRoot || "(unknown)";
+              if (res && res.ok && res.result && typeof res.result.projectRoot === "string" && res.result.projectRoot) {
+                state.diagnosticsWorktree = res.result;
+                worktreeOk = true;
+                var root = res.result.projectRoot;
                 var explicit = res.result.explicit === true;
                 worktreeBox.innerHTML = "<p><strong>Worktree:</strong> <code>" + esc(root) + "</code> <span class=\"muted\">" +
                   esc(explicit ? "explicit scope (captured at submission — delayed requests cannot be redirected)" : "implicit scope (reads only; mutations require explicit worktree.projectRoot)") + "</span></p>";
               } else {
+                state.diagnosticsWorktree = null;
+                worktreeOk = false;
                 worktreeBox.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "worktree unavailable") + "</p>";
               }
+              done();
+            }, function () {
+              if (myTok !== state.diagnosticsToken) return;
+              if (!worktreeBox) return;
+              // Rejected worktree.context is not-ready, never ready: the
+              // headline must not claim ready without a confirmed scope.
+              state.diagnosticsWorktree = null;
+              worktreeOk = false;
+              worktreeBox.innerHTML = "<p class=\"muted\">worktree context failed (bridge request failed) — requires <code>worktree.context</code>.</p>";
+              done();
             });
           } else if (worktreeBox) {
             worktreeBox.innerHTML = "<p class=\"muted\">worktree.context unavailable on this host.</p>";

@@ -1561,23 +1561,180 @@ export function isSecretFreePayload(payload: unknown): boolean {
   return true;
 }
 
-/** Overall diagnostics headline (CLI + bridge + config). Unknown config
- * (unavailable/pending/malformed/failed → undefined) is never ready:
- * it renders as pending/unavailable, fail-closed like an explicit invalid. */
+/** Overall diagnostics headline (CLI + bridge + config + worktree). Unknown legs
+ * (unavailable/pending/malformed/failed → undefined) are never ready:
+ * they render as pending/unavailable, fail-closed like an explicit invalid.
+ * The worktree leg must be an explicit healthy `worktree.context` result —
+ * the headline never claims ready without a confirmed project/worktree scope. */
 export function diagnosticsHeadline(input: {
   cli?: { ok: boolean } | undefined;
   bridge?: { structured: boolean } | undefined;
   config?: { ok: boolean } | undefined;
+  worktree?: { ok: boolean } | undefined;
 }): string {
   const cliOk = input.cli?.ok === true;
   const bridgeOk = input.bridge?.structured === true;
   const configOk = input.config?.ok === true;
   const configUnknown = input.config === undefined;
-  if (cliOk && bridgeOk && configOk) return "diagnostics: ready — CLIs available, structured bridge reachable, config valid.";
+  const worktreeOk = input.worktree?.ok === true;
+  const worktreeUnknown = input.worktree === undefined;
+  if (cliOk && bridgeOk && configOk && worktreeOk) return "diagnostics: ready — CLIs available, structured bridge reachable, config valid, worktree scope confirmed.";
   const parts: string[] = [];
   if (!cliOk) parts.push("CLIs need attention (run `orca-pi doctor`)");
   if (!bridgeOk) parts.push("bridge degraded (explicit CLI fallback)");
   if (configUnknown) parts.push("profiles validation pending/unavailable (run `orca-pi profile validate`)");
   else if (!configOk) parts.push("profiles need attention (run `orca-pi profile validate`)");
+  if (worktreeUnknown) parts.push("worktree scope pending/unavailable (requires `worktree.context` over the structured bridge)");
+  else if (!worktreeOk) parts.push("worktree scope unavailable (requires `worktree.context` over the structured bridge)");
   return `diagnostics: action needed — ${parts.join("; ")}.`;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics one-place overview (UI1.5)
+//
+// The Diagnostics section reports the required health in one redacted
+// place by composing already-typed bridge results and panel state — never
+// CLI text scraping, never shell, never secrets. Each row reuses the
+// normalizers above, so the overview agrees with the drill-down boxes.
+// ---------------------------------------------------------------------------
+
+/** One consolidated Diagnostics overview row (label + redacted detail). */
+export interface DiagnosticsOverviewRow {
+  label: string;
+  detail: string;
+}
+
+/** Typed inputs for the overview (raw bridge payloads + panel state). */
+export interface DiagnosticsOverviewInput {
+  diagnostics?: unknown;
+  validate?: unknown;
+  profilesList?: unknown;
+  orchestration?: unknown;
+  knownProfiles?: readonly string[];
+  githubStatus?: unknown;
+  githubDoctor?: unknown;
+  launchPreviewSupported?: boolean;
+  worktree?: unknown;
+}
+
+/** Per-row detail bound (redacted text, never raw runner output). */
+export const DIAGNOSTICS_OVERVIEW_LIMIT = 400;
+
+function overviewDetail(text: string): string {
+  const redacted = redactDiagnosticsText(text);
+  return redacted.length <= DIAGNOSTICS_OVERVIEW_LIMIT ? redacted : `${redacted.slice(0, DIAGNOSTICS_OVERVIEW_LIMIT)}…`;
+}
+
+/** Allowlisted `orca-pi` / bridge / protocol versions from `diagnostics.doctor` (never throws). */
+function diagnosticsVersionsText(payload: unknown): string {
+  if (!isPlainRecord(payload)) return "";
+  const rec = payload as Record<string, unknown>;
+  const pick = (key: string): string | undefined =>
+    typeof rec[key] === "string" && (rec[key] as string).length > 0 ? (rec[key] as string).slice(0, 64) : undefined;
+  const proto = rec["protocolVersion"];
+  const protoText = typeof proto === "number" ? String(proto) : typeof proto === "string" ? proto.slice(0, 16) : "(unknown)";
+  return ` Versions: orca-pi ${pick("orcaPiVersion") ?? "(unknown)"} / bridge ${pick("bridgeVersion") ?? "(unknown)"} / protocol ${protoText}.`;
+}
+
+/**
+ * User/project config paths + existence from a `profiles.list` payload
+ * (never throws). Reads only `panel.config` path names (actionable,
+ * non-secret); returns undefined when the payload carries no config block.
+ */
+export function toDiagnosticsConfigPaths(
+  payload: unknown,
+): { userPath: string; projectPath: string; userExists: boolean; projectExists: boolean } | undefined {
+  if (!isPlainRecord(payload)) return undefined;
+  const panel = (payload as Record<string, unknown>)["panel"];
+  if (!isPlainRecord(panel)) return undefined;
+  const config = (panel as Record<string, unknown>)["config"];
+  if (!isPlainRecord(config)) return undefined;
+  const rec = config as Record<string, unknown>;
+  if (typeof rec["userPath"] !== "string" || typeof rec["projectPath"] !== "string") return undefined;
+  return {
+    userPath: (rec["userPath"] as string).slice(0, 256),
+    projectPath: (rec["projectPath"] as string).slice(0, 256),
+    userExists: rec["userExists"] === true,
+    projectExists: rec["projectExists"] === true,
+  };
+}
+
+/** One-line config-paths summary (path names + existence only, never values). */
+export function describeConfigPaths(
+  paths: { userPath: string; projectPath: string; userExists: boolean; projectExists: boolean } | undefined,
+): string {
+  if (!paths) return "config paths unavailable (refresh profiles via `profiles.list`).";
+  return (
+    `user ${paths.userPath} (${paths.userExists ? "present" : "absent"}); ` +
+    `project ${paths.projectPath} (${paths.projectExists ? "present" : "absent"}).`
+  );
+}
+
+/**
+ * Consolidated one-place Diagnostics overview rows (never throws).
+ * Every row composes allowlisted typed data via the redacted describers
+ * above — no secret values can reach the details (bounded + pattern
+ * redacted), and missing legs render as pending/unavailable, never as
+ * healthy. Row order: runtime, bridge, worktree, profiles, roles,
+ * launch, GitHub status, GitHub doctor.
+ */
+export function diagnosticsOverviewRows(input: DiagnosticsOverviewInput): DiagnosticsOverviewRow[] {
+  const cliHealth = toDiagnosticsCliHealth(input.diagnostics);
+  const bridge = toDiagnosticsBridgeHealth(input.diagnostics);
+  const config = toDiagnosticsConfigHealth(input.validate);
+  const orchItems = toOrchestrationItems(input.orchestration, input.knownProfiles);
+  const statusItems = toGithubStatusItems(input.githubStatus);
+  const actor = toGithubActorSummary(input.githubDoctor);
+  const setup = githubSetupActions(input.githubDoctor);
+
+  const mapping =
+    orchItems.length > 0 ? orchItems.map((item) => `${item.role}→${item.profile}`).join(", ") : "(no mappings loaded)";
+  const rows: DiagnosticsOverviewRow[] = [
+    {
+      label: "Runtime",
+      detail: `${describeDiagnosticsCli(cliHealth)}${diagnosticsVersionsText(input.diagnostics)}`,
+    },
+    {
+      label: "Bridge",
+      detail: bridge
+        ? `${bridge.structured ? "structured" : "degraded (read-only CLI fallback)"}; ` +
+          `${bridge.supportedOperations.length} supported operation(s)` +
+          `${bridge.reasons.length > 0 ? `; notes: ${bridge.reasons.slice(0, 2).join(" ")}` : ""}.`
+        : "bridge negotiation unavailable in this response.",
+    },
+    {
+      label: "Worktree",
+      detail: describeWorktreeHealth(toDiagnosticsWorktreeHealth(input.worktree)),
+    },
+    {
+      label: "Profiles",
+      detail: `${describeConfigHealth(config)} ${describeConfigPaths(toDiagnosticsConfigPaths(input.profilesList))}`,
+    },
+    {
+      label: "Roles",
+      detail: `${orchestrationInvalidSummary(orchItems)} Mappings: ${mapping}.`,
+    },
+    {
+      label: "Launch",
+      detail:
+        input.launchPreviewSupported === true
+          ? "compiler available: sanitized display-only previews via `launch.preview` (never executed)."
+          : "compiler unavailable on this host (needs `launch.preview` over the structured bridge).",
+    },
+    {
+      label: "GitHub status",
+      detail:
+        statusItems.length > 0
+          ? statusItems.map(describeGithubStatusItem).join(" ")
+          : "GitHub status not loaded (refresh via `github.status`; redacted status only, no mint in the panel).",
+    },
+    {
+      label: "GitHub doctor",
+      detail: actor
+        ? `${actor.ok ? "actors distinct (ok)" : "actor attention needed"} — ${actor.distinctDetail}` +
+          `${setup.length > 0 ? ` Next: ${setup.slice(0, 3).join(" ")}` : ""}`
+        : "doctor not run yet (run `github.doctor` with a repo access-test; redacted, no mint in the panel).",
+    },
+  ];
+  return rows.map((row) => ({ label: row.label, detail: overviewDetail(row.detail) }));
 }
