@@ -1493,6 +1493,7 @@ export function redactDiagnosticsText(text: string): string {
   out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
   out = out.replace(/-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
   out = out.replace(/\bghp_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+  out = out.replace(/\bgho_[A-Za-z0-9]{8,}/g, "<redacted-token>");
   out = out.replace(/\bghu_[A-Za-z0-9]{8,}/g, "<redacted-token>");
   out = out.replace(/\bghs_[A-Za-z0-9]{8,}/g, "<redacted-token>");
   out = out.replace(/\bghr_[A-Za-z0-9]{8,}/g, "<redacted-token>");
@@ -1530,6 +1531,7 @@ export function containsSecretMaterial(text: string): boolean {
   if (!text) return false;
   if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(text)) return true;
   if (/\bghp_[A-Za-z0-9]{8,}/.test(text)) return true;
+  if (/\bgho_[A-Za-z0-9]{8,}/.test(text)) return true;
   if (/\bghu_[A-Za-z0-9]{8,}/.test(text)) return true;
   if (/\bghs_[A-Za-z0-9]{8,}/.test(text)) return true;
   if (/\bghr_[A-Za-z0-9]{8,}/.test(text)) return true;

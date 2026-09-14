@@ -351,6 +351,26 @@ describe("bridge host: GitHub and diagnostics are redacted", () => {
       expect(text).toMatch(/redacted/);
       expect(text).not.toMatch(/-----BEGIN [A-Z ]*PRIVATE KEY-----/);
       expect(text).not.toMatch(/\bghp_[A-Za-z0-9]{10,}/);
+      expect(text).not.toMatch(/\bgho_[A-Za-z0-9]{10,}/);
+    }
+  });
+
+  it("redacts gho_ OAuth tokens and arbitrary env secrets from bridge errors", async () => {
+    // Synthetic fixtures only — never real credentials. Exercises the
+    // generic `toBridgeError` path: pattern (`gho_`) + arbitrary env value.
+    const arbitrarySecret = "bridge-arbitrary-secret-5566";
+    const oauthToken = "gho_bridgeoauthcheck0123456789";
+    const d = deps({ env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: arbitrarySecret } as NodeJS.ProcessEnv });
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "r-err", operation: "github.status", params: { identity: `bad ${arbitrarySecret} ${oauthToken} name!` } },
+      d,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain(arbitrarySecret);
+      expect(text).not.toContain(oauthToken);
+      expect(text).not.toMatch(/\bgho_[A-Za-z0-9]{10,}/);
     }
   });
 

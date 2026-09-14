@@ -151,6 +151,7 @@ function assertNoSecrets(value: unknown, where: string): void {
   const probes: Array<{ re: RegExp; label: string }> = [
     { re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/, label: "private key material" },
     { re: /\bghp_[A-Za-z0-9]{10,}/, label: "GitHub PAT" },
+    { re: /\bgho_[A-Za-z0-9]{10,}/, label: "GitHub OAuth token" },
     { re: /\bghu_[A-Za-z0-9]{10,}/, label: "GitHub user token" },
     { re: /\bghs_[A-Za-z0-9]{10,}/, label: "GitHub server token" },
     { re: /\bghr_[A-Za-z0-9]{10,}/, label: "GitHub refresh token" },
@@ -177,15 +178,46 @@ function assertNoSecrets(value: unknown, where: string): void {
 }
 
 /**
- * Sanitize a bridge error message before it crosses the bridge (defense
- * in depth). Redacts token/key patterns (var-name labels like
- * `*_TOKEN` stay intact for actionable guidance) and bounds to
- * `DIAGNOSTICS_DETAIL_LIMIT` chars so a secret-bearing throw (runner
- * stdout, provider fetch body, panel-echoed value) can never reach the
- * DOM via error rendering. Actionable non-secret text survives.
+ * Collect redactable secret values from an env mapping without logging
+ * them (mirrors `core.collectSecretsFromEnv` for the sync error path).
+ * Any `*TOKEN*`/`*SECRET*`/`*PRIVATE_KEY*` value plus token-shaped
+ * values (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`) in any var
+ * is collected; callers only ever replace these values with
+ * placeholders, never echo them.
  */
-function sanitizeBridgeErrorMessage(message: string): string {
-  const redacted = redactDiagnosticsText(message);
+function collectEnvSecretsForBridgeError(env: NodeJS.ProcessEnv | Record<string, string | undefined>): string[] {
+  const secrets: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string" || value.length === 0) continue;
+    const upper = key.toUpperCase();
+    if (upper.includes("TOKEN") || upper.includes("SECRET") || upper.includes("PRIVATE_KEY")) {
+      secrets.push(value);
+      continue;
+    }
+    if (/^(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/.test(value) && value.length >= 12) {
+      secrets.push(value);
+    }
+  }
+  return secrets;
+}
+
+/**
+ * Sanitize a bridge error message before it crosses the bridge (defense
+ * in depth). Redacts explicit env-backed secret values first (arbitrary
+ * `*TOKEN*`/`*SECRET*`/`*PRIVATE_KEY*` values, not just known prefixes),
+ * then token/key patterns (var-name labels like `*_TOKEN` stay intact
+ * for actionable guidance), and bounds to `DIAGNOSTICS_DETAIL_LIMIT`
+ * chars so a secret-bearing throw (runner stdout, provider fetch body,
+ * panel-echoed value) can never reach the DOM via error rendering.
+ * Actionable non-secret text survives. Never echoes secret values.
+ */
+function sanitizeBridgeErrorMessage(message: string, secrets: readonly string[] = []): string {
+  let out = message;
+  for (const secret of secrets) {
+    if (!secret || secret.length < 4) continue;
+    out = out.split(secret).join("<redacted>");
+  }
+  const redacted = redactDiagnosticsText(out);
   if (redacted.length <= DIAGNOSTICS_DETAIL_LIMIT) return redacted;
   return `${redacted.slice(0, DIAGNOSTICS_DETAIL_LIMIT)}… [truncated]`;
 }
@@ -212,7 +244,8 @@ export async function handleBridgeRequest(data: unknown, deps: BridgeHostDeps = 
     const result = await dispatch(request, deps);
     return bridgeOk(request.requestId, result);
   } catch (error) {
-    return toBridgeError(request.requestId, error);
+    const secrets = collectEnvSecretsForBridgeError(deps.env ?? process.env);
+    return toBridgeError(request.requestId, error, secrets);
   }
 }
 
@@ -258,7 +291,7 @@ function enforceTransportGate(request: BridgeRequest, deps: BridgeHostDeps): Bri
   );
 }
 
-function toBridgeError(requestId: string, error: unknown): BridgeResponse {
+function toBridgeError(requestId: string, error: unknown, secrets: readonly string[] = []): BridgeResponse {
   if (error && typeof error === "object" && "code" in error && "message" in error) {
     const record = error as { code: unknown; message: unknown };
     if (typeof record.code === "string" && typeof record.message === "string") {
@@ -268,20 +301,20 @@ function toBridgeError(requestId: string, error: unknown): BridgeResponse {
       // core `load-failed` on missing config stays `internal` with action.
       // Sanitize before crossing: a panel-echoed value or core throw
       // carrying a token/key pattern must never reach the DOM via errors.
-      return bridgeFail(requestId, mapped, sanitizeBridgeErrorMessage(record.message), { detail: record.code });
+      return bridgeFail(requestId, mapped, sanitizeBridgeErrorMessage(record.message, secrets), { detail: record.code });
     }
   }
   if (error instanceof Error) {
     // Explicit unsupported/auth signals thrown with a prefix marker.
     if (error.message.startsWith("[unsupported] ")) {
-      return bridgeFail(requestId, "unsupported", sanitizeBridgeErrorMessage(error.message.slice("[unsupported] ".length)));
+      return bridgeFail(requestId, "unsupported", sanitizeBridgeErrorMessage(error.message.slice("[unsupported] ".length), secrets));
     }
     if (error.message.startsWith("[auth/setup] ")) {
-      return bridgeFail(requestId, "auth/setup", sanitizeBridgeErrorMessage(error.message.slice("[auth/setup] ".length)));
+      return bridgeFail(requestId, "auth/setup", sanitizeBridgeErrorMessage(error.message.slice("[auth/setup] ".length), secrets));
     }
-    return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(error.message));
+    return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(error.message, secrets));
   }
-  return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(String(error)));
+  return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(String(error), secrets));
 }
 
 async function dispatch(request: BridgeRequest, deps: BridgeHostDeps): Promise<unknown> {

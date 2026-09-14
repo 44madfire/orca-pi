@@ -175,7 +175,7 @@ describe("ui1.5: github.status rows", () => {
     expect(items[0]!.sourceLabel).toBe("ORCA_PI_GITHUB_WORKER_TOKEN");
     expect(items[0]!.expiresAt).toContain("2030");
     expect(describeGithubStatusItem(items[0]!)).toContain("configured via");
-    expect(describeGithubStatusItem(items[0]!)).not.toMatch(/ghp_|ghu_|ghs_|PRIVATE KEY/);
+    expect(describeGithubStatusItem(items[0]!)).not.toMatch(/ghp_|gho_|ghu_|ghs_|PRIVATE KEY/);
     expect(describeTokenFreshness(items[0]!)).toContain("2030");
   });
 
@@ -201,13 +201,38 @@ describe("ui1.5: github.status rows", () => {
     expect(items[0]!.expired).toBe(true);
     expect(describeGithubStatusItem(items[0]!)).toContain("expired");
     expect(describeGithubStatusItem(items[0]!)).toContain("mint a fresh installation token");
-    expect(JSON.stringify(items)).not.toMatch(/ghs_|ghp_|PRIVATE KEY/);
+    expect(JSON.stringify(items)).not.toMatch(/ghs_|ghp_|gho_|PRIVATE KEY/);
   });
 
   it("never throws on malformed payloads", () => {
     expect(toGithubStatusItems(null)).toEqual([]);
     expect(toGithubStatusItems({})).toEqual([]);
     expect(toGithubStatusItems({ identities: null })).toEqual([]);
+  });
+
+  it("drops smuggled token values via typed allowlisting (gho_ never reaches display)", () => {
+    // Synthetic OAuth token — never a real credential. A compromised bridge
+    // payload smuggling raw values must still render as redacted status
+    // only: allowlisted fields survive, token values never pass through.
+    const oauthToken = "gho_smuggledoauth0123456789";
+    const items = toGithubStatusItems({
+      identities: {
+        worker: {
+          configured: true,
+          sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN",
+          token: oauthToken,
+          ORCA_PI_GITHUB_WORKER_TOKEN: oauthToken,
+        },
+      },
+    });
+    expect(items.length).toBe(1);
+    expect(JSON.stringify(items)).not.toContain(oauthToken);
+    expect(containsSecretMaterial(JSON.stringify(items))).toBe(false);
+    expect(isSecretFreePayload({ items })).toBe(true);
+    for (const item of items) {
+      expect(containsSecretMaterial(describeGithubStatusItem(item))).toBe(false);
+      expect(containsSecretMaterial(describeTokenFreshness(item))).toBe(false);
+    }
   });
 });
 
@@ -399,8 +424,11 @@ describe("ui1.5: redaction (no secrets in DOM/logs/errors)", () => {
     expect(containsSecretMaterial("ok")).toBe(false);
     expect(containsSecretMaterial("sourceLabel ORCA_PI_GITHUB_WORKER_TOKEN")).toBe(false);
     expect(containsSecretMaterial("ghp_abcdefghij123456")).toBe(true);
+    expect(containsSecretMaterial("gho_oauth1234567890ab")).toBe(true);
     expect(containsSecretMaterial("ghu_abcdefghij123456")).toBe(true);
     expect(containsSecretMaterial("ghs_abcdefghij123456")).toBe(true);
+    expect(containsSecretMaterial("ghr_refresh1234567890")).toBe(true);
+    expect(containsSecretMaterial("github_pat_ABCDEF1234567890")).toBe(true);
     expect(containsSecretMaterial("-----BEGIN PRIVATE KEY-----")).toBe(true);
     expect(containsSecretMaterial("x-access-token:abc123")).toBe(true);
   });
@@ -409,6 +437,7 @@ describe("ui1.5: redaction (no secrets in DOM/logs/errors)", () => {
     expect(isSecretFreePayload(statusPayload())).toBe(true);
     expect(isSecretFreePayload(doctorReport())).toBe(true);
     expect(isSecretFreePayload({ token: "ghs_abcdefghij123456" })).toBe(false);
+    expect(isSecretFreePayload({ token: "gho_oauth1234567890ab" })).toBe(false);
     expect(isSecretFreePayload({ token: "raw-secret-value-123" })).toBe(false);
     // Var names alone never trigger (labels, not values).
     expect(isSecretFreePayload({ sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN" })).toBe(true);
@@ -715,6 +744,11 @@ describe("ui1.5/p1: diagnostics detail sanitization (no runner secret crosses)",
     expect(redactDiagnosticsText("all clear")).toBe("all clear");
     expect(redactDiagnosticsText(`saw ${LEAK_TOKEN} here`)).not.toContain(LEAK_TOKEN);
     expect(redactDiagnosticsText(`saw ${LEAK_TOKEN} here`)).toContain("<redacted-token>");
+    const oauthToken = "gho_oauthleaked0123456789";
+    expect(redactDiagnosticsText(`saw ${oauthToken} here`)).not.toContain(oauthToken);
+    expect(redactDiagnosticsText(`saw ${oauthToken} here`)).toContain("<redacted-token>");
+    expect(containsSecretMaterial(oauthToken)).toBe(true);
+    expect(isSecretFreePayload({ token: oauthToken })).toBe(false);
     expect(redactDiagnosticsText(`key ${LEAK_KEY} end`)).not.toContain("BEGIN PRIVATE KEY");
     expect(redactDiagnosticsText(`key ${LEAK_KEY} end`)).toContain("[redacted-private-key]");
     // Var-name labels alone are not values — left intact for actionable guidance.
@@ -797,6 +831,33 @@ describe("ui1.5/p1: diagnostics detail sanitization (no runner secret crosses)",
     expect(html).not.toContain('esc(cli.orca.detail || "")');
     expect(html).not.toContain('esc(cli.pi.detail || "")');
     expect(containsSecretMaterial(html)).toBe(false);
+  });
+
+  it("generic bridge errors redact arbitrary env-backed secrets, not just known prefixes", async () => {
+    // Synthetic fixtures only — never real credentials. Covers the generic
+    // `toBridgeError` path (not just runner-detail sanitization): an
+    // arbitrary `*TOKEN*` value with no known prefix plus a `gho_` OAuth
+    // token must both be redacted from the error message without echoing
+    // values, while actionable non-secret guidance survives.
+    const arbitrarySecret = "env-arbitrary-secret-value-7788";
+    const oauthToken = "gho_oauthbridgecheck0123456789";
+    const badIdentity = `bad ${arbitrarySecret} ${oauthToken} name!`;
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "bridge-err1", operation: "github.status", params: { identity: badIdentity } },
+      bridgeDeps({ env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: arbitrarySecret } as NodeJS.ProcessEnv }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain(arbitrarySecret);
+      expect(text).not.toContain(oauthToken);
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(isSecretFreePayload(res.error)).toBe(true);
+      // Actionable validation guidance survives redaction.
+      expect(text).toMatch(/portable identity|expected/i);
+      // Operator/CLI-only mint boundary preserved: no token minting in errors.
+      expect(text).not.toMatch(/mint.*token|installation-token.*gho_/i);
+    }
   });
 
   it("a throwing runner never leaks secret-bearing throw text via error response or payload", async () => {
