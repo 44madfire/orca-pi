@@ -227,20 +227,38 @@ function sanitizeBridgeErrorMessage(message: string, secrets: readonly string[] 
  * `ok: false` responses with stable requestId + machine-readable code.
  */
 export async function handleBridgeRequest(data: unknown, deps: BridgeHostDeps = {}): Promise<BridgeResponse> {
+  // Collect env-backed secrets up front so even early rejections
+  // (parse/transport gate) redact arbitrary `*TOKEN*`/`*SECRET*` /
+  // `*PRIVATE_KEY*` values and token/key patterns before crossing.
+  const earlySecrets = collectEnvSecretsForBridgeError(deps.env ?? process.env);
   const parsed = parseBridgeRequest(data);
   if (!parsed.ok) {
-    // parseBridgeRequest already chose validation vs unsupported.
+    // parseBridgeRequest already chose validation vs unsupported —
+    // preserve the stable requestId + machine-readable code, but run
+    // the message through the same redaction/bounding sanitizer as
+    // dispatch errors so panel-echoed secrets (protocol/operation/
+    // worktree-root values) can never reach the DOM via errors.
     return {
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       requestId: parsed.requestId,
       ok: false,
-      error: parsed.error,
+      error: { ...parsed.error, message: sanitizeBridgeErrorMessage(parsed.error.message, earlySecrets) },
     };
   }
   const { request } = parsed;
   try {
     const gate = enforceTransportGate(request, deps);
-    if (gate) return gate;
+    if (gate) {
+      // Same sanitizer for trusted-root / consent / reachability
+      // rejections: preserve requestId + code, redact/bound the message.
+      if (!gate.ok) {
+        return {
+          ...gate,
+          error: { ...gate.error, message: sanitizeBridgeErrorMessage(gate.error.message, earlySecrets) },
+        };
+      }
+      return gate;
+    }
     const result = await dispatch(request, deps);
     return bridgeOk(request.requestId, result);
   } catch (error) {

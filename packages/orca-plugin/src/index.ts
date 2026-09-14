@@ -104,6 +104,7 @@ export {
   describeWorktreeHealth,
   diagnosticsHeadline,
   diagnosticsOverviewRows,
+  toDiagnosticsGithubHealth,
   DIAGNOSTICS_DETAIL_LIMIT,
   DIAGNOSTICS_HOST_CAPABILITIES,
   DIAGNOSTICS_OVERVIEW_LIMIT,

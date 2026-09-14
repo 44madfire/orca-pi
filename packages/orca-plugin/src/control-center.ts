@@ -1570,16 +1570,20 @@ export function isSecretFreePayload(payload: unknown): boolean {
   return true;
 }
 
-/** Overall diagnostics headline (CLI + bridge + config + worktree). Unknown legs
+/** Overall diagnostics headline (CLI + bridge + config + worktree + GitHub). Unknown legs
  * (unavailable/pending/malformed/failed → undefined) are never ready:
  * they render as pending/unavailable, fail-closed like an explicit invalid.
  * The worktree leg must be an explicit healthy `worktree.context` result —
- * the headline never claims ready without a confirmed project/worktree scope. */
+ * the headline never claims ready without a confirmed project/worktree scope.
+ * The GitHub leg is required: missing/expired/attention-needed GitHub status
+ * or github.doctor keeps the headline at action-needed, so the top-level
+ * banner can never claim overall ready while GitHub needs attention. */
 export function diagnosticsHeadline(input: {
   cli?: { ok: boolean } | undefined;
   bridge?: { structured: boolean } | undefined;
   config?: { ok: boolean } | undefined;
   worktree?: { ok: boolean } | undefined;
+  github?: { ok: boolean } | undefined;
 }): string {
   const cliOk = input.cli?.ok === true;
   const bridgeOk = input.bridge?.structured === true;
@@ -1587,7 +1591,9 @@ export function diagnosticsHeadline(input: {
   const configUnknown = input.config === undefined;
   const worktreeOk = input.worktree?.ok === true;
   const worktreeUnknown = input.worktree === undefined;
-  if (cliOk && bridgeOk && configOk && worktreeOk) return "diagnostics: ready — CLIs available, structured bridge reachable, config valid, worktree scope confirmed.";
+  const githubOk = input.github?.ok === true;
+  const githubUnknown = input.github === undefined;
+  if (cliOk && bridgeOk && configOk && worktreeOk && githubOk) return "diagnostics: ready — CLIs available, structured bridge reachable, config valid, worktree scope confirmed, GitHub identities healthy.";
   const parts: string[] = [];
   if (!cliOk) parts.push("CLIs need attention (run `orca-pi doctor`)");
   if (!bridgeOk) parts.push("bridge degraded (explicit CLI fallback)");
@@ -1595,7 +1601,37 @@ export function diagnosticsHeadline(input: {
   else if (!configOk) parts.push("profiles need attention (run `orca-pi profile validate`)");
   if (worktreeUnknown) parts.push("worktree scope pending/unavailable (requires `worktree.context` over the structured bridge)");
   else if (!worktreeOk) parts.push("worktree scope unavailable (requires `worktree.context` over the structured bridge)");
+  if (githubUnknown) parts.push("GitHub health pending/unavailable (refresh `github.status` + `github.doctor`; redacted, no mint in panel)");
+  else if (!githubOk) parts.push("GitHub needs attention (refresh `github.status` + `github.doctor`; redacted, no mint in panel)");
   return `diagnostics: action needed — ${parts.join("; ")}.`;
+}
+
+/**
+ * Required GitHub health for the top-level Diagnostics readiness (pure,
+ * never throws). Returns `{ok:true}` only when every reported status
+ * identity is configured and unexpired AND the doctor report is
+ * `ok:true` (distinct actors, proofs, repo access). Missing status or
+ * doctor → `undefined` (pending/unavailable, never ready); any
+ * missing/expired/attention-needed leg → `{ok:false}`. The headline
+ * takes this value as its `github` leg so overall ready can never
+ * coincide with broken GitHub.
+ */
+export function toDiagnosticsGithubHealth(statusPayload: unknown, doctorPayload: unknown): { ok: boolean } | undefined {
+  if (statusPayload === undefined || statusPayload === null) return undefined;
+  const items = toGithubStatusItems(statusPayload);
+  if (items.length === 0) return undefined;
+  for (const item of items) {
+    if (item.expired === true) return { ok: false };
+    if (!item.configured) return { ok: false };
+  }
+  if (doctorPayload === undefined || doctorPayload === null) return undefined;
+  if (!isPlainRecord(doctorPayload)) return { ok: false };
+  const rec = doctorPayload as Record<string, unknown>;
+  // Doctor `ok:true` is the authoritative attention signal (distinct
+  // actors + proofs + repo access). Anything else — `ok:false`,
+  // missing flag, malformed — is attention-needed, never ready.
+  if (rec["ok"] !== true) return { ok: false };
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------

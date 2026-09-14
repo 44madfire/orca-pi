@@ -52,6 +52,7 @@ import {
   REVIEW_ACTOR_NOTE,
   sanitizeDiagnosticsDetail,
   toDiagnosticsBridgeHealth,
+  toDiagnosticsGithubHealth,
   toDiagnosticsCliHealth,
   toDiagnosticsConfigHealth,
   toDiagnosticsConfigPaths,
@@ -410,8 +411,8 @@ describe("ui1.5: diagnostics display", () => {
     expect(config.invalidCount).toBe(1);
     expect(describeConfigHealth(config)).toContain("1 invalid");
     expect(describeConfigHealth({ ok: true, invalidCount: 0, total: 3 })).toContain("all 3 valid");
-    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } })).toContain("ready");
-    expect(diagnosticsHeadline({ cli: { ok: false }, bridge: { structured: false }, config: { ok: false }, worktree: { ok: false } })).toContain("action needed");
+    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true }, github: { ok: true } })).toContain("ready");
+    expect(diagnosticsHeadline({ cli: { ok: false }, bridge: { structured: false }, config: { ok: false }, worktree: { ok: false }, github: { ok: false } })).toContain("action needed");
   });
 });
 
@@ -958,7 +959,7 @@ describe("ui1.5/p2: mapped profiles stay fresh regardless of response order", ()
 // ---------------------------------------------------------------------------
 
 describe("ui1.5/p2: diagnostics headline never claims ready without validation", () => {
-  const healthy = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } };
+  const healthy = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true }, github: { ok: true } };
   it("requires explicit ok:true on every leg for ready", () => {
     expect(
       diagnosticsHeadline(healthy),
@@ -980,7 +981,7 @@ describe("ui1.5/p2: diagnostics headline never claims ready without validation",
   });
 
   it("requires an explicit healthy worktree result (pending/unavailable/failed never ready)", () => {
-    const cliBridgeConfig = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true } };
+    const cliBridgeConfig = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, github: { ok: true } };
     // Regression: CLI, bridge, and config all healthy, but worktree.context
     // rejects (pending) or fails — the headline must stay action-needed.
     expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: undefined })).toContain("action needed");
@@ -989,6 +990,8 @@ describe("ui1.5/p2: diagnostics headline never claims ready without validation",
     expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: { ok: false } })).toContain("action needed");
     expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: { ok: false } })).toMatch(/worktree scope unavailable/);
     expect(diagnosticsHeadline({ ...cliBridgeConfig, worktree: { ok: true } })).toContain("ready");
+    // GitHub is required even when the four core legs are healthy.
+    expect(diagnosticsHeadline({ cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } })).toContain("action needed");
   });
 
   it("treats malformed/unavailable validate payloads as unknown (never valid)", () => {
@@ -1196,8 +1199,8 @@ describe("ui1.5: diagnostics one-place overview rows", () => {
 
   it("panel tracks the worktree leg and renders the one-place overview", () => {
     const html = controlHtml();
-    // Four-leg headline with explicit worktree gating.
-    expect(html).toContain("renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk)");
+    // Five-leg headline with explicit worktree + GitHub gating.
+    expect(html).toContain("renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk, githubOk");
     expect(html).toContain("worktree scope pending/unavailable");
     expect(html).toContain("worktree scope unavailable");
     expect(html).toContain("worktree scope confirmed");
@@ -1436,5 +1439,287 @@ describe("ui1.5: bridge error paths stay secret-free (hardened)", () => {
     expect(isSecretFreePayload({ sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN" })).toBe(true);
     expect(isSecretFreePayload({ tokenRefreshable: true })).toBe(true);
     expect(DIAGNOSTICS_HOST_CAPABILITIES).toContain("workspace:read");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Blockers: early-rejection sanitization (parse + transport gate)
+// Every outgoing handleBridgeRequest error — including parseBridgeRequest
+// failures and enforceTransportGate responses — passes through the same
+// diagnostics redaction/bounding sanitizer. Stable request IDs and
+// machine-readable codes preserved; no synthetic secret values echo.
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/blocker: early-rejection errors are redacted + bounded (parse + gate)", () => {
+  const SYN_GHP = "ghp_synthetictest0123456789ABCD";
+  const SYN_GHO = "gho_synthetictest0123456789ABCD";
+  const SYN_ENV = "env-synthetic-secret-99112233";
+  const SYN_KEY = "-----BEGIN PRIVATE KEY-----\nMIIEsyntheticTestKeyMaterial0123456789\n-----END PRIVATE KEY-----";
+
+  it("invalid protocolVersion echoes no token/private-key/env values (unsupported + stable id)", async () => {
+    const res = await handleBridgeRequest(
+      { protocolVersion: SYN_GHP, requestId: "early-proto1", operation: "profiles.list" },
+      bridgeDeps({ env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: SYN_ENV } as NodeJS.ProcessEnv }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.requestId).toBe("early-proto1");
+      expect(res.error.code).toBe("unsupported");
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain(SYN_GHP);
+      expect(text).not.toContain(SYN_ENV);
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(isSecretFreePayload(res.error)).toBe(true);
+      expect(text).toContain("<redacted-token>");
+      expect(res.error.message.length).toBeLessThanOrEqual(DIAGNOSTICS_DETAIL_LIMIT + 20);
+    }
+  });
+
+  it("invalid operation echoes no token/private-key values (validation + stable id + detail)", async () => {
+    const evilOp = `exec ${SYN_GHO} ${SYN_KEY}`;
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "early-op1", operation: evilOp },
+      bridgeDeps(),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.requestId).toBe("early-op1");
+      expect(res.error.code).toBe("validation");
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain(SYN_GHO);
+      expect(text).not.toContain("BEGIN PRIVATE KEY");
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(isSecretFreePayload(res.error)).toBe(true);
+      expect(res.error.message).toContain("<redacted-token>");
+      expect(res.error.message).toContain("[redacted-private-key]");
+      // Machine-readable detail preserved for allowlist branch.
+      expect((res.error as { detail?: string }).detail).toBe("allowlisted-operations-only");
+    }
+  });
+
+  it("invalid worktree-root echoes no token/env values (validation + stable id)", async () => {
+    const evilRoot = `relative-${SYN_GHP}-${SYN_ENV}`;
+    const res = await handleBridgeRequest(
+      {
+        protocolVersion: 1,
+        requestId: "early-wt1",
+        operation: "profile.mutate",
+        worktree: { projectRoot: evilRoot },
+        params: { action: "create", name: "x", scope: "project" },
+      },
+      bridgeDeps({ env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: SYN_ENV } as NodeJS.ProcessEnv }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.requestId).toBe("early-wt1");
+      expect(res.error.code).toBe("validation");
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain(SYN_GHP);
+      expect(text).not.toContain(SYN_ENV);
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(isSecretFreePayload(res.error)).toBe(true);
+      expect(res.error.message).toMatch(/absolute/);
+    }
+  });
+
+  it("trusted-root gate echoes no token/private-key/env values (validation + untrusted-scope)", async () => {
+    const evilRoot = `/other/${SYN_GHO}`;
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "early-trust1", operation: "profiles.list", worktree: { projectRoot: evilRoot } },
+      bridgeDeps({
+        transport: "operator",
+        trustedProjectRoot: "/repo/p",
+        env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: SYN_ENV } as NodeJS.ProcessEnv,
+      }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.requestId).toBe("early-trust1");
+      expect(res.error.code).toBe("validation");
+      expect((res.error as { detail?: string }).detail).toBe("untrusted-scope");
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain(SYN_GHO);
+      expect(text).not.toContain(SYN_ENV);
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(isSecretFreePayload(res.error)).toBe(true);
+    }
+  });
+
+  it("trusted-root gate with private-key material redacts key blocks (stable id + bounded)", async () => {
+    const evilRoot = `relative------BEGIN PRIVATE KEY-----${SYN_ENV}`;
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "early-trust2", operation: "profile.mutate", worktree: { projectRoot: evilRoot }, params: { action: "create", name: "y", scope: "project" } },
+      bridgeDeps({
+        transport: "operator",
+        trustedProjectRoot: "/repo/p",
+        env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: SYN_ENV } as NodeJS.ProcessEnv,
+      }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.requestId).toBe("early-trust2");
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain("BEGIN PRIVATE KEY");
+      expect(text).not.toContain(SYN_ENV);
+      expect(containsSecretMaterial(text)).toBe(false);
+      expect(res.error.message.length).toBeLessThanOrEqual(DIAGNOSTICS_DETAIL_LIMIT + 20);
+    }
+  });
+
+  it("long secret-bearing early rejections are bounded (actionable prefix survives)", async () => {
+    const longOp = `exec ${SYN_GHP} ` + "x".repeat(2000);
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "early-bound1", operation: longOp },
+      bridgeDeps(),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.requestId).toBe("early-bound1");
+      const text = JSON.stringify(res.error);
+      expect(text).not.toContain(SYN_GHP);
+      expect(res.error.message.length).toBeLessThanOrEqual(DIAGNOSTICS_DETAIL_LIMIT + 20);
+      expect(res.error.message).toContain("[truncated]");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Blocker: success-then-failed-reload never renders stale overview
+// At the start of each loadDiagnostics run the panel clears per-run
+// state.diagnostics / diagnosticsValidate / diagnosticsWorktree, and clears
+// them on diagnostics.doctor failure/rejection too.
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/blocker: diagnostics reload clears stale overview (success-then-failed-reload)", () => {
+  it("panel clears per-run legs at start and on doctor failure (no stale render)", () => {
+    const html = controlHtml();
+    // Per-run clearing at the start of loadDiagnostics.
+    expect(html).toContain("state.diagnostics = null;");
+    expect(html).toContain("state.diagnosticsValidate = null;");
+    expect(html).toContain("state.diagnosticsWorktree = null;");
+    // Start clears before any leg lands and re-renders pending overview.
+    const startIdx = html.indexOf("Per-run clearing");
+    expect(startIdx).toBeGreaterThan(-1);
+    // Doctor failure/rejection clears all three legs and re-renders.
+    expect(html).toContain("diagnostics.doctor failure/rejection clears the per-run legs");
+    expect(html).toContain("Could not load diagnostics.");
+    // Failure paths still update the headline/overview (no frozen stale DOM).
+    const failIdx = html.indexOf("Could not load diagnostics.");
+    const doneAfterFail = html.indexOf("done();", failIdx);
+    expect(doneAfterFail).toBeGreaterThan(failIdx);
+    // Token guards keep concurrent successful legs from resurrecting stale runs.
+    expect(html).toContain("myTok !== state.diagnosticsToken");
+    expect(containsSecretMaterial(html)).toBe(false);
+  });
+
+  it("cleared overview renders pending, never the prior success rows", () => {
+    const prior = diagnosticsOverviewRows({
+      diagnostics: {
+        orcaPiVersion: "0.1.0",
+        bridgeVersion: "1.0.0",
+        protocolVersion: 1,
+        cli: {
+          orca: { executable: "orca", found: true, version: "1.4.196", detail: "orca 1.4.196" },
+          pi: { executable: "pi", found: true, version: "0.84.4", detail: "pi 0.84.4" },
+          ok: true,
+        },
+        bridge: { structured: true, degraded: false, versionsOk: true, consentOk: true, seamHandshake: true, supportedOperations: ["profiles.list"], reasons: [] },
+      },
+      validate: { entries: [{ name: "worker", valid: true }], ok: true },
+      profilesList: {
+        panel: { config: { userPath: "/home/u/.pi/profiles.yaml", projectPath: "/repo/p/.pi/profiles.yaml", userExists: true, projectExists: false } },
+      },
+      orchestration: { effective: { worker: "worker" }, provenance: {} },
+      knownProfiles: ["worker"],
+      githubStatus: statusPayload(),
+      githubDoctor: doctorReport(),
+      launchPreviewSupported: true,
+      worktree: { projectRoot: "/repo/p", explicit: true },
+    });
+    const priorText = prior.map((r) => `${r.label}: ${r.detail}`).join("\n");
+    expect(priorText).toContain("orca 1.4.196");
+    // After a failed reload the panel clears all three legs: diagnostics,
+    // validate, worktree are null/pending — the overview must not reuse
+    // the prior success rows.
+    const cleared = diagnosticsOverviewRows({
+      diagnostics: null,
+      validate: null,
+      worktree: null,
+      profilesList: null,
+      orchestration: null,
+      githubStatus: null,
+      githubDoctor: null,
+    });
+    const clearedText = cleared.map((r) => `${r.label}: ${r.detail}`).join("\n");
+    expect(clearedText).not.toContain("orca 1.4.196");
+    expect(clearedText).not.toContain("all 1 valid");
+    expect(clearedText).toMatch(/unavailable|pending|not loaded|not run/);
+    for (const row of cleared) {
+      expect(containsSecretMaterial(row.detail)).toBe(false);
+      expect(isSecretFreePayload({ detail: row.detail })).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Blocker: top-level readiness requires GitHub health
+// Healthy runtime/config/worktree plus broken GitHub must never headline
+// as overall ready.
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/blocker: diagnostics readiness requires GitHub health", () => {
+  const coreHealthy = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } };
+
+  it("healthy core plus broken GitHub is action-needed (never overall ready)", () => {
+    expect(diagnosticsHeadline({ ...coreHealthy, github: { ok: true } })).toContain("ready");
+    expect(diagnosticsHeadline({ ...coreHealthy, github: { ok: true } })).toContain("GitHub identities healthy");
+    // Missing GitHub (never loaded) is pending, never ready.
+    expect(diagnosticsHeadline({ ...coreHealthy })).toContain("action needed");
+    expect(diagnosticsHeadline({ ...coreHealthy })).toMatch(/GitHub health pending\/unavailable/);
+    expect(diagnosticsHeadline({ ...coreHealthy, github: undefined })).toContain("action needed");
+    // Expired / attention-needed GitHub is not ready.
+    expect(diagnosticsHeadline({ ...coreHealthy, github: { ok: false } })).toContain("action needed");
+    expect(diagnosticsHeadline({ ...coreHealthy, github: { ok: false } })).toMatch(/GitHub needs attention/);
+    // The banner never claims overall ready while GitHub is broken.
+    expect(diagnosticsHeadline({ ...coreHealthy, github: { ok: false } })).not.toMatch(/Diagnostics: ready/);
+    expect(diagnosticsHeadline({ ...coreHealthy })).not.toMatch(/Diagnostics: ready/);
+  });
+
+  it("toDiagnosticsGithubHealth requires configured status plus doctor ok:true", () => {
+    // Healthy worker+reviewer plus distinct doctor is healthy.
+    expect(toDiagnosticsGithubHealth(statusPayload(), doctorReport()))?.toEqual({ ok: true });
+    // Missing either leg is pending (never ready).
+    expect(toDiagnosticsGithubHealth(undefined, doctorReport())).toBeUndefined();
+    expect(toDiagnosticsGithubHealth(statusPayload(), undefined)).toBeUndefined();
+    expect(toDiagnosticsGithubHealth({ identities: {} }, doctorReport())).toBeUndefined();
+    // Expired or missing status is attention-needed.
+    expect(toDiagnosticsGithubHealth({ identities: { worker: { configured: true, sourceLabel: "x", expired: true } } }, doctorReport()))?.toEqual({ ok: false });
+    expect(toDiagnosticsGithubHealth({ identities: { worker: { configured: false, sourceLabel: "x" } } }, doctorReport()))?.toEqual({ ok: false });
+    // Doctor ok:false (swapped actors, repo failure, setup needed) is attention-needed.
+    expect(toDiagnosticsGithubHealth(statusPayload(), { ...doctorReport(), ok: false }))?.toEqual({ ok: false });
+    // Null doctor is still pending (never loaded), never ready.
+    expect(toDiagnosticsGithubHealth(statusPayload(), null)).toBeUndefined();
+    expect(toDiagnosticsGithubHealth(statusPayload(), {}))?.toEqual({ ok: false });
+    const headline = diagnosticsHeadline({ ...coreHealthy, github: toDiagnosticsGithubHealth(statusPayload(), { ...doctorReport(), ok: false }) });
+    expect(headline).toContain("action needed");
+    expect(headline).toMatch(/GitHub needs attention/);
+  });
+
+  it("panel headline requires GitHub and refreshes on GitHub loads", () => {
+    const html = controlHtml();
+    expect(html).toContain("function githubOkForHeadline()");
+    expect(html).toContain("function refreshDiagnosticsHeadline()");
+    expect(html).toContain("githubOk === true");
+    expect(html).toContain("GitHub health pending/unavailable");
+    expect(html).toContain("GitHub needs attention");
+    expect(html).toContain("GitHub identities healthy");
+    // Diagnostics legs persist so GitHub refreshes can re-render readiness.
+    expect(html).toContain("state.diagnosticsCliOk");
+    expect(html).toContain("state.diagnosticsBridgeStructured");
+    expect(html).toContain("state.diagnosticsConfigOk");
+    expect(html).toContain("state.diagnosticsWorktreeOk");
+    // GitHub loads re-render the headline (not just the overview).
+    expect(html).toContain("refreshDiagnosticsHeadline();");
+    expect(containsSecretMaterial(html)).toBe(false);
   });
 });

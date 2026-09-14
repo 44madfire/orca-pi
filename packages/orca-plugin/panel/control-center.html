@@ -454,6 +454,12 @@
           profilesRaw: null,
           diagnosticsValidate: null,
           diagnosticsWorktree: null,
+          // Last-known diagnostics headline legs (persisted so GitHub
+          // refreshes can re-render readiness without stale locals).
+          diagnosticsCliOk: false,
+          diagnosticsBridgeStructured: false,
+          diagnosticsConfigOk: undefined,
+          diagnosticsWorktreeOk: undefined,
         };
         var ORCH_BUILTINS = ["worker", "scout", "reviewer"];
         var ORCH_CHAIN = "Orchestration role mapping → profile → user/project profile layers → effective launch";
@@ -2338,6 +2344,7 @@
               state.githubStatus = mergeGithubStatus(state.githubStatus, res.result);
               renderGithubStatus(state.githubStatus);
               renderGithubMapped();
+              refreshDiagnosticsHeadline();
               renderDiagnosticsOverview();
               return state.githubStatus;
             }
@@ -2380,6 +2387,7 @@
               renderGithubDoctor(res.result);
               renderGithubActor(res.result);
               renderGithubSetup(res.result);
+              refreshDiagnosticsHeadline();
               renderDiagnosticsOverview();
               return res.result;
             }
@@ -2651,15 +2659,39 @@
           else ctx = wsl;
           return "Node " + node + " on " + os + " (" + ctx + ").";
         }
-        function renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk) {
+        // Required GitHub health for the top-level readiness (mirrors
+        // control-center.ts toDiagnosticsGithubHealth): every reported
+        // status identity configured + unexpired AND doctor ok:true.
+        // Missing status/doctor -> undefined (pending, never ready);
+        // missing/expired/attention-needed -> false (never ready).
+        // No tokens/keys ever read -- allowlisted redacted fields only.
+        function githubOkForHeadline() {
+          var sItems = toGithubStatusItems(state.githubStatus);
+          if (!state.githubStatus || !sItems.length) return undefined;
+          for (var gi = 0; gi < sItems.length; gi += 1) {
+            if (sItems[gi].expired === true) return false;
+            if (!sItems[gi].configured) return false;
+          }
+          var doc = state.githubDoctor;
+          if (!doc || typeof doc !== "object" || Array.isArray(doc)) return undefined;
+          if (doc.ok !== true) return false;
+          return true;
+        }
+        function refreshDiagnosticsHeadline() {
+          renderDiagnosticsHeadline(state.diagnosticsCliOk, state.diagnosticsBridgeStructured, state.diagnosticsConfigOk, state.diagnosticsWorktreeOk, githubOkForHeadline());
+        }
+        function renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk, githubOk) {
           var box = document.getElementById("diagnostics-summary");
           if (!box) return;
           // Unknown legs (unavailable/pending/malformed/failed) are never
-          // ready — fail closed to pending/unavailable, never "ready".
+          // ready -- fail closed to pending/unavailable, never "ready".
           // The worktree leg must be an explicit healthy worktree.context
           // result: no confirmed project/worktree scope, no ready headline.
-          if (cliOk && bridgeStructured && configOk === true && worktreeOk === true) {
-            box.innerHTML = "<p><strong>Diagnostics: ready</strong> <span class=\"muted\">— CLIs available, structured bridge reachable, config valid, worktree scope confirmed. CLI remains authoritative (<code>orca-pi doctor</code>).</span></p>";
+          // The GitHub leg is required: missing/expired/attention-needed
+          // status or doctor keeps the banner at action-needed, so overall
+          // ready can never coincide with broken GitHub.
+          if (cliOk && bridgeStructured && configOk === true && worktreeOk === true && githubOk === true) {
+            box.innerHTML = "<p><strong>Diagnostics: ready</strong> <span class=\"muted\">-- CLIs available, structured bridge reachable, config valid, worktree scope confirmed, GitHub identities healthy. CLI remains authoritative (<code>orca-pi doctor</code>).</span></p>";
           } else {
             var parts = [];
             if (!cliOk) parts.push("CLIs need attention (run <code>orca-pi doctor</code>)");
@@ -2668,7 +2700,9 @@
             else if (configOk !== true) parts.push("profiles need attention (run <code>orca-pi profile validate</code>)");
             if (worktreeOk === undefined) parts.push("worktree scope pending/unavailable (requires <code>worktree.context</code> over the structured bridge)");
             else if (worktreeOk !== true) parts.push("worktree scope unavailable (requires <code>worktree.context</code> over the structured bridge)");
-            box.innerHTML = "<p><strong>Diagnostics: action needed</strong> <span class=\"muted\">— " + parts.join("; ") + ".</span></p>";
+            if (githubOk === undefined) parts.push("GitHub health pending/unavailable (refresh <code>github.status</code> + <code>github.doctor</code>; redacted, no mint in panel)");
+            else if (githubOk !== true) parts.push("GitHub needs attention (refresh <code>github.status</code> + <code>github.doctor</code>; redacted, no mint in panel)");
+            box.innerHTML = "<p><strong>Diagnostics: action needed</strong> <span class=\"muted\">-- " + parts.join("; ") + ".</span></p>";
           }
         }
 
@@ -2766,6 +2800,18 @@
           }
           state.diagnosticsToken = (state.diagnosticsToken || 0) + 1;
           var myTok = state.diagnosticsToken;
+          // Per-run clearing: a new run must never render the prior run's
+          // overview. Clear all three legs up front (pending) so a slow
+          // prior leg cannot leave stale rows, and concurrent successful
+          // legs combine only with this run's fresh diagnostics.
+          state.diagnostics = null;
+          state.diagnosticsValidate = null;
+          state.diagnosticsWorktree = null;
+          state.diagnosticsCliOk = false;
+          state.diagnosticsBridgeStructured = false;
+          state.diagnosticsConfigOk = undefined;
+          state.diagnosticsWorktreeOk = undefined;
+          renderDiagnosticsOverview();
           summary.innerHTML = "<p class=\"muted\">Loading diagnostics via <code>diagnostics.doctor</code>…</p>";
           if (runtime) runtime.innerHTML = "";
           if (bridgeBox) bridgeBox.innerHTML = "";
@@ -2777,7 +2823,14 @@
           // Worktree leg: pending until an explicit healthy worktree.context
           // result lands; rejected/failed/malformed stays not-ready.
           var worktreeOk = undefined;
-          var done = function () { renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk); renderDiagnosticsOverview(); };
+          var done = function () {
+            state.diagnosticsCliOk = cliOk;
+            state.diagnosticsBridgeStructured = bridgeStructured;
+            state.diagnosticsConfigOk = configOk;
+            state.diagnosticsWorktreeOk = worktreeOk;
+            renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk, githubOkForHeadline());
+            renderDiagnosticsOverview();
+          };
           var main = request("diagnostics.doctor").then(function (res) {
             if (myTok !== state.diagnosticsToken) return null;
             if (res && res.ok && res.result) {
@@ -2817,12 +2870,27 @@
               done();
               return r;
             }
+            // diagnostics.doctor failure/rejection clears the per-run legs
+            // so concurrent validate/worktree successes cannot combine with
+            // a stale prior diagnostics payload in the overview.
+            state.diagnostics = null;
+            state.diagnosticsValidate = null;
+            state.diagnosticsWorktree = null;
+            state.diagnosticsCliOk = false;
+            state.diagnosticsBridgeStructured = false;
             var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
             summary.innerHTML = "<p><strong>Could not load diagnostics.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+            done();
             return null;
           }, function () {
             if (myTok !== state.diagnosticsToken) return null;
+            state.diagnostics = null;
+            state.diagnosticsValidate = null;
+            state.diagnosticsWorktree = null;
+            state.diagnosticsCliOk = false;
+            state.diagnosticsBridgeStructured = false;
             summary.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
+            done();
             return null;
           });
           if (can("profile.validate")) {
