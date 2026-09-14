@@ -122,3 +122,23 @@ export {
   type PiConformanceResult,
   type PiConformanceScenario,
 } from "./pi-conformance.js";
+export {
+  checkPiLocationSupport,
+  checkPiVersionSupport,
+  comparePiVersions,
+  gatePiStructuredSession,
+  MIN_KNOWN_GOOD_PI_VERSION,
+  negotiatePiCapabilities,
+  parsePiVersion,
+  PI_COMPAT_AGENT,
+  PI_COMPAT_LOCAL_HOST_ID,
+  PI_RPC_PROTOCOL_VERSION,
+  PI_TUI_FALLBACK,
+  type PiCapabilityNegotiation,
+  type PiCompatLocation,
+  type PiLocationSupport,
+  type PiProbedCapabilities,
+  type PiStructuredGate,
+  type PiStructuredGateInput,
+  type PiVersionSupport,
+} from "./pi-compat.js";
