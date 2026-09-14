@@ -107,9 +107,16 @@ bridge capabilities) over version-string checks. The version gate is a
 coarse floor only. Enforcement is two-layer: (1) pre-spawn, required
 capabilities are checked against the static advertisement (cheap refusal
 before any Pi child exists); (2) post-start, capabilities with a dedicated
-live RPC probe (`options`/`images` via the catalogs, `history`/`resume`
-via entries/tree) are re-verified against the RUNNING Pi before the
-session is exposed — refusal closes the just-started child (no leak).
+live RPC probe are re-verified against the RUNNING Pi before the session
+is exposed — refusal closes the just-started child (no leak). Live
+verdicts prove exactly what they invoke, nothing more: `options` proves
+the catalog reads plus the `set_model` verb (bogus-id fail-closed
+rejection; presence-gated thinking/auto-compaction setters stay
+declared because invoking them pre-registration would mutate Pi state);
+`images` proves an image-capable model via the model catalog alone
+(independent of the thinking catalog); `history` mirrors the provider's
+`get_entries` → `get_tree` fallback; `resume` adds `switchSession`
+presence (declared — invoking it would redirect the live child).
 Flags without a pre-turn probe (`textStreaming`, `thinking`, `tools`,
 `cancel`, `extensionDialogs`) stay advertisement-checked pre-spawn and
 runtime-enforced per-turn. See `splitProbedCapabilities()`.

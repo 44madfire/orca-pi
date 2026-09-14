@@ -80,6 +80,7 @@
 
 import {
   PiRpcConnection,
+  PiRpcError,
   redactSecrets,
   resolvePiRpcEnv,
   toPiRpcProcessSpec,
@@ -488,12 +489,16 @@ export class PiBridgeProvider extends BridgeProvider {
    * null when everything required is live-proven. Every probe is bounded;
    * failures name the missing evidence (never prompt text or paths).
    */
-  private async verifyLiveCapabilities(conn: PiProviderConnection, required: readonly string[]): Promise<string | null> {
+  private async verifyLiveCapabilities(
+    conn: PiProviderConnection,
+    required: readonly string[],
+    stateModel?: PiModel,
+  ): Promise<string | null> {
     const { live } = splitProbedCapabilities(required);
     if (live.length === 0) return null;
     const probes: Array<Promise<string | null>> = [];
     if (live.includes("options")) {
-      probes.push(this.probeOptionsCapability(conn));
+      probes.push(this.probeOptionsCapability(conn, stateModel));
     }
     if (live.includes("images")) {
       probes.push(this.probeImagesCapability(conn));
@@ -509,11 +514,15 @@ export class PiBridgeProvider extends BridgeProvider {
   }
 
   /**
-   * `options` proves the catalog reads AND the mutation RPCs the capability
-   * exposes (`setModel`/`setThinkingLevel`/`setAutoCompaction` presence —
-   * presence only, never invoked: probing must not mutate Pi state).
+   * `options` proves the catalog reads AND the `set_model` verb against the
+   * RUNNING Pi (bogus-id rejection = definite command-level evidence without
+   * mutation). The thinking/auto-compaction setters are presence-gated only
+   * (declared): invoking `setThinkingLevel` with a bogus level would
+   * leniently MUTATE to minimal, and `setAutoCompaction` persists to Pi
+   * settings — neither is safe pre-registration. First real use of those
+   * setters fails closed (`UNKNOWN_THINKING_LEVEL` / `PI_OPTION_FAILED`).
    */
-  private async probeOptionsCapability(conn: PiProviderConnection): Promise<string | null> {
+  private async probeOptionsCapability(conn: PiProviderConnection, currentModel?: PiModel): Promise<string | null> {
     if (typeof conn.getAvailableModels !== "function" || typeof conn.getAvailableThinkingLevels !== "function") {
       return "live probe failed: options catalog RPCs unavailable on the running Pi (update Pi)";
     }
@@ -530,9 +539,41 @@ export class PiBridgeProvider extends BridgeProvider {
       if (!Array.isArray(models?.models) || !Array.isArray(levels?.levels)) {
         return "live probe failed: options RPCs returned malformed catalogs";
       }
-      return null;
     } catch (error) {
       return sanitizeCode(`live probe failed: options (${this.shortPiError(error)})`);
+    }
+    return this.probeSetModelVerb(conn, currentModel);
+  }
+
+  /**
+   * `set_model` verb proof without unsafe mutation: a bogus provider/id can
+   * never resolve against a real catalog, so a definite `Model not found`
+   * rejection proves the RUNNING Pi understands `set_model` and fails
+   * closed. Any other outcome (transport failure, unknown rejection shape)
+   * proves nothing and fails the probe. The impossible-success path
+   * restores the pre-probe model best-effort so probing never mutates state.
+   */
+  private async probeSetModelVerb(conn: PiProviderConnection, currentModel?: PiModel): Promise<string | null> {
+    try {
+      await conn.setModel!("__snc110_probe__", "__snc110_probe__", { timeoutMs: PI_LIVE_PROBE_TIMEOUT_MS });
+    } catch (error) {
+      if (
+        error instanceof PiRpcError &&
+        error.code === "rejected" &&
+        /model not found/i.test(`${error.piError ?? ""} ${error.message}`)
+      ) {
+        return null;
+      }
+      return sanitizeCode(`live probe failed: set_model verb unproven (${this.shortPiError(error)})`);
+    }
+    if (!currentModel) {
+      return "live probe failed: set_model accepted a bogus id with no model to restore";
+    }
+    try {
+      await conn.setModel!(currentModel.provider, currentModel.id, { timeoutMs: PI_LIVE_PROBE_TIMEOUT_MS });
+      return null;
+    } catch (error) {
+      return sanitizeCode(`live probe failed: set_model restore failed (${this.shortPiError(error)})`);
     }
   }
 
@@ -559,30 +600,46 @@ export class PiBridgeProvider extends BridgeProvider {
     }
   }
 
+  /**
+   * `history` mirrors the provider's own `get_entries` → `get_tree`
+   * fallback (round-4 P2): a Pi with a working tree but a removed/changed
+   * entries RPC still serves history, so the probe must not reject it.
+   */
   private async probeHistoryCapability(conn: PiProviderConnection): Promise<string | null> {
     const canEntries = typeof conn.getEntries === "function";
     const canTree = typeof conn.getTree === "function";
     if (!canEntries && !canTree) {
       return "live probe failed: history RPCs unavailable on the running Pi (update Pi)";
     }
-    try {
-      if (canEntries) {
+    const errors: string[] = [];
+    if (canEntries) {
+      try {
         const data = await conn.getEntries!(undefined, { timeoutMs: PI_LIVE_PROBE_TIMEOUT_MS });
-        if (!Array.isArray(data?.entries)) return "live probe failed: get_entries returned malformed entries";
-      } else {
-        const data = await conn.getTree!({ timeoutMs: PI_LIVE_PROBE_TIMEOUT_MS });
-        if (!Array.isArray(data?.tree)) return "live probe failed: get_tree returned a malformed tree";
+        if (Array.isArray(data?.entries)) return null;
+        errors.push("get_entries returned malformed entries");
+      } catch (error) {
+        errors.push(`get_entries (${this.shortPiError(error)})`);
       }
-      return null;
-    } catch (error) {
-      return sanitizeCode(`live probe failed: history (${this.shortPiError(error)})`);
     }
+    if (canTree) {
+      try {
+        const data = await conn.getTree!({ timeoutMs: PI_LIVE_PROBE_TIMEOUT_MS });
+        if (Array.isArray(data?.tree)) return null;
+        errors.push("get_tree returned a malformed tree");
+      } catch (error) {
+        errors.push(`get_tree (${this.shortPiError(error)})`);
+      }
+    }
+    return sanitizeCode(`live probe failed: history (${errors.join("; ")})`);
   }
 
   /**
    * `resume` proves `switchSession` presence in addition to readable
-   * history (presence only — invoking it would switch the live session).
-   * History readability is verified by `probeHistoryCapability` alongside.
+   * history. Presence only (declared): invoking it pre-registration would
+   * redirect the live child at a probe path, and there is no safe
+   * read-only switch — so the presence gate plus live history readability
+   * is the evidence, and the first real resume fails closed
+   * (`PI_RESUME_*`) on an incompatible Pi.
    */
   private async probeResumeCapability(conn: PiProviderConnection): Promise<string | null> {
     if (typeof conn.switchSession !== "function") {
@@ -760,7 +817,7 @@ export class PiBridgeProvider extends BridgeProvider {
     // changed/missing RPC behavior must fail here, not at first use.
     // Refusal closes the just-started child (no leak) and fails closed.
     if (msg.compat?.requiredCapabilities?.length) {
-      const liveFailure = await this.verifyLiveCapabilities(conn, msg.compat.requiredCapabilities);
+      const liveFailure = await this.verifyLiveCapabilities(conn, msg.compat.requiredCapabilities, state.model);
       if (liveFailure !== null) {
         await conn.close(this.piCloseGraceMs).catch(() => undefined);
         this.send({

@@ -205,7 +205,17 @@ class Snc110FakePi implements PiProviderConnection {
   async setModel(provider: string, modelId: string): Promise<PiModel> {
     const found = this.models.find((m) => m.provider === provider && m.id === modelId);
     if (!found) {
-      throw Object.assign(new Error(`Model not found: ${provider}/${modelId}`), { code: "model-not-found" });
+      // Faithful Pi rejection shape: definite `rejected` (not ambiguous),
+      // so the live `set_model` verb probe can prove command-level support.
+      throw new PiRpcError(
+        {
+          code: "rejected",
+          command: "set_model",
+          ambiguous: false,
+          piError: `Model not found: ${provider}/${modelId}`,
+        },
+        `Pi rejected set_model: Model not found: ${provider}/${modelId}`,
+      );
     }
     this.state = { ...this.state, model: { ...found } as PiState["model"] };
     return { ...found };
@@ -1013,6 +1023,54 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
       } finally {
         await harness2.teardown();
       }
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("refuses options when set_model fails at transport level (verb unproven)", async () => {
+    // Real forward-compat failure mode: the wrapper method exists but the
+    // underlying RPC command does not answer definitively.
+    const brokenSetModel = (fake: Snc110FakePi): void => {
+      const mutable = fake as unknown as Record<string, unknown>;
+      mutable["setModel"] = async (): Promise<never> => {
+        throw new PiRpcError(
+          { code: "request-timeout", command: "set_model", ambiguous: true, timeoutMs: 10 },
+          "set_model timed out",
+        );
+      };
+    };
+    const harness = makeHarness(kind, new Map(), {}, brokenSetModel);
+    try {
+      const reason = await harness.acquireExpectError("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["options"] },
+      });
+      expect(reason).toMatch(/PI_COMPAT_CAPABILITY/);
+      expect(reason).toMatch(/set_model verb unproven/);
+      expect(harness.fakes).toHaveLength(1);
+      expect(harness.fakes[0]?.isClosed).toBe(true);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("falls back to get_tree when get_entries fails (mirrors provider rebuild)", async () => {
+    const entriesFailing = (fake: Snc110FakePi): void => {
+      const mutable = fake as unknown as Record<string, unknown>;
+      mutable["getEntries"] = async (): Promise<never> => {
+        throw new PiRpcError(
+          { code: "request-timeout", command: "get_entries", ambiguous: true, timeoutMs: 10 },
+          "get_entries timed out",
+        );
+      };
+    };
+    const harness = makeHarness(kind, new Map(), {}, entriesFailing);
+    try {
+      // Tree still serves history: the probe passes (round-4 P2).
+      const ok = await harness.acquire("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["history"] },
+      });
+      expect(ok.sessionId).not.toBe("");
     } finally {
       await harness.teardown();
     }

@@ -312,13 +312,18 @@ export function checkAcquireCompat(
 /**
  * Required capabilities with a dedicated pre-turn live RPC probe.
  *
- * `options`/`images` verify against the live model + thinking catalogs;
- * `history`/`resume` verify against live entries/tree. The remaining flags
+ * `options`/`images` verify against the live model + thinking catalogs
+ * (plus the `set_model` verb for `options`); `history`/`resume` verify
+ * against live entries/tree (with entries → tree fallback) plus
+ * `switchSession` presence for `resume`. The remaining flags
  * (`textStreaming`, `thinking`, `tools`, `cancel`, `extensionDialogs`)
  * have no pre-turn probe: they are checked against the static adapter
  * advertisement pre-spawn and enforced per-turn at runtime (abort
  * fidelity, translator shaping, prompt retirement,
- * `PI_OPTION_UNSUPPORTED` on minimal transports).
+ * `PI_OPTION_UNSUPPORTED` on minimal transports). Operations whose only
+ * safe evidence is presence (thinking/auto-compaction setters,
+ * `switchSession`) are documented as declared in the probe messages and
+ * the SNC1.10 compatibility doc — never presented as command-invoked.
  */
 export const LIVE_PROBE_CAPABILITIES: readonly string[] = Object.freeze(["options", "images", "history", "resume"]);
 
