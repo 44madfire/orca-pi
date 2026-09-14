@@ -47,11 +47,13 @@ import {
   type BridgeResponse,
 } from "./bridge.js";
 import type {
+  DoctorCheck,
   DoctorReport,
   GithubDoctorReport,
   MutationScope,
   OrchestrationScope,
 } from "@orca-pi/core";
+import { DIAGNOSTICS_DETAIL_LIMIT, redactDiagnosticsText, sanitizeDiagnosticsDetail } from "./control-center.js";
 
 export interface BridgeHostDeps {
   /** Explicit project root fallback when a request carries no worktree scope (reads only). */
@@ -71,6 +73,13 @@ export interface BridgeHostDeps {
   hostInfo?: { appVersion?: string; pluginApi?: number; grantedCapabilities?: readonly string[]; seamAvailable?: boolean };
   /** Injectable credential fs for GitHub doctor (tests stub; prod resolves node:fs). */
   providerFs?: import("@orca-pi/core").CredentialProviderFs;
+  /**
+   * Injectable runtime context for `diagnostics.doctor` (tests stub;
+   * prod derives from `process.version`/`process.platform`/`process.arch`
+   * plus WSL env). Unknown/absent fields degrade to truthful unknown
+   * states — never synthesized as healthy.
+   */
+  runtimeInfo?: { nodeVersion?: string; platform?: string; arch?: string; wsl?: string };
   /**
    * Transport carrying this request (authority basis).
    * - `"seam"` (default): panel path. Structured operations require
@@ -131,7 +140,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Defensive secret scan: GitHub bridge results must never carry tokens/keys. */
+/** Defensive secret scan: GitHub/diagnostics bridge results must never carry tokens/keys. */
 function assertNoSecrets(value: unknown, where: string): void {
   let text: string;
   try {
@@ -142,20 +151,75 @@ function assertNoSecrets(value: unknown, where: string): void {
   const probes: Array<{ re: RegExp; label: string }> = [
     { re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/, label: "private key material" },
     { re: /\bghp_[A-Za-z0-9]{10,}/, label: "GitHub PAT" },
+    { re: /\bgho_[A-Za-z0-9]{10,}/, label: "GitHub OAuth token" },
     { re: /\bghu_[A-Za-z0-9]{10,}/, label: "GitHub user token" },
     { re: /\bghs_[A-Za-z0-9]{10,}/, label: "GitHub server token" },
+    { re: /\bghr_[A-Za-z0-9]{10,}/, label: "GitHub refresh token" },
+    { re: /\bgithub_pat_[A-Za-z0-9_]{10,}/, label: "GitHub fine-grained PAT" },
+    { re: /x-access-token:[^\s"']+/, label: "GitHub bearer token" },
   ];
   for (const probe of probes) {
     if (probe.re.test(text)) {
       throw new Error(`Refusing to return ${probe.label} to the panel via ${where} (redacted status only).`);
     }
   }
-  // Env-var-named token values are never echoed: the report must not contain
-  // keys literally named `*TOKEN*` with a non-empty secret-looking value.
-  // (Core reports use `tokenRefreshable`/`configured` booleans instead.)
-  if (/"[^"]*TOKEN[^"]*"\s*:\s*"[^"]{8,}"/i.test(text) && /"token"\s*:/i.test(text)) {
+  // Token/private-key values are never echoed under any `*token*` or
+  // `*private*key*` key with a non-trivial string value (covers `token`,
+  // `ORCA_PI_GITHUB_WORKER_TOKEN`, `privateKey`, ...). Redacted reports
+  // use `configured`/`sourceLabel`/`tokenRefreshable` booleans/labels
+  // instead, and `sourceLabel` values (e.g. `"sourceLabel":
+  // "ORCA_PI_GITHUB_WORKER_TOKEN"`) never match (key has no `token`).
+  if (/"[^"]*token[^"]*"\s*:\s*"[^"]{8,}"/i.test(text)) {
     throw new Error(`Refusing to return token values to the panel via ${where} (redacted status only).`);
   }
+  if (/"[^"]*private[_-]?key[^"]*"\s*:\s*"[^"]{8,}"/i.test(text)) {
+    throw new Error(`Refusing to return private-key values to the panel via ${where} (redacted status only).`);
+  }
+}
+
+/**
+ * Collect redactable secret values from an env mapping without logging
+ * them (mirrors `core.collectSecretsFromEnv` for the sync error path).
+ * Any `*TOKEN*`/`*SECRET*`/`*PRIVATE_KEY*` value plus token-shaped
+ * values (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`) in any var
+ * is collected; callers only ever replace these values with
+ * placeholders, never echo them.
+ */
+function collectEnvSecretsForBridgeError(env: NodeJS.ProcessEnv | Record<string, string | undefined>): string[] {
+  const secrets: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string" || value.length === 0) continue;
+    const upper = key.toUpperCase();
+    if (upper.includes("TOKEN") || upper.includes("SECRET") || upper.includes("PRIVATE_KEY")) {
+      secrets.push(value);
+      continue;
+    }
+    if (/^(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/.test(value) && value.length >= 12) {
+      secrets.push(value);
+    }
+  }
+  return secrets;
+}
+
+/**
+ * Sanitize a bridge error message before it crosses the bridge (defense
+ * in depth). Redacts explicit env-backed secret values first (arbitrary
+ * `*TOKEN*`/`*SECRET*`/`*PRIVATE_KEY*` values, not just known prefixes),
+ * then token/key patterns (var-name labels like `*_TOKEN` stay intact
+ * for actionable guidance), and bounds to `DIAGNOSTICS_DETAIL_LIMIT`
+ * chars so a secret-bearing throw (runner stdout, provider fetch body,
+ * panel-echoed value) can never reach the DOM via error rendering.
+ * Actionable non-secret text survives. Never echoes secret values.
+ */
+function sanitizeBridgeErrorMessage(message: string, secrets: readonly string[] = []): string {
+  let out = message;
+  for (const secret of secrets) {
+    if (!secret || secret.length < 4) continue;
+    out = out.split(secret).join("<redacted>");
+  }
+  const redacted = redactDiagnosticsText(out);
+  if (redacted.length <= DIAGNOSTICS_DETAIL_LIMIT) return redacted;
+  return `${redacted.slice(0, DIAGNOSTICS_DETAIL_LIMIT)}… [truncated]`;
 }
 
 /**
@@ -163,24 +227,43 @@ function assertNoSecrets(value: unknown, where: string): void {
  * `ok: false` responses with stable requestId + machine-readable code.
  */
 export async function handleBridgeRequest(data: unknown, deps: BridgeHostDeps = {}): Promise<BridgeResponse> {
+  // Collect env-backed secrets up front so even early rejections
+  // (parse/transport gate) redact arbitrary `*TOKEN*`/`*SECRET*` /
+  // `*PRIVATE_KEY*` values and token/key patterns before crossing.
+  const earlySecrets = collectEnvSecretsForBridgeError(deps.env ?? process.env);
   const parsed = parseBridgeRequest(data);
   if (!parsed.ok) {
-    // parseBridgeRequest already chose validation vs unsupported.
+    // parseBridgeRequest already chose validation vs unsupported —
+    // preserve the stable requestId + machine-readable code, but run
+    // the message through the same redaction/bounding sanitizer as
+    // dispatch errors so panel-echoed secrets (protocol/operation/
+    // worktree-root values) can never reach the DOM via errors.
     return {
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       requestId: parsed.requestId,
       ok: false,
-      error: parsed.error,
+      error: { ...parsed.error, message: sanitizeBridgeErrorMessage(parsed.error.message, earlySecrets) },
     };
   }
   const { request } = parsed;
   try {
     const gate = enforceTransportGate(request, deps);
-    if (gate) return gate;
+    if (gate) {
+      // Same sanitizer for trusted-root / consent / reachability
+      // rejections: preserve requestId + code, redact/bound the message.
+      if (!gate.ok) {
+        return {
+          ...gate,
+          error: { ...gate.error, message: sanitizeBridgeErrorMessage(gate.error.message, earlySecrets) },
+        };
+      }
+      return gate;
+    }
     const result = await dispatch(request, deps);
     return bridgeOk(request.requestId, result);
   } catch (error) {
-    return toBridgeError(request.requestId, error);
+    const secrets = collectEnvSecretsForBridgeError(deps.env ?? process.env);
+    return toBridgeError(request.requestId, error, secrets);
   }
 }
 
@@ -226,7 +309,7 @@ function enforceTransportGate(request: BridgeRequest, deps: BridgeHostDeps): Bri
   );
 }
 
-function toBridgeError(requestId: string, error: unknown): BridgeResponse {
+function toBridgeError(requestId: string, error: unknown, secrets: readonly string[] = []): BridgeResponse {
   if (error && typeof error === "object" && "code" in error && "message" in error) {
     const record = error as { code: unknown; message: unknown };
     if (typeof record.code === "string" && typeof record.message === "string") {
@@ -234,20 +317,22 @@ function toBridgeError(requestId: string, error: unknown): BridgeResponse {
       const mapped = mapMutationCodeToBridge(record.code);
       // `auth/setup` surfaces when GitHub setup is required (see below);
       // core `load-failed` on missing config stays `internal` with action.
-      return bridgeFail(requestId, mapped, record.message, { detail: record.code });
+      // Sanitize before crossing: a panel-echoed value or core throw
+      // carrying a token/key pattern must never reach the DOM via errors.
+      return bridgeFail(requestId, mapped, sanitizeBridgeErrorMessage(record.message, secrets), { detail: record.code });
     }
   }
   if (error instanceof Error) {
     // Explicit unsupported/auth signals thrown with a prefix marker.
     if (error.message.startsWith("[unsupported] ")) {
-      return bridgeFail(requestId, "unsupported", error.message.slice("[unsupported] ".length));
+      return bridgeFail(requestId, "unsupported", sanitizeBridgeErrorMessage(error.message.slice("[unsupported] ".length), secrets));
     }
     if (error.message.startsWith("[auth/setup] ")) {
-      return bridgeFail(requestId, "auth/setup", error.message.slice("[auth/setup] ".length));
+      return bridgeFail(requestId, "auth/setup", sanitizeBridgeErrorMessage(error.message.slice("[auth/setup] ".length), secrets));
     }
-    return bridgeFail(requestId, "internal", error.message);
+    return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(error.message, secrets));
   }
-  return bridgeFail(requestId, "internal", String(error));
+  return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(String(error), secrets));
 }
 
 async function dispatch(request: BridgeRequest, deps: BridgeHostDeps): Promise<unknown> {
@@ -676,18 +761,160 @@ async function githubDoctorResult(request: BridgeRequest, deps: BridgeHostDeps):
 
 async function diagnosticsDoctorResult(request: BridgeRequest, deps: BridgeHostDeps): Promise<unknown> {
   const core = await import("@orca-pi/core");
-  let cli: DoctorReport | undefined;
+  const secrets = core.collectSecretsFromEnv(deps.env ?? process.env);
+  let cli: DoctorReport | string | undefined;
   if (deps.runner) {
-    cli = await core.doctor(deps.runner);
+    try {
+      const raw = await core.doctor(deps.runner);
+      cli = sanitizeDoctorReportForBridge(raw, secrets);
+    } catch (error) {
+      // The runner itself threw (not a normal probe detail): core rethrows
+      // non-ENOENT runner failures, and the generic bridge error path
+      // would return `error.message` verbatim. Collapse to a sanitized
+      // degraded note instead so secret-bearing throw text can never
+      // cross the bridge via the error response (or reach the DOM
+      // through the panel's error rendering). Actionable non-secret text
+      // survives redaction/bounding; the CLI fallback stays explicit.
+      const detail = sanitizeDiagnosticsDetail(
+        error instanceof Error ? error.message : String(error),
+        DIAGNOSTICS_DETAIL_LIMIT,
+        secrets,
+      );
+      cli = `(CLI probes failed: ${detail} — run \`orca-pi doctor\` for live orca/pi versions)`;
+    }
   }
   const negotiation = negotiateBridgeCapabilities(deps.hostInfo);
-  return {
+  const host = collectDiagnosticsHost(deps, negotiation);
+  const runtime = collectDiagnosticsRuntime(deps);
+  const transport = deps.transport ?? "seam";
+  const result = {
     orcaPiVersion: core.ORCA_PI_VERSION,
     bridgeVersion: BRIDGE_VERSION,
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     ...(cli !== undefined ? { cli } : { cli: "(no runner injected — CLI probes unavailable; run `orca-pi doctor` for live orca/pi versions)" }),
     bridge: negotiation,
+    host,
+    runtime,
+    transport: { mode: transport },
     target: { appVersion: "1.4.196+", pluginApi: 1, upstreamCommit: "9aa0f7e77d366c23a3cc8de2da32ae550d397dc0" },
+  };
+  assertNoSecrets(result, "diagnostics.doctor");
+  return result;
+}
+
+/**
+ * Collect allowlisted host context for `diagnostics.doctor` (never throws,
+ * never secrets). Host-reported Orca app version / pluginApi degrade to
+ * unknown when absent (never synthesized from `target` desired versions),
+ * and granted capabilities are allowlisted to the closed Host capability
+ * set so a compromised host cannot smuggle arbitrary strings to the DOM.
+ */
+function collectDiagnosticsHost(
+  deps: BridgeHostDeps,
+  negotiation: { versionsOk: boolean; consentOk: boolean; seamHandshake: boolean; structured: boolean },
+): Record<string, unknown> {
+  const info = deps.hostInfo;
+  const out: Record<string, unknown> = {
+    versionsOk: negotiation.versionsOk === true,
+    consentOk: negotiation.consentOk === true,
+    seamHandshake: negotiation.seamHandshake === true,
+    structured: negotiation.structured === true,
+  };
+  if (typeof info?.appVersion === "string") {
+    // eslint-disable-next-line no-control-regex
+    const trimmed = info.appVersion.trim().slice(0, 64).replace(/[\0-\x1f\x7f]/g, "");
+    if (/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(trimmed)) out["appVersion"] = trimmed;
+  }
+  if (typeof info?.pluginApi === "number" && Number.isInteger(info.pluginApi) && info.pluginApi >= 0 && info.pluginApi <= 999) {
+    out["pluginApi"] = info.pluginApi;
+  }
+  if (Array.isArray(info?.grantedCapabilities)) {
+    const allowlisted = (info.grantedCapabilities as unknown[])
+      .filter((c): c is string =>
+        typeof c === "string" &&
+        ( ["workspace:read", "terminal:send", "notifications:show", "storage", "secrets", "events:subscribe", "settings:own"] as readonly string[] ).includes(c),
+      )
+      .slice(0, 16);
+    out["grantedCapabilities"] = allowlisted;
+  } else if (info !== undefined) {
+    out["grantedCapabilities"] = [];
+  }
+  return out;
+}
+
+/**
+ * Collect allowlisted OS/runtime context for `diagnostics.doctor` (never
+ * throws, never secrets). Node/platform/arch come from injected
+ * `runtimeInfo` (tests) or `process.*` (prod), bounded to 32 chars and
+ * restricted to token shapes. WSL is derived from `WSL_DISTRO_NAME` /
+ * `WSL_INTEROP` presence only (distro name sanitized, never raw env
+ * dumps) with truthful native/unknown states.
+ */
+function collectDiagnosticsRuntime(deps: BridgeHostDeps): Record<string, unknown> {
+  const env = deps.env ?? process.env;
+  const injected = deps.runtimeInfo;
+  const rawNode = injected?.nodeVersion ?? (typeof process.version === "string" ? process.version : undefined);
+  const rawPlatform = injected?.platform ?? (typeof process.platform === "string" ? process.platform : undefined);
+  const rawArch = injected?.arch ?? (typeof process.arch === "string" ? process.arch : undefined);
+  const out: Record<string, unknown> = {};
+  const asToken = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    // eslint-disable-next-line no-control-regex
+    const trimmed = value.trim().slice(0, 32).replace(/[\0-\x1f\x7f]/g, "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(trimmed)) return undefined;
+    return trimmed;
+  };
+  const node = asToken(rawNode);
+  const platform = asToken(rawPlatform);
+  const arch = asToken(rawArch);
+  if (node !== undefined) out["node"] = node;
+  if (platform !== undefined) out["platform"] = platform;
+  if (arch !== undefined) out["arch"] = arch;
+  const rawWsl = injected?.wsl;
+  const wslPattern = /^(native|unknown|wsl-unknown-distro|wsl:[A-Za-z0-9._-]+)$/;
+  if (typeof rawWsl === "string" && wslPattern.test(rawWsl.trim().slice(0, 64))) {
+    out["wsl"] = rawWsl.trim().slice(0, 64);
+  } else {
+    out["wsl"] = detectWslContext(env, platform);
+  }
+  return out;
+}
+
+function detectWslContext(env: NodeJS.ProcessEnv | Record<string, string | undefined>, platform: string | undefined): string {
+  if (platform === undefined) return "unknown";
+  if (platform !== "linux") return "native";
+  const distroRaw = typeof env["WSL_DISTRO_NAME"] === "string" ? (env["WSL_DISTRO_NAME"] as string).trim().slice(0, 64) : "";
+  const distro = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(distroRaw) ? distroRaw : undefined;
+  if (distro) return `wsl:${distro}`;
+  const hasInterop = typeof env["WSL_INTEROP"] === "string" && (env["WSL_INTEROP"] as string).length > 0;
+  if (hasInterop) return "wsl-unknown-distro";
+  // A bare WSL_DISTRO_NAME that failed sanitization still signals WSL.
+  if (typeof env["WSL_DISTRO_NAME"] === "string" && (env["WSL_DISTRO_NAME"] as string).trim().length > 0) return "wsl-unknown-distro";
+  return "native";
+}
+
+/**
+ * Sanitize a core DoctorReport before it crosses the bridge (P1).
+ *
+ * `core.doctor` embeds arbitrary orca/pi runner stdout/stderr in
+ * `detail`; a CLI/helper echoing a GitHub token or private key would
+ * otherwise reach the panel DOM. Each detail is redacted (explicit env
+ * secrets + token/key patterns) and bounded to
+ * `DIAGNOSTICS_DETAIL_LIMIT` chars; only allowlisted fields
+ * (`executable`/`found`/`version`/`detail`/`ok`) survive. Actionable
+ * non-secret diagnostics (found/version/hints) are preserved.
+ */
+function sanitizeDoctorReportForBridge(report: DoctorReport, secrets: readonly string[] = []): DoctorReport {
+  const sanitizeCheck = (check: DoctorCheck): DoctorCheck => ({
+    executable: check.executable,
+    found: check.found === true,
+    ...(typeof check.version === "string" && check.version.length > 0 ? { version: check.version.slice(0, 64) } : {}),
+    detail: sanitizeDiagnosticsDetail(check.detail, DIAGNOSTICS_DETAIL_LIMIT, secrets),
+  });
+  return {
+    orca: sanitizeCheck(report.orca),
+    pi: sanitizeCheck(report.pi),
+    ok: report.ok === true,
   };
 }
 

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildMutateParams,
   builtinGuardText,
+  containsSecretMaterial,
   controlCenterSections,
   describeDegradedMode,
   describeLayer,
@@ -41,12 +42,12 @@ describe("control center: shell + sections", () => {
     expect([...CONTROL_CENTER_COMPAT_PANEL_IDS]).toEqual(["orca-pi-status", "orca-pi-profiles"]);
   });
 
-  it("defines Profiles + Orchestration as implemented (GitHub still placeholder)", () => {
+  it("defines Profiles + Orchestration + GitHub + Diagnostics as implemented (UI1.5)", () => {
     const sections = controlCenterSections();
     expect(sections.map((s) => s.id)).toEqual(["profiles", "orchestration", "github", "diagnostics"]);
     expect(sections.find((s) => s.id === "profiles")!.implemented).toBe(true);
     expect(sections.find((s) => s.id === "orchestration")!.implemented).toBe(true);
-    expect(sections.find((s) => s.id === "github")!.implemented).toBe(false);
+    expect(sections.find((s) => s.id === "github")!.implemented).toBe(true);
     expect(sections.find((s) => s.id === "diagnostics")!.implemented).toBe(true);
   });
 
@@ -331,6 +332,9 @@ function makeControlDom(bridge?: unknown): {
     "profile-editor", "launch-preview-wrap", "launch-preview",
     "btn-launch-preview", "raw-patch-view", "orchestration-summary",
     "github-summary", "diagnostics-summary", "btn-diagnostics-reload",
+    "diagnostics-overview", "diagnostics-runtime", "diagnostics-bridge",
+    "diagnostics-config", "diagnostics-worktree",
+    "btn-github-refresh", "btn-github-worker", "btn-github-reviewer",
   ];
   for (const id of ids) {
     const e = makeEl(id.startsWith("btn-") ? "button" : "div");
@@ -1100,5 +1104,203 @@ describe("control center: bridge negotiation in the shipped script", () => {
     await flush(12);
     expect(previewParams).toMatchObject({ name: "worker" });
     expect(dom.byId["launch-preview"]!.innerHTML).toContain("pi --model");
+  });
+
+  it("scoped github.status refreshes merge (worker keeps reviewer, reviewer keeps worker)", async () => {
+    const statusFor = (identity?: string): Record<string, unknown> => {
+      const all: Record<string, Record<string, unknown>> = {
+        worker: { identity: "worker", configured: true, sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN", expired: false },
+        reviewer: { identity: "reviewer", configured: true, sourceLabel: "ORCA_PI_GITHUB_REVIEWER_TOKEN", expired: false },
+      };
+      const identities = identity ? { [identity]: all[identity] } : all;
+      return { identities, redacted: true };
+    };
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: { identity?: string } }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "github.status"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { summaries: [] } });
+        }
+        if (req.operation === "github.status") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: statusFor(req.params?.identity),
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const summary = (): string => dom.byId["github-summary"]!.innerHTML;
+    // Boot full refresh shows both identity rows (row headers use <code>;
+    // the footer hint text also mentions both names, so match the rows).
+    expect(summary()).toContain("<code>worker</code>");
+    expect(summary()).toContain("<code>reviewer</code>");
+    // Role-scoped "Refresh worker" returns worker-only but must preserve Reviewer.
+    for (const fn of dom.byId["btn-github-worker"]!.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    expect(summary()).toContain("<code>worker</code>");
+    expect(summary()).toContain("<code>reviewer</code>");
+    // And vice versa: "Refresh reviewer" preserves Worker.
+    for (const fn of dom.byId["btn-github-reviewer"]!.listeners["click"] ?? []) (fn as () => void)();
+    await flush(12);
+    expect(summary()).toContain("<code>worker</code>");
+    expect(summary()).toContain("<code>reviewer</code>");
+  });
+
+  it("headline stays action-needed when worktree.context rejects despite healthy cli/bridge/config", async () => {
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { structured: true, supportedOperations: ["profiles.list", "diagnostics.doctor", "profile.validate", "worktree.context"] },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: { summaries: [] } });
+        }
+        if (req.operation === "diagnostics.doctor") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              orcaPiVersion: "0.1.0", bridgeVersion: "1.0.0", protocolVersion: 1,
+              cli: {
+                orca: { executable: "orca", found: true, version: "1.4.196", detail: "orca 1.4.196" },
+                pi: { executable: "pi", found: true, version: "0.84.4", detail: "pi 0.84.4" },
+                ok: true,
+              },
+              bridge: { structured: true, degraded: false, versionsOk: true, consentOk: true, seamHandshake: true, supportedOperations: ["profiles.list"], reasons: [] },
+            },
+          });
+        }
+        if (req.operation === "profile.validate") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { entries: [{ name: "worker", valid: true }], ok: true },
+          });
+        }
+        if (req.operation === "worktree.context") {
+          return Promise.reject(new Error("torn down"));
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(12);
+    const headline = dom.byId["diagnostics-summary"]!.innerHTML;
+    expect(headline).toContain("action needed");
+    expect(headline).toMatch(/worktree scope unavailable/);
+    expect(headline).not.toContain("Diagnostics: ready");
+  });
+
+  it("diagnostics overview reports one-place redacted health from typed state", async () => {
+    const dom = makeControlDom({
+      request: (req: { operation: string; requestId: string; params?: { identity?: string } }) => {
+        if (req.operation === "bridge.capabilities") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              structured: true,
+              supportedOperations: ["profiles.list", "orchestration.get", "github.status", "github.doctor", "diagnostics.doctor", "profile.validate", "worktree.context", "launch.preview"],
+            },
+          });
+        }
+        if (req.operation === "profiles.list") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              summaries: [
+                { name: "worker", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["worker"], layer: "builtin", valid: true, githubIdentity: "worker" },
+                { name: "reviewer", thinking: "high", skillNames: [], skillCount: 0, extensionCount: 0, contextFiles: true, extendsChain: ["reviewer"], layer: "builtin", valid: true, githubIdentity: "reviewer" },
+              ],
+              panel: {
+                profiles: [],
+                validation: { ok: true, invalidCount: 0 },
+                config: { userPath: "/home/u/.pi/profiles.yaml", projectPath: "/repo/p/.pi/profiles.yaml", userExists: true, projectExists: false },
+              },
+            },
+          });
+        }
+        if (req.operation === "orchestration.get") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { effective: { worker: "worker", reviewer: "reviewer" }, provenance: { worker: "builtin", reviewer: "builtin" } },
+          });
+        }
+        if (req.operation === "github.status") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              identities: {
+                worker: { identity: "worker", configured: true, sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN", expired: false },
+                reviewer: { identity: "reviewer", configured: true, sourceLabel: "ORCA_PI_GITHUB_REVIEWER_TOKEN", expired: false },
+              },
+              redacted: true,
+            },
+          });
+        }
+        if (req.operation === "github.doctor") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              workerLogin: "orca-pi-worker[bot]", reviewerLogin: "orca-pi-reviewer[bot]", ambientLogin: "44madfire",
+              distinctWorkerReviewer: true, distinctFromAmbient: true,
+              distinctDetail: "orca-pi-worker[bot] != orca-pi-reviewer[bot] != 44madfire : distinct (ok)",
+              setupNeeded: [], ok: true, redacted: true,
+            },
+          });
+        }
+        if (req.operation === "diagnostics.doctor") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: {
+              orcaPiVersion: "0.1.0", bridgeVersion: "1.0.0", protocolVersion: 1,
+              cli: {
+                orca: { executable: "orca", found: true, version: "1.4.196", detail: "orca 1.4.196" },
+                pi: { executable: "pi", found: true, version: "0.84.4", detail: "pi 0.84.4" },
+                ok: true,
+              },
+              bridge: { structured: true, degraded: false, versionsOk: true, consentOk: true, seamHandshake: true, supportedOperations: ["profiles.list", "launch.preview"], reasons: [] },
+            },
+          });
+        }
+        if (req.operation === "profile.validate") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { entries: [{ name: "worker", valid: true }], ok: true },
+          });
+        }
+        if (req.operation === "worktree.context") {
+          return Promise.resolve({
+            protocolVersion: 1, requestId: req.requestId, ok: true,
+            result: { projectRoot: "/repo/p", explicit: true },
+          });
+        }
+        return Promise.resolve({ protocolVersion: 1, requestId: req.requestId, ok: true, result: {} });
+      },
+    });
+    const runner = new Function("window", "document", scriptOf()) as unknown as (w: unknown, d: unknown) => void;
+    runner(dom.window, dom.document);
+    await flush(16);
+    // All four legs healthy → headline ready.
+    expect(dom.byId["diagnostics-summary"]!.innerHTML).toContain("Diagnostics: ready");
+    const overview = dom.byId["diagnostics-overview"]!.innerHTML;
+    for (const token of [
+      "Overview", "Runtime", "1.4.196", "Bridge", "structured", "Worktree", "/repo/p",
+      "Profiles", ".pi/profiles.yaml", "Roles", "worker→worker", "Launch", "launch.preview",
+      "GitHub status", "worker: configured", "GitHub doctor", "distinct (ok)",
+    ]) {
+      expect(overview).toContain(token);
+    }
+    expect(containsSecretMaterial(overview)).toBe(false);
   });
 });

@@ -173,13 +173,21 @@ describe("github identity: shipped YAML stays in sync with builtins", () => {
 });
 
 describe("github identity: secret redaction", () => {
-  it("redacts ghp/ghs/pat shapes from text", () => {
-    const text = "token ghp_abcdefgh12345678 and ghs_zxywvuts12345678 plus github_pat_ABCDEF1234567890 done";
+  it("redacts ghp/gho/ghs/pat shapes from text", () => {
+    const text = "token ghp_abcdefgh12345678 and gho_oauth1234567890ab plus ghs_zxywvuts12345678 plus github_pat_ABCDEF1234567890 done";
     const redacted = redactTokenLikeValues(text);
     expect(redacted).not.toContain("ghp_abcdefgh12345678");
+    expect(redacted).not.toContain("gho_oauth1234567890ab");
     expect(redacted).not.toContain("ghs_zxywvuts12345678");
     expect(redacted).not.toContain("github_pat_ABCDEF1234567890");
     expect(redacted).toContain("<redacted-token>");
+  });
+
+  it("collects gho_ values from innocent vars (defense in depth)", () => {
+    const env = { SOME_HELPER_OUTPUT: "gho_oauth1234567890ab" };
+    expect(collectSecretsFromEnv(env)).toContain("gho_oauth1234567890ab");
+    const error = new Error(`helper echoed ${env.SOME_HELPER_OUTPUT}`);
+    expect(sanitizeErrorForDisplay(error, env)).not.toContain("gho_oauth1234567890ab");
   });
 
   it("redacts explicit env-sourced secrets", () => {

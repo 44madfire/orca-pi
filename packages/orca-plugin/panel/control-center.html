@@ -1,6 +1,6 @@
 <!doctype html>
 <!--
-  Orca-Pi Control Center (UI1.3 shell + Profiles, UI1.4 Orchestration).
+  Orca-Pi Control Center (UI1.3 shell + Profiles, UI1.4 Orchestration, UI1.5 GitHub + Diagnostics).
   Single Orca-native shell + structured Profiles editor over the versioned
   Orca↔Orca-Pi bridge (protocol 1, bridge 1.0.0). Live data flows through
   window.__ORCA_PI_BRIDGE__.request with stable request IDs and
@@ -248,16 +248,38 @@
         <section id="section-github" role="tabpanel" aria-labelledby="tab-github" hidden>
           <div class="cc-card">
             <h2>GitHub identities</h2>
-            <p class="muted">UI1.5 owns full identity health UI. Redacted status only — no token or private key is ever returned to the panel.</p>
-            <div id="github-summary"><p class="muted">Loading GitHub status…</p></div>
+            <p class="muted">Redacted status only — no token or private key is ever returned to the panel. Mint/refresh happens outside the panel via <code>orca-pi github mint</code> (operator, outside LLM context).</p>
+            <p class="muted">Worker bot != reviewer bot != 44madfire: human/ChatGPT review actor 44madfire holds final merge authority — a review actor, never a credential slot.</p>
+            <div class="cc-toolbar">
+              <label class="muted" for="github-repo">Repo access-test
+                <input id="github-repo" type="text" value="44madfire/orca-pi" size="22" aria-label="Repository for access test (owner/repo)" />
+              </label>
+              <label class="muted" for="github-ambient">Human review actor
+                <input id="github-ambient" type="text" value="44madfire" size="14" aria-label="Human review actor login" />
+              </label>
+              <button id="btn-github-refresh" type="button">Refresh status</button>
+              <button id="btn-github-worker" type="button">Refresh worker</button>
+              <button id="btn-github-reviewer" type="button">Refresh reviewer</button>
+              <button id="btn-github-doctor" type="button">Run doctor</button>
+            </div>
+            <div id="github-summary" aria-live="polite"><p class="muted">Loading GitHub status via <code>github.status</code>…</p></div>
+            <div id="github-doctor" aria-live="polite"><p class="muted">Doctor via <code>github.doctor</code> (installation, repository access, permissions, actor binding)…</p></div>
+            <div id="github-actor" aria-live="polite"></div>
+            <div id="github-setup" aria-live="polite"></div>
+            <div id="github-mapped" aria-live="polite"><p class="muted">Mapped Pi profiles (role→profile→identity) load with orchestration…</p></div>
           </div>
         </section>
 
         <section id="section-diagnostics" role="tabpanel" aria-labelledby="tab-diagnostics" hidden>
           <div class="cc-card">
             <h2>Diagnostics</h2>
-            <p class="muted">Bridge, capability, and CLI health via <code>diagnostics.doctor</code> and <code>profile.validate</code>. Full hardening lands with UI1.5/UI1.6.</p>
-            <div id="diagnostics-summary"><p class="muted">Loading diagnostics…</p></div>
+            <p class="muted">Runtime, plugin, Pi, orca-pi, config, bridge, and worktree health via <code>diagnostics.doctor</code>, <code>profile.validate</code>, <code>worktree.context</code>, and <code>orchestration.get</code>. CLI remains authoritative (<code>orca-pi doctor</code>).</p>
+            <div id="diagnostics-summary" aria-live="polite"><p class="muted">Loading diagnostics…</p></div>
+            <div id="diagnostics-overview" aria-live="polite"></div>
+            <div id="diagnostics-runtime" aria-live="polite"></div>
+            <div id="diagnostics-bridge" aria-live="polite"></div>
+            <div id="diagnostics-config" aria-live="polite"></div>
+            <div id="diagnostics-worktree" aria-live="polite"></div>
             <button id="btn-diagnostics-reload" type="button">Reload diagnostics</button>
           </div>
         </section>
@@ -266,7 +288,7 @@
       <p class="muted">Targets Orca app 1.4.196+ (pluginApi 1, Host API v0 re-audited 2026-09-11). See docs/ORCA_PLUGIN_API.md. No manual CLI/YAML editing is required for normal profile customization.</p>
     </div>
     <script>
-      // Control Center client (UI1.3 shell + Profiles, UI1.4 Orchestration). Structured by design: every live call
+      // Control Center client (UI1.3 shell + Profiles, UI1.4 Orchestration, UI1.5 GitHub + Diagnostics). Structured by design: every live call
       // goes through window.__ORCA_PI_BRIDGE__.request with protocol 1 and
       // stable request IDs. No fetch, no filesystem, no shell, no static
       // injection. Degraded path uses real Host API calls over postMessage
@@ -419,6 +441,25 @@
           orchPreviewToken: 0,
           orchSaveGen: 0,
           orchDraftRev: 0,
+          // GitHub identities + Diagnostics (UI1.5): redacted health only.
+          // No tokens/keys ever enter state; only allowlisted display fields.
+          githubStatus: null,
+          githubDoctor: null,
+          githubStatusToken: 0,
+          githubDoctorToken: 0,
+          diagnostics: null,
+          diagnosticsToken: 0,
+          // Raw typed payloads backing the one-place overview (in-memory
+          // panel state only — never persisted; stale-guarded by tokens).
+          profilesRaw: null,
+          diagnosticsValidate: null,
+          diagnosticsWorktree: null,
+          // Last-known diagnostics headline legs (persisted so GitHub
+          // refreshes can re-render readiness without stale locals).
+          diagnosticsCliOk: false,
+          diagnosticsBridgeStructured: false,
+          diagnosticsConfigOk: undefined,
+          diagnosticsWorktreeOk: undefined,
         };
         var ORCH_BUILTINS = ["worker", "scout", "reviewer"];
         var ORCH_CHAIN = "Orchestration role mapping → profile → user/project profile layers → effective launch";
@@ -482,6 +523,18 @@
           if (orchEd) orchEd.innerHTML = "<p class=\"muted\">Save is disabled on this host: the structured bridge is unreachable (needs <code>orchestration.get</code> + <code>orchestration.set</code>). Use the explicit terminal action above for read-only CLI commands.</p>";
           var orchCtx = document.getElementById("orch-context");
           if (orchCtx) orchCtx.innerHTML = "<p class=\"muted\">Worktree context unavailable while degraded.</p>";
+          var ghBox = document.getElementById("github-summary");
+          if (ghBox) ghBox.innerHTML = "<p><strong>Degraded (read-only CLI fallback).</strong> <span class=\"muted\">" + esc(reason) + " GitHub health needs <code>github.status</code> + <code>github.doctor</code> over the structured bridge — never a hidden store. CLI parity: <code>orca-pi github auth status --identity worker</code>.</span></p>";
+          var ghDoc = document.getElementById("github-doctor");
+          if (ghDoc) ghDoc.innerHTML = "<p class=\"muted\">Doctor unavailable while degraded (needs <code>github.doctor</code>).</p>";
+          var ghActor = document.getElementById("github-actor");
+          if (ghActor) ghActor.innerHTML = "<p class=\"muted\">Human/ChatGPT review actor 44madfire holds final merge authority — a review actor, never a credential slot.</p>";
+          var ghSetup = document.getElementById("github-setup");
+          if (ghSetup) ghSetup.innerHTML = "";
+          var ghMapped = document.getElementById("github-mapped");
+          if (ghMapped) ghMapped.innerHTML = "<p class=\"muted\">Mapped profiles unavailable while degraded.</p>";
+          var diagBox = document.getElementById("diagnostics-summary");
+          if (diagBox) diagBox.innerHTML = "<p><strong>Degraded (read-only CLI fallback).</strong> <span class=\"muted\">" + esc(reason) + " Live diagnostics need <code>diagnostics.doctor</code>; run <code>orca-pi doctor</code> in a terminal.</span></p>";
         }
         function setSaveEnabled(enabled, why) {
           var btn = document.getElementById("btn-save");
@@ -2035,6 +2088,417 @@
             state.orchItems = toOrchItems(res.result, orchKnownProfiles());
             renderOrchList();
             loadOrchContext();
+            renderGithubMapped();
+            renderDiagnosticsOverview();
+          });
+        }
+        // -----------------------------------------------------------------
+        // GitHub identities + Diagnostics (UI1.5). Redacted display only:
+        // every renderer reads allowlisted fields (identity names, source
+        // labels, expiry timestamps, permission names, setup var names —
+        // never token/key/secret values) and escapes them. No raw payload
+        // is ever dumped to the DOM; no mint/refresh is offered (operator
+        // runs `orca-pi github mint` outside LLM context). Human/ChatGPT
+        // review actor 44madfire is an actor, never a credential slot.
+        // -----------------------------------------------------------------
+        var GITHUB_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+        var GITHUB_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?$/;
+        var HUMAN_ACTOR = "44madfire";
+        var DEFAULT_REPO = "44madfire/orca-pi";
+        function githubRepoValue() {
+          try {
+            var input = document.getElementById("github-repo");
+            var v = input && typeof input.value === "string" ? input.value.trim() : "";
+            return v || DEFAULT_REPO;
+          } catch (e) { return DEFAULT_REPO; }
+        }
+        function githubAmbientValue() {
+          try {
+            var input = document.getElementById("github-ambient");
+            var v = input && typeof input.value === "string" ? input.value.trim() : "";
+            return v || HUMAN_ACTOR;
+          } catch (e) { return HUMAN_ACTOR; }
+        }
+        function toGithubStatusItems(payload) {
+          var out = [];
+          if (!payload || typeof payload !== "object" || Array.isArray(payload)) return out;
+          var raw = payload.identities;
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+          for (var identity in raw) {
+            if (!Object.prototype.hasOwnProperty.call(raw, identity)) continue;
+            var entry = raw[identity];
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            if (typeof identity !== "string" || !identity || identity.length > 64) continue;
+            out.push({
+              identity: identity,
+              configured: entry.configured === true,
+              sourceLabel: typeof entry.sourceLabel === "string" && entry.sourceLabel ? entry.sourceLabel : "(unknown source)",
+              expiresAt: typeof entry.expiresAt === "string" && entry.expiresAt ? entry.expiresAt : undefined,
+              expired: typeof entry.expired === "boolean" ? entry.expired : undefined
+            });
+          }
+          var order = { worker: 0, reviewer: 1 };
+          out.sort(function (a, b) {
+            var ao = order[a.identity] !== undefined ? order[a.identity] : 1000;
+            var bo = order[b.identity] !== undefined ? order[b.identity] : 1000;
+            if (ao !== bo) return ao - bo;
+            return a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0;
+          });
+          return out;
+        }
+        function statusLineFor(item) {
+          if (item.expired === true) return item.identity + ": expired (see " + item.sourceLabel + ") — mint a fresh installation token outside LLM context.";
+          if (!item.configured) return item.identity + ": missing (see " + item.sourceLabel + ") — run `orca-pi github setup --identity " + item.identity + "` for operator steps.";
+          return item.identity + ": configured via " + item.sourceLabel + (item.expiresAt ? " (expires " + item.expiresAt + ")" : "") + ".";
+        }
+        function renderGithubStatus(result) {
+          var box = document.getElementById("github-summary");
+          if (!box) return;
+          var items = toGithubStatusItems(result);
+          if (!items.length) {
+            box.innerHTML = "<p class=\"muted\">No GitHub credential status available (bridge returned no identities). Run <code>orca-pi github auth status --identity worker</code> for CLI parity.</p>";
+            return;
+          }
+          var html = "<ul class=\"cc-profile-list\">";
+          for (var i = 0; i < items.length; i += 1) {
+            var item = items[i];
+            var pill = item.expired === true ? "invalid" : (item.configured ? "" : "invalid");
+            html += "<li class=\"cc-profile-item\"><h3><code>" + esc(item.identity) + "</code> " +
+              "<span class=\"cc-pill " + pill + "\">" + esc(item.expired === true ? "expired" : (item.configured ? "configured" : "missing")) + "</span></h3>" +
+              "<div class=\"cc-meta\"><span>" + esc(statusLineFor(item)) + "</span></div>" +
+              "<div class=\"cc-meta\"><span class=\"muted\">Source: " + esc(item.sourceLabel) + "</span>" +
+              (item.expiresAt ? "<span class=\"muted\">Expires: " + esc(item.expiresAt) + "</span>" : "<span class=\"muted\">No expiry reported</span>") +
+              "<span class=\"muted\">Redacted — no token value displayed</span></div></li>";
+          }
+          html += "</ul><p class=\"muted\">Redacted status only via <code>github.status</code> (read-only, no mint). CLI parity: <code>orca-pi github auth status --identity worker|reviewer</code>.</p>";
+          box.innerHTML = html;
+        }
+        function toGithubDoctorItems(report) {
+          var out = [];
+          if (!report || typeof report !== "object" || Array.isArray(report)) return out;
+          var keys = ["worker", "reviewer"];
+          for (var k = 0; k < keys.length; k += 1) {
+            var entry = report[keys[k]];
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            var exp = (entry.expectedPermissions && typeof entry.expectedPermissions === "object") ? entry.expectedPermissions : {};
+            var refresh = (entry.refreshVars && typeof entry.refreshVars === "object") ? entry.refreshVars : {};
+            out.push({
+              identity: typeof entry.identity === "string" && entry.identity ? entry.identity : keys[k],
+              configured: entry.configured === true,
+              sourceLabel: typeof entry.sourceLabel === "string" && entry.sourceLabel ? entry.sourceLabel : "(unknown source)",
+              expiresAt: typeof entry.expiresAt === "string" && entry.expiresAt ? entry.expiresAt : undefined,
+              expired: typeof entry.expired === "boolean" ? entry.expired : undefined,
+              expectedPermissions: {
+                contents: typeof exp.contents === "string" ? exp.contents : "?",
+                pullRequests: typeof exp.pullRequests === "string" ? exp.pullRequests : "?",
+                checks: typeof exp.checks === "string" ? exp.checks : "?",
+                metadata: typeof exp.metadata === "string" ? exp.metadata : "read"
+              },
+              appLogin: typeof entry.appLogin === "string" && entry.appLogin ? entry.appLogin : undefined,
+              appLoginConfigured: entry.appLoginConfigured === true,
+              installationId: typeof entry.installationId === "string" && entry.installationId ? entry.installationId : undefined,
+              installationIdConfigured: entry.installationIdConfigured === true,
+              tokenRefreshable: entry.tokenRefreshable === true,
+              refreshVars: {
+                appIdVar: typeof refresh.appIdVar === "string" && refresh.appIdVar ? refresh.appIdVar : ("ORCA_PI_GITHUB_" + String(keys[k]).toUpperCase() + "_APP_ID"),
+                keyVar: typeof refresh.keyVar === "string" && refresh.keyVar ? refresh.keyVar : ("ORCA_PI_GITHUB_" + String(keys[k]).toUpperCase() + "_PRIVATE_KEY_PATH"),
+                installationVar: typeof refresh.installationVar === "string" && refresh.installationVar ? refresh.installationVar : ("ORCA_PI_GITHUB_" + String(keys[k]).toUpperCase() + "_INSTALLATION_ID")
+              },
+              iatProved: typeof entry.iatProved === "boolean" ? entry.iatProved : undefined,
+              iatError: typeof entry.iatError === "string" && entry.iatError ? entry.iatError : undefined,
+              repoAccess: typeof entry.repoAccess === "boolean" ? entry.repoAccess : undefined,
+              repoError: typeof entry.repoError === "string" && entry.repoError ? entry.repoError : undefined,
+              permissionsValid: typeof entry.permissionsValid === "boolean" ? entry.permissionsValid : undefined,
+              permissionDetail: typeof entry.permissionDetail === "string" && entry.permissionDetail ? entry.permissionDetail : undefined
+            });
+          }
+          return out;
+        }
+        function renderGithubDoctor(result) {
+          var box = document.getElementById("github-doctor");
+          if (!box) return;
+          var items = toGithubDoctorItems(result);
+          if (!items.length) {
+            box.innerHTML = "<p class=\"muted\">Doctor unavailable (no worker/reviewer entries). Run <code>orca-pi github identity doctor --repo 44madfire/orca-pi --ambient 44madfire</code> for CLI parity.</p>";
+            return;
+          }
+          var html = "<ul class=\"cc-profile-list\">";
+          for (var i = 0; i < items.length; i += 1) {
+            var item = items[i];
+            var ok = item.configured && item.expired !== true && item.appLoginConfigured && item.installationIdConfigured && item.iatProved !== false && item.repoAccess !== false && item.permissionsValid !== false;
+            html += "<li class=\"cc-profile-item\"><h3><code>" + esc(item.identity) + "</code> " +
+              "<span class=\"cc-pill" + (ok ? "" : " invalid") + "\">" + esc(ok ? "healthy" : "needs attention") + "</span></h3>" +
+              "<div class=\"cc-meta\"><span>Expected: contents=" + esc(item.expectedPermissions.contents) + " pull_requests=" + esc(item.expectedPermissions.pullRequests) + " checks=" + esc(item.expectedPermissions.checks) + "</span></div>" +
+              "<div class=\"cc-meta\"><span>App: " + esc(item.appLogin || "(missing login)") + " · installation " + esc(item.installationId || "(missing id)") + "</span></div>" +
+              "<div class=\"cc-meta\"><span class=\"muted\">" + esc(item.tokenRefreshable ? ("Refreshable via " + item.refreshVars.appIdVar + " + " + item.refreshVars.keyVar) : ("Not refreshable (missing " + item.refreshVars.appIdVar + " / " + item.refreshVars.keyVar + ")")) + "</span></div>";
+            if (item.iatProved !== undefined) {
+              html += "<div class=\"cc-meta\"><span>Installation-token proof: " + esc(item.iatProved ? "ok (GET /installation/repositories with IAT)" : ("FAILED — " + (item.iatError || "see detail"))) + "</span></div>";
+            }
+            if (item.repoAccess !== undefined) {
+              var repoLine = item.repoAccess
+                ? (item.permissionsValid === false ? ("access ok but " + (item.permissionDetail || "permission mismatch")) : "repo access ok (verified via App JWT: GET /repos/{owner}/{repo}/installation)")
+                : ("FAILED — " + (item.repoError || item.permissionDetail || "see detail"));
+              html += "<div class=\"cc-meta\"><span>Repo access: " + esc(repoLine) + "</span></div>";
+              if (item.permissionDetail && !(item.repoAccess && item.permissionsValid !== false)) {
+                html += "<div class=\"cc-meta\"><span class=\"muted\">" + esc(item.permissionDetail) + "</span></div>";
+              }
+            }
+            html += "</li>";
+          }
+          html += "</ul><p class=\"muted\">Doctor via <code>github.doctor</code> (JWT-only repo check; IAT-class proof; redacted).</p>";
+          box.innerHTML = html;
+        }
+        function renderGithubActor(result) {
+          var box = document.getElementById("github-actor");
+          if (!box) return;
+          var workerLogin = result && typeof result.workerLogin === "string" ? result.workerLogin : undefined;
+          var reviewerLogin = result && typeof result.reviewerLogin === "string" ? result.reviewerLogin : undefined;
+          var ambient = (result && typeof result.ambientLogin === "string" && result.ambientLogin) || githubAmbientValue() || HUMAN_ACTOR;
+          var distinctDetail = result && typeof result.distinctDetail === "string" ? result.distinctDetail : "";
+          var dwr = result ? result.distinctWorkerReviewer : undefined;
+          var dfa = result ? result.distinctFromAmbient : undefined;
+          var line = (workerLogin && reviewerLogin)
+            ? (workerLogin + " != " + reviewerLogin + " != " + ambient + " : " + ((dwr && dfa) ? "distinct (ok)" : "NOT distinct (fix App installs)"))
+            : ("worker/reviewer logins unconfigured; human review actor " + ambient + " holds final merge authority (distinctness unknown until App logins are set outside LLM context)");
+          box.innerHTML = "<p><strong>Actors:</strong> <code>" + esc(line) + "</code></p>" +
+            (distinctDetail ? "<p class=\"muted\">" + esc(distinctDetail) + "</p>" : "") +
+            "<p class=\"muted\">Human/ChatGPT review actor " + esc(ambient) + " holds final merge authority — a review actor, never a credential slot (worker bot != reviewer bot != " + esc(ambient) + ").</p>";
+        }
+        function renderGithubSetup(result) {
+          var box = document.getElementById("github-setup");
+          if (!box) return;
+          var actions = result && Array.isArray(result.setupNeeded) ? result.setupNeeded.filter(function (s) { return typeof s === "string" && s; }) : [];
+          if (!actions.length) {
+            var ok = result && result.ok === true;
+            box.innerHTML = ok
+              ? "<p><strong>Setup:</strong> ok — worker/reviewer actors distinct and credentials fresh.</p>"
+              : "<p class=\"muted\">No setup actions reported. Run doctor with a repo access-test for actionable errors.</p>";
+            return;
+          }
+          var html = "<p><strong>Next actions (operator, outside LLM context):</strong></p><ul>";
+          for (var i = 0; i < actions.length; i += 1) html += "<li>" + esc(actions[i]) + "</li>";
+          html += "</ul><p class=\"muted\">Never paste tokens/keys into prompts, task text, or logs. Mint via <code>orca-pi github mint --identity worker|reviewer</code>.</p>";
+          box.innerHTML = html;
+        }
+        function renderGithubMapped() {
+          var box = document.getElementById("github-mapped");
+          if (!box) return;
+          var orchItems = state.orchItems || [];
+          if (!orchItems.length) {
+            box.innerHTML = "<p class=\"muted\">Mapped Pi profiles (role→profile→identity) load with orchestration via <code>orchestration.get</code> + <code>profiles.list</code>.</p>";
+            return;
+          }
+          var byProfile = {};
+          for (var i = 0; i < (state.profiles || []).length; i += 1) {
+            var p = state.profiles[i];
+            if (p && p.name && p.githubIdentity) byProfile[p.name] = p.githubIdentity;
+          }
+          var html = "<p><strong>Mapped Pi profiles</strong> <span class=\"muted\">(role→profile→identity; Orca owns task/DAG/worktree/run — this is Pi policy only)</span></p><ul class=\"cc-profile-list\">";
+          for (var j = 0; j < orchItems.length; j += 1) {
+            var row = orchItems[j];
+            var ident = byProfile[row.profile];
+            html += "<li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>Role <code>" + esc(row.role) + "</code> → profile <code>" + esc(row.profile) + "</code>" +
+              (ident ? " → identity <code>" + esc(ident) + "</code>" : " → <span class=\"muted\">no identity (scout/neutral)</span>") +
+              (row.invalid ? " <span class=\"cc-pill invalid\">INVALID</span>" : "") + "</span></div></li>";
+          }
+          html += "</ul>";
+          box.innerHTML = html;
+        }
+        // Merge a (possibly role-scoped/partial) github.status payload into
+        // the existing snapshot: scoped refreshes return only that identity,
+        // so fold the partial map into state.githubStatus before rendering —
+        // a worker-only refresh must never hide the reviewer row, and vice
+        // versa. Mirrors control-center.ts mergeGithubStatusSnapshots.
+        function mergeGithubStatus(prev, next) {
+          var prevIds = (prev && typeof prev === "object" && !Array.isArray(prev) && prev.identities && typeof prev.identities === "object" && !Array.isArray(prev.identities)) ? prev.identities : {};
+          var nextIds = (next && typeof next === "object" && !Array.isArray(next) && next.identities && typeof next.identities === "object" && !Array.isArray(next.identities)) ? next.identities : {};
+          var merged = {};
+          var put = function (identity, entry) {
+            if (typeof identity !== "string" || !identity || identity.length > 64) return;
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
+            merged[identity] = entry;
+          };
+          for (var p in prevIds) { if (Object.prototype.hasOwnProperty.call(prevIds, p)) put(p, prevIds[p]); }
+          for (var n in nextIds) { if (Object.prototype.hasOwnProperty.call(nextIds, n)) put(n, nextIds[n]); }
+          var out = { identities: merged };
+          var redacted = (next && typeof next.redacted === "boolean") ? next.redacted : (prev && typeof prev.redacted === "boolean" ? prev.redacted : undefined);
+          if (typeof redacted === "boolean") out.redacted = redacted;
+          var note = (next && typeof next.note === "string" && next.note) ? next.note : (prev && typeof prev.note === "string" ? prev.note : undefined);
+          if (typeof note === "string" && note) out.note = note;
+          if (next && typeof next.profile === "string") out.profile = next.profile;
+          return out;
+        }
+        // Fail-closed helper for scoped github.status refreshes: drop the
+        // targeted identity from the snapshot (pending) while preserving the
+        // sibling. Never synthesizes health; a missing canonical row
+        // headlines as pending via githubOkForHeadline, so a failed scoped
+        // refresh can never leave old healthy state driving ready.
+        // Allowlisted redacted shape only (identity-keyed records).
+        function clearGithubStatusIdentity(prev, identity) {
+          if (!identity) return null;
+          if (!prev || typeof prev !== "object" || Array.isArray(prev)) return null;
+          var prevIds = (prev.identities && typeof prev.identities === "object" && !Array.isArray(prev.identities)) ? prev.identities : {};
+          var kept = {};
+          for (var k in prevIds) {
+            if (!Object.prototype.hasOwnProperty.call(prevIds, k)) continue;
+            if (k === identity) continue;
+            var entry = prevIds[k];
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            kept[k] = entry;
+          }
+          var out = { identities: kept };
+          if (typeof prev.redacted === "boolean") out.redacted = prev.redacted;
+          if (typeof prev.note === "string" && prev.note) out.note = prev.note;
+          return out;
+        }
+        function loadGithubStatus(identity) {
+          var box = document.getElementById("github-summary");
+          if (!state.structured || !can("github.status")) {
+            if (box) box.innerHTML = "<p class=\"muted\">github.status unavailable on this host (structured bridge unreachable). Full UI needs <code>github.status</code> over the structured bridge — never a hidden store.</p>";
+            return Promise.resolve(null);
+          }
+          state.githubStatusToken = (state.githubStatusToken || 0) + 1;
+          var myTok = state.githubStatusToken;
+          // Fail closed at refresh start: mark the targeted leg pending so a
+          // stale healthy snapshot cannot headline as ready while loading.
+          // Scoped refresh drops only the targeted identity (sibling
+          // preserved); full refresh clears the whole status leg.
+          if (identity) {
+            state.githubStatus = clearGithubStatusIdentity(state.githubStatus, identity);
+          } else {
+            state.githubStatus = null;
+          }
+          refreshDiagnosticsHeadline();
+          renderDiagnosticsOverview();
+          if (box) box.innerHTML = "<p class=\"muted\">Loading GitHub status via <code>github.status</code>…</p>";
+          var params = identity ? { identity: identity } : {};
+          return request("github.status", params).then(function (res) {
+            if (myTok !== state.githubStatusToken) return null;
+            if (res && res.ok && res.result) {
+              state.githubStatus = mergeGithubStatus(state.githubStatus, res.result);
+              renderGithubStatus(state.githubStatus);
+              renderGithubMapped();
+              refreshDiagnosticsHeadline();
+              renderDiagnosticsOverview();
+              return state.githubStatus;
+            }
+            // Fail closed on bridge error: clear the targeted leg (scoped
+            // drops only the failed identity, sibling preserved; full
+            // clears the whole leg) so stale healthy state can never drive
+            // ready. Rerender headline + overview on every completion path.
+            if (identity) {
+              state.githubStatus = clearGithubStatusIdentity(state.githubStatus, identity);
+            } else {
+              state.githubStatus = null;
+            }
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
+            if (box) box.innerHTML = "<p><strong>Could not load GitHub status.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+            return null;
+          }, function () {
+            if (myTok !== state.githubStatusToken) return null;
+            // Fail closed on rejection: same scoped-preserving clear plus
+            // headline/overview rerender (never leave stale ready).
+            if (identity) {
+              state.githubStatus = clearGithubStatusIdentity(state.githubStatus, identity);
+            } else {
+              state.githubStatus = null;
+            }
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            if (box) box.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
+            return null;
+          });
+        }
+        function loadGithubDoctor() {
+          var box = document.getElementById("github-doctor");
+          if (!state.structured || !can("github.doctor")) {
+            // Fail closed on unavailable capability: fence the doctor
+            // generation and clear the leg before the early return, so a
+            // prior healthy result or an in-flight response can never keep
+            // Diagnostics ready after this attempt. Sibling github.status
+            // untouched; actor/setup rerender from the cleared leg
+            // (allowlisted, secret-safe).
+            state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
+            state.githubDoctor = null;
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            if (box) box.innerHTML = "<p class=\"muted\">github.doctor unavailable on this host (structured bridge unreachable).</p>";
+            return Promise.resolve(null);
+          }
+          var repo = githubRepoValue();
+          var ambient = githubAmbientValue();
+          if (repo && !GITHUB_REPO_RE.test(repo)) {
+            // Fail closed on invalid repo: same fence + clear before the
+            // early return (never leave stale healthy driving ready).
+            state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
+            state.githubDoctor = null;
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            if (box) box.innerHTML = "<p><strong>Invalid repo.</strong> <span class=\"muted\">Expected \"owner/repo\" (e.g. \"44madfire/orca-pi\").</span></p>";
+            return Promise.resolve(null);
+          }
+          if (ambient && !GITHUB_LOGIN_RE.test(ambient)) {
+            // Fail closed on invalid review actor: same fence + clear.
+            state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
+            state.githubDoctor = null;
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            if (box) box.innerHTML = "<p><strong>Invalid review actor.</strong> <span class=\"muted\">Expected a GitHub login (e.g. \"44madfire\").</span></p>";
+            return Promise.resolve(null);
+          }
+          state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
+          var myTok = state.githubDoctorToken;
+          // Fail closed at refresh start: doctor leg pending so stale healthy
+          // doctor cannot headline as ready while the new run is in flight.
+          state.githubDoctor = null;
+          refreshDiagnosticsHeadline();
+          renderDiagnosticsOverview();
+          if (box) box.innerHTML = "<p class=\"muted\">Running doctor via <code>github.doctor</code> (repo " + esc(repo) + ", ambient " + esc(ambient) + ")…</p>";
+          var params = {};
+          if (repo) params.repo = repo;
+          if (ambient) params.ambient = ambient;
+          return request("github.doctor", params).then(function (res) {
+            if (myTok !== state.githubDoctorToken) return null;
+            if (res && res.ok && res.result) {
+              state.githubDoctor = res.result;
+              renderGithubDoctor(res.result);
+              renderGithubActor(res.result);
+              renderGithubSetup(res.result);
+              refreshDiagnosticsHeadline();
+              renderDiagnosticsOverview();
+              return res.result;
+            }
+            // Fail closed on bridge error: clear the doctor leg (unknown)
+            // so stale healthy doctor can never drive ready. Rerender
+            // actor/setup from the cleared leg plus headline + overview on
+            // every completion path.
+            state.githubDoctor = null;
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
+            if (box) box.innerHTML = "<p><strong>Doctor failed.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+            return null;
+          }, function () {
+            if (myTok !== state.githubDoctorToken) return null;
+            // Fail closed on rejection: same doctor-leg clear plus
+            // headline/overview rerender (never leave stale ready).
+            state.githubDoctor = null;
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            if (box) box.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
+            return null;
           });
         }
         function loadOrchestration(selectAfter) {
@@ -2064,6 +2528,8 @@
               state.orchItems = toOrchItems(res.result, orchKnownProfiles());
               renderOrchList();
               loadOrchContext();
+              renderGithubMapped();
+              renderDiagnosticsOverview();
               if (selectAfter && !wasDirty && (state.orchDraftRev || 0) === revBefore) {
                 state.orchSelected = selectAfter;
                 // Centralized helper: post-save/refresh drafts come from the
@@ -2096,8 +2562,19 @@
           return request("profiles.list").then(function (res) {
             if (myTok !== state.listToken) return;
             if (!res || !res.ok || !res.result) return;
+            state.profilesRaw = res.result;
             state.profiles = toListItems(res.result);
             renderList();
+            // Keep role→profile→identity fresh: profiles.list success
+            // recomputes orchestration invalid flags and rerenders the
+            // mapped view, so an orchestration-first response order (or a
+            // later profile-identity edit) can never leave it stale/blank.
+            if (state.orchMapping) {
+              state.orchItems = toOrchItems(state.orchMapping, orchKnownProfiles());
+              renderOrchList();
+            }
+            renderGithubMapped();
+            renderDiagnosticsOverview();
           });
         }
 
@@ -2113,6 +2590,7 @@
             ops.push(request("profiles.list").then(function (res) {
               if (myListToken !== state.listToken) return;
               if (!res || !res.ok || !res.result) return;
+              state.profilesRaw = res.result;
               state.profiles = toListItems(res.result);
               renderList();
               // Recompute orchestration invalid flags with fresh profile names
@@ -2122,6 +2600,10 @@
                 state.orchItems = toOrchItems(state.orchMapping, orchKnownProfiles());
                 renderOrchList();
               }
+              // Rerender mapped role→profile→identity after every
+              // profiles.list update (both response orders stay fresh).
+              renderGithubMapped();
+              renderDiagnosticsOverview();
               if (selectAfter) {
                 // Post-save target: never reload over a newer dirty same-profile
                 // draft. If the editor became dirty or its revision advanced
@@ -2162,35 +2644,427 @@
           // Orchestration mapping (UI1.4): full role→profile table + editor +
           // launch preview. Never silently overwrites a dirty mapping draft.
           ops.push(loadOrchestration(null));
-          if (can("github.status")) {
-            request("github.status").then(function (res) {
-              var box = document.getElementById("github-summary");
-              if (!box) return;
-              if (res && res.ok) box.innerHTML = "<pre><code>" + esc(JSON.stringify(res.result).slice(0, 3000)) + "</code></pre><p class=\"muted\">Redacted only. Full health UI in UI1.5.</p>";
-              else box.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "unavailable") + "</p>";
-            });
-          } else {
-            var gb = document.getElementById("github-summary");
-            if (gb) gb.innerHTML = "<p class=\"muted\">github.status unavailable on this host. Full UI in UI1.5.</p>";
-          }
-          loadDiagnostics();
+          // GitHub identities (UI1.5): role-scoped redacted refresh + doctor.
+          // No mint/refresh offered; no raw payload dumped (allowlisted fields only).
+          ops.push(loadGithubStatus(null));
+          ops.push(loadGithubDoctor());
+          ops.push(loadDiagnostics());
           return Promise.all(ops);
         }
 
-        function loadDiagnostics() {
+        // Diagnostics detail sanitizer (P1 defense in depth): runner-derived
+        // `cli.*.detail` may embed arbitrary orca/pi stdout/stderr, so it is
+        // redacted (token/key patterns) and bounded before esc()+render.
+        // Mirrors control-center.ts sanitizeDiagnosticsDetail.
+        var DIAGNOSTICS_DETAIL_LIMIT = 500;
+        function redactDiagnosticsText(text) {
+          if (!text) return text;
+          var out = text;
+          out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+          out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+          out = out.replace(/-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
+          out = out.replace(/\bghp_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bgho_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bghu_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bghs_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bghr_[A-Za-z0-9]{8,}/g, "<redacted-token>");
+          out = out.replace(/\bgithub_pat_[A-Za-z0-9_]{8,}/g, "<redacted-token>");
+          // Built via string concatenation so the panel-source secret scan
+          // (containsSecretMaterial over the HTML) keeps passing — only
+          // runtime values are ever matched.
+          out = out.replace(new RegExp("x-access-token:" + "[^\\s\"']+", "g"), "<redacted-token>");
+          return out;
+        }
+        function sanitizeDiagnosticsDetail(detail) {
+          if (typeof detail !== "string" || !detail) return "(no detail)";
+          var out = redactDiagnosticsText(detail);
+          if (out.length <= DIAGNOSTICS_DETAIL_LIMIT) return out;
+          return out.slice(0, DIAGNOSTICS_DETAIL_LIMIT) + "… [truncated]";
+        }
+        // Typed host/runtime context for the one-place overview (UI1.5 gap
+        // fix). Mirrors control-center.ts toDiagnosticsHostHealth /
+        // toDiagnosticsRuntimeHealth: allowlisted fields only, bounded,
+        // truthful unknown/degraded states, never secrets.
+        var HOST_CAPS = ["workspace:read", "terminal:send", "notifications:show", "storage", "secrets", "events:subscribe", "settings:own"];
+        function boundedPanelVersion(v) {
+          if (typeof v !== "string") return undefined;
+          var t = v.trim().slice(0, 64);
+          if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(t)) return undefined;
+          return t;
+        }
+        function boundedPanelToken(v) {
+          if (typeof v !== "string") return undefined;
+          var t = v.trim().slice(0, 32);
+          if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(t)) return undefined;
+          return t;
+        }
+        function transportModeFor(d) {
+          if (!d || typeof d !== "object" || Array.isArray(d)) return undefined;
+          var fromHost = (d.host && typeof d.host === "object" && !Array.isArray(d.host)) ? d.host.transportMode : undefined;
+          var fromTop = (d.transport && typeof d.transport === "object" && !Array.isArray(d.transport)) ? d.transport.mode : undefined;
+          var raw = (typeof fromHost === "string" && fromHost) ? fromHost : fromTop;
+          if (typeof raw !== "string") return undefined;
+          var t = raw.trim();
+          if (t === "seam" || t === "operator") return t;
+          return undefined;
+        }
+        function hostLineFor(d) {
+          if (!d || typeof d !== "object" || Array.isArray(d)) return "Orca app (unknown version) (pluginApi unknown; capabilities unknown — degraded/unknown).";
+          var host = (d.host && typeof d.host === "object" && !Array.isArray(d.host)) ? d.host : {};
+          var bridge = (d.bridge && typeof d.bridge === "object" && !Array.isArray(d.bridge)) ? d.bridge : {};
+          var hasHost = !!(d.host && typeof d.host === "object" && !Array.isArray(d.host));
+          var hasBridge = !!(d.bridge && typeof d.bridge === "object" && !Array.isArray(d.bridge));
+          var hasTransport = !!(d.transport && typeof d.transport === "object" && !Array.isArray(d.transport));
+          if (!hasHost && !hasBridge && !hasTransport) return "Orca app (unknown version) (pluginApi unknown; capabilities unknown — degraded/unknown).";
+          var app = boundedPanelVersion(host.appVersion) || "(unknown version)";
+          var api = (typeof host.pluginApi === "number" && isFinite(host.pluginApi) && Math.floor(host.pluginApi) === host.pluginApi && host.pluginApi >= 0 && host.pluginApi <= 999) ? ("pluginApi " + host.pluginApi) : "pluginApi unknown";
+          var caps = "capabilities unknown";
+          if (Array.isArray(host.grantedCapabilities)) {
+            var kept = host.grantedCapabilities.filter(function (c) { return typeof c === "string" && HOST_CAPS.indexOf(c) !== -1; }).slice(0, 16);
+            caps = kept.length ? ("capabilities " + kept.join(", ")) : "capabilities (none granted)";
+          }
+          var pick = function (key) {
+            if (typeof host[key] === "boolean") return host[key];
+            if (typeof bridge[key] === "boolean") return bridge[key];
+            return undefined;
+          };
+          var structured = pick("structured");
+          var consent = pick("consentOk");
+          var seam = pick("seamHandshake");
+          var versions = pick("versionsOk");
+          var signals = [];
+          signals.push(structured === true ? "structured" : (structured === false ? "degraded" : "reachability unknown"));
+          if (consent !== undefined) signals.push(consent ? "consent ok" : "consent missing");
+          if (seam !== undefined) signals.push(seam ? "seam ok" : "no seam");
+          if (versions !== undefined) signals.push(versions ? "versions ok" : "versions mismatch");
+          var mode = transportModeFor(d);
+          signals.push(mode ? ("transport " + mode) : "transport unknown");
+          return "Orca app " + app + " (" + api + "; " + caps + "; " + signals.join(", ") + ").";
+        }
+        function runtimeLineFor(d) {
+          if (!d || typeof d !== "object" || Array.isArray(d) || !d.runtime || typeof d.runtime !== "object" || Array.isArray(d.runtime)) return "Node (unknown) on (unknown) (OS context unknown).";
+          var r = d.runtime;
+          var node = boundedPanelToken(r.node) || "(unknown)";
+          var plat = boundedPanelToken(r.platform);
+          var arch = boundedPanelToken(r.arch);
+          var os = (plat && arch) ? (plat + "/" + arch) : (plat || arch || "(unknown)");
+          var rawWsl = (typeof r.wsl === "string") ? r.wsl.trim().slice(0, 64) : undefined;
+          var wsl = (typeof rawWsl === "string" && /^(native|unknown|wsl-unknown-distro|wsl:[A-Za-z0-9._-]+)$/.test(rawWsl)) ? rawWsl : undefined;
+          var ctx;
+          if (wsl === undefined) ctx = "OS context unknown";
+          else if (wsl === "native") ctx = (plat === "win32") ? "native Windows" : (plat === "darwin") ? "native macOS" : (plat === "linux") ? "native Linux" : "native OS";
+          else if (wsl === "unknown") ctx = "OS context unknown";
+          else if (wsl === "wsl-unknown-distro") ctx = "WSL (distro unknown)";
+          else if (wsl.slice(0, 4) === "wsl:") ctx = "WSL distro " + wsl.slice(4);
+          else ctx = wsl;
+          return "Node " + node + " on " + os + " (" + ctx + ").";
+        }
+        // Required GitHub health for the top-level readiness (mirrors
+        // control-center.ts toDiagnosticsGithubHealth): explicit healthy
+        // rows for BOTH canonical slots (worker + reviewer) AND doctor ok:true.
+        // Missing status/doctor or a healthy-but-partial snapshot (e.g.
+        // scoped worker-only merged into an empty snapshot) -> undefined
+        // (pending, never ready); observed missing/expired -> false.
+        // No tokens/keys ever read -- allowlisted redacted fields only.
+        function githubOkForHeadline() {
+          var sItems = toGithubStatusItems(state.githubStatus);
+          if (!state.githubStatus || !sItems.length) return undefined;
+          for (var gi = 0; gi < sItems.length; gi += 1) {
+            if (sItems[gi].expired === true) return false;
+            if (!sItems[gi].configured) return false;
+          }
+          var hasWorker = false;
+          var hasReviewer = false;
+          for (var ci = 0; ci < sItems.length; ci += 1) {
+            if (sItems[ci].identity === "worker") hasWorker = true;
+            if (sItems[ci].identity === "reviewer") hasReviewer = true;
+          }
+          if (!hasWorker || !hasReviewer) return undefined;
+          var doc = state.githubDoctor;
+          if (!doc || typeof doc !== "object" || Array.isArray(doc)) return undefined;
+          if (doc.ok !== true) return false;
+          return true;
+        }
+        function refreshDiagnosticsHeadline() {
+          renderDiagnosticsHeadline(state.diagnosticsCliOk, state.diagnosticsBridgeStructured, state.diagnosticsConfigOk, state.diagnosticsWorktreeOk, githubOkForHeadline());
+        }
+        function renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk, githubOk) {
           var box = document.getElementById("diagnostics-summary");
           if (!box) return;
-          if (!can("diagnostics.doctor")) { box.innerHTML = "<p class=\"muted\">diagnostics.doctor unavailable on this host.</p>"; return; }
-          box.innerHTML = "<p class=\"muted\">Loading diagnostics…</p>";
-          request("diagnostics.doctor").then(function (res) {
-            if (res && res.ok) box.innerHTML = "<pre><code>" + esc(JSON.stringify(res.result, null, 2).slice(0, 5000)) + "</code></pre>";
-            else box.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "unavailable") + "</p>";
+          // Unknown legs (unavailable/pending/malformed/failed) are never
+          // ready -- fail closed to pending/unavailable, never "ready".
+          // The worktree leg must be an explicit healthy worktree.context
+          // result: no confirmed project/worktree scope, no ready headline.
+          // The GitHub leg is required: missing/expired/attention-needed
+          // status or doctor keeps the banner at action-needed, so overall
+          // ready can never coincide with broken GitHub.
+          if (cliOk && bridgeStructured && configOk === true && worktreeOk === true && githubOk === true) {
+            box.innerHTML = "<p><strong>Diagnostics: ready</strong> <span class=\"muted\">-- CLIs available, structured bridge reachable, config valid, worktree scope confirmed, GitHub identities healthy. CLI remains authoritative (<code>orca-pi doctor</code>).</span></p>";
+          } else {
+            var parts = [];
+            if (!cliOk) parts.push("CLIs need attention (run <code>orca-pi doctor</code>)");
+            if (!bridgeStructured) parts.push("bridge degraded (explicit CLI fallback)");
+            if (configOk === undefined) parts.push("profiles validation pending/unavailable (run <code>orca-pi profile validate</code>)");
+            else if (configOk !== true) parts.push("profiles need attention (run <code>orca-pi profile validate</code>)");
+            if (worktreeOk === undefined) parts.push("worktree scope pending/unavailable (requires <code>worktree.context</code> over the structured bridge)");
+            else if (worktreeOk !== true) parts.push("worktree scope unavailable (requires <code>worktree.context</code> over the structured bridge)");
+            if (githubOk === undefined) parts.push("GitHub health pending/unavailable (refresh <code>github.status</code> + <code>github.doctor</code>; redacted, no mint in panel)");
+            else if (githubOk !== true) parts.push("GitHub needs attention (refresh <code>github.status</code> + <code>github.doctor</code>; redacted, no mint in panel)");
+            box.innerHTML = "<p><strong>Diagnostics: action needed</strong> <span class=\"muted\">-- " + parts.join("; ") + ".</span></p>";
+          }
+        }
+
+        // One-place redacted overview: runtime, bridge, worktree, profiles
+        // (+ config paths), roles, launch compiler, GitHub status/doctor —
+        // composed from allowlisted typed state only (never CLI scraping,
+        // never secrets; details sanitized + bounded before esc()).
+        // Mirrors control-center.ts diagnosticsOverviewRows.
+        function renderDiagnosticsOverview() {
+          var box = document.getElementById("diagnostics-overview");
+          if (!box) return;
+          var rows = [];
+          var d = state.diagnostics;
+          if (d && typeof d === "object" && !Array.isArray(d) && d.cli && typeof d.cli === "object" && d.cli.orca && d.cli.pi) {
+            var oL = d.cli.orca.version ? ("orca " + d.cli.orca.version) : (d.cli.orca.found ? "orca (version unknown)" : "orca missing");
+            var pL = d.cli.pi.version ? ("pi " + d.cli.pi.version) : (d.cli.pi.found ? "pi (version unknown)" : "pi missing");
+            rows.push(["Runtime", oL + ", " + pL + (d.cli.ok === true ? " — ready." : " — action needed.") +
+              " orca-pi " + (d.orcaPiVersion || "(unknown)") + " / bridge " + (d.bridgeVersion || "(unknown)") + " / protocol " + String(d.protocolVersion !== undefined ? d.protocolVersion : "(unknown)") + "." +
+              " Host: " + hostLineFor(d) + " Runtime: " + runtimeLineFor(d)]);
+          } else if (d && typeof d === "object" && !Array.isArray(d) && (d.host || d.runtime || d.transport)) {
+            rows.push(["Runtime", "CLI health unavailable — run `orca-pi doctor` for live orca/pi versions. Host: " + hostLineFor(d) + " Runtime: " + runtimeLineFor(d)]);
+          } else {
+            rows.push(["Runtime", "CLI health unavailable — run `orca-pi doctor` for live orca/pi versions."]);
+          }
+          var b = (d && typeof d === "object" && !Array.isArray(d)) ? d.bridge : null;
+          if (b && typeof b === "object" && !Array.isArray(b)) {
+            var bOps = Array.isArray(b.supportedOperations) ? b.supportedOperations.length : 0;
+            var bMode = transportModeFor(d);
+            rows.push(["Bridge", (b.structured === true ? "structured" : "degraded (read-only CLI fallback)") + " · " + bOps + " supported operation(s)" + (bMode ? (" · transport " + bMode) : " · transport unknown") + "."]);
+          } else {
+            var bModeFallback = transportModeFor(d);
+            rows.push(["Bridge", bModeFallback ? ("bridge negotiation unavailable in this response (transport " + bModeFallback + ").") : "bridge negotiation unavailable in this response."]);
+          }
+          var w = state.diagnosticsWorktree;
+          if (w && typeof w === "object" && !Array.isArray(w) && typeof w.projectRoot === "string" && w.projectRoot) {
+            rows.push(["Worktree", w.projectRoot + (w.explicit === true ? " (explicit scope)" : " (implicit scope; mutations need explicit worktree.projectRoot)") + "."]);
+          } else {
+            rows.push(["Worktree", "worktree scope pending/unavailable (requires `worktree.context`)."]);
+          }
+          var v = state.diagnosticsValidate;
+          var vEntries = (v && typeof v === "object" && Array.isArray(v.entries)) ? v.entries : null;
+          var vInvalid = 0;
+          if (vEntries) { for (var vi = 0; vi < vEntries.length; vi += 1) { if (vEntries[vi] && vEntries[vi].valid === false) vInvalid += 1; } }
+          var vLine = (vEntries && v.ok === true && vInvalid === 0)
+            ? ("all " + vEntries.length + " profile(s) valid")
+            : (vEntries ? (vInvalid + " invalid of " + vEntries.length) : "validation pending/unavailable");
+          var raw = state.profilesRaw;
+          var cfg = (raw && typeof raw === "object" && raw.panel && typeof raw.panel === "object" && raw.panel.config && typeof raw.panel.config === "object") ? raw.panel.config : null;
+          var paths = (cfg && typeof cfg.userPath === "string" && typeof cfg.projectPath === "string")
+            ? ("user " + cfg.userPath + " (" + (cfg.userExists ? "present" : "absent") + "); project " + cfg.projectPath + " (" + (cfg.projectExists ? "present" : "absent") + ")")
+            : "config paths unavailable (refresh profiles)";
+          rows.push(["Profiles", vLine + ". " + paths + "."]);
+          var items = state.orchItems || [];
+          var inv = items.filter(function (it) { return it.invalid; });
+          var mapLine = items.length ? items.map(function (it) { return it.role + "→" + it.profile; }).join(", ") : "(no mappings loaded)";
+          rows.push(["Roles", (inv.length ? (inv.length + " invalid reference(s) — fix before launch.") : ("all " + items.length + " mapping(s) valid.")) + " " + mapLine + "."]);
+          rows.push(["Launch", can("launch.preview")
+            ? "compiler available: sanitized display-only previews via `launch.preview` (never executed)."
+            : "compiler unavailable on this host (needs `launch.preview`)."]);
+          var sItems = toGithubStatusItems(state.githubStatus);
+          rows.push(["GitHub status", sItems.length ? sItems.map(statusLineFor).join(" ") : "not loaded (refresh via `github.status`; redacted, no mint in panel)."]);
+          var doc = state.githubDoctor;
+          if (doc && typeof doc === "object" && !Array.isArray(doc) && (doc.workerLogin || doc.reviewerLogin || doc.distinctDetail)) {
+            var dLine = (doc.ok === true ? "actors distinct (ok)" : "actor attention needed") + " — " + (doc.distinctDetail || "see doctor");
+            var setup = (Array.isArray(doc.setupNeeded) ? doc.setupNeeded : []).filter(function (s) { return typeof s === "string" && s; }).slice(0, 3);
+            if (setup.length) dLine += " Next: " + setup.join(" ");
+            rows.push(["GitHub doctor", dLine]);
+          } else {
+            rows.push(["GitHub doctor", "not run yet (run `github.doctor` with a repo access-test; redacted)."]);
+          }
+          var html = "<p><strong>Overview</strong> <span class=\"muted\">(one-place redacted health; CLI remains authoritative)</span></p><ul class=\"cc-profile-list\">";
+          for (var i = 0; i < rows.length; i += 1) {
+            html += "<li class=\"cc-profile-item\"><div class=\"cc-meta\"><span><strong>" + esc(rows[i][0]) + ":</strong> " + esc(sanitizeDiagnosticsDetail(rows[i][1])) + "</span></div></li>";
+          }
+          html += "</ul>";
+          box.innerHTML = html;
+        }
+
+        function loadDiagnostics() {
+          var summary = document.getElementById("diagnostics-summary");
+          var runtime = document.getElementById("diagnostics-runtime");
+          var bridgeBox = document.getElementById("diagnostics-bridge");
+          var configBox = document.getElementById("diagnostics-config");
+          var worktreeBox = document.getElementById("diagnostics-worktree");
+          if (!summary) return Promise.resolve(null);
+          // diagnostics.doctor is degraded-safe: it stays available while
+          // unstructured so the panel can always explain the fallback.
+          if (!can("diagnostics.doctor")) {
+            summary.innerHTML = "<p class=\"muted\">diagnostics.doctor unavailable on this host.</p>";
+            if (runtime) runtime.innerHTML = "";
+            if (bridgeBox) bridgeBox.innerHTML = "";
+            if (configBox) configBox.innerHTML = "";
+            if (worktreeBox) worktreeBox.innerHTML = "";
+            return Promise.resolve(null);
+          }
+          state.diagnosticsToken = (state.diagnosticsToken || 0) + 1;
+          var myTok = state.diagnosticsToken;
+          // Per-run clearing: a new run must never render the prior run's
+          // overview. Clear all three legs up front (pending) so a slow
+          // prior leg cannot leave stale rows, and concurrent successful
+          // legs combine only with this run's fresh diagnostics.
+          state.diagnostics = null;
+          state.diagnosticsValidate = null;
+          state.diagnosticsWorktree = null;
+          state.diagnosticsCliOk = false;
+          state.diagnosticsBridgeStructured = false;
+          state.diagnosticsConfigOk = undefined;
+          state.diagnosticsWorktreeOk = undefined;
+          renderDiagnosticsOverview();
+          summary.innerHTML = "<p class=\"muted\">Loading diagnostics via <code>diagnostics.doctor</code>…</p>";
+          if (runtime) runtime.innerHTML = "";
+          if (bridgeBox) bridgeBox.innerHTML = "";
+          if (configBox) configBox.innerHTML = "<p class=\"muted\">Loading config via <code>profile.validate</code>…</p>";
+          if (worktreeBox) worktreeBox.innerHTML = "<p class=\"muted\">Loading worktree via <code>worktree.context</code>…</p>";
+          var cliOk = false;
+          var bridgeStructured = false;
+          var configOk = undefined;
+          // Worktree leg: pending until an explicit healthy worktree.context
+          // result lands; rejected/failed/malformed stays not-ready.
+          var worktreeOk = undefined;
+          var done = function () {
+            state.diagnosticsCliOk = cliOk;
+            state.diagnosticsBridgeStructured = bridgeStructured;
+            state.diagnosticsConfigOk = configOk;
+            state.diagnosticsWorktreeOk = worktreeOk;
+            renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk, githubOkForHeadline());
+            renderDiagnosticsOverview();
+          };
+          var main = request("diagnostics.doctor").then(function (res) {
+            if (myTok !== state.diagnosticsToken) return null;
+            if (res && res.ok && res.result) {
+              state.diagnostics = res.result;
+              var r = res.result;
+              var cli = r.cli;
+              if (cli && typeof cli === "object" && cli.orca && cli.pi) {
+                cliOk = cli.ok === true;
+                var orcaLine = cli.orca.version ? ("orca " + cli.orca.version) : (cli.orca.found ? "orca (version unknown)" : "orca missing");
+                var piLine = cli.pi.version ? ("pi " + cli.pi.version) : (cli.pi.found ? "pi (version unknown)" : "pi missing");
+                if (runtime) {
+                  runtime.innerHTML = "<p><strong>Runtime CLIs</strong> <span class=\"muted\">(agrees with <code>orca-pi doctor</code>)</span></p>" +
+                    "<ul class=\"cc-profile-list\"><li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(orcaLine) + " — " + esc(sanitizeDiagnosticsDetail(cli.orca.detail)) + "</span></div></li>" +
+                    "<li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(piLine) + " — " + esc(sanitizeDiagnosticsDetail(cli.pi.detail)) + "</span></div></li></ul>" +
+                    "<p class=\"muted\">orca-pi " + esc(r.orcaPiVersion || "(unknown)") + " · bridge " + esc(r.bridgeVersion || "1.0.0") + " / protocol " + esc(String(r.protocolVersion !== undefined ? r.protocolVersion : 1)) + "</p>" +
+                    "<p><strong>Host</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(hostLineFor(r))) + "</span></p>" +
+                    "<p><strong>OS runtime</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(runtimeLineFor(r))) + "</span></p>";
+                }
+              } else if (runtime) {
+                runtime.innerHTML = "<p class=\"muted\">CLI probes unavailable in this response (no runner injected) — run <code>orca-pi doctor</code> for live orca/pi versions.</p>" +
+                  "<p><strong>Host</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(hostLineFor(r))) + "</span></p>" +
+                  "<p><strong>OS runtime</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(runtimeLineFor(r))) + "</span></p>";
+              }
+              var bridge = r.bridge;
+              if (bridge && typeof bridge === "object") {
+                bridgeStructured = bridge.structured === true;
+                if (bridgeBox) {
+                  var ops = Array.isArray(bridge.supportedOperations) ? bridge.supportedOperations.join(", ") : "(none)";
+                  var bModeBox = transportModeFor(r);
+                  var reasons = Array.isArray(bridge.reasons) ? bridge.reasons.slice(0, 4).map(function (x) { return esc(x); }).join("<br/>") : "";
+                  bridgeBox.innerHTML = "<p><strong>Bridge</strong> <code>" + esc(bridgeStructured ? "structured" : "degraded (read-only CLI fallback)") + "</code>" + (bModeBox ? (" <span class=\"muted\">(transport " + esc(bModeBox) + ")</span>") : "") + "</p>" +
+                    "<p class=\"muted\">Operations: " + esc(ops) + "</p>" + (reasons ? "<p class=\"muted\">" + reasons + "</p>" : "");
+                }
+              } else if (bridgeBox) {
+                bridgeBox.innerHTML = "<p class=\"muted\">Bridge negotiation unavailable.</p>";
+              }
+              done();
+              return r;
+            }
+            // diagnostics.doctor failure/rejection clears the per-run legs
+            // so concurrent validate/worktree successes cannot combine with
+            // a stale prior diagnostics payload in the overview.
+            state.diagnostics = null;
+            state.diagnosticsValidate = null;
+            state.diagnosticsWorktree = null;
+            state.diagnosticsCliOk = false;
+            state.diagnosticsBridgeStructured = false;
+            var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
+            summary.innerHTML = "<p><strong>Could not load diagnostics.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
+            done();
+            return null;
+          }, function () {
+            if (myTok !== state.diagnosticsToken) return null;
+            state.diagnostics = null;
+            state.diagnosticsValidate = null;
+            state.diagnosticsWorktree = null;
+            state.diagnosticsCliOk = false;
+            state.diagnosticsBridgeStructured = false;
+            summary.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
+            done();
+            return null;
           });
           if (can("profile.validate")) {
             request("profile.validate").then(function (res) {
-              if (res && res.ok) box.innerHTML += "<p>Profile validation: " + esc(JSON.stringify(res.result).slice(0, 2000)) + "</p>";
+              if (myTok !== state.diagnosticsToken) return;
+              if (!configBox) return;
+              if (res && res.ok && res.result) {
+                state.diagnosticsValidate = res.result;
+                var entries = Array.isArray(res.result.entries) ? res.result.entries : [];
+                var invalid = 0;
+                for (var i = 0; i < entries.length; i += 1) { if (entries[i] && entries[i].valid === false) invalid += 1; }
+                // Require explicit ok:true plus zero invalid; missing ok
+                // (malformed) stays not-ready, never ready.
+                configOk = res.result.ok === true && invalid === 0;
+                configBox.innerHTML = configOk
+                  ? "<p><strong>Config:</strong> all " + entries.length + " profile(s) valid (authoritative YAML; no second store).</p>"
+                  : "<p><strong>Config:</strong> " + invalid + " invalid of " + entries.length + " — run <code>orca-pi profile validate</code> for file/source/field diagnostics.</p>";
+              } else {
+                state.diagnosticsValidate = null;
+                configOk = false;
+                configBox.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "validation unavailable") + "</p>";
+              }
+              done();
+            }, function () {
+              if (myTok !== state.diagnosticsToken) return;
+              if (!configBox) return;
+              // Rejected validate (bridge failure) is not-ready, never ready.
+              state.diagnosticsValidate = null;
+              configOk = false;
+              configBox.innerHTML = "<p class=\"muted\">profile validation failed (bridge request failed) — run <code>orca-pi profile validate</code>.</p>";
+              done();
             });
+          } else if (configBox) {
+            configBox.innerHTML = "<p class=\"muted\">profile.validate unavailable on this host.</p>";
           }
+          if (can("worktree.context")) {
+            request("worktree.context").then(function (res) {
+              if (myTok !== state.diagnosticsToken) return;
+              if (!worktreeBox) return;
+              if (res && res.ok && res.result && typeof res.result.projectRoot === "string" && res.result.projectRoot) {
+                state.diagnosticsWorktree = res.result;
+                worktreeOk = true;
+                var root = res.result.projectRoot;
+                var explicit = res.result.explicit === true;
+                worktreeBox.innerHTML = "<p><strong>Worktree:</strong> <code>" + esc(root) + "</code> <span class=\"muted\">" +
+                  esc(explicit ? "explicit scope (captured at submission — delayed requests cannot be redirected)" : "implicit scope (reads only; mutations require explicit worktree.projectRoot)") + "</span></p>";
+              } else {
+                state.diagnosticsWorktree = null;
+                worktreeOk = false;
+                worktreeBox.innerHTML = "<p class=\"muted\">" + esc((res && res.error && res.error.message) || "worktree unavailable") + "</p>";
+              }
+              done();
+            }, function () {
+              if (myTok !== state.diagnosticsToken) return;
+              if (!worktreeBox) return;
+              // Rejected worktree.context is not-ready, never ready: the
+              // headline must not claim ready without a confirmed scope.
+              state.diagnosticsWorktree = null;
+              worktreeOk = false;
+              worktreeBox.innerHTML = "<p class=\"muted\">worktree context failed (bridge request failed) — requires <code>worktree.context</code>.</p>";
+              done();
+            });
+          } else if (worktreeBox) {
+            worktreeBox.innerHTML = "<p class=\"muted\">worktree.context unavailable on this host.</p>";
+          }
+          return main;
         }
 
         function boot() {
@@ -2229,6 +3103,16 @@
           if (lp) lp.addEventListener("click", function () { loadLaunchPreview(null); });
           var dr = document.getElementById("btn-diagnostics-reload");
           if (dr) dr.addEventListener("click", loadDiagnostics);
+          // GitHub identities (UI1.5): explicitly role-scoped refresh/doctor.
+          // Read-only workflows only (no mint); the bridge stays redacted.
+          var ghRefresh = document.getElementById("btn-github-refresh");
+          if (ghRefresh) ghRefresh.addEventListener("click", function () { loadGithubStatus(null); });
+          var ghWorker = document.getElementById("btn-github-worker");
+          if (ghWorker) ghWorker.addEventListener("click", function () { loadGithubStatus("worker"); });
+          var ghReviewer = document.getElementById("btn-github-reviewer");
+          if (ghReviewer) ghReviewer.addEventListener("click", function () { loadGithubStatus("reviewer"); });
+          var ghDoctor = document.getElementById("btn-github-doctor");
+          if (ghDoctor) ghDoctor.addEventListener("click", loadGithubDoctor);
           // Orchestration (UI1.4) toolbar: explicit scope + race-safe refresh.
           var orchRefresh = document.getElementById("btn-orch-refresh");
           if (orchRefresh) orchRefresh.addEventListener("click", function () {

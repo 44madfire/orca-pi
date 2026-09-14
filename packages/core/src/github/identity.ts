@@ -156,6 +156,7 @@ export function expiryEnvVarForIdentity(identity: GithubIdentity): string {
 /** Token-like patterns that must never appear in logs/errors. */
 const TOKEN_PATTERNS: readonly RegExp[] = [
   /\bghp_[A-Za-z0-9]{8,}\b/g,
+  /\bgho_[A-Za-z0-9]{8,}\b/g,
   /\bghu_[A-Za-z0-9]{8,}\b/g,
   /\bghs_[A-Za-z0-9]{8,}\b/g,
   /\bghr_[A-Za-z0-9]{8,}\b/g,
@@ -218,7 +219,7 @@ export function collectSecretsFromEnv(
     }
     // Token-shaped values in otherwise innocent vars (defense in depth).
     if (
-      /^(ghp_|ghu_|ghs_|ghr_|github_pat_)/.test(value) &&
+      /^(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/.test(value) &&
       value.length >= 12
     ) {
       secrets.push(value);
