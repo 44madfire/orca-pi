@@ -2328,6 +2328,29 @@
           if (next && typeof next.profile === "string") out.profile = next.profile;
           return out;
         }
+        // Fail-closed helper for scoped github.status refreshes: drop the
+        // targeted identity from the snapshot (pending) while preserving the
+        // sibling. Never synthesizes health; a missing canonical row
+        // headlines as pending via githubOkForHeadline, so a failed scoped
+        // refresh can never leave old healthy state driving ready.
+        // Allowlisted redacted shape only (identity-keyed records).
+        function clearGithubStatusIdentity(prev, identity) {
+          if (!identity) return null;
+          if (!prev || typeof prev !== "object" || Array.isArray(prev)) return null;
+          var prevIds = (prev.identities && typeof prev.identities === "object" && !Array.isArray(prev.identities)) ? prev.identities : {};
+          var kept = {};
+          for (var k in prevIds) {
+            if (!Object.prototype.hasOwnProperty.call(prevIds, k)) continue;
+            if (k === identity) continue;
+            var entry = prevIds[k];
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            kept[k] = entry;
+          }
+          var out = { identities: kept };
+          if (typeof prev.redacted === "boolean") out.redacted = prev.redacted;
+          if (typeof prev.note === "string" && prev.note) out.note = prev.note;
+          return out;
+        }
         function loadGithubStatus(identity) {
           var box = document.getElementById("github-summary");
           if (!state.structured || !can("github.status")) {
@@ -2336,6 +2359,17 @@
           }
           state.githubStatusToken = (state.githubStatusToken || 0) + 1;
           var myTok = state.githubStatusToken;
+          // Fail closed at refresh start: mark the targeted leg pending so a
+          // stale healthy snapshot cannot headline as ready while loading.
+          // Scoped refresh drops only the targeted identity (sibling
+          // preserved); full refresh clears the whole status leg.
+          if (identity) {
+            state.githubStatus = clearGithubStatusIdentity(state.githubStatus, identity);
+          } else {
+            state.githubStatus = null;
+          }
+          refreshDiagnosticsHeadline();
+          renderDiagnosticsOverview();
           if (box) box.innerHTML = "<p class=\"muted\">Loading GitHub status via <code>github.status</code>…</p>";
           var params = identity ? { identity: identity } : {};
           return request("github.status", params).then(function (res) {
@@ -2348,11 +2382,31 @@
               renderDiagnosticsOverview();
               return state.githubStatus;
             }
+            // Fail closed on bridge error: clear the targeted leg (scoped
+            // drops only the failed identity, sibling preserved; full
+            // clears the whole leg) so stale healthy state can never drive
+            // ready. Rerender headline + overview on every completion path.
+            if (identity) {
+              state.githubStatus = clearGithubStatusIdentity(state.githubStatus, identity);
+            } else {
+              state.githubStatus = null;
+            }
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
             var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
             if (box) box.innerHTML = "<p><strong>Could not load GitHub status.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
             return null;
           }, function () {
             if (myTok !== state.githubStatusToken) return null;
+            // Fail closed on rejection: same scoped-preserving clear plus
+            // headline/overview rerender (never leave stale ready).
+            if (identity) {
+              state.githubStatus = clearGithubStatusIdentity(state.githubStatus, identity);
+            } else {
+              state.githubStatus = null;
+            }
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
             if (box) box.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
             return null;
           });
@@ -2376,6 +2430,11 @@
           }
           state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
           var myTok = state.githubDoctorToken;
+          // Fail closed at refresh start: doctor leg pending so stale healthy
+          // doctor cannot headline as ready while the new run is in flight.
+          state.githubDoctor = null;
+          refreshDiagnosticsHeadline();
+          renderDiagnosticsOverview();
           if (box) box.innerHTML = "<p class=\"muted\">Running doctor via <code>github.doctor</code> (repo " + esc(repo) + ", ambient " + esc(ambient) + ")…</p>";
           var params = {};
           if (repo) params.repo = repo;
@@ -2391,12 +2450,27 @@
               renderDiagnosticsOverview();
               return res.result;
             }
+            // Fail closed on bridge error: clear the doctor leg (unknown)
+            // so stale healthy doctor can never drive ready. Rerender
+            // actor/setup from the cleared leg plus headline + overview on
+            // every completion path.
+            state.githubDoctor = null;
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
             var msg = (res && res.error && res.error.code + ": " + res.error.message) || "unavailable";
             if (box) box.innerHTML = "<p><strong>Doctor failed.</strong> <span class=\"muted\">" + esc(msg) + "</span></p>";
-            renderGithubActor(state.githubDoctor);
             return null;
           }, function () {
             if (myTok !== state.githubDoctorToken) return null;
+            // Fail closed on rejection: same doctor-leg clear plus
+            // headline/overview rerender (never leave stale ready).
+            state.githubDoctor = null;
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
             if (box) box.innerHTML = "<p><strong>Bridge request failed.</strong></p>";
             return null;
           });
@@ -2660,10 +2734,11 @@
           return "Node " + node + " on " + os + " (" + ctx + ").";
         }
         // Required GitHub health for the top-level readiness (mirrors
-        // control-center.ts toDiagnosticsGithubHealth): every reported
-        // status identity configured + unexpired AND doctor ok:true.
-        // Missing status/doctor -> undefined (pending, never ready);
-        // missing/expired/attention-needed -> false (never ready).
+        // control-center.ts toDiagnosticsGithubHealth): explicit healthy
+        // rows for BOTH canonical slots (worker + reviewer) AND doctor ok:true.
+        // Missing status/doctor or a healthy-but-partial snapshot (e.g.
+        // scoped worker-only merged into an empty snapshot) -> undefined
+        // (pending, never ready); observed missing/expired -> false.
         // No tokens/keys ever read -- allowlisted redacted fields only.
         function githubOkForHeadline() {
           var sItems = toGithubStatusItems(state.githubStatus);
@@ -2672,6 +2747,13 @@
             if (sItems[gi].expired === true) return false;
             if (!sItems[gi].configured) return false;
           }
+          var hasWorker = false;
+          var hasReviewer = false;
+          for (var ci = 0; ci < sItems.length; ci += 1) {
+            if (sItems[ci].identity === "worker") hasWorker = true;
+            if (sItems[ci].identity === "reviewer") hasReviewer = true;
+          }
+          if (!hasWorker || !hasReviewer) return undefined;
           var doc = state.githubDoctor;
           if (!doc || typeof doc !== "object" || Array.isArray(doc)) return undefined;
           if (doc.ok !== true) return false;

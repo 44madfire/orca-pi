@@ -1723,3 +1723,160 @@ describe("ui1.5/blocker: diagnostics readiness requires GitHub health", () => {
     expect(containsSecretMaterial(html)).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Blockers: GitHub readiness requires BOTH canonical slots (worker +
+// reviewer) + fail-closed GitHub refreshes (success-then-failure)
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/blocker: github readiness requires worker+reviewer (no partial ready)", () => {
+  const coreHealthy = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } };
+  const workerOnly = {
+    identities: {
+      worker: { identity: "worker", configured: true, sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN", expiresAt: "2030-01-01T00:00:00.000Z", expired: false },
+    },
+    redacted: true,
+  };
+  const reviewerOnly = {
+    identities: {
+      reviewer: { identity: "reviewer", configured: true, sourceLabel: "ORCA_PI_GITHUB_REVIEWER_TOKEN", expired: false },
+    },
+    redacted: true,
+  };
+
+  it("worker-only healthy status plus doctor ok:true stays pending (never ready)", () => {
+    // Regression: a scoped worker-only response merged into an empty
+    // snapshot must remain pending until both rows are observed healthy.
+    const merged = mergeGithubStatusSnapshots({ identities: {} }, workerOnly);
+    const items = toGithubStatusItems(merged);
+    expect(items.map((i) => i.identity)).toEqual(["worker"]);
+    expect(toDiagnosticsGithubHealth(merged, doctorReport())).toBeUndefined();
+    expect(toDiagnosticsGithubHealth(workerOnly, doctorReport())).toBeUndefined();
+    expect(toDiagnosticsGithubHealth(reviewerOnly, doctorReport())).toBeUndefined();
+    // Full worker+reviewer healthy plus doctor ok:true is the only ready shape.
+    expect(toDiagnosticsGithubHealth(statusPayload(), doctorReport()))?.toEqual({ ok: true });
+    // Headline mirrors the leg: partial stays pending, full is ready.
+    expect(diagnosticsHeadline({ ...coreHealthy, github: toDiagnosticsGithubHealth(workerOnly, doctorReport()) as never })).toMatch(/pending\/unavailable/);
+    expect(diagnosticsHeadline({ ...coreHealthy, github: toDiagnosticsGithubHealth(statusPayload(), doctorReport()) })).toContain("ready");
+    expect(isSecretFreePayload(merged)).toBe(true);
+  });
+
+  it("unhealthy rows still fail closed even when a canonical slot is missing", () => {
+    // Any observed unhealthy row is attention-needed (not pending).
+    expect(toDiagnosticsGithubHealth({ identities: { worker: { configured: false, sourceLabel: "x" } } }, doctorReport()))?.toEqual({ ok: false });
+    expect(toDiagnosticsGithubHealth({ identities: { reviewer: { configured: true, sourceLabel: "x", expired: true } } }, doctorReport()))?.toEqual({ ok: false });
+    // Extra custom identities never substitute for the canonical pair.
+    const customOnly = { identities: { custom: { configured: true, sourceLabel: "x" } }, redacted: true };
+    expect(toDiagnosticsGithubHealth(customOnly, doctorReport())).toBeUndefined();
+    const workerPlusCustom = {
+      identities: {
+        worker: { configured: true, sourceLabel: "x", expired: false },
+        custom: { configured: true, sourceLabel: "x" },
+      },
+      redacted: true,
+    };
+    expect(toDiagnosticsGithubHealth(workerPlusCustom, doctorReport())).toBeUndefined();
+  });
+
+  it("panel headline requires both canonical rows (worker+reviewer)", () => {
+    const html = controlHtml();
+    expect(html).toContain("function githubOkForHeadline()");
+    expect(html).toContain('if (sItems[ci].identity === "worker") hasWorker = true;');
+    expect(html).toContain('if (sItems[ci].identity === "reviewer") hasReviewer = true;');
+    expect(html).toContain("if (!hasWorker || !hasReviewer) return undefined;");
+    expect(containsSecretMaterial(html)).toBe(false);
+  });
+});
+
+describe("ui1.5/blocker: github refreshes fail closed (success-then-failure)", () => {
+  const coreHealthy = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } };
+
+  it("success-then-status-failure leaves headline pending (no stale ready)", () => {
+    // Healthy baseline headlines as ready.
+    const healthyLeg = toDiagnosticsGithubHealth(statusPayload(), doctorReport());
+    expect(healthyLeg)?.toEqual({ ok: true });
+    expect(diagnosticsHeadline({ ...coreHealthy, github: healthyLeg })).toContain("ready");
+    // Full status refresh failure clears the leg -> pending, never ready.
+    const clearedLeg = toDiagnosticsGithubHealth(null, doctorReport());
+    expect(clearedLeg).toBeUndefined();
+    expect(diagnosticsHeadline({ ...coreHealthy, github: clearedLeg as never })).toMatch(/pending\/unavailable/);
+    expect(diagnosticsHeadline({ ...coreHealthy, github: clearedLeg as never })).not.toMatch(/Diagnostics: ready/);
+    // Scoped worker-refresh failure preserves the reviewer sibling but
+    // stays pending (worker row unobserved) — never stale ready.
+    const full = statusPayload();
+    const reviewerKept = {
+      identities: { reviewer: (full.identities as Record<string, unknown>)["reviewer"] },
+      redacted: true,
+    };
+    expect(toGithubStatusItems(reviewerKept).map((i) => i.identity)).toEqual(["reviewer"]);
+    expect(toDiagnosticsGithubHealth(reviewerKept, doctorReport())).toBeUndefined();
+    expect(diagnosticsHeadline({ ...coreHealthy, github: toDiagnosticsGithubHealth(reviewerKept, doctorReport()) as never })).toMatch(/pending\/unavailable/);
+    // Overview mirrors the cleared leg (no stale healthy rows).
+    const clearedRows = diagnosticsOverviewRows({ githubStatus: null, githubDoctor: doctorReport() });
+    const clearedStatus = clearedRows.find((r) => r.label === "GitHub status")!.detail;
+    expect(clearedStatus).toMatch(/not loaded/);
+    expect(clearedStatus).not.toContain("configured via");
+  });
+
+  it("success-then-doctor-failure leaves headline pending (no stale ready)", () => {
+    const healthyLeg = toDiagnosticsGithubHealth(statusPayload(), doctorReport());
+    expect(diagnosticsHeadline({ ...coreHealthy, github: healthyLeg })).toContain("ready");
+    // Doctor refresh failure clears the leg -> pending, never ready.
+    const clearedLeg = toDiagnosticsGithubHealth(statusPayload(), null);
+    expect(clearedLeg).toBeUndefined();
+    expect(diagnosticsHeadline({ ...coreHealthy, github: clearedLeg as never })).toMatch(/pending\/unavailable/);
+    expect(diagnosticsHeadline({ ...coreHealthy, github: clearedLeg as never })).not.toMatch(/Diagnostics: ready/);
+    // Doctor ok:false is attention-needed (distinct from pending).
+    const failedLeg = toDiagnosticsGithubHealth(statusPayload(), { ...doctorReport(), ok: false });
+    expect(failedLeg)?.toEqual({ ok: false });
+    expect(diagnosticsHeadline({ ...coreHealthy, github: failedLeg })).toMatch(/GitHub needs attention/);
+    const clearedRows = diagnosticsOverviewRows({ githubStatus: statusPayload(), githubDoctor: null });
+    const clearedDoctor = clearedRows.find((r) => r.label === "GitHub doctor")!.detail;
+    expect(clearedDoctor).toMatch(/not run yet/);
+    expect(clearedDoctor).not.toContain("distinct (ok)");
+  });
+
+  it("panel marks pending at refresh start and clears plus rerenders on every completion path", () => {
+    const html = controlHtml();
+    // Scoped-preserving clear helper exists (drops only the targeted
+    // identity, keeps the sibling; allowlisted redacted shape only).
+    expect(html).toContain("function clearGithubStatusIdentity(prev, identity)");
+    expect(html).toContain("if (k === identity) continue;");
+    // Status: start marks pending (scoped-preserving clear vs full clear)
+    // and rerenders headline + overview before the request lands.
+    expect(html).toContain("Fail closed at refresh start: mark the targeted leg pending");
+    expect(html).toContain("state.githubStatus = clearGithubStatusIdentity(state.githubStatus, identity);");
+    expect(html).toContain("state.githubStatus = null;");
+    // Doctor: start clears the leg to pending plus headline/overview.
+    expect(html).toContain("Fail closed at refresh start: doctor leg pending");
+    expect(html).toContain("state.githubDoctor = null;");
+    // Status error + rejection clear the targeted leg and rerender
+    // headline + overview (never leave stale healthy driving ready).
+    expect(html).toContain("Fail closed on bridge error: clear the targeted leg");
+    expect(html).toContain("Fail closed on rejection: same scoped-preserving clear");
+    // Doctor error + rejection clear the leg, rerender actor/setup from
+    // the cleared leg, plus headline + overview.
+    expect(html).toContain("Fail closed on bridge error: clear the doctor leg");
+    expect(html).toContain("Fail closed on rejection: same doctor-leg clear");
+    expect(html).toContain("renderGithubActor(state.githubDoctor);");
+    expect(html).toContain("renderGithubSetup(state.githubDoctor);");
+    // Every completion path rerenders the Diagnostics headline and the
+    // one-place overview (success already did; failures now do too).
+    const bodyOf = (fn: string): string => {
+      const start = html.indexOf(`function ${fn}(`);
+      expect(start).toBeGreaterThan(-1);
+      const next = html.indexOf("\n        function ", start + 1);
+      return html.slice(start, next === -1 ? start + 12000 : next);
+    };
+    const statusBody = bodyOf("loadGithubStatus");
+    expect(statusBody.match(/refreshDiagnosticsHeadline\(\);/g)!.length).toBeGreaterThanOrEqual(3);
+    expect(statusBody.match(/renderDiagnosticsOverview\(\);/g)!.length).toBeGreaterThanOrEqual(3);
+    const doctorBody = bodyOf("loadGithubDoctor");
+    expect(doctorBody.match(/refreshDiagnosticsHeadline\(\);/g)!.length).toBeGreaterThanOrEqual(3);
+    expect(doctorBody.match(/renderDiagnosticsOverview\(\);/g)!.length).toBeGreaterThanOrEqual(3);
+    // No secrets, no mint/refresh smuggled into the fail-closed paths.
+    expect(html).not.toMatch(/\.token\b/);
+    expect(html).not.toContain("privateKey");
+    expect(containsSecretMaterial(html)).toBe(false);
+  });
+});

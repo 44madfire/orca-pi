@@ -1608,13 +1608,16 @@ export function diagnosticsHeadline(input: {
 
 /**
  * Required GitHub health for the top-level Diagnostics readiness (pure,
- * never throws). Returns `{ok:true}` only when every reported status
- * identity is configured and unexpired AND the doctor report is
+ * never throws). Returns `{ok:true}` only when explicit healthy status
+ * rows for BOTH canonical credential identities (`worker` and `reviewer`)
+ * are observed (each configured and unexpired) AND the doctor report is
  * `ok:true` (distinct actors, proofs, repo access). Missing status or
- * doctor → `undefined` (pending/unavailable, never ready); any
- * missing/expired/attention-needed leg → `{ok:false}`. The headline
- * takes this value as its `github` leg so overall ready can never
- * coincide with broken GitHub.
+ * doctor → `undefined` (pending/unavailable, never ready); any observed
+ * missing/expired row → `{ok:false}`; a healthy-but-partial snapshot
+ * (e.g. a scoped worker-only response merged into an empty snapshot)
+ * stays `undefined` until both canonical rows are observed and healthy.
+ * The headline takes this value as its `github` leg so overall ready can
+ * never coincide with broken or half-observed GitHub.
  */
 export function toDiagnosticsGithubHealth(statusPayload: unknown, doctorPayload: unknown): { ok: boolean } | undefined {
   if (statusPayload === undefined || statusPayload === null) return undefined;
@@ -1624,6 +1627,17 @@ export function toDiagnosticsGithubHealth(statusPayload: unknown, doctorPayload:
     if (item.expired === true) return { ok: false };
     if (!item.configured) return { ok: false };
   }
+  // Both canonical slots must be explicitly observed healthy. A scoped
+  // worker-only (or reviewer-only) payload that is healthy on its own
+  // row is still pending until the sibling row is observed healthy —
+  // otherwise a partial merge could headline as ready with half the
+  // credentials unverified.
+  const byIdentity = new Map(items.map((entry) => [entry.identity, entry] as const));
+  const worker = byIdentity.get("worker");
+  const reviewer = byIdentity.get("reviewer");
+  if (!worker || !reviewer) return undefined;
+  if (worker.expired === true || !worker.configured) return { ok: false };
+  if (reviewer.expired === true || !reviewer.configured) return { ok: false };
   if (doctorPayload === undefined || doctorPayload === null) return undefined;
   if (!isPlainRecord(doctorPayload)) return { ok: false };
   const rec = doctorPayload as Record<string, unknown>;
