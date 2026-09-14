@@ -305,7 +305,12 @@ interface Harness {
   setOptionsExpectError(sessionId: string, options: Record<string, unknown>): Promise<string>;
   answerPrompt(requestId: string, value?: unknown, cancelled?: boolean): Promise<string>;
   promptRequests(opId?: string): Array<{ requestId: string; opId?: string }>;
-  getHistory(sessionId: string): Promise<{ entries: Array<{ role: string; text?: string }>; leafId?: string }>;
+  /** Live `tool_end` session events (isError included: tool failure is a live-event concern). */
+  toolEndEvents(opId?: string): Array<{ toolCallId: string; isError: boolean; result: string; opId?: string }>;
+  getHistory(sessionId: string): Promise<{
+    entries: Array<{ role: string; text?: string; isError?: boolean }>;
+    leafId?: string;
+  }>;
   getSession(sessionId: string): Promise<Record<string, unknown>>;
   release(sessionId: string): Promise<void>;
   supportsCreate(location: { executionHostId: string; wslDistro: string | null }, agent: string): boolean;
@@ -314,10 +319,16 @@ interface Harness {
   teardown(): Promise<void>;
 }
 
-function makeHarness(kind: PathKind, store: SessionStore, providerOpts: { requireCompat?: boolean } = {}): Harness {
+function makeHarness(
+  kind: PathKind,
+  store: SessionStore,
+  providerOpts: { requireCompat?: boolean } = {},
+  tweakFake: (fake: Snc110FakePi) => void = () => undefined,
+): Harness {
   const fakes: Snc110FakePi[] = [];
   const factory = (opts: PiRpcConnectionOptions): Snc110FakePi => {
     const fake = new Snc110FakePi(opts, store);
+    tweakFake(fake);
     fakes.push(fake);
     return fake;
   };
@@ -401,9 +412,29 @@ function makeHarness(kind: PathKind, store: SessionStore, providerOpts: { requir
           .filter((e) => e.type === "prompt_request" && (opId === undefined || e.opId === opId))
           .map((e) => ({ requestId: String(e.event["requestId"] ?? ""), ...(e.opId ? { opId: e.opId } : {}) }));
       },
+      toolEndEvents(opId) {
+        return events
+          .filter((e) => e.type === "tool_end" && (opId === undefined || e.opId === opId))
+          .map((e) => ({
+            toolCallId: String(e.event["toolCallId"] ?? ""),
+            isError: e.event["isError"] === true,
+            result: String(e.event["result"] ?? ""),
+            ...(e.opId ? { opId: e.opId } : {}),
+          }));
+      },
       async getHistory(sessionId) {
         const h = await native.getHistory(sessionId);
-        return { entries: h.entries.map((e) => ({ role: e.role, ...(e.text !== undefined ? { text: e.text } : {}) })), ...(h.leafId ? { leafId: h.leafId } : {}) };
+        return {
+          entries: h.entries.map((e) => {
+            const raw = e as unknown as Record<string, unknown>;
+            return {
+              role: e.role,
+              ...(e.text !== undefined ? { text: e.text } : {}),
+              ...(raw["isError"] === true ? { isError: true as const } : {}),
+            };
+          }),
+          ...(h.leafId ? { leafId: h.leafId } : {}),
+        };
       },
       async getSession(sessionId) {
         return (await native.getSession(sessionId)) as unknown as Record<string, unknown>;
@@ -452,12 +483,32 @@ function makeHarness(kind: PathKind, store: SessionStore, providerOpts: { requir
       .map((m) => m as unknown as { opId?: string; event: { type: string; requestId?: string } })
       .filter((m) => m.event.type === "prompt_request" && (opId === undefined || m.opId === opId))
       .map((m) => ({ requestId: String(m.event.requestId ?? ""), ...(m.opId ? { opId: m.opId } : {}) }));
+  const toolEndEvents = (
+    opId?: string,
+  ): Array<{ toolCallId: string; isError: boolean; result: string; opId?: string }> =>
+    out
+      .filter((m) => m.kind === "session_event")
+      .map(
+        (m) =>
+          m as unknown as {
+            opId?: string;
+            event: { type: string; toolCallId?: string; isError?: boolean; result?: string };
+          },
+      )
+      .filter((m) => m.event.type === "tool_end" && (opId === undefined || m.opId === opId))
+      .map((m) => ({
+        toolCallId: String(m.event.toolCallId ?? ""),
+        isError: m.event.isError === true,
+        result: String(m.event.result ?? ""),
+        ...(m.opId ? { opId: m.opId } : {}),
+      }));
   return {
     kind,
     fakes,
     fakeForSession,
     settleTurn,
     promptRequests,
+    toolEndEvents,
     supportsCreate: (location, agent) => {
       if (agent !== "pi") return false;
       return location.executionHostId === "local" && location.wslDistro === null;
@@ -541,7 +592,10 @@ function makeHarness(kind: PathKind, store: SessionStore, providerOpts: { requir
       send({ v: 1, kind: "get_history", opId, sessionId });
       const reply = await waitFor(opId, ["history", "error"]);
       if (reply.kind === "history") {
-        const h = reply as unknown as { entries: Array<{ role: string; text?: string }>; leafId?: string };
+        const h = reply as unknown as {
+          entries: Array<{ role: string; text?: string; isError?: boolean }>;
+          leafId?: string;
+        };
         return { entries: h.entries, ...(h.leafId ? { leafId: h.leafId } : {}) };
       }
       const err = reply as unknown as { error: { code: string; message: string } };
@@ -606,15 +660,30 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
       fake.emit({ type: "tool_execution_start", toolCallId: "call_1", toolName: "read", args: { path: "a" } } as unknown as PiServerEvent);
       fake.emit({ type: "tool_execution_update", toolCallId: "call_1", partialResult: "tool-output-partial" } as unknown as PiServerEvent);
       fake.emit({ type: "tool_execution_end", toolCallId: "call_1", result: "tool-output", isError: false } as unknown as PiServerEvent);
+      // Failing tool: the error stays in the tool channel (live `tool_end`
+      // with `isError: true` plus a tool journal row), never paraphrased
+      // into assistant prose. (`isError` is a live-event concern by design:
+      // journal rows carry role/text only — see `pi-history.ts`.)
+      fake.emit({ type: "tool_execution_start", toolCallId: "call_2", toolName: "bash", args: { command: "exit 1" } } as unknown as PiServerEvent);
+      fake.emit({ type: "tool_execution_end", toolCallId: "call_2", result: "denied-by-policy", isError: true } as unknown as PiServerEvent);
       await harness.settleTurn(fake, "done");
+      const toolEnds = harness.toolEndEvents(accepted.opId);
+      expect(toolEnds.filter((e) => e.isError === false)).toHaveLength(1);
+      const failedLive = toolEnds.filter((e) => e.isError === true);
+      expect(failedLive).toHaveLength(1);
+      expect(failedLive[0]?.toolCallId).toBe("call_2");
+      expect(failedLive[0]?.result).toContain("denied-by-policy");
       const history = await harness.getHistory(sessionId);
       const assistants = history.entries.filter((e) => e.role === "assistant");
       const tools = history.entries.filter((e) => e.role === "tool");
       expect(assistants).toHaveLength(1);
-      expect(tools.length).toBeGreaterThanOrEqual(1);
-      // Thinking never becomes prose; tool stdout never becomes prose.
+      expect(tools.length).toBeGreaterThanOrEqual(2);
+      // Thinking never becomes prose; tool stdout/stderr never becomes prose.
       expect(assistants.some((e) => (e.text ?? "").includes("considering"))).toBe(false);
       expect(assistants.some((e) => (e.text ?? "").includes("tool-output"))).toBe(false);
+      expect(assistants.some((e) => (e.text ?? "").includes("denied-by-policy"))).toBe(false);
+      expect(tools.some((e) => (e.text ?? "").includes("denied-by-policy"))).toBe(true);
+      // The session survives the failed tool: settled and idle.
       const session = await harness.getSession(sessionId);
       expect(session["isStreaming"]).toBe(false);
     } finally {
@@ -824,6 +893,62 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
       const ok = await harness.acquire("/tmp/snc110-ws", { compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION } });
       expect(ok.sessionId).not.toBe("");
       expect(harness.fakes).toHaveLength(1);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("verifies required capabilities against the running Pi (live probes, not just ads)", async () => {
+    const harness = makeHarness(kind, new Map());
+    try {
+      // Live catalog + history RPCs answer: options/history/images proven live.
+      const ok = await harness.acquire("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["options", "history", "images"] },
+      });
+      expect(ok.sessionId).not.toBe("");
+      expect(harness.fakes).toHaveLength(1);
+      expect(harness.fakes[0]?.isClosed).toBe(false);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("refuses live-unproven capabilities and tears down the started child (no leak)", async () => {
+    const stripRpcs = (fake: Snc110FakePi): void => {
+      fake.getAvailableModels = undefined;
+      fake.getAvailableThinkingLevels = undefined;
+      fake.getEntries = undefined;
+      fake.getTree = undefined;
+    };
+    const harness = makeHarness(kind, new Map(), {}, stripRpcs);
+    try {
+      const reason = await harness.acquireExpectError("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["options", "history"] },
+      });
+      expect(reason).toMatch(/PI_COMPAT_CAPABILITY/);
+      expect(reason).toMatch(/live probe/);
+      // The child was constructed for probing but closed again: no leak,
+      // no session exposed.
+      expect(harness.fakes).toHaveLength(1);
+      expect(harness.fakes[0]?.isClosed).toBe(true);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("refuses images when the live Pi catalog has no image-capable model", async () => {
+    const textOnly = (fake: Snc110FakePi): void => {
+      fake.models = [{ id: "text-only-model", provider: "opencode-go", input: ["text"] } as PiModel];
+    };
+    const harness = makeHarness(kind, new Map(), {}, textOnly);
+    try {
+      const reason = await harness.acquireExpectError("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["images"] },
+      });
+      expect(reason).toMatch(/PI_COMPAT_CAPABILITY/);
+      expect(reason).toMatch(/image-capable/);
+      expect(harness.fakes).toHaveLength(1);
+      expect(harness.fakes[0]?.isClosed).toBe(true);
     } finally {
       await harness.teardown();
     }

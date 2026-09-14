@@ -309,6 +309,29 @@ export function checkAcquireCompat(
   return { allowed: true, code: "PI_COMPAT_OK", reason: "compat-ok: acquire-time gate passed", fallback: PI_TUI_FALLBACK };
 }
 
+/**
+ * Required capabilities with a dedicated pre-turn live RPC probe.
+ *
+ * `options`/`images` verify against the live model + thinking catalogs;
+ * `history`/`resume` verify against live entries/tree. The remaining flags
+ * (`textStreaming`, `thinking`, `tools`, `cancel`, `extensionDialogs`)
+ * have no pre-turn probe: they are checked against the static adapter
+ * advertisement pre-spawn and enforced per-turn at runtime (abort
+ * fidelity, translator shaping, prompt retirement,
+ * `PI_OPTION_UNSUPPORTED` on minimal transports).
+ */
+export const LIVE_PROBE_CAPABILITIES: readonly string[] = Object.freeze(["options", "images", "history", "resume"]);
+
+/** Split required capabilities into live-probed vs adapter-declared. */
+export function splitProbedCapabilities(required: readonly string[]): {
+  readonly live: readonly string[];
+  readonly declared: readonly string[];
+} {
+  const live = required.filter((name) => (LIVE_PROBE_CAPABILITIES as readonly string[]).includes(name));
+  const declared = required.filter((name) => !(LIVE_PROBE_CAPABILITIES as readonly string[]).includes(name));
+  return { live: Object.freeze([...live]), declared: Object.freeze([...declared]) };
+}
+
 export interface PiStructuredGateInput {
   readonly location: PiCompatLocation;
   readonly agent: string;

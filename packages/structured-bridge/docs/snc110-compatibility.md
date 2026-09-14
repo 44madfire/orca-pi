@@ -3,6 +3,18 @@
 Owner: `44madfire/orca-pi` (this repository). Orca-side work from issue #19
 landed separately in `44madfire/orca` and is out of scope here.
 
+> Scope boundary (stated plainly): this change delivers the **provider-owned
+> slice** of #20 — the gate logic, both provider-side enforcement points
+> (pre-spawn advertisement check with `requireCompat` evidence mode, plus
+> post-start live RPC verification), the vendored caller contract
+> (`BridgeHost.acquire({compat})`), deterministic coverage, and the opt-in
+> smoke. It does **not** land the Orca-side production wiring
+> (`requireCompat: true`, the bounded `pi --version` probe, evidence on
+> every production acquire), which lives in the Orca repository and is
+> tracked as follow-up work — so this PR is `Related to #20`, not
+> `Closes #20`. Merging it leaves the production default (`requireCompat:
+> false`) unchanged until that companion lands.
+
 ## 1. What SNC1.10 adds in this repo
 
 | Piece | Location | Notes |
@@ -85,7 +97,15 @@ defense in depth that cannot be skipped once `requireCompat` is set.
 Capability rule: prefer probing (`get_available_models`,
 `get_available_thinking_levels`, `get_entries`/`leafId`, advertised
 bridge capabilities) over version-string checks. The version gate is a
-coarse floor only.
+coarse floor only. Enforcement is two-layer: (1) pre-spawn, required
+capabilities are checked against the static advertisement (cheap refusal
+before any Pi child exists); (2) post-start, capabilities with a dedicated
+live RPC probe (`options`/`images` via the catalogs, `history`/`resume`
+via entries/tree) are re-verified against the RUNNING Pi before the
+session is exposed — refusal closes the just-started child (no leak).
+Flags without a pre-turn probe (`textStreaming`, `thinking`, `tools`,
+`cancel`, `extensionDialogs`) stay advertisement-checked pre-spawn and
+runtime-enforced per-turn. See `splitProbedCapabilities()`.
 
 ## 5. Security / reliability evidence
 

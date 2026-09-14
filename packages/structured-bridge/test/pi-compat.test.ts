@@ -20,6 +20,7 @@ import {
   negotiatePiCapabilities,
   parsePiVersion,
   PI_TUI_FALLBACK,
+  splitProbedCapabilities,
 } from "../src/pi-compat.js";
 
 describe("SNC1.10 Pi version floor (capability probing stays authoritative)", () => {
@@ -170,6 +171,24 @@ describe("SNC1.10 acquire-time gate (pre-spawn enforcement input)", () => {
       code: "PI_COMPAT_CAPABILITY",
       fallback: "pi-tui",
     });
+  });
+});
+
+describe("SNC1.10 live vs declared capability split (round-3 P1)", () => {
+  it("routes probed capabilities live and the rest to the advertisement", () => {
+    expect(splitProbedCapabilities(["options", "images", "history", "resume"]).live).toEqual([
+      "options",
+      "images",
+      "history",
+      "resume",
+    ]);
+    const text = splitProbedCapabilities(["textStreaming", "thinking", "tools", "cancel", "extensionDialogs"]);
+    expect(text.live).toEqual([]);
+    expect(text.declared).toEqual(["textStreaming", "thinking", "tools", "cancel", "extensionDialogs"]);
+    const mixed = splitProbedCapabilities(["options", "tools"]);
+    expect(mixed.live).toEqual(["options"]);
+    expect(mixed.declared).toEqual(["tools"]);
+    expect(splitProbedCapabilities([])).toEqual({ live: [], declared: [] });
   });
 });
 
