@@ -27,6 +27,8 @@ import {
   describeConfigHealth,
   describeConfigPaths,
   describeDiagnosticsCli,
+  describeDiagnosticsHost,
+  describeDiagnosticsRuntime,
   describeGithubDoctorItem,
   describeGithubStatusItem,
   describeReviewActor,
@@ -35,6 +37,8 @@ import {
   diagnosticsHeadline,
   diagnosticsOverviewRows,
   DIAGNOSTICS_DETAIL_LIMIT,
+  DIAGNOSTICS_HOST_CAPABILITIES,
+  DIAGNOSTICS_OVERVIEW_LIMIT,
   GITHUB_DEFAULT_AMBIENT,
   GITHUB_DEFAULT_REPO,
   GITHUB_IDENTITIES,
@@ -51,6 +55,8 @@ import {
   toDiagnosticsCliHealth,
   toDiagnosticsConfigHealth,
   toDiagnosticsConfigPaths,
+  toDiagnosticsHostHealth,
+  toDiagnosticsRuntimeHealth,
   toDiagnosticsWorktreeHealth,
   toGithubActorSummary,
   toGithubDoctorItems,
@@ -1149,5 +1155,225 @@ describe("ui1.5: diagnostics one-place overview rows", () => {
     }
     expect(html).toContain("sanitizeDiagnosticsDetail(rows[i][1])");
     expect(containsSecretMaterial(html)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UI1.5 gap fix: typed runtime/host context in the one-place overview
+// (Orca app version, plugin API / Host capability status, Node/OS/WSL)
+// ---------------------------------------------------------------------------
+
+describe("ui1.5: diagnostics typed host/runtime context (no CLI-only overview)", () => {
+  it("normalizes host health allowlist-only with truthful unknown states", () => {
+    expect(toDiagnosticsHostHealth(null)).toBeUndefined();
+    expect(toDiagnosticsHostHealth({})).toBeUndefined();
+    const full = toDiagnosticsHostHealth({
+      host: { appVersion: "1.4.197", pluginApi: 1, grantedCapabilities: ["workspace:read", "terminal:send", "bogus-cap"], versionsOk: true, consentOk: true, seamHandshake: true, structured: true },
+      bridge: { structured: true, versionsOk: true, consentOk: true, seamHandshake: true, supportedOperations: [], reasons: [] },
+      transport: { mode: "seam" },
+    })!;
+    expect(full.appVersion).toBe("1.4.197");
+    expect(full.pluginApi).toBe(1);
+    expect(full.grantedCapabilities).toEqual(["workspace:read", "terminal:send"]);
+    expect(full.transportMode).toBe("seam");
+    expect(describeDiagnosticsHost(full)).toContain("Orca app 1.4.197");
+    expect(describeDiagnosticsHost(full)).toContain("pluginApi 1");
+    expect(describeDiagnosticsHost(full)).toContain("workspace:read");
+    expect(describeDiagnosticsHost(full)).toContain("transport seam");
+    expect(isSecretFreePayload(full)).toBe(true);
+    // Non-allowlisted caps and malformed versions are dropped, never rendered.
+    const dirty = toDiagnosticsHostHealth({
+      host: { appVersion: "not a version!!", pluginApi: 1.5, grantedCapabilities: ["workspace:read", "exec", 42] },
+      bridge: { structured: false, supportedOperations: [], reasons: [] },
+    })!;
+    expect(dirty.appVersion).toBeUndefined();
+    expect(dirty.pluginApi).toBeUndefined();
+    expect(dirty.grantedCapabilities).toEqual(["workspace:read"]);
+    expect(describeDiagnosticsHost(dirty)).toContain("(unknown version)");
+    expect(describeDiagnosticsHost(dirty)).toContain("pluginApi unknown");
+    // Missing legs never claim healthy: unknown renders as unknown/degraded.
+    expect(describeDiagnosticsHost(undefined)).toContain("unknown");
+    expect(describeDiagnosticsHost(undefined)).not.toContain("structured; transport seam");
+    expect(describeDiagnosticsHost({})).toContain("unknown");
+  });
+
+  it("normalizes runtime health allowlist-only (Node/OS/WSL where available)", () => {
+    expect(toDiagnosticsRuntimeHealth(null)).toBeUndefined();
+    expect(toDiagnosticsRuntimeHealth({})).toBeUndefined();
+    const win = toDiagnosticsRuntimeHealth({ runtime: { node: "v22.14.0", platform: "win32", arch: "x64", wsl: "native" } })!;
+    expect(win.node).toBe("v22.14.0");
+    expect(describeDiagnosticsRuntime(win)).toContain("Node v22.14.0");
+    expect(describeDiagnosticsRuntime(win)).toContain("win32/x64");
+    expect(describeDiagnosticsRuntime(win)).toContain("native Windows");
+    const wsl = toDiagnosticsRuntimeHealth({ runtime: { node: "v20.0.0", platform: "linux", arch: "x64", wsl: "wsl:Ubuntu" } })!;
+    expect(describeDiagnosticsRuntime(wsl)).toContain("WSL distro Ubuntu");
+    const unknown = toDiagnosticsRuntimeHealth({ runtime: { wsl: "wsl-unknown-distro" } })!;
+    expect(describeDiagnosticsRuntime(unknown)).toContain("WSL (distro unknown)");
+    // Malformed/injected fields are dropped; overly long values never survive.
+    const evil = toDiagnosticsRuntimeHealth({
+      runtime: { node: "v22.14.0; rm -rf /", platform: "win32", arch: "x64", wsl: "native", extra: "ghp_leakedsecret0123456789" },
+    })!;
+    expect(evil.node).toBeUndefined();
+    expect((evil as Record<string, unknown>)["extra"]).toBeUndefined();
+    expect(describeDiagnosticsRuntime(evil)).toContain("(unknown)");
+    expect(containsSecretMaterial(describeDiagnosticsRuntime(evil))).toBe(false);
+    expect(describeDiagnosticsRuntime(undefined)).toContain("OS context unknown");
+    expect(isSecretFreePayload(win)).toBe(true);
+  });
+
+  it("overview Runtime exposes host/runtime context, not only CLI versions", () => {
+    const rows = diagnosticsOverviewRows({
+      diagnostics: {
+        orcaPiVersion: "0.1.0",
+        bridgeVersion: "1.0.0",
+        protocolVersion: 1,
+        cli: {
+          orca: { executable: "orca", found: true, version: "1.4.197", detail: "orca 1.4.197" },
+          pi: { executable: "pi", found: true, version: "0.84.4", detail: "pi 0.84.4" },
+          ok: true,
+        },
+        bridge: { structured: true, degraded: false, versionsOk: true, consentOk: true, seamHandshake: true, supportedOperations: ["profiles.list"], reasons: [] },
+        host: { appVersion: "1.4.197", pluginApi: 1, grantedCapabilities: ["workspace:read"], versionsOk: true, consentOk: true, seamHandshake: true, structured: true },
+        runtime: { node: "v22.14.0", platform: "win32", arch: "x64", wsl: "native" },
+        transport: { mode: "seam" },
+      },
+      validate: { entries: [{ name: "worker", valid: true }], ok: true },
+      orchestration: { effective: { worker: "worker" }, provenance: {} },
+      knownProfiles: ["worker"],
+    });
+    const byLabel = new Map(rows.map((r) => [r.label, r.detail]));
+    const runtime = byLabel.get("Runtime")!;
+    expect(runtime).toContain("orca 1.4.197");
+    expect(runtime).toContain("Orca app 1.4.197");
+    expect(runtime).toContain("pluginApi 1");
+    expect(runtime).toContain("workspace:read");
+    expect(runtime).toContain("Node v22.14.0");
+    expect(runtime).toContain("win32/x64");
+    expect(runtime).toContain("native Windows");
+    expect(byLabel.get("Bridge")).toContain("transport seam");
+    for (const row of rows) {
+      expect(containsSecretMaterial(row.detail)).toBe(false);
+      expect(isSecretFreePayload({ detail: row.detail })).toBe(true);
+      expect(row.detail.length).toBeLessThanOrEqual(DIAGNOSTICS_OVERVIEW_LIMIT + 5);
+    }
+  });
+
+  it("overview renders missing host/runtime as unknown, never healthy", () => {
+    const rows = diagnosticsOverviewRows({ diagnostics: { cli: { orca: { found: false, detail: "x" }, pi: { found: false, detail: "y" }, ok: false } } });
+    const byLabel = new Map(rows.map((r) => [r.label, r.detail]));
+    expect(byLabel.get("Runtime")).toMatch(/unknown/i);
+    expect(byLabel.get("Runtime")).not.toContain("Orca app 1.4.197");
+    expect(byLabel.get("Bridge")).toMatch(/unavailable|unknown|degraded/);
+    expect(byLabel.get("Runtime")).not.toMatch(/native Windows.*ready|WSL distro.*ready/);
+  });
+
+  it("panel overview + drill-down render typed host/runtime (allowlisted, escaped)", () => {
+    const html = controlHtml();
+    for (const token of ["hostLineFor", "runtimeLineFor", "transportModeFor", "HOST_CAPS", "Orca app", "native Windows", "WSL distro", "transport"]) {
+      expect(html).toContain(token);
+    }
+    // Drill-down boxes surface the same typed context.
+    expect(html).toContain("<strong>Host</strong>");
+    expect(html).toContain("<strong>OS runtime</strong>");
+    expect(html).not.toMatch(/\.token\b/);
+    expect(html).not.toContain("privateKey");
+    expect(containsSecretMaterial(html)).toBe(false);
+  });
+});
+
+describe("ui1.5: diagnostics.doctor bridge payload (typed host/runtime, secret-free)", () => {
+  it("returns host/runtime/transport alongside CLI + bridge (bounded, allowlisted)", async () => {
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "hr1", operation: "diagnostics.doctor" },
+      bridgeDeps({
+        transport: "seam",
+        hostInfo: { appVersion: "1.4.197", pluginApi: 1, grantedCapabilities: ["workspace:read", "terminal:send", "nope"], seamAvailable: true },
+        runtimeInfo: { nodeVersion: "v22.14.0", platform: "win32", arch: "x64", wsl: "native" },
+      }),
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const result = res.result as Record<string, unknown>;
+    const host = result["host"] as Record<string, unknown>;
+    expect(host["appVersion"]).toBe("1.4.197");
+    expect(host["pluginApi"]).toBe(1);
+    expect(host["grantedCapabilities"]).toEqual(["workspace:read", "terminal:send"]);
+    const runtime = result["runtime"] as Record<string, unknown>;
+    expect(runtime["node"]).toBe("v22.14.0");
+    expect(runtime["platform"]).toBe("win32");
+    expect(runtime["wsl"]).toBe("native");
+    expect((result["transport"] as Record<string, unknown>)["mode"]).toBe("seam");
+    expect(isSecretFreePayload(result)).toBe(true);
+    expect(containsSecretMaterial(JSON.stringify(result))).toBe(false);
+    // Overview agrees with the bridge payload (same typed data, no scrape).
+    const rows = diagnosticsOverviewRows({ diagnostics: result });
+    const byLabel = new Map(rows.map((r) => [r.label, r.detail]));
+    expect(byLabel.get("Runtime")).toContain("Orca app 1.4.197");
+    expect(byLabel.get("Runtime")).toContain("Node v22.14.0");
+  });
+
+  it("derives WSL context truthfully and degrades unknown host versions", async () => {
+    const wsl = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "hr2", operation: "diagnostics.doctor" },
+      bridgeDeps({
+        env: { HOME: "/home/u", WSL_DISTRO_NAME: "Ubuntu" } as NodeJS.ProcessEnv,
+        runtimeInfo: { nodeVersion: "v20.0.0", platform: "linux", arch: "x64" },
+      }),
+    );
+    expect(wsl.ok).toBe(true);
+    if (wsl.ok) {
+      const runtime = (wsl.result as Record<string, unknown>)["runtime"] as Record<string, unknown>;
+      expect(runtime["wsl"]).toBe("wsl:Ubuntu");
+    }
+    const unknown = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "hr3", operation: "diagnostics.doctor" },
+      bridgeDeps({ hostInfo: undefined, runtimeInfo: { nodeVersion: "v22.14.0", platform: "win32", arch: "x64", wsl: "native" } }),
+    );
+    expect(unknown.ok).toBe(true);
+    if (unknown.ok) {
+      const host = (unknown.result as Record<string, unknown>)["host"] as Record<string, unknown>;
+      expect(host["appVersion"]).toBeUndefined();
+      expect(host["pluginApi"]).toBeUndefined();
+      expect(describeDiagnosticsHost(toDiagnosticsHostHealth(unknown.result))).toContain("unknown");
+    }
+  });
+
+  it("never leaks injected secrets via payload or overview", async () => {
+    const secret = "ghp_leakedsecret0123456789";
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "hr4", operation: "diagnostics.doctor" },
+      bridgeDeps({ env: { HOME: "/home/u", ORCA_PI_GITHUB_WORKER_TOKEN: secret } as NodeJS.ProcessEnv }),
+    );
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const text = JSON.stringify(res.result);
+      expect(text).not.toContain(secret);
+      expect(isSecretFreePayload(res.result)).toBe(true);
+    }
+  });
+});
+
+describe("ui1.5: bridge error paths stay secret-free (hardened)", () => {
+  it("redacts token patterns from validation errors instead of echoing values", async () => {
+    const leaked = "ghp_leakedsecret0123456789";
+    const res = await handleBridgeRequest(
+      { protocolVersion: 1, requestId: "e-secret", operation: "github.doctor", params: { repo: `bad repo ${leaked}` } },
+      bridgeDeps(),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.message).not.toContain(leaked);
+      expect(res.error.message).toContain("<redacted-token>");
+      expect(containsSecretMaterial(res.error.message)).toBe(false);
+    }
+  });
+
+  it("rejects raw token/private-key payload shapes as secret-bearing", () => {
+    expect(isSecretFreePayload({ token: "ghs_abcdefghij123456" })).toBe(false);
+    expect(isSecretFreePayload({ ORCA_PI_GITHUB_WORKER_TOKEN: "raw-secret-value-123" })).toBe(false);
+    expect(isSecretFreePayload({ privateKey: "raw-secret-value-123456" })).toBe(false);
+    expect(isSecretFreePayload({ sourceLabel: "ORCA_PI_GITHUB_WORKER_TOKEN" })).toBe(true);
+    expect(isSecretFreePayload({ tokenRefreshable: true })).toBe(true);
+    expect(DIAGNOSTICS_HOST_CAPABILITIES).toContain("workspace:read");
   });
 });

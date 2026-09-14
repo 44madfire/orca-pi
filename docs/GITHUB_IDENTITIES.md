@@ -242,18 +242,12 @@ authoritative (`orca-pi doctor`, `orca-pi github auth status`).
 
 UI1.5 scope decision vs #32: the panel intentionally offers no token
 mint/refresh button — short-lived credential minting stays a CLI-only
-operator workflow so raw secrets never enter panel/LLM context. #32's
-"refresh short-lived credentials from the UI" criterion is therefore met
-as redacted `github.status` refresh (full or role-scoped per
-worker/reviewer) plus the operator `orca-pi github mint` step surfaced in
-the panel's setup guidance, not as a typed mint operation.
-
-> **Coordinator note:** #32's acceptance criteria still list "User can
-> run identity doctor and refresh short-lived credentials from the UI
-> through typed backend operations." Please update that criterion to the
-> CLI-mint workflow described above rather than requesting a panel mint
-> operation — minting inside the panel would put short-lived secrets in
-> panel/LLM context and violate #32's own secret hygiene.
+operator workflow so raw secrets never enter panel/LLM context. The
+reconciled #32 criterion requires typed, read-only `github.status` refresh
+(full or role-scoped per worker/reviewer) and identity doctor in the UI;
+when a fresh token is needed, the panel surfaces the operator
+`orca-pi github mint` step in setup guidance rather than invoking a
+secret-bearing typed operation.
 
 ## Manual E2E acceptance (post-merge to main)
 

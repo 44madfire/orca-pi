@@ -1541,9 +1541,13 @@ export function containsSecretMaterial(text: string): boolean {
 /**
  * True when a bridge payload is secret-free for panel display (pure).
  * Stringifies the payload and runs {@link containsSecretMaterial} plus
- * the token-value shape (`"token": "<non-empty>"` with a
- * secret-looking value). Var-name labels (`*_TOKEN`, `sourceLabel`) never
- * trigger — only values do (mirrors the bridge-host defensive scan).
+ * token/private-key value shapes (`"*token*": "<non-empty>"` and
+ * `"*private*key*": "<non-empty>"` with a secret-looking value).
+ * Var-name labels (`*_TOKEN`, `sourceLabel`) never trigger — only values
+ * do (mirrors the bridge-host defensive scan). Redacted reports use
+ * `configured`/`sourceLabel`/`tokenRefreshable` booleans, never raw
+ * `token`/key values, so any such key with a non-trivial string value
+ * means a secret crossed the bridge.
  */
 export function isSecretFreePayload(payload: unknown): boolean {
   let text: string;
@@ -1553,11 +1557,14 @@ export function isSecretFreePayload(payload: unknown): boolean {
     return false;
   }
   if (containsSecretMaterial(text)) return false;
-  // `"token": "<value>"` with a non-trivial value means a raw secret
-  // crossed the bridge (redacted reports use `configured`/`sourceLabel`,
-  // never `token`). Var names like `ORCA_PI_GITHUB_WORKER_TOKEN` appear
-  // as `sourceLabel` values, never as a `token` key — so this is precise.
-  if (/"token"\s*:\s*"[^"]{8,}"/.test(text)) return false;
+  // Any `*token*` key with a non-trivial string value is a leak
+  // (`token`, `ORCA_PI_GITHUB_WORKER_TOKEN`, ...). `sourceLabel` values
+  // like `"sourceLabel": "ORCA_PI_GITHUB_WORKER_TOKEN"` never match
+  // (key has no `token`), and `tokenRefreshable` booleans never match
+  // (value is not a string) — so this stays precise while closing the
+  // `*TOKEN*`-key hole the exact-`"token"` check missed.
+  if (/"[^"]*token[^"]*"\s*:\s*"[^"]{8,}"/i.test(text)) return false;
+  if (/"[^"]*private[_-]?key[^"]*"\s*:\s*"[^"]{8,}"/i.test(text)) return false;
   return true;
 }
 
@@ -1636,6 +1643,185 @@ function diagnosticsVersionsText(payload: unknown): string {
   return ` Versions: orca-pi ${pick("orcaPiVersion") ?? "(unknown)"} / bridge ${pick("bridgeVersion") ?? "(unknown)"} / protocol ${protoText}.`;
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostics typed host/runtime context (UI1.5 gap fix)
+//
+// #32 Runtime requires Orca app version, plugin API / Host capability
+// support, orca-pi/Pi versions, OS/runtime context (Windows/WSL), focused
+// project/worktree, and bridge transport mode — with truthful
+// unknown/degraded states. CLI versions alone are not enough: the panel
+// must surface the host-reported app/plugin context plus Node/OS/WSL
+// context where available, never synthesizing healthy values for missing
+// legs. All fields below are allowlisted, bounded, escaped at render
+// time, and secret-free (versions/names only, never tokens/keys/values).
+// ---------------------------------------------------------------------------
+
+/** Typed host context from `diagnostics.doctor.host` + `bridge` + `transport` (never secrets). */
+export interface DiagnosticsHostHealth {
+  appVersion?: string;
+  pluginApi?: number;
+  versionsOk?: boolean;
+  consentOk?: boolean;
+  seamHandshake?: boolean;
+  structured?: boolean;
+  grantedCapabilities?: readonly string[];
+  transportMode?: string;
+}
+
+/** Typed OS/runtime context from `diagnostics.doctor.runtime` (never secrets). */
+export interface DiagnosticsRuntimeHealth {
+  node?: string;
+  platform?: string;
+  arch?: string;
+  wsl?: string;
+}
+
+/** Allowlisted Host capability names (mirrors bridge.ts `BridgeHostCapabilityKind`). */
+export const DIAGNOSTICS_HOST_CAPABILITIES = [
+  "workspace:read",
+  "terminal:send",
+  "notifications:show",
+  "storage",
+  "secrets",
+  "events:subscribe",
+  "settings:own",
+] as const;
+
+const DIAGNOSTICS_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+const DIAGNOSTICS_RUNTIME_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/;
+const DIAGNOSTICS_WSL_RE = /^(native|unknown|wsl-unknown-distro|wsl:[A-Za-z0-9._-]+)$/;
+const DIAGNOSTICS_TRANSPORT_RE = /^(seam|operator)$/;
+
+function asBoundedVersion(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim().slice(0, 64);
+  if (trimmed.length === 0 || trimmed.length > 64) return undefined;
+  // Strip control characters; reject empty/suspicious leftovers.
+  // eslint-disable-next-line no-control-regex
+  const clean = trimmed.replace(/[\0-\x1f\x7f]/g, "");
+  if (clean.length === 0) return undefined;
+  if (!DIAGNOSTICS_VERSION_RE.test(clean)) return undefined;
+  return clean;
+}
+
+function asBoundedRuntimeToken(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim().slice(0, 32);
+  if (trimmed.length === 0) return undefined;
+  // eslint-disable-next-line no-control-regex
+  const clean = trimmed.replace(/[\0-\x1f\x7f]/g, "");
+  if (clean.length === 0 || clean.length > 32) return undefined;
+  if (!DIAGNOSTICS_RUNTIME_TOKEN_RE.test(clean)) return undefined;
+  return clean;
+}
+
+/**
+ * Normalize `diagnostics.doctor` host context (never throws). Reads only
+ * allowlisted fields: `host.{appVersion,pluginApi,grantedCapabilities}`
+ * plus `bridge.{versionsOk,consentOk,seamHandshake,structured}` signals
+ * and `transport.mode`. Missing legs stay `undefined` (unknown) — never
+ * synthesized from `target` desired versions, so the UI renders
+ * truthful unknown/degraded states.
+ */
+export function toDiagnosticsHostHealth(payload: unknown): DiagnosticsHostHealth | undefined {
+  if (!isPlainRecord(payload)) return undefined;
+  const rec = payload as Record<string, unknown>;
+  const host = isPlainRecord(rec["host"]) ? (rec["host"] as Record<string, unknown>) : {};
+  const bridge = isPlainRecord(rec["bridge"]) ? (rec["bridge"] as Record<string, unknown>) : undefined;
+  const transport = isPlainRecord(rec["transport"]) ? (rec["transport"] as Record<string, unknown>) : undefined;
+  const hasHostBlock = isPlainRecord(rec["host"]);
+  if (!hasHostBlock && !bridge && !transport) return undefined;
+  const appVersion = asBoundedVersion(host["appVersion"]);
+  const pluginApi = typeof host["pluginApi"] === "number" && Number.isInteger(host["pluginApi"]) && (host["pluginApi"] as number) >= 0 && (host["pluginApi"] as number) <= 999 ? (host["pluginApi"] as number) : undefined;
+  const rawCaps = host["grantedCapabilities"];
+  const grantedCapabilities = Array.isArray(rawCaps)
+    ? (rawCaps as unknown[]).filter((c): c is string => typeof c === "string" && (DIAGNOSTICS_HOST_CAPABILITIES as readonly string[]).includes(c)).slice(0, 16)
+    : undefined;
+  const pickBool = (scope: Record<string, unknown> | undefined, key: string): boolean | undefined => {
+    if (!scope) return undefined;
+    const v = scope[key];
+    return typeof v === "boolean" ? v : undefined;
+  };
+  const versionsOk = pickBool(host["versionsOk"] !== undefined ? host : bridge, "versionsOk");
+  const consentOk = pickBool(host["consentOk"] !== undefined ? host : bridge, "consentOk");
+  const seamHandshake = pickBool(host["seamHandshake"] !== undefined ? host : bridge, "seamHandshake");
+  const structured = pickBool(host["structured"] !== undefined ? host : bridge, "structured");
+  const rawMode = typeof host["transportMode"] === "string" ? host["transportMode"] : transport?.["mode"];
+  const transportMode = typeof rawMode === "string" && DIAGNOSTICS_TRANSPORT_RE.test(rawMode.trim()) ? rawMode.trim() : undefined;
+  return {
+    ...(appVersion !== undefined ? { appVersion } : {}),
+    ...(pluginApi !== undefined ? { pluginApi } : {}),
+    ...(versionsOk !== undefined ? { versionsOk } : {}),
+    ...(consentOk !== undefined ? { consentOk } : {}),
+    ...(seamHandshake !== undefined ? { seamHandshake } : {}),
+    ...(structured !== undefined ? { structured } : {}),
+    ...(grantedCapabilities !== undefined ? { grantedCapabilities } : {}),
+    ...(transportMode !== undefined ? { transportMode } : {}),
+  };
+}
+
+/** One-line host context (Orca app version + plugin API + capability status). Unknown legs render as unknown, never healthy. */
+export function describeDiagnosticsHost(host: DiagnosticsHostHealth | undefined): string {
+  if (!host) return "Orca app (unknown version) (pluginApi unknown; capabilities unknown — degraded/unknown).";
+  const app = host.appVersion ?? "(unknown version)";
+  const api = host.pluginApi !== undefined ? `pluginApi ${host.pluginApi}` : "pluginApi unknown";
+  const caps = host.grantedCapabilities !== undefined
+    ? (host.grantedCapabilities.length > 0 ? `capabilities ${host.grantedCapabilities.join(", ")}` : "capabilities (none granted)")
+    : "capabilities unknown";
+  const signals: string[] = [];
+  if (host.structured !== undefined) signals.push(host.structured ? "structured" : "degraded");
+  else signals.push("reachability unknown");
+  if (host.consentOk !== undefined) signals.push(host.consentOk ? "consent ok" : "consent missing");
+  if (host.seamHandshake !== undefined) signals.push(host.seamHandshake ? "seam ok" : "no seam");
+  if (host.versionsOk !== undefined) signals.push(host.versionsOk ? "versions ok" : "versions mismatch");
+  const transport = host.transportMode ? `transport ${host.transportMode}` : "transport unknown";
+  return `Orca app ${app} (${api}; ${caps}; ${signals.join(", ")}; ${transport}).`;
+}
+
+/**
+ * Normalize `diagnostics.doctor` runtime context (never throws). Reads
+ * only allowlisted `runtime.{node,platform,arch,wsl}` fields (bounded
+ * tokens); anything else is dropped. Returns undefined when the payload
+ * carries no runtime block so callers render truthful unknown states.
+ */
+export function toDiagnosticsRuntimeHealth(payload: unknown): DiagnosticsRuntimeHealth | undefined {
+  if (!isPlainRecord(payload)) return undefined;
+  const rec = payload as Record<string, unknown>;
+  const runtime = rec["runtime"];
+  if (!isPlainRecord(runtime)) return undefined;
+  const r = runtime as Record<string, unknown>;
+  const node = asBoundedRuntimeToken(r["node"]);
+  const platform = asBoundedRuntimeToken(r["platform"]);
+  const arch = asBoundedRuntimeToken(r["arch"]);
+  const rawWsl = typeof r["wsl"] === "string" ? r["wsl"].trim().slice(0, 64) : undefined;
+  // eslint-disable-next-line no-control-regex
+  const cleanWsl = rawWsl?.replace(/[\0-\x1f\x7f]/g, "");
+  const wsl = cleanWsl !== undefined && DIAGNOSTICS_WSL_RE.test(cleanWsl) ? cleanWsl : undefined;
+  if (node === undefined && platform === undefined && arch === undefined && wsl === undefined) return {};
+  return {
+    ...(node !== undefined ? { node } : {}),
+    ...(platform !== undefined ? { platform } : {}),
+    ...(arch !== undefined ? { arch } : {}),
+    ...(wsl !== undefined ? { wsl } : {}),
+  };
+}
+
+/** One-line OS/runtime context (Node + OS/arch + Windows/WSL). Unknown legs render as unknown, never healthy. */
+export function describeDiagnosticsRuntime(runtime: DiagnosticsRuntimeHealth | undefined): string {
+  if (!runtime) return "Node (unknown) on (unknown) (OS context unknown).";
+  const node = runtime.node ?? "(unknown)";
+  const os = runtime.platform && runtime.arch ? `${runtime.platform}/${runtime.arch}` : (runtime.platform ?? runtime.arch ?? "(unknown)");
+  const wsl = runtime.wsl;
+  let ctx: string;
+  if (wsl === undefined) ctx = "OS context unknown";
+  else if (wsl === "native") ctx = runtime.platform === "win32" ? "native Windows" : runtime.platform === "darwin" ? "native macOS" : runtime.platform === "linux" ? "native Linux" : "native OS";
+  else if (wsl === "unknown") ctx = "OS context unknown";
+  else if (wsl === "wsl-unknown-distro") ctx = "WSL (distro unknown)";
+  else if (wsl.startsWith("wsl:")) ctx = `WSL distro ${wsl.slice(4)}`;
+  else ctx = wsl;
+  return `Node ${node} on ${os} (${ctx}).`;
+}
+
 /**
  * User/project config paths + existence from a `profiles.list` payload
  * (never throws). Reads only `panel.config` path names (actionable,
@@ -1681,6 +1867,8 @@ export function describeConfigPaths(
 export function diagnosticsOverviewRows(input: DiagnosticsOverviewInput): DiagnosticsOverviewRow[] {
   const cliHealth = toDiagnosticsCliHealth(input.diagnostics);
   const bridge = toDiagnosticsBridgeHealth(input.diagnostics);
+  const host = toDiagnosticsHostHealth(input.diagnostics);
+  const runtime = toDiagnosticsRuntimeHealth(input.diagnostics);
   const config = toDiagnosticsConfigHealth(input.validate);
   const orchItems = toOrchestrationItems(input.orchestration, input.knownProfiles);
   const statusItems = toGithubStatusItems(input.githubStatus);
@@ -1692,15 +1880,18 @@ export function diagnosticsOverviewRows(input: DiagnosticsOverviewInput): Diagno
   const rows: DiagnosticsOverviewRow[] = [
     {
       label: "Runtime",
-      detail: `${describeDiagnosticsCli(cliHealth)}${diagnosticsVersionsText(input.diagnostics)}`,
+      detail: `${describeDiagnosticsCli(cliHealth)}${diagnosticsVersionsText(input.diagnostics)} Host: ${describeDiagnosticsHost(host)} Runtime: ${describeDiagnosticsRuntime(runtime)}`,
     },
     {
       label: "Bridge",
       detail: bridge
         ? `${bridge.structured ? "structured" : "degraded (read-only CLI fallback)"}; ` +
           `${bridge.supportedOperations.length} supported operation(s)` +
+          `${host?.transportMode ? `; transport ${host.transportMode}` : "; transport unknown"}` +
           `${bridge.reasons.length > 0 ? `; notes: ${bridge.reasons.slice(0, 2).join(" ")}` : ""}.`
-        : "bridge negotiation unavailable in this response.",
+        : host?.transportMode
+          ? `bridge negotiation unavailable in this response (transport ${host.transportMode}).`
+          : "bridge negotiation unavailable in this response.",
     },
     {
       label: "Worktree",

@@ -53,7 +53,7 @@ import type {
   MutationScope,
   OrchestrationScope,
 } from "@orca-pi/core";
-import { DIAGNOSTICS_DETAIL_LIMIT, sanitizeDiagnosticsDetail } from "./control-center.js";
+import { DIAGNOSTICS_DETAIL_LIMIT, redactDiagnosticsText, sanitizeDiagnosticsDetail } from "./control-center.js";
 
 export interface BridgeHostDeps {
   /** Explicit project root fallback when a request carries no worktree scope (reads only). */
@@ -73,6 +73,13 @@ export interface BridgeHostDeps {
   hostInfo?: { appVersion?: string; pluginApi?: number; grantedCapabilities?: readonly string[]; seamAvailable?: boolean };
   /** Injectable credential fs for GitHub doctor (tests stub; prod resolves node:fs). */
   providerFs?: import("@orca-pi/core").CredentialProviderFs;
+  /**
+   * Injectable runtime context for `diagnostics.doctor` (tests stub;
+   * prod derives from `process.version`/`process.platform`/`process.arch`
+   * plus WSL env). Unknown/absent fields degrade to truthful unknown
+   * states — never synthesized as healthy.
+   */
+  runtimeInfo?: { nodeVersion?: string; platform?: string; arch?: string; wsl?: string };
   /**
    * Transport carrying this request (authority basis).
    * - `"seam"` (default): panel path. Structured operations require
@@ -133,7 +140,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Defensive secret scan: GitHub bridge results must never carry tokens/keys. */
+/** Defensive secret scan: GitHub/diagnostics bridge results must never carry tokens/keys. */
 function assertNoSecrets(value: unknown, where: string): void {
   let text: string;
   try {
@@ -146,18 +153,41 @@ function assertNoSecrets(value: unknown, where: string): void {
     { re: /\bghp_[A-Za-z0-9]{10,}/, label: "GitHub PAT" },
     { re: /\bghu_[A-Za-z0-9]{10,}/, label: "GitHub user token" },
     { re: /\bghs_[A-Za-z0-9]{10,}/, label: "GitHub server token" },
+    { re: /\bghr_[A-Za-z0-9]{10,}/, label: "GitHub refresh token" },
+    { re: /\bgithub_pat_[A-Za-z0-9_]{10,}/, label: "GitHub fine-grained PAT" },
+    { re: /x-access-token:[^\s"']+/, label: "GitHub bearer token" },
   ];
   for (const probe of probes) {
     if (probe.re.test(text)) {
       throw new Error(`Refusing to return ${probe.label} to the panel via ${where} (redacted status only).`);
     }
   }
-  // Env-var-named token values are never echoed: the report must not contain
-  // keys literally named `*TOKEN*` with a non-empty secret-looking value.
-  // (Core reports use `tokenRefreshable`/`configured` booleans instead.)
-  if (/"[^"]*TOKEN[^"]*"\s*:\s*"[^"]{8,}"/i.test(text) && /"token"\s*:/i.test(text)) {
+  // Token/private-key values are never echoed under any `*token*` or
+  // `*private*key*` key with a non-trivial string value (covers `token`,
+  // `ORCA_PI_GITHUB_WORKER_TOKEN`, `privateKey`, ...). Redacted reports
+  // use `configured`/`sourceLabel`/`tokenRefreshable` booleans/labels
+  // instead, and `sourceLabel` values (e.g. `"sourceLabel":
+  // "ORCA_PI_GITHUB_WORKER_TOKEN"`) never match (key has no `token`).
+  if (/"[^"]*token[^"]*"\s*:\s*"[^"]{8,}"/i.test(text)) {
     throw new Error(`Refusing to return token values to the panel via ${where} (redacted status only).`);
   }
+  if (/"[^"]*private[_-]?key[^"]*"\s*:\s*"[^"]{8,}"/i.test(text)) {
+    throw new Error(`Refusing to return private-key values to the panel via ${where} (redacted status only).`);
+  }
+}
+
+/**
+ * Sanitize a bridge error message before it crosses the bridge (defense
+ * in depth). Redacts token/key patterns (var-name labels like
+ * `*_TOKEN` stay intact for actionable guidance) and bounds to
+ * `DIAGNOSTICS_DETAIL_LIMIT` chars so a secret-bearing throw (runner
+ * stdout, provider fetch body, panel-echoed value) can never reach the
+ * DOM via error rendering. Actionable non-secret text survives.
+ */
+function sanitizeBridgeErrorMessage(message: string): string {
+  const redacted = redactDiagnosticsText(message);
+  if (redacted.length <= DIAGNOSTICS_DETAIL_LIMIT) return redacted;
+  return `${redacted.slice(0, DIAGNOSTICS_DETAIL_LIMIT)}… [truncated]`;
 }
 
 /**
@@ -236,20 +266,22 @@ function toBridgeError(requestId: string, error: unknown): BridgeResponse {
       const mapped = mapMutationCodeToBridge(record.code);
       // `auth/setup` surfaces when GitHub setup is required (see below);
       // core `load-failed` on missing config stays `internal` with action.
-      return bridgeFail(requestId, mapped, record.message, { detail: record.code });
+      // Sanitize before crossing: a panel-echoed value or core throw
+      // carrying a token/key pattern must never reach the DOM via errors.
+      return bridgeFail(requestId, mapped, sanitizeBridgeErrorMessage(record.message), { detail: record.code });
     }
   }
   if (error instanceof Error) {
     // Explicit unsupported/auth signals thrown with a prefix marker.
     if (error.message.startsWith("[unsupported] ")) {
-      return bridgeFail(requestId, "unsupported", error.message.slice("[unsupported] ".length));
+      return bridgeFail(requestId, "unsupported", sanitizeBridgeErrorMessage(error.message.slice("[unsupported] ".length)));
     }
     if (error.message.startsWith("[auth/setup] ")) {
-      return bridgeFail(requestId, "auth/setup", error.message.slice("[auth/setup] ".length));
+      return bridgeFail(requestId, "auth/setup", sanitizeBridgeErrorMessage(error.message.slice("[auth/setup] ".length)));
     }
-    return bridgeFail(requestId, "internal", error.message);
+    return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(error.message));
   }
-  return bridgeFail(requestId, "internal", String(error));
+  return bridgeFail(requestId, "internal", sanitizeBridgeErrorMessage(String(error)));
 }
 
 async function dispatch(request: BridgeRequest, deps: BridgeHostDeps): Promise<unknown> {
@@ -701,16 +733,113 @@ async function diagnosticsDoctorResult(request: BridgeRequest, deps: BridgeHostD
     }
   }
   const negotiation = negotiateBridgeCapabilities(deps.hostInfo);
+  const host = collectDiagnosticsHost(deps, negotiation);
+  const runtime = collectDiagnosticsRuntime(deps);
+  const transport = deps.transport ?? "seam";
   const result = {
     orcaPiVersion: core.ORCA_PI_VERSION,
     bridgeVersion: BRIDGE_VERSION,
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     ...(cli !== undefined ? { cli } : { cli: "(no runner injected — CLI probes unavailable; run `orca-pi doctor` for live orca/pi versions)" }),
     bridge: negotiation,
+    host,
+    runtime,
+    transport: { mode: transport },
     target: { appVersion: "1.4.196+", pluginApi: 1, upstreamCommit: "9aa0f7e77d366c23a3cc8de2da32ae550d397dc0" },
   };
   assertNoSecrets(result, "diagnostics.doctor");
   return result;
+}
+
+/**
+ * Collect allowlisted host context for `diagnostics.doctor` (never throws,
+ * never secrets). Host-reported Orca app version / pluginApi degrade to
+ * unknown when absent (never synthesized from `target` desired versions),
+ * and granted capabilities are allowlisted to the closed Host capability
+ * set so a compromised host cannot smuggle arbitrary strings to the DOM.
+ */
+function collectDiagnosticsHost(
+  deps: BridgeHostDeps,
+  negotiation: { versionsOk: boolean; consentOk: boolean; seamHandshake: boolean; structured: boolean },
+): Record<string, unknown> {
+  const info = deps.hostInfo;
+  const out: Record<string, unknown> = {
+    versionsOk: negotiation.versionsOk === true,
+    consentOk: negotiation.consentOk === true,
+    seamHandshake: negotiation.seamHandshake === true,
+    structured: negotiation.structured === true,
+  };
+  if (typeof info?.appVersion === "string") {
+    // eslint-disable-next-line no-control-regex
+    const trimmed = info.appVersion.trim().slice(0, 64).replace(/[\0-\x1f\x7f]/g, "");
+    if (/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(trimmed)) out["appVersion"] = trimmed;
+  }
+  if (typeof info?.pluginApi === "number" && Number.isInteger(info.pluginApi) && info.pluginApi >= 0 && info.pluginApi <= 999) {
+    out["pluginApi"] = info.pluginApi;
+  }
+  if (Array.isArray(info?.grantedCapabilities)) {
+    const allowlisted = (info.grantedCapabilities as unknown[])
+      .filter((c): c is string =>
+        typeof c === "string" &&
+        ( ["workspace:read", "terminal:send", "notifications:show", "storage", "secrets", "events:subscribe", "settings:own"] as readonly string[] ).includes(c),
+      )
+      .slice(0, 16);
+    out["grantedCapabilities"] = allowlisted;
+  } else if (info !== undefined) {
+    out["grantedCapabilities"] = [];
+  }
+  return out;
+}
+
+/**
+ * Collect allowlisted OS/runtime context for `diagnostics.doctor` (never
+ * throws, never secrets). Node/platform/arch come from injected
+ * `runtimeInfo` (tests) or `process.*` (prod), bounded to 32 chars and
+ * restricted to token shapes. WSL is derived from `WSL_DISTRO_NAME` /
+ * `WSL_INTEROP` presence only (distro name sanitized, never raw env
+ * dumps) with truthful native/unknown states.
+ */
+function collectDiagnosticsRuntime(deps: BridgeHostDeps): Record<string, unknown> {
+  const env = deps.env ?? process.env;
+  const injected = deps.runtimeInfo;
+  const rawNode = injected?.nodeVersion ?? (typeof process.version === "string" ? process.version : undefined);
+  const rawPlatform = injected?.platform ?? (typeof process.platform === "string" ? process.platform : undefined);
+  const rawArch = injected?.arch ?? (typeof process.arch === "string" ? process.arch : undefined);
+  const out: Record<string, unknown> = {};
+  const asToken = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    // eslint-disable-next-line no-control-regex
+    const trimmed = value.trim().slice(0, 32).replace(/[\0-\x1f\x7f]/g, "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(trimmed)) return undefined;
+    return trimmed;
+  };
+  const node = asToken(rawNode);
+  const platform = asToken(rawPlatform);
+  const arch = asToken(rawArch);
+  if (node !== undefined) out["node"] = node;
+  if (platform !== undefined) out["platform"] = platform;
+  if (arch !== undefined) out["arch"] = arch;
+  const rawWsl = injected?.wsl;
+  const wslPattern = /^(native|unknown|wsl-unknown-distro|wsl:[A-Za-z0-9._-]+)$/;
+  if (typeof rawWsl === "string" && wslPattern.test(rawWsl.trim().slice(0, 64))) {
+    out["wsl"] = rawWsl.trim().slice(0, 64);
+  } else {
+    out["wsl"] = detectWslContext(env, platform);
+  }
+  return out;
+}
+
+function detectWslContext(env: NodeJS.ProcessEnv | Record<string, string | undefined>, platform: string | undefined): string {
+  if (platform === undefined) return "unknown";
+  if (platform !== "linux") return "native";
+  const distroRaw = typeof env["WSL_DISTRO_NAME"] === "string" ? (env["WSL_DISTRO_NAME"] as string).trim().slice(0, 64) : "";
+  const distro = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(distroRaw) ? distroRaw : undefined;
+  if (distro) return `wsl:${distro}`;
+  const hasInterop = typeof env["WSL_INTEROP"] === "string" && (env["WSL_INTEROP"] as string).length > 0;
+  if (hasInterop) return "wsl-unknown-distro";
+  // A bare WSL_DISTRO_NAME that failed sanitization still signals WSL.
+  if (typeof env["WSL_DISTRO_NAME"] === "string" && (env["WSL_DISTRO_NAME"] as string).trim().length > 0) return "wsl-unknown-distro";
+  return "native";
 }
 
 /**

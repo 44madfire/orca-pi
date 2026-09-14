@@ -2572,6 +2572,84 @@
           if (out.length <= DIAGNOSTICS_DETAIL_LIMIT) return out;
           return out.slice(0, DIAGNOSTICS_DETAIL_LIMIT) + "… [truncated]";
         }
+        // Typed host/runtime context for the one-place overview (UI1.5 gap
+        // fix). Mirrors control-center.ts toDiagnosticsHostHealth /
+        // toDiagnosticsRuntimeHealth: allowlisted fields only, bounded,
+        // truthful unknown/degraded states, never secrets.
+        var HOST_CAPS = ["workspace:read", "terminal:send", "notifications:show", "storage", "secrets", "events:subscribe", "settings:own"];
+        function boundedPanelVersion(v) {
+          if (typeof v !== "string") return undefined;
+          var t = v.trim().slice(0, 64);
+          if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(t)) return undefined;
+          return t;
+        }
+        function boundedPanelToken(v) {
+          if (typeof v !== "string") return undefined;
+          var t = v.trim().slice(0, 32);
+          if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(t)) return undefined;
+          return t;
+        }
+        function transportModeFor(d) {
+          if (!d || typeof d !== "object" || Array.isArray(d)) return undefined;
+          var fromHost = (d.host && typeof d.host === "object" && !Array.isArray(d.host)) ? d.host.transportMode : undefined;
+          var fromTop = (d.transport && typeof d.transport === "object" && !Array.isArray(d.transport)) ? d.transport.mode : undefined;
+          var raw = (typeof fromHost === "string" && fromHost) ? fromHost : fromTop;
+          if (typeof raw !== "string") return undefined;
+          var t = raw.trim();
+          if (t === "seam" || t === "operator") return t;
+          return undefined;
+        }
+        function hostLineFor(d) {
+          if (!d || typeof d !== "object" || Array.isArray(d)) return "Orca app (unknown version) (pluginApi unknown; capabilities unknown — degraded/unknown).";
+          var host = (d.host && typeof d.host === "object" && !Array.isArray(d.host)) ? d.host : {};
+          var bridge = (d.bridge && typeof d.bridge === "object" && !Array.isArray(d.bridge)) ? d.bridge : {};
+          var hasHost = !!(d.host && typeof d.host === "object" && !Array.isArray(d.host));
+          var hasBridge = !!(d.bridge && typeof d.bridge === "object" && !Array.isArray(d.bridge));
+          var hasTransport = !!(d.transport && typeof d.transport === "object" && !Array.isArray(d.transport));
+          if (!hasHost && !hasBridge && !hasTransport) return "Orca app (unknown version) (pluginApi unknown; capabilities unknown — degraded/unknown).";
+          var app = boundedPanelVersion(host.appVersion) || "(unknown version)";
+          var api = (typeof host.pluginApi === "number" && isFinite(host.pluginApi) && Math.floor(host.pluginApi) === host.pluginApi && host.pluginApi >= 0 && host.pluginApi <= 999) ? ("pluginApi " + host.pluginApi) : "pluginApi unknown";
+          var caps = "capabilities unknown";
+          if (Array.isArray(host.grantedCapabilities)) {
+            var kept = host.grantedCapabilities.filter(function (c) { return typeof c === "string" && HOST_CAPS.indexOf(c) !== -1; }).slice(0, 16);
+            caps = kept.length ? ("capabilities " + kept.join(", ")) : "capabilities (none granted)";
+          }
+          var pick = function (key) {
+            if (typeof host[key] === "boolean") return host[key];
+            if (typeof bridge[key] === "boolean") return bridge[key];
+            return undefined;
+          };
+          var structured = pick("structured");
+          var consent = pick("consentOk");
+          var seam = pick("seamHandshake");
+          var versions = pick("versionsOk");
+          var signals = [];
+          signals.push(structured === true ? "structured" : (structured === false ? "degraded" : "reachability unknown"));
+          if (consent !== undefined) signals.push(consent ? "consent ok" : "consent missing");
+          if (seam !== undefined) signals.push(seam ? "seam ok" : "no seam");
+          if (versions !== undefined) signals.push(versions ? "versions ok" : "versions mismatch");
+          var mode = transportModeFor(d);
+          signals.push(mode ? ("transport " + mode) : "transport unknown");
+          return "Orca app " + app + " (" + api + "; " + caps + "; " + signals.join(", ") + ").";
+        }
+        function runtimeLineFor(d) {
+          if (!d || typeof d !== "object" || Array.isArray(d) || !d.runtime || typeof d.runtime !== "object" || Array.isArray(d.runtime)) return "Node (unknown) on (unknown) (OS context unknown).";
+          var r = d.runtime;
+          var node = boundedPanelToken(r.node) || "(unknown)";
+          var plat = boundedPanelToken(r.platform);
+          var arch = boundedPanelToken(r.arch);
+          var os = (plat && arch) ? (plat + "/" + arch) : (plat || arch || "(unknown)");
+          var rawWsl = (typeof r.wsl === "string") ? r.wsl.trim().slice(0, 64) : undefined;
+          var wsl = (typeof rawWsl === "string" && /^(native|unknown|wsl-unknown-distro|wsl:[A-Za-z0-9._-]+)$/.test(rawWsl)) ? rawWsl : undefined;
+          var ctx;
+          if (wsl === undefined) ctx = "OS context unknown";
+          else if (wsl === "native") ctx = (plat === "win32") ? "native Windows" : (plat === "darwin") ? "native macOS" : (plat === "linux") ? "native Linux" : "native OS";
+          else if (wsl === "unknown") ctx = "OS context unknown";
+          else if (wsl === "wsl-unknown-distro") ctx = "WSL (distro unknown)";
+          else if (wsl.slice(0, 4) === "wsl:") ctx = "WSL distro " + wsl.slice(4);
+          else ctx = wsl;
+          return "Node " + node + " on " + os + " (" + ctx + ").";
+        }
         function renderDiagnosticsHeadline(cliOk, bridgeStructured, configOk, worktreeOk) {
           var box = document.getElementById("diagnostics-summary");
           if (!box) return;
@@ -2607,16 +2685,21 @@
             var oL = d.cli.orca.version ? ("orca " + d.cli.orca.version) : (d.cli.orca.found ? "orca (version unknown)" : "orca missing");
             var pL = d.cli.pi.version ? ("pi " + d.cli.pi.version) : (d.cli.pi.found ? "pi (version unknown)" : "pi missing");
             rows.push(["Runtime", oL + ", " + pL + (d.cli.ok === true ? " — ready." : " — action needed.") +
-              " orca-pi " + (d.orcaPiVersion || "(unknown)") + " / bridge " + (d.bridgeVersion || "(unknown)") + " / protocol " + String(d.protocolVersion !== undefined ? d.protocolVersion : "(unknown)") + "."]);
+              " orca-pi " + (d.orcaPiVersion || "(unknown)") + " / bridge " + (d.bridgeVersion || "(unknown)") + " / protocol " + String(d.protocolVersion !== undefined ? d.protocolVersion : "(unknown)") + "." +
+              " Host: " + hostLineFor(d) + " Runtime: " + runtimeLineFor(d)]);
+          } else if (d && typeof d === "object" && !Array.isArray(d) && (d.host || d.runtime || d.transport)) {
+            rows.push(["Runtime", "CLI health unavailable — run `orca-pi doctor` for live orca/pi versions. Host: " + hostLineFor(d) + " Runtime: " + runtimeLineFor(d)]);
           } else {
             rows.push(["Runtime", "CLI health unavailable — run `orca-pi doctor` for live orca/pi versions."]);
           }
           var b = (d && typeof d === "object" && !Array.isArray(d)) ? d.bridge : null;
           if (b && typeof b === "object" && !Array.isArray(b)) {
             var bOps = Array.isArray(b.supportedOperations) ? b.supportedOperations.length : 0;
-            rows.push(["Bridge", (b.structured === true ? "structured" : "degraded (read-only CLI fallback)") + " · " + bOps + " supported operation(s)."]);
+            var bMode = transportModeFor(d);
+            rows.push(["Bridge", (b.structured === true ? "structured" : "degraded (read-only CLI fallback)") + " · " + bOps + " supported operation(s)" + (bMode ? (" · transport " + bMode) : " · transport unknown") + "."]);
           } else {
-            rows.push(["Bridge", "bridge negotiation unavailable in this response."]);
+            var bModeFallback = transportModeFor(d);
+            rows.push(["Bridge", bModeFallback ? ("bridge negotiation unavailable in this response (transport " + bModeFallback + ").") : "bridge negotiation unavailable in this response."]);
           }
           var w = state.diagnosticsWorktree;
           if (w && typeof w === "object" && !Array.isArray(w) && typeof w.projectRoot === "string" && w.projectRoot) {
@@ -2708,18 +2791,23 @@
                   runtime.innerHTML = "<p><strong>Runtime CLIs</strong> <span class=\"muted\">(agrees with <code>orca-pi doctor</code>)</span></p>" +
                     "<ul class=\"cc-profile-list\"><li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(orcaLine) + " — " + esc(sanitizeDiagnosticsDetail(cli.orca.detail)) + "</span></div></li>" +
                     "<li class=\"cc-profile-item\"><div class=\"cc-meta\"><span>" + esc(piLine) + " — " + esc(sanitizeDiagnosticsDetail(cli.pi.detail)) + "</span></div></li></ul>" +
-                    "<p class=\"muted\">orca-pi " + esc(r.orcaPiVersion || "(unknown)") + " · bridge " + esc(r.bridgeVersion || "1.0.0") + " / protocol " + esc(String(r.protocolVersion !== undefined ? r.protocolVersion : 1)) + "</p>";
+                    "<p class=\"muted\">orca-pi " + esc(r.orcaPiVersion || "(unknown)") + " · bridge " + esc(r.bridgeVersion || "1.0.0") + " / protocol " + esc(String(r.protocolVersion !== undefined ? r.protocolVersion : 1)) + "</p>" +
+                    "<p><strong>Host</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(hostLineFor(r))) + "</span></p>" +
+                    "<p><strong>OS runtime</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(runtimeLineFor(r))) + "</span></p>";
                 }
               } else if (runtime) {
-                runtime.innerHTML = "<p class=\"muted\">CLI probes unavailable in this response (no runner injected) — run <code>orca-pi doctor</code> for live orca/pi versions.</p>";
+                runtime.innerHTML = "<p class=\"muted\">CLI probes unavailable in this response (no runner injected) — run <code>orca-pi doctor</code> for live orca/pi versions.</p>" +
+                  "<p><strong>Host</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(hostLineFor(r))) + "</span></p>" +
+                  "<p><strong>OS runtime</strong> <span class=\"muted\">" + esc(sanitizeDiagnosticsDetail(runtimeLineFor(r))) + "</span></p>";
               }
               var bridge = r.bridge;
               if (bridge && typeof bridge === "object") {
                 bridgeStructured = bridge.structured === true;
                 if (bridgeBox) {
                   var ops = Array.isArray(bridge.supportedOperations) ? bridge.supportedOperations.join(", ") : "(none)";
+                  var bModeBox = transportModeFor(r);
                   var reasons = Array.isArray(bridge.reasons) ? bridge.reasons.slice(0, 4).map(function (x) { return esc(x); }).join("<br/>") : "";
-                  bridgeBox.innerHTML = "<p><strong>Bridge</strong> <code>" + esc(bridgeStructured ? "structured" : "degraded (read-only CLI fallback)") + "</code></p>" +
+                  bridgeBox.innerHTML = "<p><strong>Bridge</strong> <code>" + esc(bridgeStructured ? "structured" : "degraded (read-only CLI fallback)") + "</code>" + (bModeBox ? (" <span class=\"muted\">(transport " + esc(bModeBox) + ")</span>") : "") + "</p>" +
                     "<p class=\"muted\">Operations: " + esc(ops) + "</p>" + (reasons ? "<p class=\"muted\">" + reasons + "</p>" : "");
                 }
               } else if (bridgeBox) {
