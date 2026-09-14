@@ -47,6 +47,28 @@ import {
   gatePiStructuredSession,
   MIN_KNOWN_GOOD_PI_VERSION,
 } from "../src/pi-compat.js";
+
+/**
+ * Model Pi's session-file persistence in the scripted store: append a
+ * user→assistant turn parented at the current leaf and advance the leaf.
+ * Ids are namespaced per call so structured and TUI legs never collide.
+ */
+let persistedTurns = 0;
+function persistTurnToStore(store: SessionStore, resumePath: string, userText: string, assistantText: string): void {
+  const current = store.get(resumePath);
+  if (!current) throw new Error("missing seeded session");
+  persistedTurns += 1;
+  const userId = `pt${persistedTurns}u`;
+  const assistantId = `pt${persistedTurns}a`;
+  store.set(resumePath, {
+    entries: [
+      ...current.entries,
+      piMsg(userId, current.leafId, "user", userText),
+      piMsg(assistantId, userId, "assistant", assistantText),
+    ],
+    leafId: assistantId,
+  });
+}
 import { PiRpcError, redactSecrets } from "@orca-pi/pi-rpc";
 import type { ProviderToHostMessage } from "../src/protocol.js";
 import type {
@@ -261,10 +283,22 @@ interface HarnessSession {
   resumed: boolean;
 }
 
+interface AcquireOpts {
+  resumePath?: string;
+  options?: Record<string, unknown>;
+  compat?: {
+    readonly piVersion?: string;
+    readonly executionHostId?: string;
+    readonly wslDistro?: string | null;
+    readonly requiredCapabilities?: readonly string[];
+  };
+}
+
 interface Harness {
   readonly kind: PathKind;
   readonly fakes: Snc110FakePi[];
-  acquire(workspaceRoot: string, opts?: { resumePath?: string; options?: Record<string, unknown> }): Promise<HarnessSession>;
+  acquire(workspaceRoot: string, opts?: AcquireOpts): Promise<HarnessSession>;
+  acquireExpectError(workspaceRoot: string, opts?: AcquireOpts): Promise<string>;
   dispatch(sessionId: string, text: string, images?: Array<{ data: string; mimeType: string }>): Promise<{ status: string; reason?: string; opId?: string }>;
   cancel(sessionId: string, targetOpId?: string): Promise<{ settled: boolean }>;
   setOptions(sessionId: string, options: Record<string, unknown>): Promise<Record<string, unknown>>;
@@ -320,8 +354,21 @@ function makeHarness(kind: PathKind, store: SessionStore): Harness {
       fakeForSession,
       settleTurn,
       supportsCreate: (location, agent) => native.supportsCreate(location, agent),
-      async acquire(workspaceRoot, opts = {}) {
-        return native.acquire({ workspaceRoot, ...(opts.resumePath ? { resumePath: opts.resumePath } : {}), ...(opts.options ? { options: opts.options as never } : {}) });
+      async acquire(workspaceRoot, opts: AcquireOpts = {}) {
+        return native.acquire({
+          workspaceRoot,
+          ...(opts.resumePath ? { resumePath: opts.resumePath } : {}),
+          ...(opts.options ? { options: opts.options as never } : {}),
+          ...(opts.compat ? { compat: opts.compat } : {}),
+        });
+      },
+      async acquireExpectError(workspaceRoot, opts: AcquireOpts = {}) {
+        try {
+          await (this as Harness).acquire(workspaceRoot, opts);
+          return "NO_ERROR";
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
       },
       async dispatch(sessionId, text, images) {
         const res = await native.dispatch({ sessionId, text, ...(images?.length ? { images } : {}) });
@@ -415,10 +462,18 @@ function makeHarness(kind: PathKind, store: SessionStore): Harness {
       if (agent !== "pi") return false;
       return location.executionHostId === "local" && location.wslDistro === null;
     },
-    async acquire(workspaceRoot, opts = {}) {
+    async acquire(workspaceRoot, opts: AcquireOpts = {}) {
       await ensureHello();
       const opId = nextOp("acq");
-      send({ v: 1, kind: "acquire", opId, workspaceRoot, ...(opts.resumePath ? { resumePath: opts.resumePath } : {}), ...(opts.options ? { options: opts.options } : {}) });
+      send({
+        v: 1,
+        kind: "acquire",
+        opId,
+        workspaceRoot,
+        ...(opts.resumePath ? { resumePath: opts.resumePath } : {}),
+        ...(opts.options ? { options: opts.options } : {}),
+        ...(opts.compat ? { compat: opts.compat } : {}),
+      });
       const reply = await waitFor(opId, ["acquired", "error"]);
       if (reply.kind === "acquired") {
         const r = reply as unknown as { sessionId: string; resumed: boolean };
@@ -426,6 +481,14 @@ function makeHarness(kind: PathKind, store: SessionStore): Harness {
       }
       const err = reply as unknown as { error: { code: string; message: string } };
       throw new Error(`${err.error.code}: ${err.error.message}`);
+    },
+    async acquireExpectError(workspaceRoot, opts: AcquireOpts = {}) {
+      try {
+        await (this as Harness).acquire(workspaceRoot, opts);
+        return "NO_ERROR";
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
     },
     async dispatch(sessionId, text, images) {
       await ensureHello();
@@ -714,6 +777,35 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
     }
   });
 
+  it("refuses a failing acquire-time gate before any Pi child starts (both paths)", async () => {
+    const harness = makeHarness(kind, new Map());
+    try {
+      // Old Pi: refused with an actionable code, zero Pi children started.
+      expect(await harness.acquireExpectError("/tmp/snc110-ws", { compat: { piVersion: "0.1.0" } })).toMatch(
+        /PI_COMPAT_VERSION/,
+      );
+      expect(harness.fakes).toHaveLength(0);
+      // Remote host: refused the same way, still no Pi child.
+      expect(
+        await harness.acquireExpectError("/tmp/snc110-ws", { compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, executionHostId: "remote" } }),
+      ).toMatch(/PI_COMPAT_LOCATION/);
+      expect(harness.fakes).toHaveLength(0);
+      // Missing required capability: refused against the advertised set.
+      expect(
+        await harness.acquireExpectError("/tmp/snc110-ws", {
+          compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["teleportation"] },
+        }),
+      ).toMatch(/PI_COMPAT_CAPABILITY/);
+      expect(harness.fakes).toHaveLength(0);
+      // A passing gate acquires normally (one Pi child, honest lease).
+      const ok = await harness.acquire("/tmp/snc110-ws", { compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION } });
+      expect(ok.sessionId).not.toBe("");
+      expect(harness.fakes).toHaveLength(1);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
   it("round-trips structured → TUI → structured on the same session without duplication", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "snc110-ws-"));
     const store: SessionStore = new Map();
@@ -725,25 +817,35 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
       const fake = harness.fakeForSession(0);
       expect(await harness.dispatch(first.sessionId, "structured turn")).toMatchObject({ status: "accepted" });
       await harness.settleTurn(fake, "structured reply");
+      // The structured leg is journaled before handoff (live rows present).
+      const before = await harness.getHistory(first.sessionId);
+      const beforeText = before.entries.map((e) => `${e.role}:${e.text ?? ""}`).join("|");
+      expect(beforeText).toContain("user:structured turn");
+      expect(beforeText).toContain("assistant:structured reply");
       await harness.release(first.sessionId);
       expect(fake.isClosed).toBe(true);
-      // TUI interlude persists two rows at the leaf (scripted: Pi owns the file).
-      const seeded = store.get(resumePath);
-      if (!seeded) throw new Error("missing seeded session");
-      store.set(resumePath, {
-        entries: [...seeded.entries, piMsg("e3", "e2", "user", "tui followup"), piMsg("e4", "e3", "assistant", "tui reply")],
-        leafId: "e4",
-      });
-      // Structured reacquires the same session: full chain, each row once.
+      // Real Pi persists the structured leg to its session file; the scripted
+      // store models that persistence explicitly (parented at the leaf).
+      persistTurnToStore(store, resumePath, "structured turn", "structured reply");
+      // TUI interlude appends two more rows at the new leaf (Pi owns the file).
+      persistTurnToStore(store, resumePath, "tui followup", "tui reply");
+      // Structured reacquires the same session: every row from BOTH legs, each once.
       const second = await harness.acquire(workspaceRoot, { resumePath });
       expect(second.resumed).toBe(true);
       const history = await harness.getHistory(second.sessionId);
       const transcript = history.entries.map((e) => `${e.role}:${e.text ?? ""}`).join("|");
-      for (const row of ["user:hello active", "assistant:active reply", "user:tui followup", "assistant:tui reply"]) {
+      for (const row of [
+        "user:hello active",
+        "assistant:active reply",
+        "user:structured turn",
+        "assistant:structured reply",
+        "user:tui followup",
+        "assistant:tui reply",
+      ]) {
         const occurrences = transcript.split(row).length - 1;
         expect(occurrences).toBe(1);
       }
-      expect(history.leafId).toBe("e4");
+      expect(history.leafId).toBe(store.get(resumePath)?.leafId);
     } finally {
       await harness.teardown();
     }

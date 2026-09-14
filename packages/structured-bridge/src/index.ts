@@ -123,9 +123,11 @@ export {
   type PiConformanceScenario,
 } from "./pi-conformance.js";
 export {
+  checkAcquireCompat,
   checkPiLocationSupport,
   checkPiVersionSupport,
   comparePiVersions,
+  formatPiVersion,
   gatePiStructuredSession,
   MIN_KNOWN_GOOD_PI_VERSION,
   negotiatePiCapabilities,
@@ -134,6 +136,9 @@ export {
   PI_COMPAT_LOCAL_HOST_ID,
   PI_RPC_PROTOCOL_VERSION,
   PI_TUI_FALLBACK,
+  type ParsedPiVersion,
+  type PiAcquireCompat,
+  type PiAcquireCompatVerdict,
   type PiCapabilityNegotiation,
   type PiCompatLocation,
   type PiLocationSupport,

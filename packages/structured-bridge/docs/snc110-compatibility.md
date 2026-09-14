@@ -7,7 +7,7 @@ landed separately in `44madfire/orca` and is out of scope here.
 
 | Piece | Location | Notes |
 |---|---|---|
-| Compatibility + capability gates | `src/pi-compat.ts` | Pure, process-free: Pi version floor, honest execution-location matrix, capability probing over version checks, combined `gatePiStructuredSession()` entry point. No shell strings, no process execution, no credentials. |
+| Compatibility + capability gates | `src/pi-compat.ts` | Pure, process-free: Pi version floor (SemVer prerelease-aware), honest execution-location matrix, capability probing over version checks, combined `gatePiStructuredSession()` entry point, and the pre-spawn `checkAcquireCompat()` verdict consumed by both acquisition paths. No shell strings, no process execution, no credentials. Only `import type` from `protocol.ts`, so the module stays runtime-import-free and safe to vendor. |
 | Gate unit tests | `test/pi-compat.test.ts` | Deterministic, offline. |
 | Full-lifecycle E2E (bridge + native) | `test/pi-snc110-e2e.test.ts` | Scripted fake Pi, no binary, no credentials. Covers the §2 checklist on both paths. |
 | Opt-in real-Pi smoke | `test/pi-live-smoke.test.ts` | `ORCA_PI_LIVE_SMOKE=1` only; skipped otherwise. Env failures skip with `LIVE-SMOKE-ENV`, never fail. |
@@ -17,7 +17,21 @@ The Orca fork vendors `framing.ts` + `protocol.ts` + `host.ts` only
 (provider-neutral). `pi-compat.ts` is additionally safe to vendor: it
 imports nothing and owns no transport.
 
-## 2. Deterministic E2E checklist (no credentials, no binary)
+## 2. Runtime wiring (the gate is enforced, not advisory)
+
+`PiBridgeProvider` (`acquire{compat}` wire field) and `PiNativeProvider`
+(`acquire({compat})` input) run `checkAcquireCompat()` **before** spec
+resolution, the hello handshake, and any Pi child creation. A refused gate
+fails with `PI_COMPAT_LOCATION` / `PI_COMPAT_VERSION` /
+`PI_COMPAT_CAPABILITY` naming the Pi TUI fallback, and no Pi connection is
+constructed (asserted: the connection factory is never called). Absent
+`compat` dimensions are skipped, preserving existing behavior for callers
+that gate elsewhere. Orca's wiring contract: probe `pi --version` once
+(bounded, out of band), pass it as `compat.piVersion` at acquire, and keep
+`supportsCreate` as the location first-line with this gate as pre-spawn
+defense in depth.
+
+## 3. Deterministic E2E checklist (no credentials, no binary)
 
 `test/pi-snc110-e2e.test.ts` runs every row on **both** paths:
 
@@ -42,7 +56,7 @@ imports nothing and owns no transport.
 - bounded/redacted stderr, secret-safe errors, no credential fields on the
   wire, argv-only transport (never a shell string).
 
-## 3. Support matrix (honest)
+## 4. Support matrix (honest)
 
 | Dimension | Proven (fixture/test evidence) | Expected, unproven | Unsupported (fail closed to Pi TUI) |
 |---|---|---|---|
@@ -57,7 +71,7 @@ Capability rule: prefer probing (`get_available_models`,
 bridge capabilities) over version-string checks. The version gate is a
 coarse floor only.
 
-## 4. Security / reliability evidence
+## 5. Security / reliability evidence
 
 - Stderr is a bounded, redacted tail (`MAX_STDERR_BYTES`, secret + path
   patterns) — see the redaction tests in `pi-snc110-e2e.test.ts` and
@@ -76,7 +90,7 @@ coarse floor only.
   finalization); release proves Pi exit; prompts/turns retire on
   settle/cancel/exit/release fences.
 
-## 5. Known boundaries / unproven (do not claim)
+## 6. Known boundaries / unproven (do not claim)
 
 - No live-Pi run is recorded in deterministic CI (by design — no
   credentials). Run `ORCA_PI_LIVE_SMOKE=1 npm test -- pi-live-smoke` on a

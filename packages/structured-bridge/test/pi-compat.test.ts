@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  checkAcquireCompat,
   checkPiLocationSupport,
   checkPiVersionSupport,
   comparePiVersions,
@@ -26,7 +27,8 @@ describe("SNC1.10 Pi version floor (capability probing stays authoritative)", ()
     expect(parsePiVersion("0.85.1")).toEqual({ major: 0, minor: 85, patch: 1 });
     expect(parsePiVersion("v0.85.1")).toEqual({ major: 0, minor: 85, patch: 1 });
     expect(parsePiVersion("  0.85.1  ")).toEqual({ major: 0, minor: 85, patch: 1 });
-    expect(parsePiVersion("0.85.1-beta.1")).toEqual({ major: 0, minor: 85, patch: 1 });
+    expect(parsePiVersion("0.85.1-beta.1")).toEqual({ major: 0, minor: 85, patch: 1, prerelease: ["beta", "1"] });
+    expect(parsePiVersion("0.85.1+build.7")).toEqual({ major: 0, minor: 85, patch: 1 });
     expect(parsePiVersion("0.85")).toBeNull();
     expect(parsePiVersion("latest")).toBeNull();
     expect(parsePiVersion("")).toBeNull();
@@ -57,6 +59,18 @@ describe("SNC1.10 Pi version floor (capability probing stays authoritative)", ()
       expect(verdict.fallback).toBe("pi-tui");
       expect(verdict.reason).toMatch(/unsupported-pi-version/);
     }
+  });
+
+  it("refuses floor prereleases (SemVer orders them before the release)", () => {
+    // Regression: the floor is the final release; its own betas are older.
+    const beta = checkPiVersionSupport("0.85.1-beta.1");
+    expect(beta.supported).toBe(false);
+    expect(beta.reason).toMatch(/unsupported-pi-version/);
+    expect(beta.reason).toContain("0.85.1-beta.1");
+    // Newer prereleases still pass the floor (probing decides features).
+    expect(checkPiVersionSupport("0.86.0-rc.1").supported).toBe(true);
+    // Build metadata never affects precedence.
+    expect(checkPiVersionSupport(`${MIN_KNOWN_GOOD_PI_VERSION}+build.7`).supported).toBe(true);
   });
 });
 
@@ -121,6 +135,41 @@ describe("SNC1.10 capability probing over version checks", () => {
     const verdict = negotiatePiCapabilities(["cancel"], {});
     expect(verdict.structured).toBe(false);
     expect(verdict.unsupported).toEqual(["cancel"]);
+  });
+});
+
+describe("SNC1.10 acquire-time gate (pre-spawn enforcement input)", () => {
+  const advertised = { textStreaming: true, history: true };
+
+  it("allows a passing gate and skips absent dimensions", () => {
+    expect(checkAcquireCompat({}, advertised).allowed).toBe(true);
+    expect(checkAcquireCompat({ piVersion: MIN_KNOWN_GOOD_PI_VERSION }, advertised).allowed).toBe(true);
+    expect(
+      checkAcquireCompat({ requiredCapabilities: ["textStreaming"] }, advertised).allowed,
+    ).toBe(true);
+  });
+
+  it("refuses version/location/capability failures with PI_COMPAT_* codes", () => {
+    expect(checkAcquireCompat({ piVersion: "0.1.0" }, advertised)).toMatchObject({
+      allowed: false,
+      code: "PI_COMPAT_VERSION",
+      fallback: "pi-tui",
+    });
+    expect(checkAcquireCompat({ executionHostId: "remote" }, advertised)).toMatchObject({
+      allowed: false,
+      code: "PI_COMPAT_LOCATION",
+      fallback: "pi-tui",
+    });
+    expect(checkAcquireCompat({ wslDistro: "Ubuntu" }, advertised)).toMatchObject({
+      allowed: false,
+      code: "PI_COMPAT_LOCATION",
+      fallback: "pi-tui",
+    });
+    expect(checkAcquireCompat({ requiredCapabilities: ["images"] }, advertised)).toMatchObject({
+      allowed: false,
+      code: "PI_COMPAT_CAPABILITY",
+      fallback: "pi-tui",
+    });
   });
 });
 

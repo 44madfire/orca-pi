@@ -118,6 +118,7 @@ import {
   piBridgeCapabilities,
   validatePiDispatch,
 } from "./pi-mapping.js";
+import { checkAcquireCompat } from "./pi-compat.js";
 import { PiTranslator } from "./pi-translator.js";
 import { open } from "node:fs/promises";
 import path from "node:path";
@@ -472,6 +473,21 @@ export class PiBridgeProvider extends BridgeProvider {
         error: { code: "BAD_WORKSPACE", message: "acquire requires a non-empty workspaceRoot (Orca-selected cwd)" },
       });
       return;
+    }
+    // SNC1.10 acquire-time compatibility gate: enforced BEFORE any spec
+    // resolution or Pi child creation, so a refused gate never starts
+    // structured Pi (fail closed to Pi TUI with an actionable code).
+    if (msg.compat !== undefined) {
+      const verdict = checkAcquireCompat(msg.compat, this.providerCapabilities);
+      if (!verdict.allowed) {
+        this.send({
+          v: BRIDGE_PROTOCOL_VERSION,
+          kind: "error",
+          opId: msg.opId,
+          error: { code: verdict.code, message: `${verdict.reason} (use Pi TUI)` },
+        });
+        return;
+      }
     }
     const sessionId = msg.sessionId ?? this.newId("ses");
     const existing = this.sessions.get(sessionId);

@@ -51,27 +51,62 @@ export interface PiVersionSupport {
   readonly fallback: typeof PI_TUI_FALLBACK;
 }
 
-/** Parse `major.minor.patch` (leading `v`/whitespace tolerated). */
-export function parsePiVersion(raw: string): { major: number; minor: number; patch: number } | null {
+export interface ParsedPiVersion {
+  readonly major: number;
+  readonly minor: number;
+  readonly patch: number;
+  /** Dot-separated prerelease identifiers (`undefined` when absent; `+build` never captured). */
+  readonly prerelease?: readonly string[];
+}
+
+/**
+ * Parse `major.minor.patch[-prerelease][+build]` (leading `v`/whitespace
+ * tolerated). Prerelease is preserved for precedence; `+build` metadata is
+ * ignored per SemVer. A release without prerelease outranks the same
+ * release with one (`0.85.1-beta.1` < `0.85.1`), so floor betas never
+ * slip through as known-good.
+ */
+export function parsePiVersion(raw: string): ParsedPiVersion | null {
   if (typeof raw !== "string") return null;
-  const match = raw.trim().replace(/^v/i, "").match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+  const match = raw
+    .trim()
+    .replace(/^v/i, "")
+    .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
   if (!match) return null;
   const major = Number(match[1]);
   const minor = Number(match[2]);
   const patch = Number(match[3]);
   if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch)) return null;
-  return { major, minor, patch };
+  const prerelease = match[4] !== undefined && match[4] !== "" ? Object.freeze(match[4].split(".")) : undefined;
+  return prerelease === undefined ? { major, minor, patch } : { major, minor, patch, prerelease };
 }
 
-/** Compare two parsed versions: negative / zero / positive. */
-export function comparePiVersions(
-  a: { major: number; minor: number; patch: number },
-  b: { major: number; minor: number; patch: number },
-): number {
+function compareIdentifiers(a: string, b: string): number {
+  const aNum = /^\d+$/.test(a) ? Number(a) : null;
+  const bNum = /^\d+$/.test(b) ? Number(b) : null;
+  if (aNum !== null && bNum !== null) return aNum < bNum ? -1 : aNum > bNum ? 1 : 0;
+  if (aNum !== null) return -1;
+  if (bNum !== null) return 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Compare two parsed versions: negative / zero / positive (SemVer precedence). */
+export function comparePiVersions(a: ParsedPiVersion, b: ParsedPiVersion): number {
   if (a.major !== b.major) return a.major < b.major ? -1 : 1;
   if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
   if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
-  return 0;
+  const aPre = a.prerelease;
+  const bPre = b.prerelease;
+  if (aPre === undefined && bPre === undefined) return 0;
+  if (aPre !== undefined && bPre === undefined) return -1;
+  if (aPre === undefined && bPre !== undefined) return 1;
+  const len = Math.min(aPre!.length, bPre!.length);
+  for (let i = 0; i < len; i += 1) {
+    const cmp = compareIdentifiers(aPre![i]!, bPre![i]!);
+    if (cmp !== 0) return cmp;
+  }
+  if (aPre!.length === bPre!.length) return 0;
+  return aPre!.length < bPre!.length ? -1 : 1;
 }
 
 /**
@@ -80,6 +115,12 @@ export function comparePiVersions(
  * per-feature support); older or unparseable versions fail closed to
  * Pi TUI with an actionable reason.
  */
+/** Render a parsed version for diagnostics (prerelease preserved, build dropped). */
+export function formatPiVersion(v: ParsedPiVersion): string {
+  const base = `${v.major}.${v.minor}.${v.patch}`;
+  return v.prerelease === undefined ? base : `${base}-${v.prerelease.join(".")}`;
+}
+
 export function checkPiVersionSupport(rawVersion: string): PiVersionSupport {
   const parsed = parsePiVersion(rawVersion);
   if (!parsed) {
@@ -96,13 +137,13 @@ export function checkPiVersionSupport(rawVersion: string): PiVersionSupport {
   if (comparePiVersions(parsed, floor) < 0) {
     return {
       supported: false,
-      reason: `unsupported-pi-version: ${parsed.major}.${parsed.minor}.${parsed.patch} < minimum known-good ${MIN_KNOWN_GOOD_PI_VERSION} (update Pi or use Pi TUI)`,
+      reason: `unsupported-pi-version: ${formatPiVersion(parsed)} < minimum known-good ${MIN_KNOWN_GOOD_PI_VERSION} (update Pi or use Pi TUI)`,
       fallback: PI_TUI_FALLBACK,
     };
   }
   return {
     supported: true,
-    reason: `pi-version-ok: ${parsed.major}.${parsed.minor}.${parsed.patch} >= ${MIN_KNOWN_GOOD_PI_VERSION} (confirm per-feature support by capability probing)`,
+    reason: `pi-version-ok: ${formatPiVersion(parsed)} >= ${MIN_KNOWN_GOOD_PI_VERSION} (confirm per-feature support by capability probing)`,
     fallback: PI_TUI_FALLBACK,
   };
 }
@@ -200,6 +241,72 @@ export function negotiatePiCapabilities(
     fallback: PI_TUI_FALLBACK,
     unsupported,
   };
+}
+
+/**
+ * Acquire-time compatibility input (wire-safe plain data).
+ *
+ * Every field is optional: absent dimensions are skipped, present ones
+ * are enforced BEFORE any Pi child is spawned. Orca probes `pi --version`
+ * once (bounded, out of band) and passes it here; the provider refuses a
+ * failing gate with an actionable `PI_COMPAT_*` error naming the Pi TUI
+ * fallback instead of starting structured Pi.
+ */
+export interface PiAcquireCompat {
+  /** Probed `pi --version` output (floor-gated when present). */
+  readonly piVersion?: string;
+  /** Execution host id (location-gated for agent `pi` when present). */
+  readonly executionHostId?: string;
+  /** WSL distro (location-gated when non-null). */
+  readonly wslDistro?: string | null;
+  /** Required capabilities (probed against the advertised set when present). */
+  readonly requiredCapabilities?: readonly string[];
+}
+
+export interface PiAcquireCompatVerdict {
+  readonly allowed: boolean;
+  /** Machine-readable code (`PI_COMPAT_*` on refusal; safe for logs/toasts). */
+  readonly code: string;
+  readonly reason: string;
+  readonly fallback: typeof PI_TUI_FALLBACK;
+}
+
+/**
+ * Pre-spawn acquisition gate consumed by BOTH provider paths
+ * (`PiBridgeProvider.onPiAcquire` + `PiNativeProvider.acquire`) before any
+ * spec resolution or Pi child creation. Pure: no I/O, no processes.
+ * `advertised` is the provider's own capability advertisement (the same
+ * object carried by `hello_ok`), so required capabilities are probed
+ * against exactly what structured Pi would offer.
+ */
+export function checkAcquireCompat(
+  compat: PiAcquireCompat,
+  advertised: PiProbedCapabilities,
+): PiAcquireCompatVerdict {
+  if (compat.executionHostId !== undefined || compat.wslDistro !== undefined) {
+    const location: PiCompatLocation = {
+      executionHostId: compat.executionHostId ?? PI_COMPAT_LOCAL_HOST_ID,
+      wslDistro: compat.wslDistro ?? null,
+    };
+    const verdict = checkPiLocationSupport(location, PI_COMPAT_AGENT);
+    if (!verdict.supported) {
+      return { allowed: false, code: "PI_COMPAT_LOCATION", reason: verdict.reason, fallback: PI_TUI_FALLBACK };
+    }
+  }
+  if (compat.piVersion !== undefined) {
+    const verdict = checkPiVersionSupport(compat.piVersion);
+    if (!verdict.supported) {
+      return { allowed: false, code: "PI_COMPAT_VERSION", reason: verdict.reason, fallback: PI_TUI_FALLBACK };
+    }
+  }
+  const required = compat.requiredCapabilities ?? [];
+  if (required.length > 0) {
+    const negotiated = negotiatePiCapabilities(required, advertised);
+    if (!negotiated.structured) {
+      return { allowed: false, code: "PI_COMPAT_CAPABILITY", reason: negotiated.reason, fallback: PI_TUI_FALLBACK };
+    }
+  }
+  return { allowed: true, code: "PI_COMPAT_OK", reason: "compat-ok: acquire-time gate passed", fallback: PI_TUI_FALLBACK };
 }
 
 export interface PiStructuredGateInput {

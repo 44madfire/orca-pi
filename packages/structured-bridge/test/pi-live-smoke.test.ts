@@ -45,10 +45,12 @@ function probePiVersion(): { raw: string } | { envFailure: string } {
 }
 
 describe.skipIf(!enabled)("real-Pi compatibility smoke (ORCA_PI_LIVE_SMOKE=1)", () => {
-  it("probes version support and runs idle reads without credentials", async () => {
+  it("probes version support and runs idle reads without credentials", async (ctx) => {
     const probe = probePiVersion();
     if ("envFailure" in probe) {
-      console.warn(`LIVE-SMOKE-ENV: ${probe.envFailure} — skipping (environment, not a code failure)`);
+      // Explicitly enabled but unrunnable here: record a SKIP (never a pass)
+      // so the result cannot be mistaken for a successful live smoke.
+      ctx.skip(`LIVE-SMOKE-ENV: ${probe.envFailure}`);
       return;
     }
     console.warn(`LIVE-SMOKE: platform=${process.platform} piVersion=${probe.raw}`);
@@ -59,8 +61,8 @@ describe.skipIf(!enabled)("real-Pi compatibility smoke (ORCA_PI_LIVE_SMOKE=1)", 
       piVersion: probe.raw,
     });
     if (!versionGate.supported || !gate.structured) {
-      console.warn(`LIVE-SMOKE-ENV: ${versionGate.reason} — skipping idle reads (fail-closed to Pi TUI as designed)`);
       expect(versionGate.fallback).toBe("pi-tui");
+      ctx.skip(`LIVE-SMOKE-ENV: ${versionGate.reason} — idle reads skipped (fail-closed to Pi TUI as designed)`);
       return;
     }
     const { PiRpcConnection } = await import("@orca-pi/pi-rpc");
@@ -75,7 +77,9 @@ describe.skipIf(!enabled)("real-Pi compatibility smoke (ORCA_PI_LIVE_SMOKE=1)", 
     try {
       await conn.start();
     } catch (error) {
-      console.warn(`LIVE-SMOKE-ENV: Pi startup failed (${error instanceof Error ? error.message.split("\n")[0] : String(error)}) — skipping (environment, not a code failure)`);
+      ctx.skip(
+        `LIVE-SMOKE-ENV: Pi startup failed (${error instanceof Error ? error.message.split("\n")[0] : String(error)})`,
+      );
       return;
     }
     try {
@@ -83,7 +87,8 @@ describe.skipIf(!enabled)("real-Pi compatibility smoke (ORCA_PI_LIVE_SMOKE=1)", 
       expect(state).toHaveProperty("isStreaming");
       const entries = await conn.getEntries();
       expect(Array.isArray(entries.entries)).toBe(true);
-      expect(typeof entries.leafId).toBe("string");
+      // Empty sessions legitimately report a null leaf (no current leaf yet).
+      expect(entries.leafId === null || typeof entries.leafId === "string").toBe(true);
       const levels = await conn.getAvailableThinkingLevels();
       expect(Array.isArray(levels.levels)).toBe(true);
     } finally {

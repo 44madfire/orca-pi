@@ -92,7 +92,8 @@ describe.skipIf(!enabled)("real-Pi smoke (PI_RPC_SMOKE=1)", () => {
       expect(state).toHaveProperty("isStreaming");
       const entries = await conn.getEntries();
       expect(Array.isArray(entries.entries)).toBe(true);
-      expect(typeof entries.leafId).toBe("string");
+      // Empty sessions legitimately report a null leaf (no current leaf yet).
+      expect(entries.leafId === null || typeof entries.leafId === "string").toBe(true);
       const levels = await conn.getAvailableThinkingLevels();
       expect(Array.isArray(levels.levels)).toBe(true);
       const stats = await conn.getSessionStats();

@@ -59,6 +59,7 @@
  *   `agent === "pi"` and never claims `codex`/`claude`/`external` sessions.
  */
 
+import { checkAcquireCompat, type PiAcquireCompat } from "./pi-compat.js";
 import { PiBridgeProvider, type PiBridgeProviderOptions } from "./pi-provider.js";
 import type {
   BridgeCapabilities,
@@ -88,6 +89,13 @@ export interface PiNativeAcquireInput {
   readonly resumePath?: string;
   readonly sessionId?: string;
   readonly options?: BridgeSessionOptions;
+  /**
+   * Optional acquire-time compatibility gate (SNC1.10, plain data).
+   * Enforced before the hello handshake and any Pi child creation: a
+   * refused gate throws `PI_COMPAT_*` (use Pi TUI) and never starts
+   * structured Pi.
+   */
+  readonly compat?: PiAcquireCompat;
 }
 
 export interface PiNativeAcquireResult {
@@ -210,10 +218,19 @@ export class PiNativeProvider {
   }
 
   async acquire(input: PiNativeAcquireInput): Promise<PiNativeAcquireResult> {
-    await this.ensureHello();
     if (!input.workspaceRoot || input.workspaceRoot.trim() === "") {
       throw new Error("BAD_WORKSPACE: acquire requires a non-empty workspaceRoot");
     }
+    // SNC1.10 acquire-time compatibility gate: enforced before the hello
+    // handshake and any Pi child creation, so a refused gate never starts
+    // structured Pi (fail closed to Pi TUI with an actionable code).
+    if (input.compat !== undefined) {
+      const verdict = checkAcquireCompat(input.compat, this.capabilities);
+      if (!verdict.allowed) {
+        throw new Error(`${verdict.code}: ${verdict.reason} (use Pi TUI)`);
+      }
+    }
+    await this.ensureHello();
     const opId = nextOpId("acq", this.seq);
     const pending = this.waitFor(opId, new Set(["acquired", "error"]), PI_NATIVE_REQUEST_TIMEOUT_MS);
     this.send({
