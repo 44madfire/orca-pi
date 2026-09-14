@@ -871,14 +871,24 @@ export class BridgeHost {
     }
     if (msg.kind === "exiting" || msg.kind === "error") {
       const isBenignAnswerAck = msg.kind === "error" && msg.error.code === "ANSWERED";
-      if (!isBenignAnswerAck) {
+      const opId = msg.opId;
+      const pendingEntry = opId ? this.pending.get(opId) : undefined;
+      // SNC1.10: a correlated acquire refusal carrying a request-scoped
+      // compatibility verdict (PI_COMPAT_*) is an EXPECTED refusal, not a
+      // provider failure — deliver it to the waiter verbatim and skip the
+      // generic provider-error lifecycle event. All other error mapping is
+      // unchanged (dispatch → unknown, ANSWERED ack, generic rejection).
+      const isCompatRefusal =
+        msg.kind === "error" &&
+        pendingEntry?.kind === "acquire" &&
+        msg.error.code.startsWith("PI_COMPAT_");
+      if (!isBenignAnswerAck && !isCompatRefusal) {
         this.emitLifecycle({
           kind: msg.kind === "exiting" ? "provider-exit" : "provider-error",
           message: sanitizeReason(msg.kind === "exiting" ? `provider exiting: ${msg.reason}` : `provider error: ${msg.error.code}`),
           ...(msg.kind === "exiting" ? { code: msg.exit.code, signal: msg.exit.signal } : {}),
         });
       }
-      const opId = msg.opId;
       if (opId && this.pending.has(opId)) {
         const entry = this.pending.get(opId);
         if (entry) {
@@ -891,6 +901,17 @@ export class BridgeHost {
             // Benign ack for answer_prompt (see provider onAnswer): the turn
             // continues via session_event; resolve so the host never hangs.
             entry.resolve(msg);
+          } else if (isCompatRefusal && msg.kind === "error") {
+            // Preserve the sanitized request-scoped compatibility code and
+            // message so the caller can route to Pi TUI with the reason.
+            // Provider messages are pre-sanitized; redact + bound again
+            // here so a rogue helper can never smuggle secrets through.
+            entry.reject(
+              new BridgeUnavailableError(
+                sanitizeReason(redactSecretsFromText(msg.error.message)),
+                msg.error.code,
+              ),
+            );
           } else {
             entry.reject(new BridgeUnavailableError(`provider error before ${entry.kind}`, "BRIDGE_PROVIDER_ERROR"));
           }
