@@ -210,6 +210,20 @@ export interface AcquireRequest extends BridgeWireBase {
   resumePath?: string;
   sessionId?: string;
   options?: BridgeSessionOptions;
+  /**
+   * Optional acquire-time compatibility gate (SNC1.10, plain data).
+   * When present the provider enforces it BEFORE spawning Pi:
+   * refusal is an `error{PI_COMPAT_*}` naming the Pi TUI fallback and
+   * no Pi child is started. Shape mirrors `PiAcquireCompat` in
+   * `pi-compat.ts` (kept structural here so this vendored core stays
+   * dependency-free).
+   */
+  compat?: {
+    readonly piVersion?: string;
+    readonly executionHostId?: string;
+    readonly wslDistro?: string | null;
+    readonly requiredCapabilities?: readonly string[];
+  };
 }
 
 export interface ReleaseRequest extends BridgeWireBase {

@@ -183,16 +183,21 @@ export interface PiCommandInfo {
   readonly [key: string]: unknown;
 }
 
-/** `get_entries` data. */
+/**
+ * `get_entries` data. `leafId` is `null` on an empty session (no current
+ * leaf yet) per the Pi RPC contract — consumers must treat non-string as
+ * missing (the bridge maps it to `PI_HISTORY_LEAF_MISSING`, never a
+ * silent truncated transcript).
+ */
 export interface PiEntriesData {
   readonly entries: readonly PiEntry[];
-  readonly leafId: string;
+  readonly leafId: string | null;
 }
 
-/** `get_tree` data. */
+/** `get_tree` data (`leafId` nullable on empty sessions, same contract). */
 export interface PiTreeData {
   readonly tree: readonly PiTreeNode[];
-  readonly leafId: string;
+  readonly leafId: string | null;
 }
 
 /** `get_messages` data (active-branch flattened view). */
