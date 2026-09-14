@@ -296,8 +296,10 @@ Fork-side injection contract (`window.__ORCA_PI_BRIDGE__`):
   explicit scope + source hash → core validate + atomic write →
   authoritative round-trip (`profile.read` + `profiles.list`). Dirty state
   is visible; navigation confirms; validation maps to fields; `conflict`
-  prompts reload/compare (never silent overwrite); built-ins block direct
-  saves (clone instead). Launch previews use `launch.preview` (JEF-7
+  prompts reload/compare (never silent overwrite); built-in bases stay
+  immutable while user/project overrides for built-in names save into the
+  selected layer (clone only for a new profile name). Launch previews use
+  `launch.preview` (JEF-7
   compiler, sanitized, display-only — never rebuilt argv in the UI).
 - Pure helpers live in `packages/orca-plugin/src/control-center.ts`
   (tested in `test/control-center.test.ts` alongside the shipped script).
