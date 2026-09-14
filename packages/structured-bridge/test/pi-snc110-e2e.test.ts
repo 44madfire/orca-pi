@@ -53,6 +53,16 @@ import {
  * user→assistant turn parented at the current leaf and advance the leaf.
  * Ids are namespaced per call so structured and TUI legs never collide.
  */
+/**
+ * Remove optional Pi RPC methods from a scripted fake (proves
+ * presence-gated probes). Assigns own-property `undefined` (shadowing the
+ * prototype) rather than `delete`, which cannot remove prototype methods.
+ */
+function stripMethods(fake: Snc110FakePi, names: readonly string[]): void {
+  const mutable = fake as unknown as Record<string, unknown>;
+  for (const name of names) mutable[name] = undefined;
+}
+
 let persistedTurns = 0;
 function persistTurnToStore(store: SessionStore, resumePath: string, userText: string, assistantText: string): void {
   const current = store.get(resumePath);
@@ -875,7 +885,7 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
     }
   });
 
-  it("fails closed when version evidence is required but missing (requireCompat)", async () => {
+  it("fails closed when compatibility evidence is required but missing (requireCompat)", async () => {
     const harness = makeHarness(kind, new Map(), { requireCompat: true });
     try {
       // No evidence at all, and present-but-empty evidence: both refuse
@@ -884,13 +894,23 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
       expect(harness.fakes).toHaveLength(0);
       expect(await harness.acquireExpectError("/tmp/snc110-ws", { compat: {} })).toMatch(/PI_COMPAT_EVIDENCE_MISSING/);
       expect(harness.fakes).toHaveLength(0);
-      // Evidence supplied: the floor still applies (old Pi refused).
-      expect(await harness.acquireExpectError("/tmp/snc110-ws", { compat: { piVersion: "0.1.0" } })).toMatch(
-        /PI_COMPAT_VERSION/,
-      );
+      // Version alone is NOT enough in fail-closed mode: live capability
+      // evidence is required too (round-4 P1).
+      expect(
+        await harness.acquireExpectError("/tmp/snc110-ws", { compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION } }),
+      ).toMatch(/PI_COMPAT_EVIDENCE_MISSING/);
       expect(harness.fakes).toHaveLength(0);
-      // Known-good evidence: acquire proceeds (exactly one Pi child).
-      const ok = await harness.acquire("/tmp/snc110-ws", { compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION } });
+      // Evidence supplied: the floor still applies (old Pi refused).
+      expect(
+        await harness.acquireExpectError("/tmp/snc110-ws", {
+          compat: { piVersion: "0.1.0", requiredCapabilities: ["options", "history"] },
+        }),
+      ).toMatch(/PI_COMPAT_VERSION/);
+      expect(harness.fakes).toHaveLength(0);
+      // Full evidence (version + live-provable set): exactly one Pi child.
+      const ok = await harness.acquire("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["options", "history"] },
+      });
       expect(ok.sessionId).not.toBe("");
       expect(harness.fakes).toHaveLength(1);
     } finally {
@@ -915,10 +935,7 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
 
   it("refuses live-unproven capabilities and tears down the started child (no leak)", async () => {
     const stripRpcs = (fake: Snc110FakePi): void => {
-      fake.getAvailableModels = undefined;
-      fake.getAvailableThinkingLevels = undefined;
-      fake.getEntries = undefined;
-      fake.getTree = undefined;
+      stripMethods(fake, ["getAvailableModels", "getAvailableThinkingLevels", "getEntries", "getTree"]);
     };
     const harness = makeHarness(kind, new Map(), {}, stripRpcs);
     try {
@@ -931,6 +948,71 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
       // no session exposed.
       expect(harness.fakes).toHaveLength(1);
       expect(harness.fakes[0]?.isClosed).toBe(true);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("refuses options when the live Pi lacks the mutation setters (presence, never invoked)", async () => {
+    const noSetters = (fake: Snc110FakePi): void => {
+      stripMethods(fake, ["setModel", "setThinkingLevel", "setAutoCompaction"]);
+    };
+    const harness = makeHarness(kind, new Map(), {}, noSetters);
+    try {
+      // Catalogs read fine, but the capability exposes mutations the
+      // running Pi cannot perform: fail closed, child torn down.
+      const reason = await harness.acquireExpectError("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["options"] },
+      });
+      expect(reason).toMatch(/PI_COMPAT_CAPABILITY/);
+      expect(reason).toMatch(/setter/);
+      expect(harness.fakes).toHaveLength(1);
+      expect(harness.fakes[0]?.isClosed).toBe(true);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("refuses resume when the live Pi lacks switchSession (readable history is not enough)", async () => {
+    const noSwitch = (fake: Snc110FakePi): void => {
+      stripMethods(fake, ["switchSession"]);
+    };
+    const harness = makeHarness(kind, new Map(), {}, noSwitch);
+    try {
+      const reason = await harness.acquireExpectError("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["resume"] },
+      });
+      expect(reason).toMatch(/PI_COMPAT_CAPABILITY/);
+      expect(reason).toMatch(/switchSession/);
+      expect(harness.fakes).toHaveLength(1);
+      expect(harness.fakes[0]?.isClosed).toBe(true);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("proves images without the thinking catalog (no unrelated coupling)", async () => {
+    const noThinkingCatalog = (fake: Snc110FakePi): void => {
+      stripMethods(fake, ["getAvailableThinkingLevels"]);
+    };
+    const harness = makeHarness(kind, new Map(), {}, noThinkingCatalog);
+    try {
+      // Images needs the model catalog only: succeeds despite the missing
+      // thinking catalog (round-4 P2).
+      const ok = await harness.acquire("/tmp/snc110-ws", {
+        compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["images"] },
+      });
+      expect(ok.sessionId).not.toBe("");
+      // But options still requires the thinking catalog: refuses.
+      const harness2 = makeHarness(kind, new Map(), {}, noThinkingCatalog);
+      try {
+        const reason = await harness2.acquireExpectError("/tmp/snc110-ws", {
+          compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["options"] },
+        });
+        expect(reason).toMatch(/PI_COMPAT_CAPABILITY/);
+      } finally {
+        await harness2.teardown();
+      }
     } finally {
       await harness.teardown();
     }

@@ -201,13 +201,15 @@ export interface PiBridgeProviderOptions {
    */
   piOptionTimeoutMs?: number;
   /**
-   * Fail closed when version evidence is missing (SNC1.10).
-   * When true, `acquire` without a usable `compat.piVersion` is refused
-   * with `PI_COMPAT_EVIDENCE_MISSING` BEFORE any Pi child is spawned —
-   * the deployer declares compatibility evidence required. Default false
+   * Fail closed when compatibility evidence is missing (SNC1.10).
+   * When true, `acquire` without a usable `compat.piVersion` AND a
+   * nonempty `compat.requiredCapabilities` set is refused with
+   * `PI_COMPAT_EVIDENCE_MISSING` BEFORE any Pi child is spawned — the
+   * deployer declares compatibility evidence required. Default false
    * preserves dev-harness/back-compat behavior; production Orca sets this
-   * (one line) and passes its bounded `pi --version` probe as
-   * `compat.piVersion` at acquire (see `docs/snc110-compatibility.md`).
+   * (one line) and passes its bounded `pi --version` probe plus the
+   * capability set it relies on at acquire (see
+   * `docs/snc110-compatibility.md`).
    */
   requireCompat?: boolean;
   /** Inject a fake Pi connection (tests). Default constructs a real `PiRpcConnection`. */
@@ -490,19 +492,35 @@ export class PiBridgeProvider extends BridgeProvider {
     const { live } = splitProbedCapabilities(required);
     if (live.length === 0) return null;
     const probes: Array<Promise<string | null>> = [];
-    if (live.includes("options") || live.includes("images")) {
-      probes.push(this.probeOptionsCatalog(conn, live.includes("images")));
+    if (live.includes("options")) {
+      probes.push(this.probeOptionsCapability(conn));
+    }
+    if (live.includes("images")) {
+      probes.push(this.probeImagesCapability(conn));
     }
     if (live.includes("history") || live.includes("resume")) {
-      probes.push(this.probeHistoryRpc(conn));
+      probes.push(this.probeHistoryCapability(conn));
+    }
+    if (live.includes("resume")) {
+      probes.push(this.probeResumeCapability(conn));
     }
     const results = await Promise.all(probes);
     return results.find((r) => r !== null) ?? null;
   }
 
-  private async probeOptionsCatalog(conn: PiProviderConnection, needImages: boolean): Promise<string | null> {
+  /**
+   * `options` proves the catalog reads AND the mutation RPCs the capability
+   * exposes (`setModel`/`setThinkingLevel`/`setAutoCompaction` presence —
+   * presence only, never invoked: probing must not mutate Pi state).
+   */
+  private async probeOptionsCapability(conn: PiProviderConnection): Promise<string | null> {
     if (typeof conn.getAvailableModels !== "function" || typeof conn.getAvailableThinkingLevels !== "function") {
-      return "live probe failed: options RPCs unavailable on the running Pi (update Pi)";
+      return "live probe failed: options catalog RPCs unavailable on the running Pi (update Pi)";
+    }
+    for (const setter of ["setModel", "setThinkingLevel", "setAutoCompaction"] as const) {
+      if (typeof conn[setter] !== "function") {
+        return `live probe failed: options setter ${setter} unavailable on the running Pi (update Pi)`;
+      }
     }
     try {
       const [models, levels] = await Promise.all([
@@ -512,16 +530,36 @@ export class PiBridgeProvider extends BridgeProvider {
       if (!Array.isArray(models?.models) || !Array.isArray(levels?.levels)) {
         return "live probe failed: options RPCs returned malformed catalogs";
       }
-      if (needImages && !models.models.some((m) => (m.input ?? []).includes("image"))) {
-        return "live probe failed: running Pi advertises no image-capable model";
-      }
       return null;
     } catch (error) {
       return sanitizeCode(`live probe failed: options (${this.shortPiError(error)})`);
     }
   }
 
-  private async probeHistoryRpc(conn: PiProviderConnection): Promise<string | null> {
+  /**
+   * `images` proves an image-capable model via the live model catalog
+   * alone — deliberately independent of the thinking catalog (round-4 P2:
+   * image support must not require unrelated thinking support).
+   */
+  private async probeImagesCapability(conn: PiProviderConnection): Promise<string | null> {
+    if (typeof conn.getAvailableModels !== "function") {
+      return "live probe failed: model catalog RPC unavailable on the running Pi (update Pi)";
+    }
+    try {
+      const models = await conn.getAvailableModels({ timeoutMs: PI_LIVE_PROBE_TIMEOUT_MS });
+      if (!Array.isArray(models?.models)) {
+        return "live probe failed: model catalog RPC returned a malformed catalog";
+      }
+      if (!models.models.some((m) => (m.input ?? []).includes("image"))) {
+        return "live probe failed: running Pi advertises no image-capable model";
+      }
+      return null;
+    } catch (error) {
+      return sanitizeCode(`live probe failed: images (${this.shortPiError(error)})`);
+    }
+  }
+
+  private async probeHistoryCapability(conn: PiProviderConnection): Promise<string | null> {
     const canEntries = typeof conn.getEntries === "function";
     const canTree = typeof conn.getTree === "function";
     if (!canEntries && !canTree) {
@@ -539,6 +577,18 @@ export class PiBridgeProvider extends BridgeProvider {
     } catch (error) {
       return sanitizeCode(`live probe failed: history (${this.shortPiError(error)})`);
     }
+  }
+
+  /**
+   * `resume` proves `switchSession` presence in addition to readable
+   * history (presence only — invoking it would switch the live session).
+   * History readability is verified by `probeHistoryCapability` alongside.
+   */
+  private async probeResumeCapability(conn: PiProviderConnection): Promise<string | null> {
+    if (typeof conn.switchSession !== "function") {
+      return "live probe failed: switchSession unavailable on the running Pi (update Pi)";
+    }
+    return null;
   }
 
   // -- acquire: spawn pi --mode rpc in the Orca-selected workspace/cwd -----
@@ -569,19 +619,27 @@ export class PiBridgeProvider extends BridgeProvider {
         return;
       }
     }
-    // Deployer declared version evidence required (production Orca sets
-    // `requireCompat: true` and passes its `pi --version` probe as
-    // `compat.piVersion`): missing evidence fails closed pre-spawn, even
-    // when `compat` is present but carries no version.
+    // Deployer declared compatibility evidence required (production Orca
+    // sets `requireCompat: true` and passes its `pi --version` probe plus
+    // the capability set it intends to rely on): missing version evidence
+    // OR an empty capability set fails closed pre-spawn, even when `compat`
+    // is present but incomplete — a version alone must not pass fail-closed
+    // production mode without live capability evidence (round-4 P1).
     const versionEvidence = typeof msg.compat?.piVersion === "string" ? msg.compat.piVersion.trim() : "";
-    if (this.requireCompat && versionEvidence === "") {
+    const capabilityEvidence = Array.isArray(msg.compat?.requiredCapabilities)
+      ? (msg.compat.requiredCapabilities as readonly unknown[]).filter((c) => typeof c === "string" && c !== "")
+      : [];
+    if (this.requireCompat && (versionEvidence === "" || capabilityEvidence.length === 0)) {
       this.send({
         v: BRIDGE_PROTOCOL_VERSION,
         kind: "error",
         opId: msg.opId,
         error: {
           code: "PI_COMPAT_EVIDENCE_MISSING",
-          message: "acquire requires Pi version evidence (pass compat.piVersion from a bounded pi --version probe; use Pi TUI)",
+          message:
+            versionEvidence === ""
+              ? "acquire requires Pi version evidence (pass compat.piVersion from a bounded pi --version probe; use Pi TUI)"
+              : "acquire requires a nonempty compat.requiredCapabilities set for live verification (pass the capabilities production relies on; use Pi TUI)",
         },
       });
       return;

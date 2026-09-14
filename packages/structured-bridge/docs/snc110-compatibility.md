@@ -45,19 +45,26 @@ pre-spawn with `PI_COMPAT_EVIDENCE_MISSING`. The vendored `BridgeHost`
 forwards `acquire({compat})` to the wire verbatim, so the production
 caller contract lives in this repo.
 
-Orca production wiring (one-time, Orca repo):
+Orca production wiring (one-time, Orca repo — REQUIRED for the merged
+production path; tracked as follow-up, not landed by this PR):
 
 ```ts
 // Backend init: probe once, bounded, out of band (argv array, no shell).
 const piVersion = await probePiVersionBounded("pi"); // `pi --version`, 5s
 const pi = new PiNativeProvider({ createConnection, requireCompat: true });
-// Per acquire: evidence rides the call; refusal throws PI_COMPAT_* (TUI fallback).
-await pi.acquire({ workspaceRoot, resumePath, compat: { piVersion } });
-// Bridge path equivalent: host.acquire({ resumePath, compat: { piVersion } }).
+// Per acquire: version PLUS the capability set production relies on ride
+// the call — a version alone fails closed production mode (round-4 P1).
+// Refusal throws PI_COMPAT_* (TUI fallback).
+const requiredCapabilities = ["textStreaming", "options", "history", "cancel", "resume"];
+await pi.acquire({ workspaceRoot, resumePath, compat: { piVersion, requiredCapabilities } });
+// Bridge path equivalent:
+// host.acquire({ resumePath, compat: { piVersion, requiredCapabilities } }).
 ```
 
 `supportsCreate` stays the location first-line; this gate is pre-spawn
 defense in depth that cannot be skipped once `requireCompat` is set.
+Companion Orca work must also flip `requireCompat: true` — until it lands,
+production defaults (`requireCompat: false`) are unchanged by this PR.
 
 ## 3. Deterministic E2E checklist (no credentials, no binary)
 
