@@ -43,10 +43,16 @@ describe("orca-plugin artifact", () => {
     }
   });
 
-  it("ships a placeholder panel referencing the companion CLI", () => {
-    const { panelHtml } = loadArtifact();
-    expect(panelHtml).toContain("Orca–Pi Status");
-    expect(panelHtml).toContain("orca-pi doctor");
+  it("ships the Control Center as the primary panel referencing the companion CLI", () => {
+    const root = join(here, "..");
+    const center = readFileSync(join(root, "panel", "control-center.html"), "utf8");
+    expect(center).toContain("Orca-Pi Control Center");
+    expect(center).toContain("orca-pi doctor");
+    // Legacy standalone entries stay on disk as deprecated fallbacks only;
+    // the manifest primary + compat aliases all share the Control Center.
+    for (const legacy of ["panel.html", join("panel", "profiles.html")]) {
+      expect(existsSync(join(root, legacy))).toBe(true);
+    }
   });
 
   it("declares the bridge worker main and only the capabilities actually used", () => {
