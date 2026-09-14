@@ -2414,17 +2414,43 @@
         function loadGithubDoctor() {
           var box = document.getElementById("github-doctor");
           if (!state.structured || !can("github.doctor")) {
-            if (box) box.innerHTML = "<p class=\"muted\">github.doctor unavailable on this host (structured bridge unreachable).</p>";
+            // Fail closed on unavailable capability: fence the doctor
+            // generation and clear the leg before the early return, so a
+            // prior healthy result or an in-flight response can never keep
+            // Diagnostics ready after this attempt. Sibling github.status
+            // untouched; actor/setup rerender from the cleared leg
+            // (allowlisted, secret-safe).
+            state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
+            state.githubDoctor = null;
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
             renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
+            if (box) box.innerHTML = "<p class=\"muted\">github.doctor unavailable on this host (structured bridge unreachable).</p>";
             return Promise.resolve(null);
           }
           var repo = githubRepoValue();
           var ambient = githubAmbientValue();
           if (repo && !GITHUB_REPO_RE.test(repo)) {
+            // Fail closed on invalid repo: same fence + clear before the
+            // early return (never leave stale healthy driving ready).
+            state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
+            state.githubDoctor = null;
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
             if (box) box.innerHTML = "<p><strong>Invalid repo.</strong> <span class=\"muted\">Expected \"owner/repo\" (e.g. \"44madfire/orca-pi\").</span></p>";
             return Promise.resolve(null);
           }
           if (ambient && !GITHUB_LOGIN_RE.test(ambient)) {
+            // Fail closed on invalid review actor: same fence + clear.
+            state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;
+            state.githubDoctor = null;
+            refreshDiagnosticsHeadline();
+            renderDiagnosticsOverview();
+            renderGithubActor(state.githubDoctor);
+            renderGithubSetup(state.githubDoctor);
             if (box) box.innerHTML = "<p><strong>Invalid review actor.</strong> <span class=\"muted\">Expected a GitHub login (e.g. \"44madfire\").</span></p>";
             return Promise.resolve(null);
           }

@@ -1880,3 +1880,59 @@ describe("ui1.5/blocker: github refreshes fail closed (success-then-failure)", (
     expect(containsSecretMaterial(html)).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// UI1.5/#32 readiness race: invalid-input doctor refresh fences + clears
+// loadGithubDoctor used to return on invalid repo/ambient (and unavailable
+// capability) before incrementing githubDoctorToken and clearing
+// githubDoctor, so a prior healthy doctor result or an in-flight response
+// could keep Diagnostics ready after an invalid refresh attempt.
+// ---------------------------------------------------------------------------
+
+describe("ui1.5/#32: invalid-input doctor refresh fences generation + clears state", () => {
+  const coreHealthy = { cli: { ok: true }, bridge: { structured: true }, config: { ok: true }, worktree: { ok: true } };
+
+  it("cleared doctor leg headlines as pending, never stale ready", () => {
+    expect(diagnosticsHeadline({ ...coreHealthy, github: toDiagnosticsGithubHealth(statusPayload(), doctorReport()) })).toContain("ready");
+    // An invalid refresh attempt clears the doctor leg: status healthy but
+    // doctor unobserved must stay pending (never stale ready).
+    expect(diagnosticsHeadline({ ...coreHealthy, github: toDiagnosticsGithubHealth(statusPayload(), null) as never })).toMatch(/pending\/unavailable/);
+    expect(diagnosticsHeadline({ ...coreHealthy, github: toDiagnosticsGithubHealth(statusPayload(), null) as never })).not.toMatch(/Diagnostics: ready/);
+  });
+
+  it("panel fences + clears the doctor leg before invalid/unavailable early returns", () => {
+    const html = controlHtml();
+    const start = html.indexOf("function loadGithubDoctor(");
+    expect(start).toBeGreaterThan(-1);
+    const next = html.indexOf("\n        function ", start + 1);
+    const doctorBody = html.slice(start, next === -1 ? start + 12000 : next);
+    // Every early return fences the generation before bailing: the token
+    // bump must precede the invalid/unavailable messages, so an in-flight
+    // valid response arriving after the invalid attempt is ignored.
+    const firstFence = doctorBody.indexOf("state.githubDoctorToken = (state.githubDoctorToken || 0) + 1;");
+    expect(firstFence).toBeGreaterThan(-1);
+    expect(firstFence).toBeLessThan(doctorBody.indexOf("github.doctor unavailable"));
+    expect(firstFence).toBeLessThan(doctorBody.indexOf("Invalid repo."));
+    expect(firstFence).toBeLessThan(doctorBody.indexOf("Invalid review actor."));
+    // Each early return clears the doctor leg and rerenders headline +
+    // overview plus actor/setup from the cleared leg (secret-safe:
+    // allowlisted renderers only, sibling github.status untouched).
+    expect(doctorBody.match(/state\.githubDoctor = null;/g)!.length).toBeGreaterThanOrEqual(4);
+    expect(doctorBody).toContain("Fail closed on unavailable capability");
+    expect(doctorBody).toContain("Fail closed on invalid repo");
+    expect(doctorBody).toContain("Fail closed on invalid review actor");
+    expect(doctorBody.match(/refreshDiagnosticsHeadline\(\);/g)!.length).toBeGreaterThanOrEqual(6);
+    expect(doctorBody.match(/renderDiagnosticsOverview\(\);/g)!.length).toBeGreaterThanOrEqual(6);
+    expect(doctorBody.match(/renderGithubActor\(state\.githubDoctor\);/g)!.length).toBeGreaterThanOrEqual(4);
+    expect(doctorBody.match(/renderGithubSetup\(state\.githubDoctor\);/g)!.length).toBeGreaterThanOrEqual(4);
+    // Sibling preservation: invalid doctor attempts never touch status.
+    expect(doctorBody).not.toContain("state.githubStatus");
+    // Typed bridge + CLI-only credential boundaries preserved: the panel
+    // still issues typed github.doctor requests and never mints/refreshes.
+    expect(doctorBody).toContain('request("github.doctor"');
+    expect(html).toContain("orca-pi github mint");
+    expect(html).not.toMatch(/\.token\b/);
+    expect(html).not.toContain("privateKey");
+    expect(containsSecretMaterial(html)).toBe(false);
+  });
+});
