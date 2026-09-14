@@ -32,6 +32,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkPiVersionSupport, gatePiStructuredSession } from "../src/pi-compat.js";
+import { PiRpcError } from "@orca-pi/pi-rpc";
 
 const enabled = process.env["ORCA_PI_LIVE_SMOKE"] === "1";
 
@@ -77,10 +78,14 @@ describe.skipIf(!enabled)("real-Pi compatibility smoke (ORCA_PI_LIVE_SMOKE=1)", 
     try {
       await conn.start();
     } catch (error) {
-      ctx.skip(
-        `LIVE-SMOKE-ENV: Pi startup failed (${error instanceof Error ? error.message.split("\n")[0] : String(error)})`,
-      );
-      return;
+      // Skip ONLY positively identified spawn/environment failures (missing
+      // binary). Readiness-probe and protocol failures are exactly what an
+      // explicitly enabled smoke must catch, so they fail loudly.
+      if (error instanceof PiRpcError && error.code === "spawn-failed") {
+        ctx.skip(`LIVE-SMOKE-ENV: Pi spawn failed (${error.toSecretSafeString()})`);
+        return;
+      }
+      throw error;
     }
     try {
       const state = await conn.getState();

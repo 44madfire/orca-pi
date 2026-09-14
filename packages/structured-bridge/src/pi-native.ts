@@ -241,6 +241,9 @@ export class PiNativeProvider {
       ...(input.resumePath !== undefined ? { resumePath: input.resumePath } : {}),
       ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
       ...(input.options !== undefined ? { options: input.options } : {}),
+      // Forwarded so the inner provider enforces the same pre-spawn gate
+      // (including `requireCompat` evidence) on this path too.
+      ...(input.compat !== undefined ? { compat: { ...input.compat } } : {}),
     });
     const reply = await pending;
     if (reply.kind === "acquired") {

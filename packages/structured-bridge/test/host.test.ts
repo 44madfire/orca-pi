@@ -136,6 +136,27 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     await host.dispose();
   });
 
+  it("passes acquire-time compat evidence through to the provider (SNC1.10 caller contract)", async () => {
+    const { host, written } = createMockPair();
+    await host.probeSupport();
+    const { sessionId } = await host.acquire({ compat: { piVersion: "0.85.1" } });
+    expect(sessionId).toMatch(/^ses_/);
+    const acquireLine = written.map((s) => s.trim()).filter((s) => s !== "").pop() as string;
+    const msg = JSON.parse(acquireLine) as { kind: string; compat?: { piVersion?: string } };
+    expect(msg.kind).toBe("acquire");
+    expect(msg.compat).toEqual({ piVersion: "0.85.1" });
+    // Absent compat stays absent (dev-harness default unchanged).
+    written.length = 0;
+    await host.acquire();
+    const bare = JSON.parse((written.map((s) => s.trim()).filter((s) => s !== "").pop() as string)) as {
+      kind: string;
+      compat?: unknown;
+    };
+    expect(bare.kind).toBe("acquire");
+    expect("compat" in bare).toBe(false);
+    await host.dispose();
+  });
+
   it("preserves literal U+2028/U+2029 in dispatch text as one turn", async () => {
     const { host } = createMockPair();
     await host.probeSupport();

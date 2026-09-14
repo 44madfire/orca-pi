@@ -314,7 +314,7 @@ interface Harness {
   teardown(): Promise<void>;
 }
 
-function makeHarness(kind: PathKind, store: SessionStore): Harness {
+function makeHarness(kind: PathKind, store: SessionStore, providerOpts: { requireCompat?: boolean } = {}): Harness {
   const fakes: Snc110FakePi[] = [];
   const factory = (opts: PiRpcConnectionOptions): Snc110FakePi => {
     const fake = new Snc110FakePi(opts, store);
@@ -338,7 +338,7 @@ function makeHarness(kind: PathKind, store: SessionStore): Harness {
   };
 
   if (kind === "native") {
-    const native = new PiNativeProvider({ createConnection: factory });
+    const native = new PiNativeProvider({ createConnection: factory, ...(providerOpts.requireCompat ? { requireCompat: true } : {}) });
     const events: Array<{ sessionId: string; opId?: string; type: string; event: Record<string, unknown> }> = [];
     native.onSessionEvent((envelope) => {
       events.push({
@@ -417,7 +417,7 @@ function makeHarness(kind: PathKind, store: SessionStore): Harness {
     };
   }
 
-  const provider = new PiBridgeProvider({ createConnection: factory });
+  const provider = new PiBridgeProvider({ createConnection: factory, ...(providerOpts.requireCompat ? { requireCompat: true } : {}) });
   const out: ProviderToHostMessage[] = [];
   provider.attachTestTransport((msg) => out.push(msg));
   let seq = 0;
@@ -798,6 +798,29 @@ describe.each(PATHS)("SNC1.10 lifecycle E2E (%s path, scripted Pi, no credential
       ).toMatch(/PI_COMPAT_CAPABILITY/);
       expect(harness.fakes).toHaveLength(0);
       // A passing gate acquires normally (one Pi child, honest lease).
+      const ok = await harness.acquire("/tmp/snc110-ws", { compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION } });
+      expect(ok.sessionId).not.toBe("");
+      expect(harness.fakes).toHaveLength(1);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  it("fails closed when version evidence is required but missing (requireCompat)", async () => {
+    const harness = makeHarness(kind, new Map(), { requireCompat: true });
+    try {
+      // No evidence at all, and present-but-empty evidence: both refuse
+      // pre-spawn with zero Pi children started.
+      expect(await harness.acquireExpectError("/tmp/snc110-ws")).toMatch(/PI_COMPAT_EVIDENCE_MISSING/);
+      expect(harness.fakes).toHaveLength(0);
+      expect(await harness.acquireExpectError("/tmp/snc110-ws", { compat: {} })).toMatch(/PI_COMPAT_EVIDENCE_MISSING/);
+      expect(harness.fakes).toHaveLength(0);
+      // Evidence supplied: the floor still applies (old Pi refused).
+      expect(await harness.acquireExpectError("/tmp/snc110-ws", { compat: { piVersion: "0.1.0" } })).toMatch(
+        /PI_COMPAT_VERSION/,
+      );
+      expect(harness.fakes).toHaveLength(0);
+      // Known-good evidence: acquire proceeds (exactly one Pi child).
       const ok = await harness.acquire("/tmp/snc110-ws", { compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION } });
       expect(ok.sessionId).not.toBe("");
       expect(harness.fakes).toHaveLength(1);

@@ -38,6 +38,7 @@ import {
   MAX_STDERR_BYTES,
   redactSecretsFromText,
   validateBridgeMessage,
+  type AcquireRequest,
   type AcquiredResponse,
   type BridgeCapabilities,
   type BridgeHistoryEntry,
@@ -532,7 +533,20 @@ export class BridgeHost {
 
   // -- session operations ----------------------------------------------------
 
-  async acquire(init: { resumePath?: string; sessionId?: string; options?: BridgeSessionOptions } = {}): Promise<AcquireResult> {
+  async acquire(
+    init: {
+      resumePath?: string;
+      sessionId?: string;
+      options?: BridgeSessionOptions;
+      /**
+       * SNC1.10 acquire-time compatibility evidence (plain data, passed
+       * through to the provider verbatim). Production callers pass their
+       * bounded `pi --version` probe as `compat.piVersion`; providers with
+       * `requireCompat: true` refuse evidence-less acquires pre-spawn.
+       */
+      compat?: AcquireRequest["compat"];
+    } = {},
+  ): Promise<AcquireResult> {
     await this.ensureStarted();
     const opId = createOpId("acq");
     const req: HostToProviderMessage = {
@@ -543,6 +557,7 @@ export class BridgeHost {
       ...(init.resumePath ? { resumePath: init.resumePath } : {}),
       ...(init.sessionId ? { sessionId: init.sessionId } : {}),
       ...(init.options ? { options: init.options } : {}),
+      ...(init.compat ? { compat: init.compat } : {}),
     };
     const res = (await this.sendAndWait(req, this.requestTimeout())) as AcquiredResponse;
     if (res.kind !== "acquired") throw new BridgeUnavailableError(`acquire failed: ${res.kind}`, "BRIDGE_ACQUIRE_FAILED");

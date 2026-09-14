@@ -26,10 +26,26 @@ fails with `PI_COMPAT_LOCATION` / `PI_COMPAT_VERSION` /
 `PI_COMPAT_CAPABILITY` naming the Pi TUI fallback, and no Pi connection is
 constructed (asserted: the connection factory is never called). Absent
 `compat` dimensions are skipped, preserving existing behavior for callers
-that gate elsewhere. Orca's wiring contract: probe `pi --version` once
-(bounded, out of band), pass it as `compat.piVersion` at acquire, and keep
-`supportsCreate` as the location first-line with this gate as pre-spawn
-defense in depth.
+that gate elsewhere — **unless** the deployer sets `requireCompat: true`
+(a `PiBridgeProvider`/`PiNativeProvider` construction option), in which
+case an acquire without usable `compat.piVersion` evidence is refused
+pre-spawn with `PI_COMPAT_EVIDENCE_MISSING`. The vendored `BridgeHost`
+forwards `acquire({compat})` to the wire verbatim, so the production
+caller contract lives in this repo.
+
+Orca production wiring (one-time, Orca repo):
+
+```ts
+// Backend init: probe once, bounded, out of band (argv array, no shell).
+const piVersion = await probePiVersionBounded("pi"); // `pi --version`, 5s
+const pi = new PiNativeProvider({ createConnection, requireCompat: true });
+// Per acquire: evidence rides the call; refusal throws PI_COMPAT_* (TUI fallback).
+await pi.acquire({ workspaceRoot, resumePath, compat: { piVersion } });
+// Bridge path equivalent: host.acquire({ resumePath, compat: { piVersion } }).
+```
+
+`supportsCreate` stays the location first-line; this gate is pre-spawn
+defense in depth that cannot be skipped once `requireCompat` is set.
 
 ## 3. Deterministic E2E checklist (no credentials, no binary)
 

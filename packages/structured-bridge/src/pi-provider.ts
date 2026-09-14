@@ -200,6 +200,16 @@ export interface PiBridgeProviderOptions {
    * 3000ms via fetchCatalogShared (shared, bounded).
    */
   piOptionTimeoutMs?: number;
+  /**
+   * Fail closed when version evidence is missing (SNC1.10).
+   * When true, `acquire` without a usable `compat.piVersion` is refused
+   * with `PI_COMPAT_EVIDENCE_MISSING` BEFORE any Pi child is spawned —
+   * the deployer declares compatibility evidence required. Default false
+   * preserves dev-harness/back-compat behavior; production Orca sets this
+   * (one line) and passes its bounded `pi --version` probe as
+   * `compat.piVersion` at acquire (see `docs/snc110-compatibility.md`).
+   */
+  requireCompat?: boolean;
   /** Inject a fake Pi connection (tests). Default constructs a real `PiRpcConnection`. */
   createConnection?: PiConnectionFactory;
   /**
@@ -376,6 +386,7 @@ export class PiBridgeProvider extends BridgeProvider {
   private readonly startupTimeoutMs?: number;
   private readonly piCloseGraceMs: number;
   private readonly piOptionTimeoutMs: number;
+  private readonly requireCompat: boolean;
   private readonly createConnection: PiConnectionFactory;
   private readonly resolvePiSpec?: PiSpecResolver;
 
@@ -399,6 +410,7 @@ export class PiBridgeProvider extends BridgeProvider {
     if (opts.startupTimeoutMs !== undefined) this.startupTimeoutMs = opts.startupTimeoutMs;
     this.piCloseGraceMs = opts.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
     this.piOptionTimeoutMs = opts.piOptionTimeoutMs ?? 8000;
+    this.requireCompat = opts.requireCompat ?? false;
     this.resolvePiSpec = opts.resolvePiSpec;
     this.createConnection =
       opts.createConnection ??
@@ -488,6 +500,23 @@ export class PiBridgeProvider extends BridgeProvider {
         });
         return;
       }
+    }
+    // Deployer declared version evidence required (production Orca sets
+    // `requireCompat: true` and passes its `pi --version` probe as
+    // `compat.piVersion`): missing evidence fails closed pre-spawn, even
+    // when `compat` is present but carries no version.
+    const versionEvidence = typeof msg.compat?.piVersion === "string" ? msg.compat.piVersion.trim() : "";
+    if (this.requireCompat && versionEvidence === "") {
+      this.send({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "error",
+        opId: msg.opId,
+        error: {
+          code: "PI_COMPAT_EVIDENCE_MISSING",
+          message: "acquire requires Pi version evidence (pass compat.piVersion from a bounded pi --version probe; use Pi TUI)",
+        },
+      });
+      return;
     }
     const sessionId = msg.sessionId ?? this.newId("ses");
     const existing = this.sessions.get(sessionId);
