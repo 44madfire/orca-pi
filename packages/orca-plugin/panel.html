@@ -1,7 +1,11 @@
 <!doctype html>
 <!--
-  Orca–Pi status panel (UI1.2 bridge).
-  Structured by design: live data flows through the versioned Orca↔Orca-Pi
+  Orca–Pi status panel (UI1.2 bridge; DEPRECATED standalone entry).
+  UI1.3+ primary is the Orca-Pi Control Center
+  (panel/control-center.html, id orca-pi-control-center); the manifest
+  keeps `orca-pi-status` only as a compatibility alias pointing at the
+  Control Center. This file remains as a deprecated read-only fallback and
+  must not gain new product surface: live data flows through the versioned Orca↔Orca-Pi
   bridge (typed request/response with stable request IDs and
   validation/conflict/unsupported/auth-setup/internal errors). The panel
   never scrapes terminal output or YAML and never stores a second copy of

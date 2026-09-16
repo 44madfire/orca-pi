@@ -225,27 +225,58 @@ source of truth for completion/status.
 
 ## Orca plugin
 
+Normal path: install the Orca-Pi plugin → open the **Orca-Pi Control
+Center** → configure profiles/orchestration/GitHub → launch through
+Orca. The CLI remains for automation, diagnostics, scripting, and
+recovery (`orca-pi profiles list`, `profile show|inspect|validate|path`,
+`bridge`, `doctor`, `github …`).
+
 - Manifest: `packages/orca-plugin/orca-plugin.json` (manifest v1:
-  `manifestVersion: 1`, `pluginApi: 1`, `engines.orca: ">=1.4.0"`, no
-  capabilities). Install identity: `44madfire.orca-pi`.
-- Panels (`contributes.panels`, declarative sandboxed HTML, no worker):
-  - `orca-pi-status` (`panel.html`) — plugin/CLI version plus `orca-pi doctor`
-    and profile CLI pointers.
-  - `orca-pi-profiles` (`panel/profiles.html`, OP1.7 / JEF-11) — read-only
-    Pi profiles sidebar: effective model/thinking, tool count, skill
-    names/count, extension count, context-file policy, validation state.
-    Live data comes from `orca-pi profiles list --json`; without a supported
-    host bridge the panel shows CLI fallback content. Conservative actions
-    only: validate, show/open/copy config location, refresh/reload. Editing
-    happens in config files — the panel keeps no local store.
-  - Feature detection (`detectPanelSupport()` in `src/panel.ts`) reports
-    read-only support vs `cli-only` fallback; unsupported APIs degrade
-    gracefully without blocking orchestration.
-- No commands yet: manifest v1 treats action-less commands as worker
-  commands requiring a `main` entry, and `action` aliases must come from the
-  host's closed built-in list — so a command waits for a later ticket with a
-  real worker or a suitable built-in action.
-- The plugin is declarative-only: no `main` worker entry, `capabilities: []`.
+  `manifestVersion: 1`, `pluginApi: 1`, `engines.orca: ">=1.4.0"`,
+  capabilities `workspace:read` + `terminal:send` only). Install identity:
+  `44madfire.orca-pi`. Worker entry `worker-entry.mjs` serves the
+  versioned panel↔bridge protocol; panels stay declarative sandboxed HTML.
+- Control Center (`orca-pi-control-center`, `panel/control-center.html`,
+  UI1.3 shell + Profiles, UI1.4 Orchestration, UI1.5 GitHub + Diagnostics)
+  is the single primary UI (one UI, never two independent panels).
+  `orca-pi-status` / `orca-pi-profiles` remain only as compatibility
+  aliases pointing at the same entry. Live data flows through the typed
+  bridge (`bridge.capabilities`, `worktree.context`, `profiles.list`,
+  `profile.read|validate|mutate`, `launch.preview`, `orchestration.get|set`,
+  `github.status|doctor`, `diagnostics.doctor`); the panel never scrapes
+  terminal output or YAML and never stores a second copy of configuration.
+- Configuration layering: built-ins < user/global < project. The editor
+  shows per-field provenance plus the `extends` chain; saves target an
+  explicit user or project scope with a source hash (stale writes conflict
+  with reload/compare instead of overwriting). Built-in bases are
+  immutable, but saving a built-in name creates/updates only the selected
+  layer override (clone only for a new profile name). Resetting a project
+  override reveals the user value; inheritance cycles fail before write.
+- Bridge/Host requirements: structured editing needs Orca app `>=1.4.0` +
+  pluginApi `1` + `workspace:read` consent + the panel↔bridge seam
+  handshake (`window.__ORCA_PI_BRIDGE__.request`; CLI sidecar
+  `orca-pi bridge` where the harness provides it). Otherwise the panel
+  degrades explicitly to read-only CLI fallback with one user-triggered
+  `terminal.sendText` of an allowlisted read-only command (never
+  auto-sent, never parsed). See `docs/ORCA_PLUGIN_API.md`.
+- GitHub identities: the Control Center shows redacted worker/reviewer
+  health (`github.status`/`github.doctor`) — never tokens or private keys.
+  Mint/refresh happens outside the panel via `orca-pi github mint`
+  (operator, outside LLM context). Worker bot != reviewer bot !=
+  `44madfire` (human/ChatGPT review actor with merge authority, never a
+  credential slot). See `docs/GITHUB_IDENTITIES.md`.
+- Windows/WSL: project roots stay absolute and slash-normalized (`C:/`,
+  UNC, `\\wsl.localhost\…` preserved; no `cwd` resolution); atomic writes
+  use sibling-temp + rename. Live Desktop/WSL validation remains a manual
+  checklist (see below); headless tests cover scope normalization only.
+- No worker commands yet: manifest v1 treats action-less commands as worker
+  commands, and `action` aliases must come from the host's closed built-in
+  list — so a command waits for a later ticket with a real worker command
+  or a suitable built-in action.
+- The plugin ships a bridge worker entry (`main: "worker-entry.mjs"`) plus
+  declarative panels; capabilities stay minimal (`workspace:read` for the
+  fallback terminal target, `terminal:send` for one explicit user-gesture
+  fallback send — nothing unused is declared).
 - Skills (`skills/`, installed through Orca's skill flow, not the plugin
   manifest — v1 has no `skills` contribution point):
   - `orca-pi-doctor/SKILL.md` (OP1.1) — read-only `doctor` diagnostics.
@@ -261,14 +292,23 @@ source of truth for completion/status.
 - Dependency-free entry `src/index.ts` (`activate()`, `renderPluginStatus()`)
   proves the artifact loads without Electron.
 
-### Manual smoke test (Orca Desktop)
+### Manual smoke test (Orca Desktop — required for UI1.6 visual/integration items)
 
 1. Build: `npm run build`.
 2. In Orca, load the folder `packages/orca-plugin/` via the development
    plugin loader (it must contain `orca-plugin.json` at its root).
-3. Verify Orca loads it and the `Orca-Pi Status` panel appears,
-   without destabilizing Orca.
+3. Verify Orca loads it and the `Orca-Pi Control Center` panel appears
+   (Profiles · Orchestration · GitHub · Diagnostics), without
+   destabilizing Orca. `orca-pi-status` / `orca-pi-profiles` open the same
+   Control Center entry (compat aliases, one UI).
 4. In a terminal, verify `orca-pi doctor` reports your Orca/Pi versions.
+5. Headless `npm test` does not cover live Desktop rendering, WSL path
+   translation against a real WSL project, live App token mint/refresh, or
+   visual UX (loading/skeleton states, reconnect/retry, dirty-form
+   handling, keyboard/focus behavior, validation/error accessibility,
+   narrow panels, dark/light themes, long strings, large profile sets,
+   slow-GitHub responsiveness) — check those manually on Windows 11 +
+   WSL/Orca Desktop before claiming UI1.6 acceptance.
 
 If your Orca build reports a manifest error, update
 `packages/core/src/pluginManifest.ts`, `orca-plugin.json`, and
