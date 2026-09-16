@@ -3,10 +3,13 @@ import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { BridgeHost, type SessionEventEnvelope } from "../src/host.js";
+import { BridgeHost, type LifecycleEnvelope, type SessionEventEnvelope } from "../src/host.js";
 import { MockExternalProvider } from "../src/provider.js";
+import { PiBridgeProvider, type PiProviderConnection } from "../src/pi-provider.js";
+import { MIN_KNOWN_GOOD_PI_VERSION } from "../src/pi-compat.js";
 import { serializeBridgeLine } from "../src/framing.js";
 import { BRIDGE_PROTOCOL_VERSION, BridgeUnavailableError } from "../src/protocol.js";
+import type { PiRpcCloseResult, PiRpcConnectionOptions, PiServerEvent, PiState } from "@orca-pi/pi-rpc";
 
 /** Minimal ChildProcess stand-in for BridgeHost tests. */
 function createFakeProc() {
@@ -98,6 +101,119 @@ function collectUntilSettled(host: BridgeHost, timeoutMs = 3000): Promise<Sessio
   });
 }
 
+/** Minimal scripted Pi connection: counts construction/starts, never a real process. */
+class CompatProbeFakePi implements PiProviderConnection {
+  static constructed = 0;
+  readonly seenOpts: PiRpcConnectionOptions;
+  started = false;
+  private _closed = false;
+  private readonly eventHandlers = new Set<(e: PiServerEvent) => void>();
+  private readonly exitHandlers = new Set<(info: PiRpcCloseResult) => void>();
+  state: PiState = {
+    model: { id: "glm-5.3-flash", provider: "opencode-go" } as PiState["model"],
+    thinkingLevel: "low",
+    isStreaming: false,
+    isCompacting: false,
+    sessionId: "pi_host_1",
+    messageCount: 0,
+  };
+
+  constructor(opts: PiRpcConnectionOptions) {
+    this.seenOpts = opts;
+    CompatProbeFakePi.constructed += 1;
+  }
+
+  get isClosed(): boolean {
+    return this._closed;
+  }
+
+  async start(): Promise<void> {
+    this.started = true;
+  }
+
+  async prompt(message: string): Promise<void> {
+    void message;
+  }
+
+  async abort(): Promise<void> {}
+
+  async close(graceMs = 2000): Promise<PiRpcCloseResult> {
+    this._closed = true;
+    return { exitCode: 0, signal: null, forced: graceMs === 0 };
+  }
+
+  onEvent(handler: (event: PiServerEvent) => void): () => void {
+    this.eventHandlers.add(handler);
+    return () => {
+      this.eventHandlers.delete(handler);
+    };
+  }
+
+  onExit(handler: (info: PiRpcCloseResult) => void): () => void {
+    this.exitHandlers.add(handler);
+    return () => {
+      this.exitHandlers.delete(handler);
+    };
+  }
+
+  async getState(): Promise<PiState> {
+    return { ...this.state };
+  }
+
+  respondToExtensionUi(): void {}
+
+  async getEntries(): Promise<{ entries: never[]; leafId: string }> {
+    return { entries: [], leafId: "e0" };
+  }
+}
+
+/** Wire a BridgeHost to an in-process PiBridgeProvider (no OS process). */
+function createPiPair(providerOpts: ConstructorParameters<typeof PiBridgeProvider>[0] = {}) {
+  const provider = new PiBridgeProvider({
+    createConnection: (opts) => new CompatProbeFakePi(opts),
+    ...providerOpts,
+  });
+  const proc = createFakeProc();
+  const written: string[] = [];
+  provider.attachTestTransport((msg) => {
+    proc.stdout.emit("data", Buffer.from(serializeBridgeLine(msg), "utf8"));
+  });
+  proc.stdin.write = ((s: string) => {
+    written.push(s);
+    for (const chunk of s.split("\n")) {
+      if (chunk.trim() === "") continue;
+      provider.onLine(chunk.endsWith("\r") ? chunk.slice(0, -1) : chunk);
+    }
+  }) as never;
+  const host = new BridgeHost({
+    bridgeCommand: "pi-in-memory",
+    bridgeArgs: [],
+    workspaceRoot: "/tmp/ws",
+    spawnFn: (() => proc) as never,
+    helloTimeoutMs: 2000,
+    requestTimeoutMs: 5000,
+    closeGraceMs: 50,
+  });
+  const realEnd = proc.stdin.end.bind(proc.stdin);
+  proc.stdin.end = (() => {
+    realEnd();
+    queueMicrotask(() => proc.emit("exit", 0, null));
+  }) as never;
+  return { host, provider, proc, written };
+}
+
+function lastAcquireLine(written: string[]): Record<string, unknown> {
+  const lines = written
+    .flatMap((s) => s.split("\n"))
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const parsed = JSON.parse(lines[i] as string) as Record<string, unknown>;
+    if (parsed["kind"] === "acquire") return parsed;
+  }
+  throw new Error("no acquire line written");
+}
+
 describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
   it("negotiates hello and reports structured support", async () => {
     const { host } = createMockPair();
@@ -133,6 +249,72 @@ describe("BridgeHost + MockExternalProvider (SNC1.3 acceptance)", () => {
     const history = await host.getHistory(sessionId);
     expect(history.entries.some((e) => e.role === "user" && e.text === "hello")).toBe(true);
     expect(history.entries.some((e) => e.role === "assistant" && e.text?.includes("mock response"))).toBe(true);
+    await host.dispose();
+  });
+
+  it("passes acquire-time compat evidence through to the provider (SNC1.10 caller contract)", async () => {
+    const { host, written } = createMockPair();
+    await host.probeSupport();
+    const { sessionId } = await host.acquire({ compat: { piVersion: "0.85.1" } });
+    expect(sessionId).toMatch(/^ses_/);
+    const acquireLine = written.map((s) => s.trim()).filter((s) => s !== "").pop() as string;
+    const msg = JSON.parse(acquireLine) as { kind: string; compat?: { piVersion?: string } };
+    expect(msg.kind).toBe("acquire");
+    expect(msg.compat).toEqual({ piVersion: "0.85.1" });
+    // Absent compat stays absent (dev-harness default unchanged).
+    written.length = 0;
+    await host.acquire();
+    const bare = JSON.parse((written.map((s) => s.trim()).filter((s) => s !== "").pop() as string)) as {
+      kind: string;
+      compat?: unknown;
+    };
+    expect(bare.kind).toBe("acquire");
+    expect("compat" in bare).toBe(false);
+    await host.dispose();
+  });
+
+  it("preserves PI_COMPAT_* acquire refusals end-to-end (code, message, no provider-error event)", async () => {
+    CompatProbeFakePi.constructed = 0;
+    const { host, written } = createPiPair({ requireCompat: true });
+    await host.probeSupport();
+    const lifecycle: LifecycleEnvelope[] = [];
+    host.onLifecycle((envelope) => lifecycle.push(envelope));
+
+    // Version refusal: exact code + useful bounded message survive the hop.
+    const versionErr = await host
+      .acquire({ compat: { piVersion: "0.1.0", requiredCapabilities: ["history"] } })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(versionErr).toBeInstanceOf(BridgeUnavailableError);
+    expect((versionErr as BridgeUnavailableError).code).toBe("PI_COMPAT_VERSION");
+    expect((versionErr as Error).message).toMatch(/unsupported-pi-version/);
+    expect((versionErr as Error).message).toMatch(/Pi TUI/);
+    // Capability refusal: same preservation, still pre-spawn (no Pi child).
+    const capErr = await host
+      .acquire({ compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["teleportation"] } })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(capErr).toBeInstanceOf(BridgeUnavailableError);
+    expect((capErr as BridgeUnavailableError).code).toBe("PI_COMPAT_CAPABILITY");
+    expect((capErr as Error).message).toMatch(/unsupported-capabilities/);
+    expect(CompatProbeFakePi.constructed).toBe(0);
+    // Expected refusals are not provider failures: no generic event.
+    expect(lifecycle.filter((e) => e.kind === "provider-error")).toHaveLength(0);
+    // Compat rode the wire on both refuses (serialization + round trip).
+    expect(lastAcquireLine(written)["compat"]).toEqual({
+      piVersion: MIN_KNOWN_GOOD_PI_VERSION,
+      requiredCapabilities: ["teleportation"],
+    });
+    // Control: a passing gate still acquires through the host.
+    const ok = await host.acquire({
+      compat: { piVersion: MIN_KNOWN_GOOD_PI_VERSION, requiredCapabilities: ["history"] },
+    });
+    expect(ok.sessionId).toMatch(/^ses_/);
+    expect(CompatProbeFakePi.constructed).toBe(1);
     await host.dispose();
   });
 
