@@ -1,0 +1,59 @@
+# Driver profile: orchestrator-pi (in-process subagent layer).
+#
+# This is the Orca worker Pi session that fans out to gotgenes subagents
+# (scout/task/reviewer/oracle/designer/planner from agents/). It implements
+# AND delegates within one Pi process:
+# - full tools (it edits code) plus the pi-orchestration playbook skill.
+# - session is `fresh` so background subagents track across the run.
+# - extensions: [] here because the fork checkout path is machine-local.
+#   After cloning https://github.com/44madfire/pi-packages (branch
+#   feat/model-aliases until merged), add ONE project-local override, e.g. in
+#   <projectRoot>/.pi/profiles.yaml:
+#
+#     profiles:
+#       driver:
+#         extensions: [third-party/pi-packages/packages/pi-subagents/src/index.ts]
+#
+#   (clone the fork to <projectRoot>/third-party/pi-packages). The extension
+#   entry must stay a project-relative path (schema rejects absolute/URL).
+# - NEVER attach orca-pi-orchestration or run `orca-pi spawn` here: nested
+#   Orca supervision causes double-spend and worktree chaos. Escalation inside
+#   this layer is ask_parent → oracle → steer (see skills/pi-orchestration).
+#   gotgenes strips subagent tools from children unconditionally, so leaves
+#   cannot nest — oracle queries are always driver-mediated.
+#
+# Launch: orca-pi spawn driver --task "<issue handoff>" --worktree new-child --name <issue> --json
+# Validate with: orca-pi profile inspect driver --project-root .
+
+profiles:
+  driver:
+    thinking: high
+    systemPrompt: |-
+      You are an issue driver. Decompose the task, delegate research/review to
+      subagents, implement the core change, and validate it.
+
+      Rules:
+      - Fan out first: spawn scout for unfamiliar code before implementing.
+      - Implement the smallest scoped change that meets acceptance criteria.
+      - Review every diff: resume reviewer on the change, apply blocking findings.
+      - Escalate when stuck: ask oracle via a fresh subagent call with full context,
+        then steer the blocked work with the answer. Leaves cannot spawn — you mediate.
+      - Validate: run the focused tests/typecheck/lint covering the change.
+      - Report: changed files, validation results, unresolved concerns, subagent IDs used.
+
+      Output format:
+      1. Plan (scout findings → approach)
+      2. Changes (file — what changed and why)
+      3. Reviews (reviewer verdict — findings applied)
+      4. Validation (command — result)
+      5. Unresolved concerns (explicit; write "None" if empty)
+    tools: [read, grep, find, ls, bash, edit, write]
+    skills: [packages/orca-plugin/skills/pi-orchestration]
+    extensions: []
+    contextFiles: true
+    discoverSkills: false
+    discoverExtensions: false
+    session: fresh
+    githubIdentity: worker
+    displayName: Driver
+    description: Issue driver. Implements and fans out to in-process subagents.

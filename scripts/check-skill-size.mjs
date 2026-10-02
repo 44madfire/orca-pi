@@ -3,9 +3,10 @@
 /**
  * Skill-size regression guard (OP1.5 / JEF-9).
  *
- * Compares the compact `orca-pi-orchestration` skill against the upstream
- * `orca skills get orchestration --full` guide so documentation growth is
- * visible during review.
+ * Compares the compact orchestration skills (`orca-pi-orchestration` against
+ * the upstream `orca skills get orchestration --full` guide, plus the
+ * `pi-orchestration` driver playbook against the same budget) so
+ * documentation growth is visible during review.
  *
  * Usage:
  *   node scripts/check-skill-size.mjs [--json] [--max-bytes <n>] [--max-tokens <n>]
@@ -22,7 +23,10 @@ import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SKILL_REL = "../packages/orca-plugin/skills/orca-pi-orchestration/SKILL.md";
+const SKILL_RELS = [
+  "../packages/orca-plugin/skills/orca-pi-orchestration/SKILL.md",
+  "../packages/orca-plugin/skills/pi-orchestration/SKILL.md",
+];
 const BASELINE_FULL_BYTES = 42500;
 const BASELINE_FULL_LINES = 440;
 const DEFAULT_MAX_BYTES = 6000;
@@ -86,38 +90,48 @@ async function main() {
     process.exit(2);
   }
   const here = dirname(fileURLToPath(import.meta.url));
-  const skillPath = join(here, SKILL_REL);
-  let skillText;
-  try {
-    skillText = await readFile(skillPath, "utf8");
-  } catch (error) {
-    console.error(`error: could not read skill at ${skillPath}: ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(1);
-  }
-  const skill = {
-    bytes: Buffer.byteLength(skillText, "utf8"),
-    lines: skillText.split("\n").length,
-    words: skillText.trim().split(/\s+/).length,
-    tokens: approxTokens(skillText),
-  };
   const full = measureFullGuide();
-  const ratio = full.bytes > 0 ? skill.bytes / full.bytes : 0;
-  const ok = skill.bytes <= opts.maxBytes && skill.tokens <= opts.maxTokens;
+  const skills = [];
+  let ok = true;
+  for (const rel of SKILL_RELS) {
+    const skillPath = join(here, rel);
+    let skillText;
+    try {
+      skillText = await readFile(skillPath, "utf8");
+    } catch (error) {
+      console.error(`error: could not read skill at ${skillPath}: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+    const skill = {
+      path: rel,
+      bytes: Buffer.byteLength(skillText, "utf8"),
+      lines: skillText.split("\n").length,
+      words: skillText.trim().split(/\s+/).length,
+      tokens: approxTokens(skillText),
+      maxBytes: opts.maxBytes,
+      maxTokens: opts.maxTokens,
+    };
+    skill.ok = skill.bytes <= opts.maxBytes && skill.tokens <= opts.maxTokens;
+    if (!skill.ok) ok = false;
+    skills.push(skill);
+  }
+  const ratio = full.bytes > 0 ? skills[0].bytes / full.bytes : 0;
   const report = {
     ok,
-    skill: { path: SKILL_REL, ...skill, maxBytes: opts.maxBytes, maxTokens: opts.maxTokens },
+    skills,
     fullGuide: { bytes: full.bytes, lines: full.lines, tokens: full.tokens, live: full.live, baselineBytes: BASELINE_FULL_BYTES },
     ratio: Number(ratio.toFixed(3)),
-    summary: `skill ${skill.bytes} bytes (~${skill.tokens} tokens, ${skill.lines} lines) vs full guide ${full.bytes} bytes (~${full.tokens} tokens) — ${(ratio * 100).toFixed(1)}%${full.live ? "" : " (baseline; orca unavailable)"}`,
+    summary: skills.map((s) => `${s.path}: ${s.bytes} bytes (~${s.tokens} tokens, ${s.lines} lines) — ${s.ok ? "PASS" : "FAIL"}`).join("\n") +
+      `\nvs full guide ${full.bytes} bytes (~${full.tokens} tokens) — ${(ratio * 100).toFixed(1)}%${full.live ? "" : " (baseline; orca unavailable)"}`,
   };
   if (opts.json) {
     console.log(JSON.stringify(report, null, 2));
   } else {
     console.log(report.summary);
-    console.log(`budget: <= ${opts.maxBytes} bytes, <= ${opts.maxTokens} tokens — ${ok ? "PASS" : "FAIL"}`);
-    if (!ok) {
-      if (skill.bytes > opts.maxBytes) console.log(`  over bytes budget by ${skill.bytes - opts.maxBytes}`);
-      if (skill.tokens > opts.maxTokens) console.log(`  over tokens budget by ${skill.tokens - opts.maxTokens}`);
+    console.log(`budget per skill: <= ${opts.maxBytes} bytes, <= ${opts.maxTokens} tokens — ${ok ? "PASS" : "FAIL"}`);
+    for (const s of skills) {
+      if (s.bytes > opts.maxBytes) console.log(`  ${s.path} over bytes budget by ${s.bytes - opts.maxBytes}`);
+      if (s.tokens > opts.maxTokens) console.log(`  ${s.path} over tokens budget by ${s.tokens - opts.maxTokens}`);
     }
   }
   process.exit(ok ? 0 : 1);

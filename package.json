@@ -34,6 +34,7 @@
     "skills": [
       "./packages/orca-plugin/skills/orca-pi-doctor",
       "./packages/orca-plugin/skills/orca-pi-orchestration",
+      "./packages/orca-plugin/skills/pi-orchestration",
       "./packages/orca-plugin/skills/orca-pi-github"
     ]
   }

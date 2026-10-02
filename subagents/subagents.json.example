@@ -1,0 +1,10 @@
+{
+  "$comment": "Template for ~/.pi/agent/subagents.json (global) — merge modelAliases and point each alias at a real provider/model-id you have auth for. Project file <cwd>/.pi/subagents.json replaces the WHOLE modelAliases map (shallow merge). Requires the pi-packages fork, branch feat/model-aliases until merged.",
+  "maxConcurrent": 4,
+  "modelAliases": {
+    "fast": "anthropic/claude-haiku-4-5",
+    "balanced": "anthropic/claude-sonnet-4-6",
+    "review": "anthropic/claude-sonnet-4-6",
+    "max": "anthropic/claude-opus-4-6"
+  }
+}

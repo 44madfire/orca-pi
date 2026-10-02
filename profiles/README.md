@@ -198,3 +198,14 @@ profiles:
   <https://github.com/up0to1/pi-mono/blob/main/packages/coding-agent/README.md>
 - Skills (Agent Skills standard, discovery, `--skill`/`--no-skills`):
   <https://github.com/can1357/pi-mono/blob/main/packages/coding-agent/docs/skills.md>
+
+## Orchestration-layer profiles (two-layer system, see docs/SUBAGENTS.md)
+
+| Profile | Layer | Tools | Skill | Session | Notes |
+|---|---|---|---|---|---|
+| `coordinator` | orchestrator-me (Orca) | `read,bash` (no edits) | `orca-pi-orchestration` | `fresh` | Supervises workers, never implements |
+| `driver` | orchestrator-pi (gotgenes) | full incl. `edit/write` | `pi-orchestration` | `fresh` | Implements + fans out to subagents; add fork ext. via project-local override (see `driver.yaml`) |
+
+Role prompts for gotgenes leaves live in `agents/` (templates installed to
+`~/.pi/agent/agents/`), **not** in this directory — this directory holds Orca
+worker launch profiles only. Alias map template: `subagents/subagents.json.example`.

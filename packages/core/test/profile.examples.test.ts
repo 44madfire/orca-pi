@@ -35,12 +35,41 @@ describe("shipped profile examples", () => {
   });
 
   it("per-role profile files parse, validate, and resolve", () => {
-    for (const name of ["scout", "worker", "reviewer"] as const) {
+    for (const name of ["scout", "worker", "reviewer", "coordinator", "driver"] as const) {
       const text = readShipped(`profiles/${name}.yaml`);
       const doc = parseAndValidateProfilesText(text, `profiles/${name}.yaml`);
       expect(listProfileNames(doc)).toEqual([name]);
       const all = resolveAllProfiles(doc);
       expect(all[name]?.name ?? name).toBeTruthy();
     }
+  });
+
+  it("orchestration layers stay separated by absence", () => {
+    const coordinator = resolveAllProfiles(
+      parseAndValidateProfilesText(readShipped("profiles/coordinator.yaml"), "profiles/coordinator.yaml"),
+    ).coordinator;
+    const driver = resolveAllProfiles(
+      parseAndValidateProfilesText(readShipped("profiles/driver.yaml"), "profiles/driver.yaml"),
+    ).driver;
+    // Coordinator never touches code; driver implements.
+    expect(coordinator?.tools).not.toContain("edit");
+    expect(coordinator?.tools).not.toContain("write");
+    expect(driver?.tools).toContain("edit");
+    expect(driver?.tools).toContain("write");
+    // Each layer attaches only its own skill (exact entries — note
+    // "orca-pi-orchestration" contains "pi-orchestration" as a substring).
+    expect(coordinator?.skills).toEqual([
+      "packages/orca-plugin/skills/orca-pi-orchestration",
+    ]);
+    expect(driver?.skills).toEqual(["packages/orca-plugin/skills/pi-orchestration"]);
+    expect(driver?.skills?.join(" ")).not.toContain("orca-pi-orchestration");
+    // Neither layer discovers ambient skills/extensions; driver extensions stay
+    // empty here (fork checkout path is machine-local, added via project override).
+    expect(coordinator?.discoverSkills).toBe(false);
+    expect(driver?.discoverSkills).toBe(false);
+    expect(driver?.extensions).toEqual([]);
+    // Long supervision/fan-out runs keep transcripts.
+    expect(coordinator?.session).toBe("fresh");
+    expect(driver?.session).toBe("fresh");
   });
 });
