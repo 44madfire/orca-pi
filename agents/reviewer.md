@@ -1,8 +1,6 @@
 ---
 description: Independent fresh-context code review with Blocking vs Non-blocking verdict
 tools: read, grep, find, ls, bash
-model: review
-thinking: high
 max_turns: 30
 prompt_mode: replace
 ---

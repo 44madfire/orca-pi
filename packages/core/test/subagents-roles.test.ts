@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..", "..");
 const agentsDir = join(repoRoot, "agents");
-const examplePath = join(repoRoot, "subagents", "subagents.json.example");
+const examplePath = join(repoRoot, "model-aliases", "model-aliases.json.example");
 
 const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const GUARDED_NAMES = ["subagent", "get_subagent_result", "steer_subagent"];
@@ -65,30 +65,46 @@ describe("gotgenes role templates (agents/)", () => {
     }
   });
 
-  it("read-only roles cannot edit; oracle is pinned and locked", () => {
+  it("read-only roles cannot edit", () => {
     for (const name of ["scout", "reviewer", "oracle", "planner"]) {
       const { frontmatter } = parseAgentFile(name);
       const tools = toolList(frontmatter.tools ?? "");
       expect(tools, name).not.toContain("edit");
       expect(tools, name).not.toContain("write");
     }
-    const oracle = parseAgentFile("oracle");
-    expect(oracle.frontmatter.locked).toContain("model");
     const task = parseAgentFile("task");
     expect(toolList(task.frontmatter.tools ?? "")).toContain("write");
   });
 
-  it("agent models are aliases resolved by subagents.json.example (single swap point)", () => {
-    expect(existsSync(examplePath)).toBe(true);
-    const example = JSON.parse(readFileSync(examplePath, "utf8")) as {
-      modelAliases: Record<string, string>;
-    };
+  it("roles are model-agnostic: tiers live in model-aliases.json.example", () => {
+    // No `model`/`thinking` pins in agent files — the model-aliases extension
+    // substitutes tiers per call, so swaps never touch these files.
     for (const name of EXPECTED_ROLES) {
       const { frontmatter } = parseAgentFile(name);
-      const model = frontmatter.model ?? "";
-      // Alias or fuzzy: never a hardcoded provider/model-id (contains "/").
-      expect(model, `${name}: model must be an alias, not provider/model`).not.toContain("/");
-      expect(Object.keys(example.modelAliases), `${name}: alias ${model}`).toContain(model);
+      expect(frontmatter.model, `${name}: no model pin`).toBeUndefined();
+      expect(frontmatter.thinking, `${name}: no thinking pin`).toBeUndefined();
+      expect(frontmatter.locked, `${name}: nothing to lock`).toBeUndefined();
+    }
+    expect(existsSync(examplePath)).toBe(true);
+    const example = JSON.parse(readFileSync(examplePath, "utf8")) as {
+      aliases: Record<string, { model: string; thinking?: string; fallbacks?: string[] }>;
+    };
+    expect(Object.keys(example.aliases).length).toBeGreaterThan(0);
+    for (const [alias, target] of Object.entries(example.aliases)) {
+      expect(target.model, `alias ${alias} pins a real model`).toContain("/");
+    }
+  });
+
+  it("playbook mapping table covers every role and alias", () => {
+    const playbook = readFileSync(join(repoRoot, "pi-extensions", "playbook.md"), "utf8");
+    const example = JSON.parse(readFileSync(examplePath, "utf8")) as {
+      aliases: Record<string, unknown>;
+    };
+    for (const name of EXPECTED_ROLES) {
+      expect(playbook, `playbook maps role ${name}`).toContain(`\`${name}\``);
+    }
+    for (const alias of Object.keys(example.aliases)) {
+      expect(playbook, `playbook maps alias ${alias}`).toContain(`\`${alias}\``);
     }
   });
 

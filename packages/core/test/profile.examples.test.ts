@@ -67,18 +67,22 @@ describe("shipped profile examples", () => {
       "packages/orca-plugin/skills/orca-pi-orchestration",
     ]);
     expect(driver?.skills).toEqual([]);
-    // Driver extensions are committed paths: valid in every worktree.
+    // Driver extensions are committed paths: valid in every worktree. The
+    // subagent framework itself is user-installed (ambient discovery on).
     expect(driver?.extensions).toEqual([
-      "third-party/pi-subagents/src/index.ts",
       "pi-extensions/driver-context.ts",
+      "pi-extensions/model-aliases.ts",
     ]);
     for (const ext of driver?.extensions ?? []) {
-      expect(existsSync(join(repoRoot, ext)), `vendored ext present: ${ext}`).toBe(true);
+      expect(existsSync(join(repoRoot, ext)), `committed ext present: ${ext}`).toBe(true);
     }
-    // Neither layer discovers ambient skills/extensions.
+    // Neither layer discovers ambient skills. The coordinator is fully
+    // hermetic (--no-extensions); the driver enables extension discovery so
+    // the user-installed framework package loads (see driver.yaml).
     expect(coordinator?.discoverSkills).toBe(false);
+    expect(coordinator?.discoverExtensions).toBe(false);
     expect(driver?.discoverSkills).toBe(false);
-    expect(driver?.discoverExtensions).toBe(false);
+    expect(driver?.discoverExtensions).toBe(true);
     // Long supervision/fan-out runs keep transcripts.
     expect(coordinator?.session).toBe("fresh");
     expect(driver?.session).toBe("fresh");
@@ -110,8 +114,11 @@ describe("shipped profile examples", () => {
     expect(driverLaunch.spec.args).toContain("--extension");
     const args = driverLaunch.spec.args.join(" ");
     // Launcher emits project-joined paths (posix separators).
-    expect(args).toContain("third-party/pi-subagents/src/index.ts");
     expect(args).toContain("pi-extensions/driver-context.ts");
+    expect(args).toContain("pi-extensions/model-aliases.ts");
+    expect(args).not.toContain("third-party");
+    // Ambient discovery stays on so the user-installed framework loads.
+    expect(driverLaunch.spec.args).not.toContain("--no-extensions");
     expect(driverLaunch.spec.args).toContain("--no-skills");
     expect(driverLaunch.spec.args).toContain("--tools");
   });

@@ -1,8 +1,6 @@
 ---
 description: Read-only implementation planner. Produces plans with acceptance criteria and verification steps
 tools: read, grep, find, ls, bash
-model: balanced
-thinking: high
 max_turns: 30
 prompt_mode: replace
 ---

@@ -1,8 +1,6 @@
 ---
 description: Fast read-only codebase reconnaissance with evidence-backed handoff
 tools: read, grep, find, ls
-model: fast
-thinking: low
 max_turns: 30
 prompt_mode: replace
 ---

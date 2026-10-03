@@ -1,8 +1,6 @@
 ---
 description: Bounded implementation leaf. Executes a scoped spec, validates, reports
 tools: read, grep, find, ls, bash, edit, write
-model: balanced
-thinking: high
 prompt_mode: append
 ---
 

@@ -7,5 +7,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["pi-extensions/**/*.ts", "packages/core/test/driver-context.test.ts"]
+  "include": ["pi-extensions/**/*.ts", "packages/core/test/driver-context.test.ts", "packages/core/test/model-aliases.test.ts"]
 }

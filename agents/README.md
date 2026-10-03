@@ -1,24 +1,26 @@
 # agents/
 
 Gotgenes subagent role definitions for the driver layer
-(`profiles/driver.yaml` + `pi-orchestration` skill). These are **templates** —
+(`profiles/driver.yaml` + `pi-extensions/`). These are **templates** —
 copy them into Pi's agent directory; they are not loaded from this repo
-directly.
+directly. Files intentionally carry no `model`/`thinking` — tiers resolve
+per call from `model-aliases.json` via the model-aliases extension.
 
 ## Install
 
 ```sh
-# 1. Framework is vendored in this repo (third-party/pi-subagents, see VENDOR.md).
-#    No clone needed. Refresh after upstream changes:
-#    node scripts/vendor-pi-subagents.mjs
+# 1. Framework (pinned stock, no fork): one-time per machine
+pi install npm:@gotgenes/pi-subagents@22.0.0
+#    optionally also declare it in ~/.pi/agent/settings.json:
+#    { "packages": ["npm:@gotgenes/pi-subagents@22.0.0"] }
 
 # 2. Copy roles to Pi's global agent dir
 mkdir -p ~/.pi/agent/agents
 cp agents/*.md ~/.pi/agent/agents/
 
-# 3. Merge aliases into Pi settings (create if absent)
-# See subagents/subagents.json.example — copy modelAliases into
-# ~/.pi/agent/subagents.json and point each alias at a real
+# 3. Install the alias map (create if absent)
+# See model-aliases/model-aliases.json.example — copy to
+# ~/.pi/agent/model-aliases.json and point each alias at a real
 # provider/model-id you have auth for.
 ```
 
@@ -27,14 +29,18 @@ project wins over global for the same filename.
 
 ## Roles
 
-| File | Job | Model alias | Thinking | Mode |
-|---|---|---|---|---|
-| `scout.md` | Read-only recon, evidence handoff | `fast` | low | replace |
-| `task.md` | Bounded implementation leaf | `balanced` | high | append |
-| `reviewer.md` | Fresh-context review, verdict blocks PR | `review` | high | replace |
-| `oracle.md` | Strategic advice, final review. Pinned + `locked` | `max` | max | replace |
-| `designer.md` | UI/UX craft + review | `balanced` | high | append |
-| `planner.md` | Read-only plan with acceptance criteria | `balanced` | high | replace |
+| File | Job | Spawn alias | Mode |
+|---|---|---|---|
+| `scout.md` | Read-only recon, evidence handoff | `fast` | replace |
+| `task.md` | Bounded implementation leaf | `balanced` | append |
+| `reviewer.md` | Fresh-context review, verdict blocks PR | `review` | replace |
+| `oracle.md` | Strategic advice, final review (model per call) | `max` | replace |
+| `designer.md` | UI/UX craft + review | `balanced` | append |
+| `planner.md` | Read-only plan with acceptance criteria | `balanced` | replace |
+
+Pass the alias as the spawn's `model` (the model-aliases extension
+substitutes tiers + fallbacks; see `pi-extensions/playbook.md` for the full
+mapping table).
 
 Adapted from `oh-my-opencode-slim` role prompts; OpenCode-only tools
 (`glob`, `ast_grep_search`, `context7`, `gh_grep`) mapped to Pi built-ins

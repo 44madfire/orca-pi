@@ -1,16 +1,20 @@
 # Driver profile: orchestrator-pi (in-process subagent layer).
 #
-# This is the Orca worker Pi session that fans out to gotgenes subagents
+# This is the Orca worker Pi session that fans out to stock gotgenes subagents
 # (scout/task/reviewer/oracle/designer/planner from agents/). It implements
 # AND delegates within one Pi process:
 # - full tools (it edits code); orchestration policy arrives via the
 #   pi-extensions/driver-context extension (tagged prompt section, active
-#   only when the `subagent` tool is registered — never in leaves).
-# - extensions are COMMITTED paths (third-party/ + pi-extensions/), so they
-#   exist in every Orca worktree by git construction. third-party/pi-subagents
-#   is a vendored copy of https://github.com/44madfire/pi-packages
-#   (see third-party/pi-subagents/VENDOR.md; refresh with
-#   node scripts/vendor-pi-subagents.mjs). No machine-local clone needed.
+#   only when the `subagent` tool is registered — never in leaves), and
+#   model aliases resolve via pi-extensions/model-aliases.ts (tool_call
+#   rewrite from model-aliases.json — no framework fork required).
+# - The subagent framework itself is NOT vendored: each machine installs the
+#   pinned stock package once (`pi install npm:@gotgenes/pi-subagents@22.0.0`,
+#   also declared in settings.json `packages`), so `discoverExtensions` stays
+#   true here and ambient user packages load too. That variance is accepted
+#   consciously: it keeps zero framework bytes in-repo and tracks upstream
+#   without re-vendoring. Our two pi-extensions are committed paths, so they
+#   exist in every Orca worktree by git construction.
 # - skills: [] — the pi-orchestration SKILL.md is a pointer stub only; the
 #   policy travels via the extension surface children do not inherit.
 # - session is `fresh` so background subagents track across the run.
@@ -27,6 +31,9 @@
 # Install (one-time, mirrors the profiles/examples.yaml flow): copy this
 # `driver:` block into $PI_CODING_AGENT_DIR/profiles.yaml or
 # <projectRoot>/.pi/profiles.yaml, then `orca-pi profile inspect driver`.
+# Plus per-machine: `pi install npm:@gotgenes/pi-subagents@22.0.0`,
+# `cp agents/*.md ~/.pi/agent/agents/`, merge
+# model-aliases/model-aliases.json.example into ~/.pi/agent/model-aliases.json.
 # Launch: orca-pi spawn driver --task "<issue handoff>" --worktree new-child --name <issue> --json
 # Validate with: orca-pi profile inspect driver --project-root .
 
@@ -55,10 +62,10 @@ profiles:
       5. Unresolved concerns (explicit; write "None" if empty)
     tools: [read, grep, find, ls, bash, edit, write]
     skills: []
-    extensions: [third-party/pi-subagents/src/index.ts, pi-extensions/driver-context.ts]
+    extensions: [pi-extensions/driver-context.ts, pi-extensions/model-aliases.ts]
     contextFiles: true
     discoverSkills: false
-    discoverExtensions: false
+    discoverExtensions: true
     session: fresh
     githubIdentity: worker
     displayName: Driver

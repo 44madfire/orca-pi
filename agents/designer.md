@@ -1,8 +1,6 @@
 ---
 description: Frontend UI/UX specialist. Crafts and reviews intentional, polished experiences
 tools: read, grep, find, ls, bash, edit, write
-model: balanced
-thinking: high
 prompt_mode: append
 ---
 

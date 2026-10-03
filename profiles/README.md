@@ -204,8 +204,8 @@ profiles:
 | Profile | Layer | Tools | Skill | Session | Notes |
 |---|---|---|---|---|---|
 | `coordinator` | orchestrator-me (Orca) | `read,bash` (no edits) | `orca-pi-orchestration` | `fresh` | Supervises workers, never implements |
-| `driver` | orchestrator-pi (gotgenes) | full incl. `edit/write` | none (policy via `driver-context` ext.) | `fresh` | Implements + fans out; extensions vendored in-repo (see `driver.yaml`, `third-party/pi-subagents/VENDOR.md`) |
+| `driver` | orchestrator-pi (gotgenes) | full incl. `edit/write` | none (policy via `driver-context` ext., tiers via `model-aliases` ext.) | `fresh` | Implements + fans out; framework user-installed (pinned spec in `driver.yaml`), ours committed (see `driver.yaml`) |
 
 Role prompts for gotgenes leaves live in `agents/` (templates installed to
 `~/.pi/agent/agents/`), **not** in this directory — this directory holds Orca
-worker launch profiles only. Alias map template: `subagents/subagents.json.example`.
+worker launch profiles only. Alias map template: `model-aliases/model-aliases.json.example`.

@@ -8,7 +8,8 @@ description: Pointer to the driver playbook. The policy itself is injected by th
 Driver orchestration policy is **not** stored here. It lives in
 `pi-extensions/playbook.md` and is injected as a tagged system-prompt
 section by `pi-extensions/driver-context.ts`, which only activates in
-sessions registering the `subagent` tool (the driver).
+sessions registering the `subagent` tool (the driver). Model tiers live in
+`model-aliases.json`, substituted per call by `pi-extensions/model-aliases.ts`.
 
 Why: the pi-subagents runtime inherits parent skills into child sessions,
 so a skill body would leak driver-only instructions into every leaf.
