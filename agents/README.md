@@ -46,6 +46,7 @@ set plus explicitly installed extension tools.
 
 Gotgenes strips `subagent`/`get_subagent_result`/`steer_subagent` from every
 child unconditionally — leaves **cannot nest**. Escalation is always
-driver-mediated: leaf `ask_parent` → driver calls `oracle` → driver
-`steer_subagent`s the leaf. `task.md`/`scout.md` restate this so the model
-doesn't try.
+driver-mediated: leaf `ask_parent` (ends its turn) → driver calls `oracle` →
+driver continues the leaf via `subagent` with `resume:` (`steer_subagent`
+rejects ended turns). `task.md`/`scout.md` restate the no-nesting rule so the
+model doesn't try.

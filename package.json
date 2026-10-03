@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --verbose",
+    "typecheck:extensions": "tsc --noEmit -p tsconfig.pi-extensions.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",

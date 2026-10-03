@@ -32,10 +32,18 @@ Swap targets there — never edit agent files per model change.
 
 ## Escalation (leaves cannot spawn — you mediate)
 
+`ask_parent` ends the leaf's turn, and `steer_subagent` rejects agents
+that are not running — so the continuation is always a resume, never a
+steer:
+
 1. A stuck leaf calls `ask_parent` and ends its turn with the question.
 2. Call `oracle` with full context (result text + files).
-3. `steer_subagent(<leaf-id>, oracle-answer)` to continue it in place.
+3. `subagent({ resume: <leaf-id>, prompt: <oracle answer + next step> })`
+   to continue it in place with full history.
 4. `notify_parent` findings arrive exactly once — act only if that agent still runs.
+
+(Use `steer_subagent` only for agents still running — e.g. redirecting live
+work after a `notify_parent` update — never to answer an `ask_parent`.)
 
 ## Rules
 

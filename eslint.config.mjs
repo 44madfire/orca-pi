@@ -5,7 +5,9 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["**/dist/**", "**/node_modules/**", "**/*.html"],
+    // third-party/ is a vendored external boundary (see VENDOR.md): Orca's
+    // first-party rules do not apply to upstream source.
+    ignores: ["**/dist/**", "**/node_modules/**", "**/*.html", "third-party/**"],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,

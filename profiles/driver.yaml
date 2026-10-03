@@ -16,7 +16,7 @@
 # - session is `fresh` so background subagents track across the run.
 # - NEVER attach orca-pi-orchestration or run `orca-pi spawn` here: nested
 #   Orca supervision causes double-spend and worktree chaos. Escalation inside
-#   this layer is ask_parent → oracle → steer (see pi-extensions/playbook.md).
+#   this layer is ask_parent → oracle → resume (see pi-extensions/playbook.md).
 #   gotgenes strips subagent tools from children unconditionally, so leaves
 #   cannot nest — oracle queries are always driver-mediated.
 # - Shell caveat: this profile keeps `bash` for implementation/validation, so
@@ -42,7 +42,8 @@ profiles:
       - Implement the smallest scoped change that meets acceptance criteria.
       - Review every diff: resume reviewer on the change, apply blocking findings.
       - Escalate when stuck: ask oracle via a fresh subagent call with full context,
-        then steer the blocked work with the answer. Leaves cannot spawn — you mediate.
+        then resume the blocked leaf with the answer (`subagent` + `resume:` —
+        `steer_subagent` rejects ended turns). Leaves cannot spawn — you mediate.
       - Validate: run the focused tests/typecheck/lint covering the change.
       - Report: changed files, validation results, unresolved concerns, subagent IDs used.
 

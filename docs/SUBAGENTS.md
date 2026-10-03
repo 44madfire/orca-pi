@@ -51,9 +51,11 @@ dispatch is a bug, visible in `orca-pi status` sweeps; fence with
 ## Escalation (leaves can't nest)
 
 Gotgenes removes `subagent` tools from every child — oracle queries are
-driver-mediated: leaf `ask_parent` (ends turn) → driver calls `oracle` with
-full context → driver `steer_subagent`s the leaf. `notify_parent` findings
-arrive exactly once; act only if the agent still runs.
+driver-mediated: leaf `ask_parent` (ends its turn) → driver calls `oracle`
+with full context → driver continues the leaf via
+`subagent({ resume: <leaf-id>, prompt: <oracle answer> })`. (`steer_subagent`
+rejects non-running agents — steer live work only, never answer ended turns.)
+`notify_parent` findings arrive exactly once; act only if the agent still runs.
 
 ## Conventions
 
