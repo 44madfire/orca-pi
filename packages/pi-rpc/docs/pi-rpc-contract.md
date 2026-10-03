@@ -1,6 +1,6 @@
 # Pi RPC Contract (SNC1.1 — authoritative)
 
-Validated against **real Pi `0.85.1`** in `--mode rpc` (not OMP/mocks).
+Framing fixtures captured against **real Pi `0.85.1`** in `--mode rpc` (not OMP/mocks); replay suite, launch argv, and CLI flags re-verified against **Pi `1.0.0`** with no contract drift observed (live-session re-capture deferred — needs model auth).
 Fixtures: `packages/pi-rpc/fixtures/*.jsonl` (normalized, secret-free,
 LF-only). Spike client: `packages/pi-rpc/src/spike-client.ts` (strict
 LF-only JSONL). Capture procedure: `packages/pi-rpc/spike/README.md`.

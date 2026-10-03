@@ -31,12 +31,35 @@ function realRunner(): ProcessRunner | undefined {
   };
 }
 
+/**
+ * Keep real-git invocations hermetic: never consult the user's global/system
+ * gitconfig (which may register interactive credential helpers such as Git
+ * Credential Manager that pop OS login dialogs for unknown hosts like
+ * example.invalid), and never prompt on the terminal. Spawns have no TTY, so
+ * an unanswered `git credential fill` would otherwise fall back to the GUI
+ * askpass (`Username for 'https://...'`); pointing it at echo fails such
+ * prompts silently with empty output. Repo-local config under test is
+ * unaffected.
+ */
+function isolatedGitEnv(): Record<string, string> {
+  const dir = mkdtempSync(join(tmpdir(), "orca-pi-gitcfg-"));
+  const empty = join(dir, "empty.config");
+  writeFileSync(empty, "");
+  return {
+    GIT_CONFIG_GLOBAL: empty,
+    GIT_CONFIG_SYSTEM: empty,
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "never",
+    GIT_ASKPASS: "echo",
+  };
+}
+
 function git(args: readonly string[], cwd: string, env?: Record<string, string>): { stdout: string; stderr: string; status: number } {
   const result = spawnSync("git", [...args], {
     cwd,
     encoding: "utf8",
     windowsHide: true,
-    ...(env ? { env: { ...process.env, ...env } } : {}),
+    env: { ...process.env, ...isolatedGitEnv(), ...(env ?? {}) },
   });
   return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", status: result.status ?? 1 };
 }
@@ -114,13 +137,14 @@ describe("setup-git linked worktree integration (real git, no runner mocks)", ()
       const overlay = buildWorkerExecEnv("WORKER_TOKEN", {
         helperCommand: workerCmd,
       });
+      const iso = isolatedGitEnv();
       const fill = (input: string, env?: Record<string, string>) =>
         spawnSync("git", ["credential", "fill"], {
           cwd: base,
           input,
           encoding: "utf8",
           windowsHide: true,
-          env: { ...process.env, ...(env ?? {}) },
+          env: { ...process.env, ...iso, ...(env ?? {}) },
         });
       const githubInput = "protocol=https\nhost=github.com\n\n";
       const withOverlay = fill(githubInput, overlay);
