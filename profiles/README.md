@@ -204,7 +204,7 @@ profiles:
 | Profile | Layer | Tools | Skill | Session | Notes |
 |---|---|---|---|---|---|
 | `coordinator` | orchestrator-me (Orca) | `read,bash` (no edits) | `orca-pi-orchestration` | `fresh` | Supervises workers, never implements |
-| `driver` | orchestrator-pi (gotgenes) | full incl. `edit/write` | `pi-orchestration` | `fresh` | Implements + fans out to subagents; add fork ext. via project-local override (see `driver.yaml`) |
+| `driver` | orchestrator-pi (gotgenes) | full incl. `edit/write` | none (policy via `driver-context` ext.) | `fresh` | Implements + fans out; extensions vendored in-repo (see `driver.yaml`, `third-party/pi-subagents/VENDOR.md`) |
 
 Role prompts for gotgenes leaves live in `agents/` (templates installed to
 `~/.pi/agent/agents/`), **not** in this directory — this directory holds Orca

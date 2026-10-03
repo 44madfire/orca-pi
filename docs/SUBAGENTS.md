@@ -18,31 +18,34 @@ orchestrator-me (coordinator profile + orca-pi-orchestration skill)
 
 | Session | Gets | Never gets |
 |---|---|---|
-| coordinator | `orca-pi-orchestration` skill, `read+bash` (runs `orca-pi`) | `pi-orchestration`, pi-subagents ext., `acp_*` |
-| driver | `pi-orchestration` skill, fork ext., full tools | `orca-pi-orchestration`, `orca-pi spawn` |
-| leaves | role `.md` only, `tools:` allowlist | both skills, `acp_*` (except oracle path), nested `subagent*` (stripped by core) |
+| coordinator | `orca-pi-orchestration` skill, `read+bash` (runs `orca-pi`) | pi-subagents ext., `subagent*` tools, `acp_*` |
+| driver | vendored framework + `driver-context` ext. (policy as tagged section), full tools, no skills | `orca-pi-orchestration`, `orca-pi spawn` mandate |
+| leaves | role `.md` only, `tools:` allowlist | nested `subagent*` (stripped by core); `pi-orchestration` skill is a pointer stub, and the `driver_playbook` section is rebuilt per session so leaves never see it |
 
-A coordinator has no `subagent` tool to misuse; a driver has no `orca-pi
-spawn` to misuse. Skill descriptions route loading:
-"supervising Pi workers through Orca Tasks/Dispatches" vs "delegating to
-in-process subagents within this Pi session".
+A coordinator has no `subagent` tool to misuse. Shell caveat: the driver
+keeps `bash` for implementation, so `orca-pi spawn` remains *executable*
+there — the boundary is enforced where the platform allows
+(tools/skills/extensions) and audited elsewhere: any non-coordinator
+dispatch is a bug, visible in `orca-pi status` sweeps; fence with
+`orca-pi stop` and report.
 
 ## Setup
 
-1. Fork ext.: `git clone https://github.com/44madfire/pi-packages
-   third-party/pi-packages` (branch `feat/model-aliases` until merged;
-   see [PR #1](https://github.com/44madfire/pi-packages/pull/1)). Point the
-   driver profile's `extensions` at
-   `third-party/pi-packages/packages/pi-subagents/src/index.ts` via a
-   project-local `profiles.yaml` override (schema requires project-relative
-   paths — see `profiles/driver.yaml`).
-2. Roles: `cp agents/*.md ~/.pi/agent/agents/` (project override:
+1. Framework: already vendored at `third-party/pi-subagents` (pinned; see
+   `VENDOR.md`). Refresh with `node scripts/vendor-pi-subagents.mjs`
+   (defaults track the fork until upstream PR #1 merges, then `--ref main`).
+   Because it is committed, `profiles/driver.yaml`'s extension entries are
+   valid in every Orca worktree by git construction.
+2. Install profiles (one-time, same flow as `profiles/examples.yaml`): copy
+   the `coordinator:`/`driver:` blocks into `$PI_CODING_AGENT_DIR/profiles.yaml`
+   or `<projectRoot>/.pi/profiles.yaml`.
+3. Roles: `cp agents/*.md ~/.pi/agent/agents/` (project override:
    `<root>/.pi/agents/<name>.md`).
-3. Aliases: merge `subagents/subagents.json.example` → `~/.pi/agent/subagents.json`,
+4. Aliases: merge `subagents/subagents.json.example` → `~/.pi/agent/subagents.json`,
    pointing `fast/balanced/review/max` at models you have auth for
    (`/login` subscriptions preferred over bridges; ACP only for providers Pi
    can't auth — oracle path only).
-4. Validate: `orca-pi profile inspect coordinator|driver --project-root .`,
+5. Validate: `orca-pi profile inspect coordinator|driver --project-root .`,
    `node scripts/check-skill-size.mjs`, `npm test`.
 
 ## Escalation (leaves can't nest)

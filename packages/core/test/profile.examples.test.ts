@@ -1,14 +1,18 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { getBuiltinProfilesDocument } from "../src/profile/builtins.js";
 import {
   listProfileNames,
+  mergeValidatedDocuments,
   parseAndValidateProfilesText,
 } from "../src/profile/load.js";
-import { resolveAllProfiles } from "../src/profile/resolve.js";
+import { resolveAllProfiles, resolveProfile } from "../src/profile/resolve.js";
+import { buildPiLaunch } from "../src/pi/build-pi-launch.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = join(here, "..", "..", "..");
 
 function readShipped(rel: string): string {
   return readFileSync(join(here, "..", "..", "..", rel), "utf8");
@@ -56,20 +60,59 @@ describe("shipped profile examples", () => {
     expect(coordinator?.tools).not.toContain("write");
     expect(driver?.tools).toContain("edit");
     expect(driver?.tools).toContain("write");
-    // Each layer attaches only its own skill (exact entries — note
-    // "orca-pi-orchestration" contains "pi-orchestration" as a substring).
+    // Coordinator attaches only its own skill; the driver carries policy via
+    // the driver-context extension (skills are inherited by leaves, appended
+    // extension sections are not) — so the driver attaches no skills at all.
     expect(coordinator?.skills).toEqual([
       "packages/orca-plugin/skills/orca-pi-orchestration",
     ]);
-    expect(driver?.skills).toEqual(["packages/orca-plugin/skills/pi-orchestration"]);
-    expect(driver?.skills?.join(" ")).not.toContain("orca-pi-orchestration");
-    // Neither layer discovers ambient skills/extensions; driver extensions stay
-    // empty here (fork checkout path is machine-local, added via project override).
+    expect(driver?.skills).toEqual([]);
+    // Driver extensions are committed paths: valid in every worktree.
+    expect(driver?.extensions).toEqual([
+      "third-party/pi-subagents/src/index.ts",
+      "pi-extensions/driver-context.ts",
+    ]);
+    for (const ext of driver?.extensions ?? []) {
+      expect(existsSync(join(repoRoot, ext)), `vendored ext present: ${ext}`).toBe(true);
+    }
+    // Neither layer discovers ambient skills/extensions.
     expect(coordinator?.discoverSkills).toBe(false);
     expect(driver?.discoverSkills).toBe(false);
-    expect(driver?.extensions).toEqual([]);
+    expect(driver?.discoverExtensions).toBe(false);
     // Long supervision/fan-out runs keep transcripts.
     expect(coordinator?.session).toBe("fresh");
     expect(driver?.session).toBe("fresh");
+  });
+
+  it("shipped coordinator/driver survive the production install path", async () => {
+    // Mirrors the documented setup (docs/SUBAGENTS.md): user copies the
+    // shipped blocks into user/project profiles.yaml, which merges over
+    // built-ins through loadMergedProfiles. Resolve + launch through the
+    // real production functions so the profiles prove usable by
+    // `orca-pi profile inspect <name>` / `orca-pi spawn <name>`.
+    const installed = mergeValidatedDocuments([
+      getBuiltinProfilesDocument(),
+      parseAndValidateProfilesText(readShipped("profiles/coordinator.yaml"), "installed"),
+      parseAndValidateProfilesText(readShipped("profiles/driver.yaml"), "installed"),
+    ]);
+    const coordinator = resolveProfile("coordinator", installed);
+    const driver = resolveProfile("driver", installed);
+    const projectRoot = join(repoRoot, "tmp", "install-path-probe");
+    const coordLaunch = await buildPiLaunch(coordinator, { projectRoot });
+    expect(coordLaunch.spec.args).toContain("--skill");
+    expect(coordLaunch.spec.args.join(" ")).toContain("orca-pi-orchestration");
+    expect(coordLaunch.spec.args).toContain("--no-extensions");
+    // fresh: keeps transcripts, never resumes — no session flags at all.
+    for (const forbidden of ["--no-session", "--continue", "--resume", "--session", "--fork"]) {
+      expect(coordLaunch.spec.args).not.toContain(forbidden);
+    }
+    const driverLaunch = await buildPiLaunch(driver, { projectRoot });
+    expect(driverLaunch.spec.args).toContain("--extension");
+    const args = driverLaunch.spec.args.join(" ");
+    // Launcher emits project-joined paths (posix separators).
+    expect(args).toContain("third-party/pi-subagents/src/index.ts");
+    expect(args).toContain("pi-extensions/driver-context.ts");
+    expect(driverLaunch.spec.args).toContain("--no-skills");
+    expect(driverLaunch.spec.args).toContain("--tools");
   });
 });

@@ -8,9 +8,9 @@ directly.
 ## Install
 
 ```sh
-# 1. Install the fork (branch feat/model-aliases until merged)
-git clone https://github.com/44madfire/pi-packages third-party/pi-packages
-# (or anywhere; point the driver profile's extensions at the real path)
+# 1. Framework is vendored in this repo (third-party/pi-subagents, see VENDOR.md).
+#    No clone needed. Refresh after upstream changes:
+#    node scripts/vendor-pi-subagents.mjs
 
 # 2. Copy roles to Pi's global agent dir
 mkdir -p ~/.pi/agent/agents

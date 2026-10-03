@@ -3,25 +3,30 @@
 # This is the Orca worker Pi session that fans out to gotgenes subagents
 # (scout/task/reviewer/oracle/designer/planner from agents/). It implements
 # AND delegates within one Pi process:
-# - full tools (it edits code) plus the pi-orchestration playbook skill.
+# - full tools (it edits code); orchestration policy arrives via the
+#   pi-extensions/driver-context extension (tagged prompt section, active
+#   only when the `subagent` tool is registered — never in leaves).
+# - extensions are COMMITTED paths (third-party/ + pi-extensions/), so they
+#   exist in every Orca worktree by git construction. third-party/pi-subagents
+#   is a vendored copy of https://github.com/44madfire/pi-packages
+#   (see third-party/pi-subagents/VENDOR.md; refresh with
+#   node scripts/vendor-pi-subagents.mjs). No machine-local clone needed.
+# - skills: [] — the pi-orchestration SKILL.md is a pointer stub only; the
+#   policy travels via the extension surface children do not inherit.
 # - session is `fresh` so background subagents track across the run.
-# - extensions: [] here because the fork checkout path is machine-local.
-#   After cloning https://github.com/44madfire/pi-packages (branch
-#   feat/model-aliases until merged), add ONE project-local override, e.g. in
-#   <projectRoot>/.pi/profiles.yaml:
-#
-#     profiles:
-#       driver:
-#         extensions: [third-party/pi-packages/packages/pi-subagents/src/index.ts]
-#
-#   (clone the fork to <projectRoot>/third-party/pi-packages). The extension
-#   entry must stay a project-relative path (schema rejects absolute/URL).
 # - NEVER attach orca-pi-orchestration or run `orca-pi spawn` here: nested
 #   Orca supervision causes double-spend and worktree chaos. Escalation inside
-#   this layer is ask_parent → oracle → steer (see skills/pi-orchestration).
+#   this layer is ask_parent → oracle → steer (see pi-extensions/playbook.md).
 #   gotgenes strips subagent tools from children unconditionally, so leaves
 #   cannot nest — oracle queries are always driver-mediated.
+# - Shell caveat: this profile keeps `bash` for implementation/validation, so
+#   `orca-pi spawn` remains *executable* here. The separation is enforced at
+#   the tool/skill/extension layer; the shell is shared surface. Treat any
+#   non-coordinator dispatch as a bug: fence with `orca-pi stop` and report.
 #
+# Install (one-time, mirrors the profiles/examples.yaml flow): copy this
+# `driver:` block into $PI_CODING_AGENT_DIR/profiles.yaml or
+# <projectRoot>/.pi/profiles.yaml, then `orca-pi profile inspect driver`.
 # Launch: orca-pi spawn driver --task "<issue handoff>" --worktree new-child --name <issue> --json
 # Validate with: orca-pi profile inspect driver --project-root .
 
@@ -48,8 +53,8 @@ profiles:
       4. Validation (command — result)
       5. Unresolved concerns (explicit; write "None" if empty)
     tools: [read, grep, find, ls, bash, edit, write]
-    skills: [packages/orca-plugin/skills/pi-orchestration]
-    extensions: []
+    skills: []
+    extensions: [third-party/pi-subagents/src/index.ts, pi-extensions/driver-context.ts]
     contextFiles: true
     discoverSkills: false
     discoverExtensions: false
