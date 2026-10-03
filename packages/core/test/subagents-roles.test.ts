@@ -20,10 +20,12 @@ interface AgentFile {
 
 function parseAgentFile(name: string): AgentFile {
   const text = readFileSync(join(agentsDir, `${name}.md`), "utf8");
-  const match = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
   expect(match, `${name}.md must have YAML frontmatter`).toBeTruthy();
   const frontmatter: Record<string, string> = {};
-  for (const line of (match?.[1] ?? "").split("\n")) {
+  // Split CRLF-aware: `.` never matches `\r`, so a trailing CR would break
+  // the key/value match below on Windows checkouts (git autocrlf).
+  for (const line of (match?.[1] ?? "").split(/\r?\n/)) {
     const kv = line.match(/^([a-z_]+):\s*(.+)$/);
     if (kv) frontmatter[kv[1]] = kv[2].trim();
   }
