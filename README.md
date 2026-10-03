@@ -58,7 +58,7 @@ executables.
 - Pi coding agent with the `pi` CLI on PATH
   ([coding-agent README](https://github.com/up0to1/pi-mono/blob/main/packages/coding-agent/README.md)).
 
-This scaffold was developed against Orca app `1.4.196` and Pi `0.84.4`.
+This scaffold was developed against Orca app `1.4.196` and Pi `1.0.0`.
 See `docs/ORCA_PLUGIN_API.md` for the targeted plugin API/version and for
 how to re-validate against a new Orca release.
 

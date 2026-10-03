@@ -1,0 +1,23 @@
+{
+  "$comment": "Template for ~/.pi/agent/model-aliases.json (global). Copy there and point each model at a real provider/model-id you have auth for. Project file <cwd>/.pi/model-aliases.json replaces the WHOLE map (even when empty — explicit clear). Read on every subagent spawn by pi-extensions/model-aliases.ts; hand-edits apply without restart. Thinking levels: off|minimal|low|medium|high|xhigh|max.",
+  "aliases": {
+    "fast": {
+      "model": "anthropic/claude-haiku-4-5",
+      "thinking": "low"
+    },
+    "balanced": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "thinking": "high"
+    },
+    "review": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "thinking": "high",
+      "fallbacks": ["anthropic/claude-haiku-4-5"]
+    },
+    "max": {
+      "model": "anthropic/claude-opus-4-6",
+      "thinking": "max",
+      "fallbacks": ["anthropic/claude-sonnet-4-6"]
+    }
+  }
+}

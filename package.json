@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --verbose",
+    "typecheck:extensions": "tsc --noEmit -p tsconfig.pi-extensions.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
@@ -20,6 +21,7 @@
     "check:skill-size": "node scripts/check-skill-size.mjs"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "@types/node": "^22.7.4",
     "eslint": "^9.12.0",
     "typescript": "^5.6.3",
@@ -33,6 +35,7 @@
     "skills": [
       "./packages/orca-plugin/skills/orca-pi-doctor",
       "./packages/orca-plugin/skills/orca-pi-orchestration",
+      "./packages/orca-plugin/skills/pi-orchestration",
       "./packages/orca-plugin/skills/orca-pi-github"
     ]
   }

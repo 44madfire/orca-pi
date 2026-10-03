@@ -164,7 +164,15 @@ export async function buildPiLaunch(
 
   const args: string[] = [];
 
-  // 1-2. Provider / model (optional).
+  // 1-2. Provider / model (optional). Pi 1.0 rejects `--provider` without
+  // `--model` (previously silently ignored), so fail pre-launch with the
+  // dotted-path diagnostic instead of a confusing worker-start failure.
+  if (profile.provider !== undefined && profile.model === undefined) {
+    throw new Error(
+      `Pi profile "${profile.name}" sets provider without model. ` +
+        `Pi 1.0 rejects a lone --provider; set both provider and model, or neither.`,
+    );
+  }
   if (profile.provider !== undefined) {
     args.push("--provider", profile.provider);
   }

@@ -1,0 +1,41 @@
+# Coordinator profile: orchestrator-me (Orca supervision layer).
+#
+# This is the Pi session YOU (or your coordinator model) run in to supervise
+# Orca workers. It never touches code and never spawns in-process subagents:
+# - tools exclude edit/write/grep/find/ls (receipts come from `orca-pi --json`).
+# - the orca-pi-orchestration skill is attached declaratively (no --skill flag
+#   needed when launched via `orca-pi spawn coordinator` from this project).
+# - session is `fresh` so waits/status track across a long supervision run.
+# - NEVER attach the pi-orchestration skill or the pi-subagents extension here:
+#   that is the driver's layer (see profiles/driver.yaml). The two layers stay
+#   separated by absence, not by instruction.
+#
+# Launch: orca-pi spawn coordinator --task "<issue handoff>" --json
+# Validate with: orca-pi profile inspect coordinator --project-root .
+
+profiles:
+  coordinator:
+    thinking: medium
+    systemPrompt: |-
+      You are an orchestration coordinator. Supervise Orca workers; do not implement.
+
+      Rules:
+      - Orca owns completion: use `orca-pi status`/`wait` receipts, never terminal text.
+      - One Orca Task per GitHub issue; prefer `new-child` worktrees for isolation.
+      - Keep handoffs bounded: goal, constraints, acceptance criteria, involved paths.
+      - Escalate: worker blocked → send follow-up mail or stop and respawn with narrower scope.
+      - Never edit code, never run implementation commands, never spawn in-process subagents.
+
+      Output format:
+      1. Workers (dispatch — profile — task — state)
+      2. Blockers (explicit; write "None" if empty)
+      3. Next action
+    tools: [read, bash]
+    skills: [packages/orca-plugin/skills/orca-pi-orchestration]
+    extensions: []
+    contextFiles: false
+    discoverSkills: false
+    discoverExtensions: false
+    session: fresh
+    displayName: Coordinator
+    description: Orca supervision layer. Spawns/waits on Pi workers, never implements.

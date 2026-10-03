@@ -330,6 +330,22 @@ describe("pi launch: fresh-session behavior", () => {
   });
 });
 
+describe("pi launch: Pi 1.0 rejects lone --provider", () => {
+  it("fails pre-launch when provider is set without model", async () => {
+    const profile = makeProfile({ name: "lonely", provider: "anthropic" });
+    await expect(buildPiLaunch(profile, { projectRoot: PROJECT_ROOT })).rejects.toThrow(
+      /sets provider without model/,
+    );
+  });
+
+  it("emits --provider only alongside --model", async () => {
+    const profile = makeProfile({ name: "paired", provider: "anthropic", model: "anthropic/claude-sonnet" });
+    const launch = await buildPiLaunch(profile, { projectRoot: PROJECT_ROOT });
+    expect(launch.spec.args).toContain("--provider");
+    expect(launch.spec.args).toContain("--model");
+  });
+});
+
 describe("pi launch: every supported field is covered", () => {
   it("exercises provider/model/thinking/tools/exclude/skills/extensions/context/session/prompt", async () => {
     const profile = makeProfile({
