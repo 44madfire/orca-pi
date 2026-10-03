@@ -33,7 +33,7 @@ const ref = arg("--ref", "feat/model-aliases");
 const work = mkdtempSync(join(tmpdir(), "vendor-pi-subagents-"));
 try {
   execFileSync("git", ["clone", "--depth", "1", "--branch", ref, "--filter=blob:none", "--sparse", sourceUrl, work], { stdio: "inherit" });
-  execFileSync("git", ["-C", work, "sparse-checkout", "set", "packages/pi-subagents/src", "packages/pi-subagents/package.json", "packages/pi-subagents/LICENSE", "packages/pi-subagents/docs/configuration.md"], { stdio: "inherit" });
+  execFileSync("git", ["-C", work, "sparse-checkout", "set", "--no-cone", "packages/pi-subagents/src/*", "packages/pi-subagents/docs/configuration.md", "packages/pi-subagents/package.json", "packages/pi-subagents/LICENSE"], { stdio: "inherit" });
   execFileSync("git", ["-C", work, "checkout"], { stdio: "inherit" });
   const pin = execFileSync("git", ["-C", work, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   const src = join(work, "packages", "pi-subagents");
@@ -43,12 +43,18 @@ try {
     console.error(`error: ${ref} @ ${pin} lacks modelAliases support; refusing to vendor`);
     process.exit(1);
   }
+  let vendor;
+  try {
+    vendor = readFileSync(join(dest, "VENDOR.md"), "utf8");
+  } catch {
+    vendor = `# Vendored pi-subagents (DO NOT EDIT — refresh with \`node scripts/vendor-pi-subagents.mjs\`)\n\n- Source: ${sourceUrl} (\`packages/pi-subagents\`)\n- Pinned commit: 0000000000000000000000000000000000000000\n- Branch at vendor time: \`${ref}\` (upstream PR #1 — re-vendor from \`main\` once merged)\n- Vendored: 1970-01-01 — \`src/\`, \`package.json\`, \`LICENSE\`, \`docs/configuration.md\`\n  (tests, media, and remaining docs intentionally excluded; ~660KB)\n- Sanity gate passed: \`modelAliases\` in \`src/settings.ts\`, \`expandModelAlias\` in\n  \`src/session/model-resolver.ts\`\n\nWhy vendored instead of referenced: Orca \`new-child\` worktrees only reproduce\ntracked files, so a machine-local clone path would not exist at worker launch.\nA committed copy keeps \`profiles/driver.yaml\`'s extension entries valid in\nevery worktree by git construction.\n`;
+  }
   rmSync(dest, { recursive: true, force: true });
   cpSync(join(src, "src"), join(dest, "src"), { recursive: true });
   cpSync(join(src, "package.json"), join(dest, "package.json"));
   cpSync(join(src, "LICENSE"), join(dest, "LICENSE"));
   cpSync(join(src, "docs", "configuration.md"), join(dest, "docs", "configuration.md"));
-  const vendor = readFileSync(join(dest, "VENDOR.md"), "utf8")
+  vendor = vendor
     .replace(/Pinned commit: [0-9a-f]{40}/, `Pinned commit: ${pin}`)
     .replace(/Branch at vendor time: `[^`]+`/, `Branch at vendor time: \`${ref}\``)
     .replace(/Vendored: \d{4}-\d{2}-\d{2}/, `Vendored: ${new Date().toISOString().slice(0, 10)}`);

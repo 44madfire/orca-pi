@@ -169,7 +169,7 @@ or `subagent(model=...)` param:
   "modelAliases": {
     "fast": "anthropic/claude-haiku-4-5",
     "balanced": "anthropic/claude-sonnet-4-6",
-    "max": "anthropic/claude-opus-4-6:max"
+    "max": "anthropic/claude-opus-4-6"
   }
 }
 ```
@@ -182,13 +182,24 @@ locked: [model]
 ---
 ```
 
+Alias targets are plain model strings (exact `provider/model-id` or fuzzy
+names). There is no `:thinking` suffix on targets — thinking stays in the
+separate `thinking:` field, which keeps the existing caller-wins-unless-
+`locked` precedence unambiguous.
+
 Resolution order per spawn: alias (case-insensitive, chains to 5 hops) →
-exact `provider/model-id` → fuzzy → inherit parent. An unresolvable alias
-fails before spawn (never inherits silently) and names the alias plus its
-target in the error; a cycle reports `alias cycle` instead of hanging.
-Per-call `model` still wins unless `locked`. No `/subagents:settings`
-affordance — hand-edited, round-tripped on save like
-`excludedExtensionPackages`.
+exact `provider/model-id` → fuzzy → inherit parent. A broken alias always
+fails before spawn and never inherits silently — whichever side named it
+(agent frontmatter or tool param) — and names the alias plus its target in
+the error. A cycle reports which aliases loop; a chain longer than 5 hops
+reports depth exhaustion distinctly. A non-alias frontmatter typo keeps the
+legacy silent-inherit behavior. Per-call `model` still wins unless `locked`.
+
+An explicit empty object (`"modelAliases": {}`) in the project file clears
+global aliases; malformed entries are ignored without clearing. Both spawn
+doors re-read `subagents.json` from disk on every spawn, so hand-edits apply
+without restart. No `/subagents:settings` affordance — hand-edited, and
+preserved across unrelated saves like `excludedExtensionPackages`.
 
 ### Locking fields against callers
 

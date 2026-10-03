@@ -2,7 +2,7 @@
 // - Global:  ~/.pi/agent/subagents.json (agentDir injected at construction) — manual defaults, never written here
 // - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { type LayeredSettingsSource, loadLayeredSettings } from "#src/layered-settings";
 import type { PromptInheritance } from "#src/types";
@@ -45,12 +45,17 @@ export interface SubagentsSettings {
    */
   promptInheritance?: Record<string, PromptInheritance>;
   /**
-   * Named model aliases, e.g. `{ fast: "provider/model-id:thinking" }.
+   * Named model aliases, e.g. `{ fast: "provider/model-id" }.
    * An agent's `model:` frontmatter or a `subagent(model=...)` param naming
    * an alias resolves to its target before exact/fuzzy registry lookup.
-   * Keys are matched case-insensitively; values are resolved as model
-   * strings (exact `provider/model-id` with optional `:thinking` suffix,
-   * or fuzzy names). Hand-edited only; no `/subagents:settings` affordance.
+   * Keys are matched case-insensitively; values are plain model strings
+   * (exact `provider/model-id` or fuzzy names — no `:thinking` suffix;
+   * thinking stays in the separate `thinking:` field). A broken alias
+   * always fails before spawn, never inherits silently. An explicit empty
+   * object clears aliases inherited from the global layer; malformed
+   * entries are ignored. Hand-edited only; no `/subagents:settings`
+   * affordance. Re-read from disk on every spawn door, so hand-edits apply
+   * without restart.
    */
   modelAliases?: Record<string, string>;
 }
@@ -196,6 +201,18 @@ export class SettingsManager {
    */
   resolveAlias(input: string): string | undefined {
     return this._modelAliases[input.toLowerCase().trim()];
+  }
+
+  /**
+   * Re-read only the alias map from disk (global + project layers).
+   * Spawn doors call this before resolving models so hand-edits to
+   * `subagents.json` apply without restart; other in-memory settings are
+   * untouched and no lifecycle event fires. Missing/malformed files clear
+   * the map, matching `load()` semantics.
+   */
+  reloadModelAliases(): void {
+    const settings = loadSettings(this.agentDir, this.cwd);
+    this._modelAliases = { ...(settings.modelAliases ?? {}) };
   }
 
   // ── promptInheritance: hand-edited only; no /subagents:settings affordance ──
@@ -411,7 +428,7 @@ function sanitize(raw: unknown): SubagentsSettings {
     out.promptInheritance = promptInheritance;
   }
   const modelAliases = sanitizeModelAliases(r.modelAliases);
-  if (modelAliases) {
+  if (modelAliases !== undefined) {
     out.modelAliases = modelAliases;
   }
   return out;
@@ -421,12 +438,17 @@ function sanitize(raw: unknown): SubagentsSettings {
  * Keep only string→string alias entries with sane keys/values.
  * Keys are lowercased (matched case-insensitively), trimmed, and limited to
  * `[a-z0-9][a-z0-9-_]*` (max 64 chars); values must be non-empty strings
- * (max 256 chars). Absent when none survive. Silent — garbage becomes absent.
+ * (max 256 chars). An explicitly empty object is preserved as an explicit
+ * clear of the other layer; malformed entries are dropped, and a value with
+ * no surviving entries (but non-empty raw) is dropped as garbage.
+ * Returns undefined when the key was absent or unusable.
  */
 function sanitizeModelAliases(raw: unknown): Record<string, string> | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (entries.length === 0) return {};
   const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+  for (const [key, value] of entries) {
     if (typeof value !== "string") continue;
     const name = key.trim().toLowerCase();
     const target = value.trim();
@@ -472,16 +494,38 @@ export function loadSettings(agentDir: string, cwd: string): SubagentsSettings {
   } satisfies LayeredSettingsSource<SubagentsSettings>);
 }
 
+/** Hand-edited keys with no `/subagents:settings` affordance. A snapshot omits
+ * them when empty, so an unrelated save must not delete a user's explicit
+ * value (including an explicit `{}` clear) from the project file. */
+const PRESERVED_KEYS = ["excludedExtensionPackages", "promptInheritance", "modelAliases"] as const;
+
 /**
  * Write project-local settings. Global is never touched from code.
- * Returns `true` on success, `false` if the write (or mkdir) failed so the
- * caller can surface a warning — persistence isn't fatal but isn't silent.
+ * Hand-edited keys already present in the project file survive an unrelated
+ * save even when the snapshot omits them. Returns `true` on success, `false`
+ * if the write (or mkdir) failed so the caller can surface a warning —
+ * persistence isn't fatal but isn't silent.
  */
 export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()): boolean {
   const path = projectPath(cwd);
   try {
+    let prev: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        prev = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Absent or malformed project file — nothing to preserve.
+    }
+    const merged: Record<string, unknown> = { ...s };
+    for (const key of PRESERVED_KEYS) {
+      if (!(key in merged) && key in prev) {
+        merged[key] = prev[key];
+      }
+    }
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(s, null, 2), "utf-8");
+    writeFileSync(path, JSON.stringify(merged, null, 2), "utf-8");
     return true;
   } catch {
     return false;

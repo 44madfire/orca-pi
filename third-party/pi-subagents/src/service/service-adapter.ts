@@ -43,18 +43,26 @@ export interface ServiceRuntimeLike {
   getSessionInfo(): { parentSessionFile: string; parentSessionId: string };
 }
 
+/** Optional spawn-door hooks. `reloadAliases` re-reads `modelAliases` from disk
+ * so hand-edits apply without restart (mirrors the Agent tool door). */
+export interface ServiceAdapterHooks {
+  reloadAliases?: () => void;
+}
+
 /** Adapter that wraps SubagentManager to satisfy SubagentsService. */
 export class SubagentsServiceAdapter implements SubagentsService {
   constructor(
     private readonly manager: SubagentManagerLike,
     private readonly resolveModel: (input: string, registry: ModelRegistry) => Model<any> | string,
     private readonly runtime: ServiceRuntimeLike,
+    private readonly hooks?: ServiceAdapterHooks,
   ) {}
 
   spawn(type: string, prompt: string, options?: SpawnOptions): string {
     if (!this.runtime.currentCtx) {
       throw new Error("No active session — cannot spawn agents outside a session.");
     }
+    this.hooks?.reloadAliases?.();
 
     const model = this.resolveModelOption(options?.model);
     const description = options?.description ?? prompt.slice(0, 80);

@@ -198,11 +198,14 @@ export default function (pi: ExtensionAPI) {
 
   // Typed service published via Symbol.for() for cross-extension access.
   // Consumers: const { getSubagentsService } = await import("@gotgenes/pi-subagents");
-  // Alias-aware: reads live settings.modelAliases on every call so hand-edits
-  // apply without restart (same as the Agent tool door via resolveSpawnConfig).
+  // Alias-aware: reads live settings.modelAliases on every call, and both
+  // spawn doors re-read subagents.json from disk first, so hand-edits apply
+  // without restart (Agent tool door reloads in execute; service door below).
   const aliasAwareResolve: typeof resolveModel = (input, registry) =>
     resolveModel(input, registry, settings.modelAliases);
-  const service = new SubagentsServiceAdapter(manager, aliasAwareResolve, runtime);
+  const service = new SubagentsServiceAdapter(manager, aliasAwareResolve, runtime, {
+    reloadAliases: () => settings.reloadModelAliases(),
+  });
   publishSubagentsService(service);
 
   const lifecycle = new SessionLifecycleHandler(

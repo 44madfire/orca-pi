@@ -46,6 +46,8 @@ export type AgentToolSettings = {
 	readonly defaultMaxTurns: number | undefined;
 	readonly maxConcurrent: number;
 	readonly modelAliases?: Readonly<Record<string, string>>;
+	/** Re-read aliases from disk; absent in tests and minimal hosts. */
+	readonly reloadModelAliases?: () => void;
 };
 
 // ---- Class ----
@@ -76,6 +78,8 @@ export class AgentTool {
 	) {
 		// Reload custom agents so new .pi/agents/*.md files are picked up without restart
 		this.registry.reload();
+		// Re-read aliases so hand-edits to subagents.json apply without restart
+		this.settings.reloadModelAliases?.();
 
 		// ---- Config resolution (pure) ----
 		const config = resolveSpawnConfig(
